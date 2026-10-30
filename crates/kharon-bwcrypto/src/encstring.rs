@@ -192,6 +192,10 @@ impl std::str::FromStr for EncString {
 
 /// Proof that an HMAC check passed for a specific `(iv, ct)` pair.
 /// Only [`verify_mac`] constructs this; [`aes_cbc_decrypt`] requires it.
+///
+/// The guarantee is module-scoped: any code inside this module could
+/// construct one, so do not add a second constructor — new code in this
+/// module must go through [`verify_mac`] (noted on review of PR #33).
 struct MacVerified<'a> {
     iv: &'a [u8],
     ct: &'a [u8],
@@ -205,8 +209,11 @@ fn verify_mac<'a>(
     ct: &'a [u8],
     mac: &[u8],
 ) -> Result<MacVerified<'a>, EncError> {
-    let mut h =
-        <HmacSha256 as Mac>::new_from_slice(mac_key).map_err(|_| EncError::InvalidKeyLength)?;
+    // HMAC accepts a key of any length, so this cannot fail; `expect`
+    // states the invariant honestly instead of mapping to an error
+    // variant no caller can ever observe.
+    let mut h = <HmacSha256 as Mac>::new_from_slice(mac_key)
+        .expect("invariant: HMAC-SHA256 accepts keys of any length");
     h.update(iv);
     h.update(ct);
     h.verify_slice(mac).map_err(|_| EncError::MacMismatch)?;
@@ -221,8 +228,12 @@ fn aes_cbc_decrypt(
 ) -> Result<Zeroizing<Vec<u8>>, EncError> {
     #[cfg(test)]
     CBC_DECRYPT_CALLS.with(|c| c.set(c.get() + 1));
+    // `enc_key` is 32 bytes by construction (`SymmetricKey` splits a
+    // 64-byte key) and `verified.iv` was length-checked to 16 bytes at
+    // parse time, so construction cannot fail; `expect` states that
+    // invariant instead of mapping to an unreachable error variant.
     let pt = cbc::Decryptor::<aes::Aes256>::new_from_slices(enc_key, verified.iv)
-        .map_err(|_| EncError::Malformed)?
+        .expect("invariant: 32-byte enc_key and 16-byte iv, checked at parse/key construction")
         .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(verified.ct)
         .map_err(|_| EncError::DecryptionFailed)?;
     Ok(Zeroizing::new(pt))
@@ -251,9 +262,10 @@ mod tests {
 
     /// External vector: plaintext bytes 0x00..0x40 encrypted with
     /// `openssl pkeyutl`, RSA-OAEP-SHA1, under the throwaway fixture key
-    /// below (generated for these tests only).
+    /// in `tests/fixtures/type4-throwaway-key.pem` (generated for these
+    /// tests only; never used for anything real).
     const TYPE4_CT_B64: &str = "MiHE+v1yx6Of009CSGoA4IpshdPxJl6cWObzi6HcvH6bauWyU2dK7GVi1uVn0mvTtpL05Gm/EctFiyY+JnD9rnuzg6CwxbQEkW4Bpj/jmKjB8PUZOsPNlDJbRRMJa//K9xMUXVGu5fwr93SsTpjmgd2b5j3NRyI3DgUA+eML/6d96hbu0O2lOXLwTNL1Q21w7pKW5a7fmZsWapURuoM0b7qJb6avUkmajFXGrpeRTBlq0Z6RlYrhFm5iOup2lMhZfmlqTMAZ+dItZzsdo3X9z6wgE4SA+uQQwx+uYf7gT3BATJ45WPPe8VJKViNaxbrlqkTa72qEyWJ1oEVKHiulQA==";
-    const TYPE4_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC9WJbm1xBd6CJz\n78pFaSH2AHqkEkYpAXkqYI1nax0NfFHBugNyC84nH9ZWo/U3KFP857a5ZfkFs8Ul\nlEYhLemItSdLBasFgpm0wnhV+3TsrM48oQaS6QzSo0eCQeJkcjh4tZpcI9xfHBzC\nRrg73Yb5goOTqghyYy8hYE4NcEC3xxaE1JrYCDmVJeNdIuJVVGil5yYC6po4hXNz\nBj0f0YNc2jTS/cu9ZdFxWjFs9SZkyzsdjOZdrvrMNnZCruxHG2a0SBpOcHvHnyZP\nMhEDVLWVESBuWvCKYychTEvu0t1tSklG69+o0rkEzzGcXFmNUPeMDPLZawnu6V3f\nHI2BBVwDAgMBAAECggEAC61N88MpnZD2UaNlHFi6dnBbH96HTc9rHdjsf4c/OG4F\nS2bhqtky3SjSesS2bQYN/+0jpgAK68twChGV2EVQ6f8PWEoWMkshQuDcs6NuojXv\nVhUxfEKRFDXA8DXd9LHdQlx4vjFGouWZ7xqWEWMSXYrV+yJOTmJILXfB+IQxXuP2\nDI6oca0vIhfPbmH8T+SGHzqPFjPciwXjMfQjwf7q0bLXt2D/epU+p81zSYMiGYvC\ngM03Aih0YWSOWaaTKtKLMwvlQgaqI0GOzkDEkCcKQ70WcaqsNpt7gNESEC1Ia2Mp\nGxd2ZPzpiFaM1l800bkArjcudgfIQpgEqkuZ25vseQKBgQDrCGvNGjDTTPGbKVox\nDwWV75jlFxoe/dR4R08/PHBt0FgDkp1ew7BNnzH2xwTTHDTSQ6RMvI+w3Jd4ZAop\nun3age/uod/dpSnl2wbPWj78hWdAZ7pQD+ArFgwYqxpjWmNitSf9SPhk+A6GtwBO\njtoWDuspWlBEQYpuvVRyMj5dPQKBgQDOPMrKeAr929Us2SOKqnry/TQdyE4PEpdA\nTlyfoR/2B58By64MLQg43YfTLH0tIX6RxpDCYDC3KlIB46b3n9NoE5OAR8upWdDG\nQurUfPY8zT1XNJrkQYZVpsHCe3Alk+kLSm3hNK14uqMpOOxyTm6e/Sa6HM5oX9iN\nUJgl/7iyPwKBgQDKBXcD2RtWxLB3+ld4C711X3lAkVb2hJ/4svK/HChXe9nrWD7E\nkdgdIFVGFVNkUr5kbZfwDbRFBZd8+CB0NcSv6ThfGezfC3S0CkwUNzIkxFY32fEf\nmEXLQywqmAgaljsPQT+aSvqXb1CtIue0nr1+cFxaMzMDOILRJRRNBDru0QKBgEfY\nt9DnFvUvE0mnb5FMKL7j5LcHY+IuWNDHO89Eg2zjZMpsWXrWaUneKwYvNoB1bbF9\nGksM1YvJy33q/+y+Ghjk0PrciB+8MVYQU9yol+PAoED0C42/IfxOtqt48y20JHiR\nekv9XP11D4g5021S04jBqi8l/+YulbNNQ2PhfUdjAoGBAJHy9ZvHBPN4C/3YZbQ9\nYSoKSYJRw6yEH0mOXMP33OHNs4qfWubo3gugoTIEJGbukLn1QoiwOWIgQsYJQo+m\nQLp7EDqAtoq39ICHbsMjN90UBn8556D3m0jIHBOJzGJV1Vc0grb5kNc6vY9kSAKz\n4JXjmLUH2JaPlHxN4mWfSiJC\n-----END PRIVATE KEY-----";
+    const TYPE4_KEY_PEM: &str = include_str!("../tests/fixtures/type4-throwaway-key.pem");
 
     fn test_symmetric_key() -> SymmetricKey {
         let bytes: Vec<u8> = (0u8..64).collect();

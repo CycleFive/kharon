@@ -6,7 +6,7 @@ kharon is built by three agents plus the owner. The spec ([`SPEC.md`](SPEC.md)) 
 |---|---|---|
 | Nyx (lead) | `cycle-five-nyx[bot]` | `nyx/` |
 | Muse | `cycle-five-muse[bot]` | `muse/` |
-| Kimi | `cycle-five-nix[bot]` | `kimi/` |
+| Nix | `cycle-five-nix[bot]` | `kimi/` |
 | Owner | `cycle-five` (Lothrop) | — |
 
 ## Claim protocol

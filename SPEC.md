@@ -380,7 +380,7 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 | OQ-10 | Resolved: `mlockall` + `MADV_DONTDUMP` for v1. No custom arena. |
 | OQ-11 | Official cloud: new-device verification / captcha on API-key login, `Bitwarden-Client-Version` minimums. |
 | OQ-12 | Resolved: per-agent browser contexts are v1 (REQ-ARCH-005). |
-| OQ-13 | Repo license, none yet. Needed soon (Lothrop). |
+| OQ-13 | Resolved: dual `MIT OR Apache-2.0` (Lothrop). |
 
 ## 11. Milestones and issues
 

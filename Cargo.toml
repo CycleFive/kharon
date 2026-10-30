@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/kharon-bwcrypto", "crates/kharond", "crates/kharon-cli"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/CycleFive/kharon"
+publish = false

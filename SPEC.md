@@ -119,9 +119,9 @@ Recommendation: own minimal crate `kharon-bwcrypto` using RustCrypto (`aes`, `cb
 | REQ-CRY-003 | Verify MAC in constant time before decrypting. Never decrypt on MAC failure. | A flipped bit in ct, iv, or mac yields `MacMismatch`. The test asserts the CBC decryptor was not invoked. |
 | REQ-CRY-004 | Unwrap user key → private key → org key → optional cipher key. | Fixture account in Vaultwarden: decrypt a known item with and without `cipher.key`, matching `bw get item`. |
 | REQ-CRY-005 | Log in with personal API key, then sync. | Against Vaultwarden 1.3x and a Bitwarden cloud test account: `GET /api/sync` returns 200 and the collection items decrypt. |
-| REQ-CRY-006 | Decrypt only the needed cipher field at fill time. Keep no plaintext item cache. | A heap snapshot (debug feature) after sync contains no canary plaintext. After a fill completes, the canary is absent within 1 s. |
+| REQ-CRY-006 | Field classes: metadata = name, URIs, username (decrypted at sync, held in memory for list/match). Secret = password, TOTP, hidden custom fields, notes (decrypted per fill only). Keep no plaintext secret cache. | A heap snapshot (debug feature) after sync contains no canary plaintext. After a fill completes, the canary is absent within 1 s. |
 | REQ-CRY-007 | Restrict the item set to configured org and collection IDs. | Items in other collections or orgs visible to the account are absent from `list` and rejected by `fill` (`ItemNotFound`). |
-| REQ-CRY-008 | Dedicated org: the broker refuses to start if the kharon account can see any org other than `organization_id`, or any item outside it, unless `allow_extra_orgs=true`. | Fixture with the account added to a second org → startup error `ScopeTooBroad`. |
+| REQ-CRY-008 | Dedicated org: the broker refuses to start if the kharon account can see any org other than `organization_id`, or any item outside it, unless `allow_extra_orgs=true`. | Fixture with the account added to a second org → startup error `ScopeTooBroad`. The check reruns on every sync: widening mid-run → lock + audit `scope_widened`. E2E adds a second org while unlocked and the next sync locks. |
 | REQ-CRY-009 | Live sync: web-vault changes reach the broker without restart. Full `/api/sync` runs every ≤ 5 min while unlocked. If the server supports the notifications hub (`/notifications/hub`, SignalR), sync runs on push. | E2E: add, edit, and delete an item in the web vault. Within 5 min (≤ 10 s with push), `list` reflects each change with no process restart (PID unchanged). |
 | REQ-CRY-010 | Document each crypto step with a whitepaper/sdk citation. | `docs/crypto.md` exists. Each table row links a source. Reviewed. |
 
@@ -169,6 +169,7 @@ Recommendation: (a). Chromium runs as OS user `browser` with `--remote-debugging
 | REQ-ARCH-001 | No kharon binary or secret-bearing config on the agent host. | The deployment guide's agent-host steps install only Chromium flags and tunnel config. CI checks the docs. |
 | REQ-ARCH-002 | Broker ↔ CDP traffic is authenticated and encrypted. | Plain `ws://` to a non-loopback address is refused at config load. A tunnel test with a wrong peer key fails to connect. |
 | REQ-ARCH-003 | Broker uses its own CDP session and never enables domains that echo secrets to other sessions. | In an E2E with a second CDP client subscribed to `Runtime`, `Log`, `Network`, and `Page`, the canary is not received by the second client during fill. Mutation observers in page JS are excluded per N1. |
+| REQ-ARCH-005 | Target ownership. The broker creates one browser context per agent (`Target.createBrowserContext`) and hands the agent its `browserContextId`. `fill` is accepted only if `cdp_target_id` is in the requesting agent's context. Targets in the default context are refused unless `allow_default_context=true`, for single-agent setups. | E2E: agent A fills into a tab in agent B's context → `target_not_owned`. Default-context tab with the flag off → refused. |
 | REQ-ARCH-004 | Chromium launched with password manager and autofill save disabled. | Profile `Login Data` contains 0 rows after 10 fills. |
 
 ## 4. Agent-facing API
@@ -204,7 +205,7 @@ There is no read-secret, export, or reveal route, and no `include_secret` flag. 
 // FillTotpRequest = FillRequest with fields=[{kind:"totp", selector?}]
 
 // FillResult
-{ "status": "filled|pending_approval|denied|origin_mismatch|navigated|field_not_found|locked|rate_limited|not_found|error",
+{ "status": "filled|pending_approval|denied|origin_mismatch|target_not_owned|navigated|field_not_found|locked|rate_limited|not_found|error",
   "fields_filled": ["username","password"],        // kinds only
   "grant_request_id": "string?", "audit_seq": 1234, "detail": "string?" } // detail never contains values
 ```
@@ -232,16 +233,16 @@ Grant = `{id, agent_id, item_id|*collection, origin (eTLD+1 or host), actions �
 
 | Channel | Owner authN | Notes |
 |---|---|---|
-| ntfy (self-hosted beside Vaultwarden) | Message carries an `http` action to `/owner/approve/<one-time token>`. The token is single-use, 120 s, and 256-bit. For grants >1 h it also requires a web UI WebAuthn step. | ntfy topic is access-controlled. The message contains agent, item name, origin, and action, never secrets. |
+| ntfy (self-hosted beside Vaultwarden) | `once` grants: an ntfy `http` action, which the ntfy app sends as a POST on tap (ntfy default; not a link, so no prefetch), to `/owner/approve/<one-time token>`. The token is single-use, 120 s, and 256-bit. per-origin and standing grants: a `view` action opens a confirm page (GET renders only) and the confirm needs WebAuthn. The approve endpoint is POST-only. GET never mutates. | ntfy topic is access-controlled. The message contains agent, item name, origin, and action, never secrets. |
 | Web UI | WebAuthn passkey (owner), session ≤ 15 min | Shows pending requests, grants, audit tail |
 | CLI | Unix socket `0600` owned by kharon user. `SO_PEERCRED` uid check. | `kharon approve <id> [--ttl 1h --scope origin]`, `kharon deny`, `kharon grants` |
 
 | ID | Requirement | AC |
 |---|---|---|
-| REQ-APR-001 | Fill without a grant → `pending_approval`. No secret is decrypted before approval. | Test: a decrypt counter stays 0 until approval. |
+| REQ-APR-001 | Fill without a grant → `pending_approval`. No secret-bearing field (password, TOTP seed, hidden custom field, notes) is decrypted before approval. Match metadata (name, URIs, username) is decrypted at sync. | Test: the secret-field decrypt counter stays 0 until approval. The metadata counter is unconstrained. |
 | REQ-APR-002 | Grants match on agent, item, origin, and action, plus TTL and max_uses. | Table-driven tests: each dimension mismatch → new request. Expired grant → new request. |
 | REQ-APR-003 | Request auto-denies at timeout. | With the clock mocked at +121 s the state is `denied` and audited. |
-| REQ-APR-004 | ntfy channel with single-use approve/deny tokens. | Replay of a used token → 410. A token older than 120 s → 410. |
+| REQ-APR-004 | ntfy channel with single-use approve/deny tokens. Approve and deny are POST-only. | Replay of a used token → 410. A token older than 120 s → 410. GET on the approve URL → confirm page, grant state unchanged. |
 | REQ-APR-005 | Web UI with WebAuthn-only owner login. | A login without passkey assertion is impossible (no password route). E2E with a virtual authenticator. |
 | REQ-APR-006 | CLI over unix socket with peer uid check. | Connect as another uid → rejected and audited. |
 | REQ-APR-007 | Approval prompt shows the live origin observed at request time, not the agent's claim. | Test: agent claims origin A while the tab is on B. The prompt shows B and the request is `origin_mismatch` before prompting. |
@@ -263,7 +264,7 @@ Rules: scheme must be `https`, except `http://localhost`/IP only if the item URI
 
 Redirect-race defense. The check and the write happen in one renderer task:
 1. `Page.createIsolatedWorld(frameId)` → contextId. Record `loaderId`.
-2. `Runtime.callFunctionOn` in that context with args `(expectedOriginSet, kind, selector, secret)`. The function checks `location.origin ∈ expectedOriginSet`, and `window.top.location.origin` if same-origin-accessible (else uses step 1's frame-tree origin check). It resolves the field, sets the value via the native `HTMLInputElement.prototype.value` setter, and dispatches `input` and `change`. All of this runs synchronously, so JS run-to-completion means no navigation can commit mid-function.
+2. `Runtime.callFunctionOn` in that context with args `(matchers, kind, selector, secret)`. Comparand per match type: Domain → `location.protocol` plus `location.hostname` equal to or ending in `.`+d, where the broker PSL-reduced d (no PSL in-page). Host → `location.origin`. Exact → `location.href` equal. StartsWith → `location.origin` equal and `location.href` prefix. The function checks these and `window.top.location.origin` if same-origin-accessible (else uses step 1's frame-tree origin check). It resolves the field, sets the value via the native `HTMLInputElement.prototype.value` setter, and dispatches `input` and `change`. All of this runs synchronously, so JS run-to-completion means no navigation can commit mid-function.
 3. If the document navigates, the isolated world context is destroyed and the call fails (`navigated`). It cannot land in the new document.
 4. After the call: check that `loaderId` is unchanged. If it changed, attempt a clear in the old context (best effort) and report `navigated`.
 
@@ -271,7 +272,7 @@ The fallback path, `Input.insertText` for sites that ignore programmatic value s
 
 | ID | Requirement | AC |
 |---|---|---|
-| REQ-ORG-001 | Implement the match table above with PSL. | Table tests ≥ 40 cases, including `co.uk`, `github.io`, IDN, ports, `http`, RegEx refused. |
+| REQ-ORG-001 | Implement the match table above with PSL. | Table tests ≥ 40 cases, including `co.uk`, `github.io`, IDN, ports, `http`, RegEx refused. In-page E2E for Exact and StartsWith: matching origin with a non-matching href → `origin_mismatch`. |
 | REQ-ORG-002 | Origin read from the live frame via CDP, never from agent input. | Test: the agent passes `expected_origin` = item origin while the tab is evil.test → `origin_mismatch`. |
 | REQ-ORG-003 | Atomic check-and-set in an isolated world. Context destruction → `navigated`. | E2E: the page schedules `location = evil` on the `focus` event and in a microtask, 1000 iterations. 0 fills land on evil.test (server logs). |
 | REQ-ORG-004 | Cross-origin iframe fill refused unless allowlisted. | E2E: the login form in an iframe from another eTLD+1 → `origin_mismatch`. Allowlisted → filled. |
@@ -280,19 +281,20 @@ The fallback path, `Input.insertText` for sites that ignore programmatic value s
 ## 7. Audit, rate limits, revocation
 
 Audit: append-only JSONL at `/data/audit/audit.jsonl`, opened `O_APPEND`, with `chattr +a` recommended. Entry:
-`{seq, ts, prev_hash, event, agent_id, item_id, item_name_hash, origin, grant_id, channel, result, detail_code}`, with `hash = SHA-256(prev_hash ‖ JCS(entry without hash))` (RFC 8785 canonical JSON). Every N=100 entries or 10 min, a checkpoint `{seq, hash}` is signed with the broker's Ed25519 audit key and optionally pushed to ntfy or a remote syslog so truncation is detectable. Events: unlock, lock, sync, list, search, fill_*, grant_request, grant_issue, grant_revoke, token_create/revoke, owner_auth_fail, rate_limit, panic.
+`{seq, ts, prev_hash, event, agent_id, item_id, item_name_hash, origin, grant_id, channel, result, detail_code}`, with `hash = SHA-256(prev_hash ‖ JCS(entry without hash))` (RFC 8785 canonical JSON). Every N=100 entries or 10 min, a checkpoint `{seq, hash}` is signed with the broker's Ed25519 audit key and pushed off-host (ntfy or remote syslog) by default. Local-only checkpoints require `audit_checkpoint_local_only=true`, which is logged as a startup warning. Events: unlock, lock, sync, list, search, fill_*, grant_request, grant_issue, grant_revoke, token_create/revoke, owner_auth_fail, rate_limit, panic.
 
 | ID | Requirement | AC |
 |---|---|---|
 | REQ-AUD-001 | Hash-chained JSONL with JCS canonicalization. | `kharon audit verify` passes on a clean log. Editing any byte of entry k reports the first bad seq = k. |
-| REQ-AUD-002 | Signed checkpoints. Verifier detects truncation past a checkpoint. | Delete the last 150 entries → verify reports `truncated after checkpoint seq=…`. |
-| REQ-AUD-003 | Every API call and owner action produces exactly one entry before the response is sent. Write failure → request fails closed. | Test with a read-only audit file → fill returns `error`. No CDP write occurred. |
-| REQ-AUD-004 | No secrets or usernames in audit. Item name stored as a keyed hash plus a cleartext name only if `audit_item_names=true`. | Canary scan of the log = 0. |
-| REQ-RL-001 | Per-agent token bucket: fills 10/min and 100/day, list/search 60/min (configurable). | Load test: the 11th fill in 60 s → `rate_limited`. |
-| REQ-RL-002 | Per-item: 5 fills per 10 min. Per-agent: 5 consecutive `origin_mismatch` → agent suspended until owner reset. | Tests for both thresholds. Suspension audited. |
+| REQ-AUD-002 | Signed checkpoints pushed off-host by default. Verifier, given the off-host checkpoint stream, detects truncation. | Delete the last 150 entries → verify reports `truncated after checkpoint seq=…`. |
+| REQ-AUD-003 | Every state transition (request, grant_request, fill, owner action) produces exactly one entry, all written before the response is sent. Write failure → request fails closed. | Test with a read-only audit file → fill returns `error`. No CDP write occurred. |
+| REQ-AUD-004 | No secrets or usernames in audit. Item name stored as HMAC-SHA256 under `audit_name_key`, a random 32-byte key generated at first start in `/data/keys/` (0600), separate from the Ed25519 audit key and never logged. It is not rotated: rotating breaks correlation, and its exposure reveals only names guessable by dictionary. Cleartext name only if `audit_item_names=true`. | Canary scan of the log = 0. |
+| REQ-RL-001 | Per-agent token bucket (`fill` and `fill_totp` share it): fills 10/min and 100/day, list/search 60/min (configurable). | Load test: the 11th fill in 60 s → `rate_limited`. |
+| REQ-RL-002 | Per-item: 5 fills (password or TOTP) per 10 min. Per-agent: 5 consecutive `origin_mismatch` → agent suspended until owner reset. | Tests for both thresholds. Suspension audited. |
 | REQ-RL-003 | Pending grant requests ≤ 3 per agent (anti-approval-fatigue). | The 4th request → `rate_limited` without notification. |
 | REQ-REV-001 | `kharon revoke grant <id>`, `revoke agent <id>` (token + grants), effective for the next request. | Revoke then fill within 10 ms → denied. |
 | REQ-REV-002 | `kharon panic`: lock, zeroize keys, revoke all grants, close CDP sessions, notify. Also via ntfy action and web UI. | After panic, the heap scan shows no key canary. `status.locked=true`. Fill → `locked`. |
+| REQ-REV-004 | Rollback detection: keep a per-item high-water `revisionDate` and an item-set hash in memory since unlock. A sync that regresses either → lock + audit `rollback_detected`. Grants pin the item revision at issuance; a fill against a different revision → `denied` (re-approval). Closes OQ-7 for v1. | Fixture serves an older cipher → lock. Changing an item revision after grant → fill denied. |
 | REQ-REV-003 | Item removed from the collection, or revision changed, invalidates per-item grants on next sync. | Move an item out, sync → its grants are gone and audited. |
 
 ## 8. Unlock and key lifecycle
@@ -311,6 +313,7 @@ Audit: append-only JSONL at `/data/audit/audit.jsonl`, opened `O_APPEND`, with `
 | REQ-MEM-002 | mlockall succeeds or the daemon refuses to unlock (`require_mlock=true` default). | Without IPC_LOCK, unlock → error `MlockUnavailable`. |
 | REQ-MEM-003 | Password and master key zeroized after unlock. Keys zeroized on lock. | Debug-build canary scan of `/proc/self/mem` after unlock (password) and after lock (keys) = 0 hits. |
 | REQ-MEM-004 | Idle and absolute lock timers. | With the clock mocked, state = locked at T+30m idle and T+12h absolute. |
+| REQ-MEM-007 | Lock dominates grants: any fill while locked returns `locked`, regardless of standing or per-origin grants. Grants survive lock but are inert until unlock. | Standing grant + locked broker → `locked`, no CDP write. |
 | REQ-MEM-005 | Boots locked. No secret persisted. | Kill -9 and restart → `locked`. `strings` on `/data` finds no canary or key. |
 | REQ-MEM-006 | Unknown crypto version or org key change forces lock. | A fixture with a rotated org key → lock + audit `key_rotated`. |
 
@@ -357,6 +360,8 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 | REQ-DEP-002 | Compose example runs E2E against Vaultwarden. | CI job: compose up, then a seeded fixture fills a test page through headless Chromium. |
 | REQ-DEP-003 | Config validated at startup. Unsafe combos refused (non-loopback plain CDP, standing grants without flag, missing mlock). | Table of bad configs → each exits non-zero with a specific error. |
 | REQ-DEP-004 | Official Bitwarden compatibility tested. | A manual or nightly job against a cloud test account passes REQ-CRY-005. Result recorded in `COMPAT.md`. |
+| REQ-DEP-006 | Agent API binds only to the configured WireGuard interface address. Owner API binds to loopback or a unix socket. Wildcard binds are refused. | Config with `0.0.0.0` → startup error. `ss -ltn` in E2E shows only the expected addresses. |
+| REQ-DEP-007 | The kharon account master password is generated with ≥ 128 bits of entropy and stored by the owner outside the kharon org. The API-key file plus server access reduces to an offline attack on it. | Guide documents it. `kharon init` generates the password and prints it once to the tty. |
 | REQ-DEP-005 | Agent-host guide: Chromium as `browser` user, `ptrace_scope=1`, WireGuard peer, password manager disabled. | The doc exists and an Ansible/shell snippet is tested in a VM. |
 
 ## 10. Open questions
@@ -365,17 +370,17 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 |---|---|
 | OQ-1 | Resolved: name is `kharon`. |
 | OQ-2 | `bitwarden/sdk-internal` license per crate (`bitwarden-crypto`): is it usable in a GPL/MIT/Apache tool? Unverified. Defaults to own impl. |
-| OQ-3 | Should kharon ship an MCP browser-tool profile without `evaluate`/DOM value reads, to narrow N1? Or recommend an agent harness policy? |
+| OQ-3 | Resolved: a recommended harness policy in the deployment guide (no `evaluate` or value reads), not a kharon feature. |
 | OQ-4 | Is the masked username in metadata acceptable, or is it itself sensitive (account enumeration)? Default masked. Config to hide. |
 | OQ-5 | Resolved: a dedicated `kharon` org. The owner adds or moves items there via the web vault, and live sync picks them up (REQ-CRY-008/009). |
 | OQ-6 | Passkey (FIDO2 credential in vault) assertion via CDP WebAuthn virtual authenticator: feasible for v2? |
-| OQ-7 | Bind item IDs to ciphertext (detect server item swapping)? Bitwarden has no AEAD binding of cipher ID. Consider pinning item revision hashes at grant time. |
+| OQ-7 | Resolved for v1: revision pinning plus high-water mark (REQ-REV-004). Cryptographic binding remains out of scope. |
 | OQ-8 | Account crypto v2 (type 7 EncStrings, COSE keys): timeline on cloud and Vaultwarden support. |
-| OQ-9 | Sites rejecting programmatic value set (React controlled inputs usually accept native setter + `input` event; some require trusted events). How often is the `insertText` fallback needed? |
-| OQ-10 | mlocked allocator choice. Is `mlockall` enough, or do we need a guarded arena? |
+| OQ-9 | Fallback stays off. The M2 fixture suite includes 2–3 realistic controlled-input pages (React, Vue, and a trusted-event-only page) to measure need. |
+| OQ-10 | Resolved: `mlockall` + `MADV_DONTDUMP` for v1. No custom arena. |
 | OQ-11 | Official cloud: new-device verification / captcha on API-key login, `Bitwarden-Client-Version` minimums. |
-| OQ-13 | License for the repo (none yet). |
-| OQ-12 | Multiple agents sharing one Chromium: grants are per agent token, but CDP target ownership is not authenticated. Should the target be required to be in a per-agent browser context? |
+| OQ-12 | Resolved: per-agent browser contexts are v1 (REQ-ARCH-005). |
+| OQ-13 | Repo license, none yet. Needed soon (Lothrop). |
 
 ## 11. Milestones and issues
 
@@ -395,15 +400,15 @@ M0 skeleton · M1 vault read path · M2 fill path · M3 policy and approvals · 
 | 9 | Agent auth tokens and HTTP API (status/list/search) | REQ-API-002, 003, 004, 006 | 5, 8 |
 | 10 | MCP server over the same core | REQ-API-001 | 9 |
 | 11 | Origin matcher (PSL, BW match types) | REQ-ORG-001 | 1 |
-| 12 | CDP client and tunnel transport. Isolated-world atomic fill. Navigation detection. | REQ-ARCH-002, 003, REQ-ORG-002..005 | 11 |
+| 12 | CDP client and tunnel transport. Per-agent browser contexts. Isolated-world atomic fill. Navigation detection. | REQ-ARCH-002, 003, 005, REQ-ORG-002..005 | 11 |
 | 13 | Fill and fill_and_submit endpoints | REQ-API-008, REQ-GOAL-001 | 7, 9, 12 |
 | 14 | TOTP generation and `fill_totp` | REQ-API-007 | 13 |
 | 15 | Grant model and request lifecycle | REQ-APR-001, 002, 003, 007 | 9, 8 |
 | 16 | Approval channels: CLI socket, ntfy one-time actions | REQ-APR-004, 006 | 15 |
 | 17 | Owner web UI with WebAuthn (approvals, grants, audit tail, unlock) | REQ-APR-005 | 15, 7 |
-| 18 | Rate limits, suspension, revocation, panic | REQ-RL-001..003, REQ-REV-001..003 | 13, 15 |
-| 19 | Docker image, compose, agent-host guide, canary E2E suite | REQ-DEP-001, 002, 005, REQ-ARCH-001, 004, REQ-GOAL-002 | 13, 16 |
-| 21 | Export mode loader | REQ-EXP-001..005 | 4, 7 |
+| 18 | Rate limits, suspension, revocation, panic | REQ-RL-001..003, REQ-REV-001..004, REQ-MEM-007 | 13, 15 |
+| 19 | Docker image, compose, agent-host guide, canary E2E suite | REQ-DEP-001, 002, 005, 006, 007, REQ-ARCH-001, 004, REQ-GOAL-002 | 13, 16 |
 | 20 | Official Bitwarden compat run plus `COMPAT.md` | REQ-DEP-004 | 5 |
+| 21 | Export mode loader | REQ-EXP-001..005 | 4, 7 |
 
 Parallelizable from day 1: 2, 3, 8, 11. After 4: 5, 7. Critical path: 1→3→4→5→9→13→18/19.

@@ -168,7 +168,7 @@ Recommendation: (a). Chromium runs as OS user `browser` with `--remote-debugging
 |---|---|---|
 | REQ-ARCH-001 | No kharon binary or secret-bearing config on the agent host. | The deployment guide's agent-host steps install only Chromium flags and tunnel config. CI checks the docs. |
 | REQ-ARCH-002 | Broker ↔ CDP traffic is authenticated and encrypted. | Plain `ws://` to a non-loopback address is refused at config load. A tunnel test with a wrong peer key fails to connect. |
-| REQ-ARCH-003 | Broker uses its own CDP session and never enables domains that echo secrets to other sessions. | In an E2E with a second CDP client subscribed to `Runtime`, `Log`, `Network`, and `Page`, the canary is not received by the second client during fill. Mutation observers in page JS are excluded per N1. |
+| REQ-ARCH-003 | Broker uses its own CDP session and never enables domains that echo secrets to other sessions. | In an E2E with a second CDP client subscribed to `Runtime`, `Log`, `Network`, and `Page`, the canary is not received by the second client during fill. Mutation observers in page JS are excluded per N1. The second client does receive `Runtime.executionContextCreated` for the broker's isolated world (expected, since context creation is visible), but zero canary bytes appear in any event or response it receives (byte search over its full CDP transcript). |
 | REQ-ARCH-005 | Target ownership. The broker creates one browser context per agent (`Target.createBrowserContext`) and hands the agent its `browserContextId`. `fill` is accepted only if `cdp_target_id` is in the requesting agent's context. Targets in the default context are refused unless `allow_default_context=true`, for single-agent setups. | E2E: agent A fills into a tab in agent B's context → `target_not_owned`. Default-context tab with the flag off → refused. |
 | REQ-ARCH-004 | Chromium launched with password manager and autofill save disabled. | Profile `Login Data` contains 0 rows after 10 fills. |
 
@@ -205,7 +205,7 @@ There is no read-secret, export, or reveal route, and no `include_secret` flag. 
 // FillTotpRequest = FillRequest with fields=[{kind:"totp", selector?}]
 
 // FillResult
-{ "status": "filled|pending_approval|denied|origin_mismatch|target_not_owned|navigated|field_not_found|locked|rate_limited|not_found|error",
+{ "status": "filled|pending_approval|denied|origin_mismatch|target_not_owned|navigated|field_not_found|locked|timeout|rate_limited|not_found|error",
   "fields_filled": ["username","password"],        // kinds only
   "grant_request_id": "string?", "audit_seq": 1234, "detail": "string?" } // detail never contains values
 ```
@@ -218,7 +218,8 @@ There is no read-secret, export, or reveal route, and no `include_secret` flag. 
 | REQ-API-004 | `list`/`search` return `ItemMeta` only, filtered by `origin` if given. | Golden test: response keys ⊆ the ItemMeta schema. Canary absent. |
 | REQ-API-005 | Secret types (`Secret<String>`) do not implement `Serialize`/`Debug`/`Display`. | A compile-fail test (`trybuild`) shows serializing a `Secret` fails to compile. |
 | REQ-API-006 | Error `detail` strings are built from an enum, never interpolated with field values. | A lint/test asserts no `format!` in `detail` constructors takes `Secret`. Fuzz finds no canary in details. |
-| REQ-API-007 | `fill_totp` computes RFC 6238 (SHA1/256/512, digits, period from `otpauth://` or bare base32; `steam://` 5-char) and fills the code. The code is never returned. | RFC 6238 test vectors pass. Steam vector passes. Response has no digits field. |
+| REQ-API-007 | `fill_totp` computes RFC 6238 (SHA1/256/512, digits, period from `otpauth://` or bare base32; `steam://` 5-char) and fills the code. The code is never returned. | RFC 6238 test vectors pass. Steam vector passes. Response has no digits field. The code is computed for the current time step; verification-side tolerance (±1 step) is the site's, so tests assert codes for T-1, T and T+1 match the vectors. At startup the broker compares system time with the Vaultwarden `Date` response header: skew above `clock_skew_warn` (default 30 s) → warning + audit `clock_skew`; above `clock_skew_refuse` (default 90 s) → `fill_totp` returns `error: clock_skew` until resolved. Tests: injected skew of 45 s → warning only; 120 s → `fill_totp` refused, password fills unaffected. |
+| REQ-API-009 | End-to-end fill deadline: each `fill`, `fill_totp`, and `fill_and_submit` runs under a deadline (`fill_deadline`, default 10 s, configurable) from request receipt to final CDP result. On expiry the fill fails closed (`status: timeout`, no further CDP writes, submit not dispatched), the plaintext buffer is zeroized, and an audit entry `fill_timeout` is written before the response. | Test with a CDP stub that stalls `callFunctionOn`: response `timeout` at 10 s ± 0.5 s, zeroize hook observed on the secret buffer, exactly one `fill_timeout` audit entry, and no later write reaches the stub. Config `fill_deadline=2s` → timeout at 2 s. |
 | REQ-API-008 | `submit:true` dispatches submit (Enter on last field, or `form.requestSubmit()` in the isolated world) only after all fields fill successfully. | E2E: a test page records the submit event exactly once, and only when all fields filled. |
 
 ## 5. Approval flow
@@ -401,7 +402,7 @@ M0 skeleton · M1 vault read path · M2 fill path · M3 policy and approvals · 
 | 10 | MCP server over the same core | REQ-API-001 | 9 |
 | 11 | Origin matcher (PSL, BW match types) | REQ-ORG-001 | 1 |
 | 12 | CDP client and tunnel transport. Per-agent browser contexts. Isolated-world atomic fill. Navigation detection. | REQ-ARCH-002, 003, 005, REQ-ORG-002..005 | 11 |
-| 13 | Fill and fill_and_submit endpoints | REQ-API-008, REQ-GOAL-001 | 7, 9, 12 |
+| 13 | Fill and fill_and_submit endpoints, fill deadline | REQ-API-008, 009, REQ-GOAL-001 | 7, 9, 12 |
 | 14 | TOTP generation and `fill_totp` | REQ-API-007 | 13 |
 | 15 | Grant model and request lifecycle | REQ-APR-001, 002, 003, 007 | 9, 8 |
 | 16 | Approval channels: CLI socket, ntfy one-time actions | REQ-APR-004, 006 | 15 |

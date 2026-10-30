@@ -2,7 +2,7 @@
 
 Vaultwarden fill broker: lets AI agents fill credentials without ever seeing them.
 
-Design: [`SPEC.md`](SPEC.md) (on the `spec` branch until PR #1 merges). Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Design: [`SPEC.md`](SPEC.md). Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 

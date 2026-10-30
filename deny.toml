@@ -6,6 +6,19 @@
 
 [advisories]
 version = 2
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin attack): timing side-channel in the `rsa`
+    # crate's private-key operations. No patched release exists (all
+    # released versions are affected), so accepting it is the only way to
+    # use the canonical RustCrypto RSA implementation at all. kharon's
+    # exposure is narrow: RSA decryption happens locally, at unwrap time,
+    # on ciphertexts served by the account's own Vaultwarden — the broker
+    # exposes no decryption endpoint, so an attacker cannot submit chosen
+    # ciphertexts or take the repeated timing measurements the attack
+    # needs. Revisit the moment `rsa` ships a fixed release; the ignore
+    # must be removed then. (Added 2026-10-30 with issue #6.)
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2

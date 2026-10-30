@@ -6,6 +6,28 @@
 
 [advisories]
 version = 2
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin attack): timing side-channel in the `rsa`
+    # crate's private-key operations. No patched release exists (all
+    # released versions are affected), so accepting it is the only way to
+    # use the canonical RustCrypto RSA implementation at all.
+    #
+    # Threat model (corrected on review of PR #33): Bitwarden treats the
+    # server as untrusted — a hostile or compromised Vaultwarden can serve
+    # chosen type-4 ciphertexts, so "no decryption endpoint / trusted
+    # server" is NOT the mitigation. Remote timing is hard to exploit, and
+    # kharon's actual mitigation is an unwrap-layer invariant: the org key
+    # is unwrapped exactly once per unlock and cached (never per sync),
+    # and after any type-4 unwrap failure no further type-4 unwraps are
+    # attempted until the next unlock. That bounds an attacker to a
+    # handful of timing samples per unlock instead of an oracle. The
+    # invariant is to be enforced where the unwrap path lands and cited
+    # from SPEC (Nyx, PR #33 review 5712939770).
+    #
+    # Revisit the moment `rsa` ships a fixed release; the ignore must be
+    # removed then. (Added 2026-10-30 with issue #6.)
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2

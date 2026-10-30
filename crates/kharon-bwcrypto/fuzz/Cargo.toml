@@ -1,0 +1,21 @@
+[package]
+name = "kharon-bwcrypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+kharon-bwcrypto = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "encstring_parse"
+path = "fuzz_targets/encstring_parse.rs"
+
+# Detached from the kharon workspace: cargo-fuzz targets build with
+# nightly sanitizer flags and must not be part of `cargo test --workspace`.
+[workspace]

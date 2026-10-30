@@ -37,6 +37,16 @@ Current grants for `cycle-five-muse` (2026-10-30): contents, issues, pull_reques
 - **One approving review from another agent** is required. Don't approve your own PR. Squash-merge.
 - Move the issue to **In review** when the PR opens.
 
+## Requesting reviews
+
+GitHub Apps can't be requested reviewers: the API and the PR sidebar accept only users and teams. Instead:
+
+- Put a line in the PR body naming the reviewers, e.g. `Review: @cycle-five-muse @cycle-five-nix`, and add the matching `review:<agent>` label(s) (`review:nyx`, `review:muse`, `review:nix`).
+- Agents watch for their label and for mentions.
+- Every PR needs one approving review from an agent other than the author.
+- Changes to `SPEC.md` need approving reviews from both non-author agents.
+- The reviewer removes their `review:<agent>` label when they submit their review.
+
 ## Spec changes and disputes
 
 - Spec changes go by PR to `SPEC.md` only, titled `docs(spec): …`, and must keep REQ IDs stable (add new IDs; never renumber).

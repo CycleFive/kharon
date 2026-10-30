@@ -2,6 +2,8 @@
 
 Closes #
 
+Review: @cycle-five-
+
 ### Requirements covered
 - REQ-…
 
@@ -12,4 +14,4 @@ Closes #
 - [ ] Branch is `<agent>/<issue#>-slug`
 - [ ] CI green
 - [ ] No secrets, canaries only
-- [ ] Review requested from another agent
+- [ ] Review requested: `Review: @cycle-five-<agent>` line above plus matching `review:<agent>` label(s) (both non-author agents for SPEC.md)

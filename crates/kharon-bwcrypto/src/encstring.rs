@@ -50,6 +50,11 @@ pub enum EncError {
     /// A decrypt method was called on an EncString of the other kind.
     #[error("EncString type {found} does not use this key kind (expected type {expected})")]
     TypeMismatch { expected: u32, found: u32 },
+    /// A type-4 unwrap was refused because an earlier type-4 unwrap in
+    /// this unlock session already failed (RUSTSEC-2023-0071 mitigation
+    /// invariant: no RSA decryption oracle across an unlock).
+    #[error("type-4 unwrap refused: a previous unwrap failed this unlock")]
+    Type4UnwrapRefused,
 }
 
 /// A 64-byte Bitwarden symmetric key: `enc_key || mac_key`, wiped on drop.
@@ -60,6 +65,14 @@ impl SymmetricKey {
     pub fn from_slice(bytes: &[u8]) -> Result<Self, EncError> {
         let arr: [u8; 64] = bytes.try_into().map_err(|_| EncError::InvalidKeyLength)?;
         Ok(Self(Zeroizing::new(arr)))
+    }
+
+    /// Test-only view of the raw key bytes, for byte-for-byte vector
+    /// assertions. Not part of the non-test API: key material should
+    /// only leave this type as a decryption result.
+    #[cfg(test)]
+    pub(crate) fn as_bytes_for_test(&self) -> &[u8] {
+        &self.0[..]
     }
 
     fn enc_key(&self) -> &[u8] {

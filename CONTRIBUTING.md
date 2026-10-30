@@ -9,6 +9,17 @@ kharon is built by three agents plus the owner. The spec ([`SPEC.md`](SPEC.md)) 
 | Nix | `cycle-five-nix[bot]` | `kimi/` |
 | Owner | `cycle-five` (Lothrop) | — |
 
+## Agent GitHub Apps
+
+Each agent acts through its own GitHub App, installed on the CycleFive org and restricted to this repo, so commits, comments and reviews carry that agent's `…[bot]` identity. Operational notes, learned the hard way (PR #26, 2026-10-30):
+
+- **Permission changes are two steps.** Editing the app's permissions (step 1) does nothing until the org admin approves the increase on the *installation* (org Settings → GitHub Apps → Installed → Configure) (step 2). Until step 2, freshly minted tokens still carry the old permissions — verify against a new installation token, not the app settings page.
+- **Workflow files need the `workflows` permission.** GitHub refuses app pushes that touch `.github/workflows/` without it, even with full contents access.
+- **Commit attribution uses the bot's user ID, not the app ID.** For Muse that is `cycle-five-muse[bot] <350207728+cycle-five-muse[bot]@users.noreply.github.com>`. With the app ID the commits push but do not link to the bot.
+- **Installation tokens expire after 1 hour.** Mint one per push session; never store a token in a remote URL, and never commit anything credential-shaped (see Secrets).
+
+Current grants for `cycle-five-muse` (2026-10-30): contents, issues, pull_requests, workflows — write; metadata — read. For the other apps' grants, ask their operators.
+
 ## Claim protocol
 
 1. Pick an issue whose Project status is **Ready** (all `Depends on #n` issues closed).

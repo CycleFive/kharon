@@ -4,14 +4,18 @@
 //!
 //! Type-4 (RSA-OAEP) unwraps enforce the RUSTSEC-2023-0071 mitigation
 //! invariant recorded in `deny.toml` and SPEC §3.1 review history: the
-//! org key is unwrapped **exactly once per unlock** and cached (never
-//! per sync), and after any type-4 unwrap failure no further type-4
-//! unwraps are attempted until the next unlock (a fresh
+//! org key is unwrapped **exactly once per unlock per org** and cached
+//! (never per sync), and after any type-4 unwrap failure no further
+//! type-4 unwraps are attempted until the next unlock (a fresh
 //! [`OrgKeyUnwrapper`]). A hostile server can serve chosen type-4
-//! ciphertexts, so this bounds it to a handful of RSA timing samples
-//! per unlock instead of a decryption oracle.
+//! ciphertexts, so two further bounds keep it from turning distinct
+//! fake org IDs into an unbounded decryption oracle (PR #34 review):
+//! an optional allow-list of the profile's organization IDs (orgs not
+//! on it are refused *without* decrypting), and a hard cap of
+//! [`MAX_ORG_UNWRAPS_PER_UNLOCK`] distinct-org decrypts per unlock,
+//! exceeding which poisons the session like a failure does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rsa::RsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
@@ -62,29 +66,86 @@ pub fn decrypt_item_field(
     field.decrypt_symmetric(cipher_key.unwrap_or(org_key))
 }
 
+/// Hard cap on distinct-org type-4 decrypts per unlock session.
+/// Real accounts belong to a handful of organizations; a server
+/// offering more distinct org keys than this in one unlock is
+/// harvesting RSA timing samples, so exceeding the cap poisons the
+/// session (same as a failed unwrap). The allow-list
+/// ([`OrgKeyUnwrapper::with_allowed_orgs`]) normally binds tighter.
+pub const MAX_ORG_UNWRAPS_PER_UNLOCK: usize = 16;
+
+/// One cached org key plus the protected ciphertext it came from, so a
+/// later call presenting a *different* ciphertext for the same org is
+/// noticed instead of silently ignored.
+struct CachedOrgKey {
+    key: SymmetricKey,
+    protected_ct: Vec<u8>,
+}
+
+/// Bitwarden organization IDs are GUIDs; case spellings of the same ID
+/// must not become two cache entries (and two decrypts). Normalize by
+/// trimming and lowercasing before any cache/allow-list use.
+fn normalize_org_id(org_id: &str) -> String {
+    org_id.trim().to_lowercase()
+}
+
 /// Stateful org-key unwrapper for one unlock session. See the module
 /// docs for the once-per-unlock + fail-poisoned invariant.
 pub struct OrgKeyUnwrapper {
     private_key: RsaPrivateKey,
-    cache: HashMap<String, SymmetricKey>,
+    cache: HashMap<String, CachedOrgKey>,
+    allowed_orgs: Option<HashSet<String>>,
+    decrypt_count: usize,
+    mismatched_orgs: HashSet<String>,
     poisoned: bool,
 }
 
 impl OrgKeyUnwrapper {
-    /// Start a fresh unlock session with the unwrapped private key.
+    /// Start a fresh unlock session with the unwrapped private key,
+    /// without an organization allow-list (the per-unlock decrypt cap
+    /// still applies). Prefer [`OrgKeyUnwrapper::with_allowed_orgs`]
+    /// whenever the profile's organization list is known.
     pub fn new(private_key: RsaPrivateKey) -> Self {
         Self {
             private_key,
             cache: HashMap::new(),
+            allowed_orgs: None,
+            decrypt_count: 0,
+            mismatched_orgs: HashSet::new(),
             poisoned: false,
         }
     }
 
+    /// Start a fresh unlock session restricted to the given
+    /// organization IDs (the profile's `organizations` list). Unwraps
+    /// for any other org are refused *without* decrypting and without
+    /// poisoning: the server gets no timing sample and the listed
+    /// orgs are unaffected.
+    pub fn with_allowed_orgs(
+        private_key: RsaPrivateKey,
+        allowed_orgs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
+        Self {
+            allowed_orgs: Some(
+                allowed_orgs
+                    .into_iter()
+                    .map(|id| normalize_org_id(id.as_ref()))
+                    .collect(),
+            ),
+            ..Self::new(private_key)
+        }
+    }
+
     /// Unwrap an organization's key (type 4). A second call for the
-    /// same org returns the cached key **without** decrypting again.
-    /// On any failure the session is poisoned: every later call —
-    /// for any org — returns [`EncError::Type4UnwrapRefused`] until
-    /// the next unlock.
+    /// same org returns the cached key **without** decrypting again —
+    /// even if handed a different ciphertext; in that case the cached
+    /// key is still returned (no decrypt happens, so the oracle bound
+    /// holds) but the org is flagged in
+    /// [`OrgKeyUnwrapper::ciphertext_mismatch`] so the caller can
+    /// audit-log possible org-key rotation or server misbehaviour.
+    /// On any decrypt failure — or once the per-unlock distinct-org
+    /// cap is exceeded — the session is poisoned: every later call
+    /// returns [`EncError::Type4UnwrapRefused`] until the next unlock.
     pub fn unwrap_org_key(
         &mut self,
         org_id: &str,
@@ -93,30 +154,76 @@ impl OrgKeyUnwrapper {
         if self.poisoned {
             return Err(EncError::Type4UnwrapRefused);
         }
-        if !self.cache.contains_key(org_id) {
-            let key = protected_org_key
-                .decrypt_rsa(&self.private_key)
-                .and_then(|pt| SymmetricKey::from_slice(&pt));
-            match key {
-                Ok(key) => {
-                    self.cache.insert(org_id.to_string(), key);
-                }
-                Err(e) => {
-                    self.poisoned = true;
-                    return Err(e);
-                }
+        let org_id = normalize_org_id(org_id);
+        if let Some(cached) = self.cache.get(&org_id) {
+            if cached.protected_ct != protected_org_key.ciphertext_bytes() {
+                self.mismatched_orgs.insert(org_id.clone());
+            }
+            return Ok(&self
+                .cache
+                .get(&org_id)
+                .expect("invariant: checked above")
+                .key);
+        }
+        if let Some(allowed) = &self.allowed_orgs
+            && !allowed.contains(&org_id)
+        {
+            return Err(EncError::Type4UnwrapRefused);
+        }
+        if self.decrypt_count >= MAX_ORG_UNWRAPS_PER_UNLOCK {
+            self.poisoned = true;
+            return Err(EncError::Type4UnwrapRefused);
+        }
+        self.decrypt_count += 1;
+        let key = protected_org_key
+            .decrypt_rsa(&self.private_key)
+            .and_then(|pt| SymmetricKey::from_slice(&pt));
+        match key {
+            Ok(key) => {
+                self.cache.insert(
+                    org_id.clone(),
+                    CachedOrgKey {
+                        key,
+                        protected_ct: protected_org_key.ciphertext_bytes().to_vec(),
+                    },
+                );
+            }
+            Err(e) => {
+                self.poisoned = true;
+                return Err(e);
             }
         }
-        Ok(self.cache.get(org_id).expect("invariant: just inserted"))
+        Ok(&self
+            .cache
+            .get(&org_id)
+            .expect("invariant: just inserted")
+            .key)
     }
 
     /// The cached org key, if this org was already unwrapped in this
     /// unlock session. Never triggers a decrypt.
     pub fn org_key(&self, org_id: &str) -> Option<&SymmetricKey> {
-        self.cache.get(org_id)
+        self.cache
+            .get(&normalize_org_id(org_id))
+            .map(|cached| &cached.key)
     }
 
-    /// Whether a type-4 failure has poisoned this unlock session.
+    /// Whether a later call presented a different protected ciphertext
+    /// for this org than the one originally unwrapped (possible key
+    /// rotation or server misbehaviour). The cached key was returned
+    /// regardless and no extra decrypt happened; callers should
+    /// audit-log this.
+    pub fn ciphertext_mismatch(&self, org_id: &str) -> bool {
+        self.mismatched_orgs.contains(&normalize_org_id(org_id))
+    }
+
+    /// How many type-4 decrypts this session has performed.
+    pub fn decrypt_count(&self) -> usize {
+        self.decrypt_count
+    }
+
+    /// Whether a type-4 failure (or the per-unlock cap) has poisoned
+    /// this unlock session.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -133,7 +240,9 @@ mod tests {
     // RSA-OAEP-SHA1 type-4 ciphertext — never with this crate. The
     // RSA key is the throwaway fixture in
     // `tests/fixtures/chain-throwaway-key.pem`, generated for these
-    // tests only. KDF side: PBKDF2, 123 456 iterations, email
+    // tests only; the generator is committed at
+    // `tests/fixtures/gen/gen_chain_vectors.py` (pinned versions in
+    // its header). KDF side: PBKDF2, 123 456 iterations, email
     // `Kharon-Fixture@Example.com`, password below (same fixture as
     // kdf.rs). Plaintext keys are sequential byte ranges, so a wrong
     // unwrap cannot accidentally match.
@@ -155,7 +264,7 @@ mod tests {
     /// unwrapped key byte-for-byte.
     fn full_chain() -> (SymmetricKey, OrgKeyUnwrapper) {
         let master = derive_master_key(
-            PASSWORD,
+            &Zeroizing::new(PASSWORD.to_string()),
             EMAIL,
             &Kdf::Pbkdf2 {
                 iterations: 123_456,
@@ -195,7 +304,7 @@ mod tests {
             let org_key = unwrapper
                 .unwrap_org_key("org-fixture", &EncString::parse(PROTECTED_ORG_KEY).unwrap())
                 .unwrap();
-            org_key.as_bytes_for_test().to_vec()
+            Zeroizing::new(org_key.as_bytes_for_test().to_vec())
         };
         let org_key = SymmetricKey::from_slice(&org_key_bytes).unwrap();
         let cipher_key =
@@ -207,17 +316,82 @@ mod tests {
     }
 
     #[test]
-    fn req_cry_004_org_key_unwrapped_once_per_unlock() {
+    fn req_cry_004_cache_hit_never_redecrypts_and_flags_new_ciphertext() {
         let (_user, mut unwrapper) = full_chain();
         let protected = EncString::parse(PROTECTED_ORG_KEY).unwrap();
         unwrapper.unwrap_org_key("org-fixture", &protected).unwrap();
-        // Second call with a *garbage* type-4 string for the same org:
-        // if it decrypted again it would fail (and poison); instead the
-        // cached key is returned.
+        // Same ciphertext again: cache hit, no flag.
+        unwrapper.unwrap_org_key("org-fixture", &protected).unwrap();
+        assert!(!unwrapper.ciphertext_mismatch("org-fixture"));
+        // A *different* ciphertext for the same org: the cached key is
+        // still returned without decrypting (a re-decrypt of this
+        // garbage would fail and poison), but the mismatch is flagged
+        // for the caller's audit log — rotation or server misbehaviour
+        // must not pass silently.
         let garbage = EncString::parse(&format!("4.{}==", "A".repeat(342))).unwrap();
         let again = unwrapper.unwrap_org_key("org-fixture", &garbage).unwrap();
         assert_eq!(again.as_bytes_for_test(), &range(0x80)[..]);
         assert!(!unwrapper.is_poisoned());
+        assert_eq!(unwrapper.decrypt_count(), 1);
+        assert!(unwrapper.ciphertext_mismatch("org-fixture"));
+    }
+
+    #[test]
+    fn req_cry_004_org_id_case_is_normalized() {
+        let (_user, mut unwrapper) = full_chain();
+        let protected = EncString::parse(PROTECTED_ORG_KEY).unwrap();
+        unwrapper.unwrap_org_key("Org-Fixture", &protected).unwrap();
+        // The same GUID in another case spelling is the same cache
+        // entry — not a second decrypt.
+        assert!(unwrapper.org_key("ORG-FIXTURE").is_some());
+        let garbage = EncString::parse(&format!("4.{}==", "A".repeat(342))).unwrap();
+        let again = unwrapper.unwrap_org_key("org-fixture", &garbage).unwrap();
+        assert_eq!(again.as_bytes_for_test(), &range(0x80)[..]);
+        assert_eq!(unwrapper.decrypt_count(), 1);
+    }
+
+    /// The fixture account's RSA private key, unwrapped via the chain.
+    fn fixture_private_key() -> RsaPrivateKey {
+        let (user_key, _unwrapper) = full_chain();
+        unwrap_private_key(&EncString::parse(PROTECTED_PRIVATE_KEY).unwrap(), &user_key).unwrap()
+    }
+
+    #[test]
+    fn req_cry_004_allow_list_refuses_unlisted_without_decrypt_or_poison() {
+        let mut listed = OrgKeyUnwrapper::with_allowed_orgs(fixture_private_key(), ["Org-Fixture"]);
+        let protected = EncString::parse(PROTECTED_ORG_KEY).unwrap();
+        // Unlisted org with a *valid* ciphertext: refused, no decrypt
+        // performed, session not poisoned.
+        assert!(matches!(
+            listed.unwrap_org_key("org-other", &protected),
+            Err(EncError::Type4UnwrapRefused)
+        ));
+        assert_eq!(listed.decrypt_count(), 0);
+        assert!(!listed.is_poisoned());
+        // The listed org (any case spelling) still unwraps afterwards.
+        let key = listed.unwrap_org_key("org-fixture", &protected).unwrap();
+        assert_eq!(key.as_bytes_for_test(), &range(0x80)[..]);
+    }
+
+    #[test]
+    fn req_cry_004_distinct_org_decrypts_are_capped_per_unlock() {
+        let (_user, mut unwrapper) = full_chain();
+        let protected = EncString::parse(PROTECTED_ORG_KEY).unwrap();
+        // The same valid ciphertext under MAX distinct org IDs: each
+        // is a cache miss and a real decrypt.
+        for i in 0..MAX_ORG_UNWRAPS_PER_UNLOCK {
+            unwrapper
+                .unwrap_org_key(&format!("org-{i}"), &protected)
+                .unwrap();
+        }
+        assert_eq!(unwrapper.decrypt_count(), MAX_ORG_UNWRAPS_PER_UNLOCK);
+        // One more distinct org exceeds the cap: refused, poisoned —
+        // a server minting fake org IDs gets no further samples.
+        assert!(matches!(
+            unwrapper.unwrap_org_key("org-one-too-many", &protected),
+            Err(EncError::Type4UnwrapRefused)
+        ));
+        assert!(unwrapper.is_poisoned());
     }
 
     #[test]
@@ -241,7 +415,7 @@ mod tests {
     #[test]
     fn req_cry_004_wrong_password_fails_at_user_key_unwrap() {
         let master = derive_master_key(
-            "wrong password",
+            &Zeroizing::new("wrong password".to_string()),
             EMAIL,
             &Kdf::Pbkdf2 {
                 iterations: 123_456,

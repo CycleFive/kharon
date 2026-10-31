@@ -159,6 +159,17 @@ impl EncString {
         }
     }
 
+    /// The raw ciphertext segment bytes (for type 4, the RSA-OAEP
+    /// ciphertext). Lets callers compare a presented ciphertext against
+    /// one seen before without decrypting again — e.g. the org-key
+    /// cache in `keys.rs`, which must notice a *different* ciphertext
+    /// arriving for an already-unwrapped org.
+    pub fn ciphertext_bytes(&self) -> &[u8] {
+        match self {
+            Self::AesCbc256WithMac { ct, .. } | Self::Rsa2048OaepSha1 { ct } => ct,
+        }
+    }
+
     /// The EncString type number (2 or 4 for a successfully parsed value).
     pub fn enc_type(&self) -> u32 {
         match self {

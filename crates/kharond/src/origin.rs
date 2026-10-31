@@ -37,7 +37,7 @@ pub enum MatchType {
     Host,
     /// Origin must be host-equal; prefix check on the full URL.
     StartsWith,
-    /// Full URL equal (origin + path).
+    /// Full URL equal (`location.href`, query and fragment included).
     Exact,
     /// Refused, fail closed.
     Regex,
@@ -72,6 +72,8 @@ pub enum MismatchReason {
     NeverRefused,
     /// Item URI did not parse as an absolute URL.
     ItemUriInvalid,
+    /// Item URI scheme is not `http`/`https`.
+    ItemSchemeNotHttp,
     /// Page scheme is not `https` and not the literal-http localhost/IP exception.
     SchemeNotHttps,
     /// Page scheme is `http` but `allow_http` is false.
@@ -80,10 +82,10 @@ pub enum MismatchReason {
     DomainMismatch,
     /// Host differs (or port differs, for `Host`/`StartsWith`/`Exact`).
     HostMismatch,
+    /// Full URL differs (Exact, REQ-ORG-001: `location.href` equal).
+    HrefMismatch,
     /// Origin equal but `location.href` does not carry the item URL prefix.
     HrefPrefixMismatch,
-    /// Origin equal but path differs.
-    PathMismatch,
 }
 
 /// Outcome of an origin comparison. `reason` is `Some` exactly when the
@@ -166,38 +168,26 @@ impl OriginMatcher {
         }
     }
 
-    /// The broker-PSL-reduced comparand injected into the page for the
-    /// `Domain` in-page check (no PSL in-page, SPEC §6 step 2).
-    pub fn reduced_domain(&self) -> Option<String> {
-        registrable(self.url.host_str()?)
+    /// The broker-side comparand for the in-page `Domain` re-check (no PSL
+    /// in-page, SPEC §6 step 2). IPs and single-label hosts have no
+    /// registrable domain, so they compare by exact host — the same
+    /// fallback `domain_match` uses. Both paths derive it from
+    /// `domain_comparand`, which is what keeps broker and in-page
+    /// semantics identical.
+    pub fn domain_comparand(&self) -> DomainComparand {
+        domain_comparand(self.url.host_str().expect("validated in new"))
     }
 
     fn domain_match(&self, page: &Url) -> Decision {
         let item_host = self.url.host_str().expect("validated in new");
         let page_host = page.host_str().expect("absolute http(s) URL has a host");
-        // IPs have no PSL entry; Bitwarden treats Domain on an IP as host
-        // equality, so mirror that. (`url` serializes IPv6 hosts with
-        // brackets, which `IpAddr::from_str` rejects.)
-        let item_ip = parse_ip(item_host);
-        let page_ip = parse_ip(page_host);
-        match (item_ip, page_ip) {
-            (Some(a), Some(b)) => {
-                return if a == b {
-                    Decision::allow()
-                } else {
-                    Decision::refuse(MismatchReason::DomainMismatch)
-                };
+        match (domain_comparand(item_host), domain_comparand(page_host)) {
+            (DomainComparand::Registrable(a), DomainComparand::Registrable(b)) if a == b => {
+                Decision::allow()
             }
-            (Some(_), None) | (None, Some(_)) => {
-                return Decision::refuse(MismatchReason::DomainMismatch);
+            (DomainComparand::HostEqual(a), DomainComparand::HostEqual(b)) if a == b => {
+                Decision::allow()
             }
-            (None, None) => {}
-        }
-        // Single-label names (`localhost`, intranet hosts) have no PSL
-        // registrable domain either; Bitwarden falls back to host equality.
-        match (registrable(item_host), registrable(page_host)) {
-            (Some(a), Some(b)) if a == b => Decision::allow(),
-            (None, None) if item_host == page_host => Decision::allow(),
             _ => Decision::refuse(MismatchReason::DomainMismatch),
         }
     }
@@ -222,22 +212,51 @@ impl OriginMatcher {
     }
 
     fn exact_match(&self, page: &Url) -> Decision {
-        if !(hosts_equal(&self.url, page) && effective_port(&self.url) == effective_port(page)) {
-            return Decision::refuse(MismatchReason::HostMismatch);
-        }
-        if self.url.path() == page.path() {
+        // Exact = full URL equal. SPEC §6 step 2 fixes the in-page
+        // comparand as `location.href`, and comparing the normalized
+        // serializations (`url::Url` drops default ports, lowercases,
+        // punycode-encodes) makes the broker path identical. Item
+        // selection and the atomic fill gate must reason from one table.
+        if self.url.as_str() == page.as_str() {
             Decision::allow()
         } else {
-            Decision::refuse(MismatchReason::PathMismatch)
+            Decision::refuse(MismatchReason::HrefMismatch)
         }
     }
 }
 
-/// Scheme gate (SPEC §6): the page must be `https`, except
-/// `http://localhost`/IP pages only when the item URI is literally `http`
-/// and `allow_http` is set. This is also the secure-context rule: the
-/// http exception is by construction localhost/IP only.
+/// How a host participates in a `Domain` comparison. Derived once by
+/// `domain_comparand` and consumed by both the broker match and the
+/// in-page re-check so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainComparand {
+    /// eTLD+1 via the PSL: the page hostname must equal it or sit under it.
+    Registrable(String),
+    /// No PSL entry (IP or single-label host): exact host equality.
+    HostEqual(String),
+}
+
+/// Derive the `Domain` comparand for a host: the registrable domain when
+/// the PSL has one, else exact host equality (IPs, `localhost`, intranet
+/// names — Bitwarden's own fallback).
+fn domain_comparand(host: &str) -> DomainComparand {
+    if parse_ip(host).is_none()
+        && let Some(d) = registrable(host)
+    {
+        return DomainComparand::Registrable(d);
+    }
+    DomainComparand::HostEqual(host.to_string())
+}
+
+/// Scheme gate (SPEC §6): the item URI must be `http`/`https`, and the page
+/// must be `https`, except `http://localhost`/IP pages only when the item
+/// URI is literally `http` and `allow_http` is set. This is also the
+/// secure-context rule: the http exception is by construction
+/// localhost/IP only.
 fn scheme_gate(page: &Url, item: &Url, cfg: &OriginConfig) -> Option<MismatchReason> {
+    if !matches!(item.scheme(), "http" | "https") {
+        return Some(MismatchReason::ItemSchemeNotHttp);
+    }
     match page.scheme() {
         "https" => None,
         "http" => {
@@ -247,10 +266,12 @@ fn scheme_gate(page: &Url, item: &Url, cfg: &OriginConfig) -> Option<MismatchRea
             if item.scheme() != "http" {
                 return Some(MismatchReason::SchemeNotHttps);
             }
+            // SPEC §6 says "localhost/IP" literally; `*.localhost` is a
+            // deliberate extension (browser secure-context semantics treat
+            // it as trustworthy). Flagged on PR #35 for the lead to confirm.
             let host = page.host_str()?;
-            let local = host == "localhost"
-                || host.parse::<IpAddr>().is_ok()
-                || host.ends_with(".localhost");
+            let local =
+                host == "localhost" || parse_ip(host).is_some() || host.ends_with(".localhost");
             if local {
                 None
             } else {
@@ -298,22 +319,29 @@ pub struct PageLocation {
     pub href: String,
 }
 
-/// In-page mirror of the match table (SPEC §6 step 2). `reduced_domain` is
-/// the broker-computed eTLD+1 for `Domain` items; ignored otherwise.
+/// In-page mirror of the match table (SPEC §6 step 2). `comparand` is the
+/// broker-derived `DomainComparand`; for `Domain` it is the PSL-reduced
+/// domain (or the host-equality fallback) — the two paths share
+/// `domain_comparand` so they cannot diverge.
 pub fn in_page_match(
     matcher: &OriginMatcher,
-    reduced_domain: &str,
+    comparand: &DomainComparand,
     page: &PageLocation,
 ) -> Decision {
     match matcher.match_type {
         MatchType::Regex => Decision::refuse(MismatchReason::RegexRefused),
         MatchType::Never => Decision::refuse(MismatchReason::NeverRefused),
         MatchType::Domain => {
-            let host_ok = page.hostname == reduced_domain
-                || page
-                    .hostname
-                    .strip_suffix(reduced_domain)
-                    .is_some_and(|rest| rest.ends_with('.'));
+            let host_ok = match comparand {
+                DomainComparand::Registrable(d) => {
+                    page.hostname == *d
+                        || page
+                            .hostname
+                            .strip_suffix(d.as_str())
+                            .is_some_and(|rest| rest.ends_with('.'))
+                }
+                DomainComparand::HostEqual(h) => page.hostname == *h,
+            };
             let scheme_ok = page.protocol == format!("{}:", matcher.url.scheme());
             if scheme_ok && host_ok {
                 Decision::allow()
@@ -332,7 +360,7 @@ pub fn in_page_match(
             if page.href == matcher.url.as_str() {
                 Decision::allow()
             } else {
-                Decision::refuse(MismatchReason::HrefPrefixMismatch)
+                Decision::refuse(MismatchReason::HrefMismatch)
             }
         }
         MatchType::StartsWith => {
@@ -380,8 +408,7 @@ mod tests {
 
     fn in_page(item: &str, mt: Option<u8>, href: &str) -> Decision {
         let m = OriginMatcher::new(item, mt).expect("item parses");
-        let d = m.reduced_domain().unwrap_or_default();
-        in_page_match(&m, &d, &page_location(href))
+        in_page_match(&m, &m.domain_comparand(), &page_location(href))
     }
 
     // ---- MatchType::from_bw_repr -------------------------------------
@@ -629,13 +656,15 @@ mod tests {
     // ---- Exact (3) ------------------------------------------------------
 
     #[test]
-    fn req_org_001_exact_path_equality() {
+    fn req_org_001_exact_full_url_equality() {
+        // Exact = full URL equal (location.href). Queries and fragments
+        // participate; default-port spelling does not (normalized away).
         assert!(allowed(
             "https://example.com/login",
             Some(3),
             "https://example.com/login"
         ));
-        assert!(allowed(
+        assert!(!allowed(
             "https://example.com/login",
             Some(3),
             "https://example.com/login?reset=1"
@@ -643,7 +672,17 @@ mod tests {
         assert!(!allowed(
             "https://example.com/login",
             Some(3),
+            "https://example.com/login#reset"
+        ));
+        assert!(!allowed(
+            "https://example.com/login",
+            Some(3),
             "https://example.com/login/"
+        ));
+        assert!(allowed(
+            "https://example.com/login",
+            Some(3),
+            "https://example.com:443/login"
         ));
         assert!(!allowed(
             "https://example.com/login",
@@ -740,6 +779,13 @@ mod tests {
                 .decide("ftp://example.com/", &HTTP_ON)
                 .allowed
         );
+        // ... including an exotic item scheme on an https page: refused at
+        // the source, before any in-page check is needed.
+        let d = OriginMatcher::new("ftp://example.com", Some(0))
+            .unwrap()
+            .decide("https://example.com/", &HTTPS_ON);
+        assert!(!d.allowed);
+        assert_eq!(d.reason, Some(MismatchReason::ItemSchemeNotHttp));
     }
 
     #[test]
@@ -821,7 +867,8 @@ mod tests {
             )
             .allowed
         );
-        // Exact compares the full href, so a query string mismatches.
+        // Exact compares the full href, so a query string mismatches —
+        // same semantics the broker now applies.
         assert!(
             !in_page(
                 "https://example.com/login",
@@ -881,6 +928,70 @@ mod tests {
     }
 
     // ---- Snapshot sanity ---------------------------------------------------
+
+    #[test]
+    fn req_org_001_exact_broker_in_page_parity() {
+        // Muse review #35: the two paths must reason from one table.
+        for (item, page) in [
+            ("https://example.com/login", "https://example.com/login"),
+            ("https://example.com/login", "https://example.com/login?x=1"),
+            ("https://example.com/login", "https://example.com/other"),
+            ("https://example.com/login", "https://sub.example.com/login"),
+        ] {
+            let broker = decide(item, Some(3), page).allowed;
+            let page_d = in_page(item, Some(3), page).allowed;
+            assert_eq!(broker, page_d, "broker/in-page diverge on {item} vs {page}");
+        }
+    }
+
+    #[test]
+    fn req_org_001_domain_comparand_fallback() {
+        // IPs and single-label hosts: exact host equality on both paths,
+        // so the allow_http localhost/IP flow is not undercut in-page.
+        let m = OriginMatcher::new("http://localhost", Some(0)).unwrap();
+        assert_eq!(
+            m.domain_comparand(),
+            DomainComparand::HostEqual("localhost".to_string())
+        );
+        assert!(in_page("http://localhost", Some(0), "http://localhost:3000/").allowed);
+        assert!(!in_page("http://localhost", Some(0), "http://other.localhost/").allowed);
+
+        let m = OriginMatcher::new("https://192.168.1.1", Some(0)).unwrap();
+        assert_eq!(
+            m.domain_comparand(),
+            DomainComparand::HostEqual("192.168.1.1".to_string())
+        );
+        assert!(in_page("https://192.168.1.1", Some(0), "https://192.168.1.1/").allowed);
+        assert!(!in_page("https://192.168.1.1", Some(0), "https://192.168.1.2/").allowed);
+
+        let m = OriginMatcher::new("https://[::1]", Some(0)).unwrap();
+        assert_eq!(
+            m.domain_comparand(),
+            DomainComparand::HostEqual("[::1]".to_string())
+        );
+        assert!(in_page("https://[::1]", Some(0), "https://[::1]/").allowed);
+
+        let m = OriginMatcher::new("https://example.co.uk", Some(0)).unwrap();
+        assert!(matches!(
+            m.domain_comparand(),
+            DomainComparand::Registrable(_)
+        ));
+    }
+
+    #[test]
+    fn req_org_001_domain_broker_in_page_parity() {
+        for (item, page) in [
+            ("https://example.co.uk", "https://sub.example.co.uk/"),
+            ("https://example.co.uk", "https://www.example.co.uk/"),
+            ("https://example.co.uk", "https://evil.co.uk/"),
+            ("https://user.github.io", "https://user.github.io/x"),
+            ("https://user.github.io", "https://other.github.io/"),
+        ] {
+            let broker = decide(item, Some(0), page).allowed;
+            let page_d = in_page(item, Some(0), page).allowed;
+            assert_eq!(broker, page_d, "broker/in-page diverge on {item} vs {page}");
+        }
+    }
 
     #[test]
     fn req_org_001_psl_snapshot_covers_known_suffixes() {

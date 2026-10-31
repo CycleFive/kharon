@@ -18,6 +18,8 @@ rand = "0.8"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 fs2 = "0.4"
+publicsuffix = "2.3"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

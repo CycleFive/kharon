@@ -10,7 +10,16 @@
 //! - Server auth hash: PBKDF2-HMAC-SHA256(master key, salt = password, 1).
 //!
 //! Passwords and derived keys live in [`Zeroizing`] buffers / [`MasterKey`]
-//! and are wiped on drop.
+//! and are wiped on drop. Callers pass the password as
+//! `&Zeroizing<String>` (see [`derive_master_key`]) so the plaintext's
+//! owner and wiping are unambiguous.
+//!
+//! The prelogin response is server-supplied and the server is untrusted,
+//! so KDF parameters are range-checked against Bitwarden's own client
+//! bounds before any derivation (see [`Kdf::validate`]): a hostile or
+//! compromised server must not be able to talk kharon into deriving a
+//! cheaply crackable master key (and then receiving the auth hash), nor
+//! into an Argon2 allocation that OOMs the client.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
@@ -22,6 +31,29 @@ use crate::encstring::SymmetricKey;
 /// Prelogin KDF type numbers (`POST /identity/accounts/prelogin`).
 const KDF_TYPE_PBKDF2: u32 = 0;
 const KDF_TYPE_ARGON2ID: u32 = 1;
+
+/// PBKDF2 iteration floor. The current server default is 600 000, but
+/// Bitwarden's hard client minimum is 5 000 and pre-default accounts
+/// legitimately sit between the two — so 5 000 is the floor, stated
+/// explicitly: anything below it is refused, anything at or above it is
+/// a (possibly legacy) account setting, not an attack signal by itself.
+pub const PBKDF2_MIN_ITERATIONS: u32 = 5_000;
+/// PBKDF2 iteration ceiling (Bitwarden's documented maximum): bounds
+/// the CPU a hostile prelogin response can make the client burn.
+pub const PBKDF2_MAX_ITERATIONS: u32 = 2_000_000;
+/// Argon2id time-cost floor (Bitwarden minimum; the default is 3).
+pub const ARGON2_MIN_ITERATIONS: u32 = 2;
+/// Argon2id time-cost ceiling (Bitwarden maximum).
+pub const ARGON2_MAX_ITERATIONS: u32 = 10;
+/// Argon2id memory floor in MiB (Bitwarden minimum; the default is 64).
+pub const ARGON2_MIN_MEMORY_MIB: u32 = 16;
+/// Argon2id memory ceiling in MiB (Bitwarden maximum): a hostile
+/// prelogin response must not be able to OOM the client.
+pub const ARGON2_MAX_MEMORY_MIB: u32 = 1_024;
+/// Argon2id parallelism floor (also the default is 4, but 1 is valid).
+pub const ARGON2_MIN_PARALLELISM: u32 = 1;
+/// Argon2id parallelism ceiling (Bitwarden maximum).
+pub const ARGON2_MAX_PARALLELISM: u32 = 16;
 
 /// KDF parameters from the prelogin response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,30 +91,68 @@ pub enum KdfError {
 impl Kdf {
     /// Build from prelogin fields. `kdf_memory` / `kdf_parallelism` are
     /// only meaningful for Argon2id and may be `None` for PBKDF2.
+    /// Parameters are range-checked by [`Kdf::validate`].
     pub fn from_prelogin(
         kdf_type: u32,
         iterations: u32,
         kdf_memory_mib: Option<u32>,
         kdf_parallelism: Option<u32>,
     ) -> Result<Self, KdfError> {
-        if iterations == 0 {
-            return Err(KdfError::InvalidParams("iterations must be non-zero"));
-        }
-        match kdf_type {
-            KDF_TYPE_PBKDF2 => Ok(Self::Pbkdf2 { iterations }),
-            KDF_TYPE_ARGON2ID => {
-                Ok(Self::Argon2id {
-                    iterations,
-                    memory_mib: kdf_memory_mib
-                        .filter(|&m| m > 0)
-                        .ok_or(KdfError::InvalidParams("argon2id memory must be non-zero"))?,
-                    parallelism: kdf_parallelism.filter(|&p| p > 0).ok_or(
-                        KdfError::InvalidParams("argon2id parallelism must be non-zero"),
-                    )?,
-                })
+        let kdf = match kdf_type {
+            KDF_TYPE_PBKDF2 => Self::Pbkdf2 { iterations },
+            KDF_TYPE_ARGON2ID => Self::Argon2id {
+                iterations,
+                memory_mib: kdf_memory_mib
+                    .ok_or(KdfError::InvalidParams("argon2id memory missing"))?,
+                parallelism: kdf_parallelism
+                    .ok_or(KdfError::InvalidParams("argon2id parallelism missing"))?,
+            },
+            other => return Err(KdfError::UnsupportedKdf(other)),
+        };
+        kdf.validate()?;
+        Ok(kdf)
+    }
+
+    /// Range-check the parameters against Bitwarden's client bounds
+    /// (see the `*_MIN_*` / `*_MAX_*` constants). The prelogin response
+    /// is untrusted: below-floor parameters would make the derived
+    /// master key — and the auth hash sent back to that server —
+    /// crackable at negligible cost, and above-ceiling parameters are
+    /// a CPU/memory denial of service against the client. Enforced in
+    /// [`Kdf::from_prelogin`] and again in [`derive_master_key`], so
+    /// direct construction cannot bypass it.
+    pub fn validate(&self) -> Result<(), KdfError> {
+        match *self {
+            Self::Pbkdf2 { iterations } => {
+                if !(PBKDF2_MIN_ITERATIONS..=PBKDF2_MAX_ITERATIONS).contains(&iterations) {
+                    return Err(KdfError::InvalidParams(
+                        "pbkdf2 iterations outside 5_000..=2_000_000",
+                    ));
+                }
             }
-            other => Err(KdfError::UnsupportedKdf(other)),
+            Self::Argon2id {
+                iterations,
+                memory_mib,
+                parallelism,
+            } => {
+                if !(ARGON2_MIN_ITERATIONS..=ARGON2_MAX_ITERATIONS).contains(&iterations) {
+                    return Err(KdfError::InvalidParams(
+                        "argon2id iterations outside 2..=10",
+                    ));
+                }
+                if !(ARGON2_MIN_MEMORY_MIB..=ARGON2_MAX_MEMORY_MIB).contains(&memory_mib) {
+                    return Err(KdfError::InvalidParams(
+                        "argon2id memory outside 16..=1024 MiB",
+                    ));
+                }
+                if !(ARGON2_MIN_PARALLELISM..=ARGON2_MAX_PARALLELISM).contains(&parallelism) {
+                    return Err(KdfError::InvalidParams(
+                        "argon2id parallelism outside 1..=16",
+                    ));
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -112,7 +182,7 @@ impl MasterKey {
     /// Server auth hash: PBKDF2-HMAC-SHA256(master key, salt = password,
     /// 1 iteration). Not needed for API-key login, but needed for password
     /// login and `/accounts/verify-password` (SPEC §3.1).
-    pub fn password_hash(&self, password: &str) -> Zeroizing<[u8; 32]> {
+    pub fn password_hash(&self, password: &Zeroizing<String>) -> Zeroizing<[u8; 32]> {
         let mut out = Zeroizing::new([0u8; 32]);
         pbkdf2::pbkdf2_hmac::<Sha256>(self.0.as_ref(), password.as_bytes(), 1, &mut out[..]);
         out
@@ -126,7 +196,19 @@ fn normalized_email(email: &str) -> String {
 
 /// Derive the 32-byte master key from the master password, the account
 /// email, and the prelogin KDF parameters (REQ-CRY-001).
-pub fn derive_master_key(password: &str, email: &str, kdf: &Kdf) -> Result<MasterKey, KdfError> {
+///
+/// The password is taken as `&Zeroizing<String>`: the caller keeps the
+/// plaintext in a buffer that wipes on drop, and this function never
+/// copies it into an un-wiped buffer of its own (the KDF internals are
+/// a documented exception — see `docs/crypto.md`, "Zeroization
+/// limits"). The KDF parameters are re-validated here so a directly
+/// constructed [`Kdf`] cannot bypass the prelogin bounds.
+pub fn derive_master_key(
+    password: &Zeroizing<String>,
+    email: &str,
+    kdf: &Kdf,
+) -> Result<MasterKey, KdfError> {
+    kdf.validate()?;
     let email = normalized_email(email);
     let mut out = Zeroizing::new([0u8; 32]);
     match *kdf {
@@ -164,7 +246,9 @@ mod tests {
     // All vectors in this module were generated with independent
     // implementations — Python `hashlib.pbkdf2_hmac`, `argon2-cffi`
     // (libargon2), and a hand-rolled RFC 5869 HKDF-Expand over Python
-    // `hmac` — never with this crate. Fixture account:
+    // `hmac` — never with this crate. The generator is committed at
+    // `tests/fixtures/gen/gen_kdf_vectors.py` (pinned versions in its
+    // header) and reproduces every constant below. Fixture account:
     // email `Kharon-Fixture@Example.com` (mixed case on purpose: the
     // salt is the lowercased form), password below. KDF parameters are
     // deliberately non-default (PBKDF2 123 456 iterations vs the 600 000
@@ -173,6 +257,10 @@ mod tests {
     const EMAIL: &str = "Kharon-Fixture@Example.com";
     const PASSWORD: &str = "kharon fixture password 7";
 
+    fn password() -> Zeroizing<String> {
+        Zeroizing::new(PASSWORD.to_string())
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -180,7 +268,7 @@ mod tests {
     #[test]
     fn req_cry_001_pbkdf2_nondefault_params_match_vector() {
         let kdf = Kdf::from_prelogin(0, 123_456, None, None).unwrap();
-        let master = derive_master_key(PASSWORD, EMAIL, &kdf).unwrap();
+        let master = derive_master_key(&password(), EMAIL, &kdf).unwrap();
         assert_eq!(
             hex(&master.0[..]),
             "5ea111139336d17e265f1935527ead750c0f9007e7a054a050d1fca0730ec549"
@@ -190,7 +278,7 @@ mod tests {
     #[test]
     fn req_cry_001_argon2id_nondefault_params_match_vector() {
         let kdf = Kdf::from_prelogin(1, 2, Some(32), Some(2)).unwrap();
-        let master = derive_master_key(PASSWORD, EMAIL, &kdf).unwrap();
+        let master = derive_master_key(&password(), EMAIL, &kdf).unwrap();
         assert_eq!(
             hex(&master.0[..]),
             "30773da8d8818c524e69c134da04b0ff9fd8af72c816c44b9211b21afa68a0ff"
@@ -199,16 +287,16 @@ mod tests {
 
     #[test]
     fn req_cry_001_email_is_lowercased_before_salting() {
-        let kdf = Kdf::Pbkdf2 { iterations: 1_000 };
-        let a = derive_master_key(PASSWORD, "Kharon-Fixture@Example.com", &kdf).unwrap();
-        let b = derive_master_key(PASSWORD, "  kharon-fixture@example.com ", &kdf).unwrap();
+        let kdf = Kdf::Pbkdf2 { iterations: 5_000 };
+        let a = derive_master_key(&password(), "Kharon-Fixture@Example.com", &kdf).unwrap();
+        let b = derive_master_key(&password(), "  kharon-fixture@example.com ", &kdf).unwrap();
         assert_eq!(&a.0[..], &b.0[..]);
     }
 
     #[test]
     fn req_cry_001_stretch_matches_hkdf_expand_vector() {
         let kdf = Kdf::from_prelogin(0, 123_456, None, None).unwrap();
-        let master = derive_master_key(PASSWORD, EMAIL, &kdf).unwrap();
+        let master = derive_master_key(&password(), EMAIL, &kdf).unwrap();
         let stretched = master.stretch();
         // Compare through the public consumer: unwrapping is covered in
         // keys.rs; here the raw stretched bytes are checked via the
@@ -223,9 +311,9 @@ mod tests {
     #[test]
     fn req_cry_001_password_hash_matches_vector() {
         let kdf = Kdf::from_prelogin(0, 123_456, None, None).unwrap();
-        let master = derive_master_key(PASSWORD, EMAIL, &kdf).unwrap();
+        let master = derive_master_key(&password(), EMAIL, &kdf).unwrap();
         assert_eq!(
-            hex(&master.password_hash(PASSWORD)[..]),
+            hex(&master.password_hash(&password())[..]),
             "9ccb246223d23dcb09ba04d15859b49fd89acfee120874de8edbfe28ccf79f9b"
         );
     }
@@ -254,6 +342,75 @@ mod tests {
             memory_mib: u32::MAX,
             parallelism: 4,
         };
-        assert!(derive_master_key(PASSWORD, EMAIL, &kdf).is_err());
+        assert!(derive_master_key(&password(), EMAIL, &kdf).is_err());
+    }
+
+    #[test]
+    fn req_cry_001_kdf_bounds_enforced() {
+        // The prelogin response is untrusted (PR #34 review, Nyx):
+        // every bound is refused below/above, accepted at the edge.
+        // PBKDF2 iterations: floor is the explicit legacy minimum
+        // 5_000 (server default is 600_000), ceiling 2_000_000.
+        for (iters, ok) in [
+            (0, false),
+            (1, false),
+            (4_999, false),
+            (5_000, true),
+            (600_000, true),
+            (2_000_000, true),
+            (2_000_001, false),
+            (u32::MAX, false),
+        ] {
+            assert_eq!(
+                Kdf::from_prelogin(0, iters, None, None).is_ok(),
+                ok,
+                "pbkdf2 iterations={iters}"
+            );
+        }
+        // Argon2id time cost: 2..=10.
+        for (t, ok) in [(1, false), (2, true), (10, true), (11, false)] {
+            assert_eq!(
+                Kdf::from_prelogin(1, t, Some(64), Some(4)).is_ok(),
+                ok,
+                "argon2id t={t}"
+            );
+        }
+        // Argon2id memory: 16..=1024 MiB.
+        for (m, ok) in [
+            (1, false),
+            (15, false),
+            (16, true),
+            (1_024, true),
+            (1_025, false),
+        ] {
+            assert_eq!(
+                Kdf::from_prelogin(1, 3, Some(m), Some(4)).is_ok(),
+                ok,
+                "argon2id m={m}"
+            );
+        }
+        // Argon2id parallelism: 1..=16.
+        for (p, ok) in [(0, false), (1, true), (16, true), (17, false)] {
+            assert_eq!(
+                Kdf::from_prelogin(1, 3, Some(64), Some(p)).is_ok(),
+                ok,
+                "argon2id p={p}"
+            );
+        }
+        // Direct construction cannot bypass the bounds at derive time.
+        let cheap = Kdf::Pbkdf2 { iterations: 1 };
+        assert!(matches!(
+            derive_master_key(&password(), EMAIL, &cheap),
+            Err(KdfError::InvalidParams(_))
+        ));
+        let huge = Kdf::Argon2id {
+            iterations: 3,
+            memory_mib: 1_025,
+            parallelism: 4,
+        };
+        assert!(matches!(
+            derive_master_key(&password(), EMAIL, &huge),
+            Err(KdfError::InvalidParams(_))
+        ));
     }
 }

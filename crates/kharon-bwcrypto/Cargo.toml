@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 aes = "0.8"
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["zeroize"] }
 base64ct = { version = "1", features = ["alloc"] }
 cbc = { version = "0.1", features = ["alloc"] }
 hkdf = "0.12"

@@ -48,7 +48,14 @@ jobs:
         # manifest is read here, credentials are not duplicated in env.
         run: |
           export NODE_EXTRA_CA_CERTS="$PWD/tls/cert.pem"
-          npm install -g @bitwarden/cli
+          # bw is PINNED: 2026.2+ moved password login into the Rust
+          # SDK, whose prelogin call (POST
+          # /identity/accounts/prelogin/password) the spec-pinned
+          # Vaultwarden 1.33.0 does not route — login dies with a 404
+          # before it starts. 2026.1.0 is the last release whose
+          # prelogin is POST /api/accounts/prelogin, which 1.33.0
+          # serves. Unpin only together with the server pin.
+          npm install -g @bitwarden/cli@2026.1.0
           bw config server https://127.0.0.1:8222
           read -r BW_EMAIL BW_PASSWORD <<< "$(python3 -c '
           import json

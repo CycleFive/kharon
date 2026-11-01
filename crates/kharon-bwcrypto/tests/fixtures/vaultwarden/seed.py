@@ -172,7 +172,25 @@ class Fixture:
             "login": {
                 "username": enc_type2(field_key, item["username"].encode()),
                 "password": enc_type2(field_key, item["password"].encode()),
-                "uris": [{"uri": enc_type2(field_key, item["uri"].encode()), "match": None}],
+                # uriChecksum is load-bearing, not decoration: when a
+                # cipher carries a per-cipher key, official clients
+                # validate each URI against the decrypted checksum
+                # (base64 SHA-256 of the URI plaintext, itself an
+                # EncString under the field key) and silently DROP the
+                # URI when the checksum is missing or mismatched.
+                # Without it, `bw get item` returns `uris: []` for the
+                # with-key cipher. With no cipher key the validation
+                # is bypassed, so one shape serves both items.
+                "uris": [
+                    {
+                        "uri": enc_type2(field_key, item["uri"].encode()),
+                        "uriChecksum": enc_type2(
+                            field_key,
+                            b64(hashlib.sha256(item["uri"].encode()).digest()).encode(),
+                        ),
+                        "match": None,
+                    }
+                ],
             },
         }
 

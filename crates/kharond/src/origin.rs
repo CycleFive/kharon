@@ -121,6 +121,95 @@ pub struct OriginConfig {
     pub allow_http: bool,
 }
 
+/// Serializable match descriptor for the in-page re-check (SPEC §6 step
+/// 2). Emitted by the broker from the same `OriginMatcher` that made
+/// the broker-side decision, so the two tables cannot drift: the JS in
+/// the isolated world evaluates exactly the comparands decided here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InPageSpec {
+    /// `domain` | `host` | `starts_with` | `exact` | `refused`.
+    pub kind: &'static str,
+    /// Required scheme, e.g. `"https"` (compared as `protocol`).
+    pub scheme: String,
+    /// For `domain`: the PSL-reduced registrable domain, or the exact
+    /// host when `host_equal` (IPs, `localhost`, single labels).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// For `domain`: compare by exact host equality instead of suffix.
+    #[serde(skip_serializing_if = "is_false")]
+    pub host_equal: bool,
+    /// For `host`/`starts_with`: the exact `location.origin` comparand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// For `exact`/`starts_with`: the full `location.href` comparand
+    /// (prefix for `starts_with`, equality for `exact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+}
+
+impl OriginMatcher {
+    /// The in-page comparands for this matcher (SPEC §6 step 2). The
+    /// `Domain` arm resolves the PSL-reduced domain once, here, so the
+    /// page does no PSL work.
+    pub fn in_page_spec(&self) -> InPageSpec {
+        let scheme = self.url.scheme().to_string();
+        match self.match_type {
+            MatchType::Domain => match self.domain_comparand() {
+                DomainComparand::Registrable(d) => InPageSpec {
+                    kind: "domain",
+                    scheme,
+                    domain: Some(d),
+                    host_equal: false,
+                    origin: None,
+                    href: None,
+                },
+                DomainComparand::HostEqual(h) => InPageSpec {
+                    kind: "domain",
+                    scheme,
+                    domain: Some(h),
+                    host_equal: true,
+                    origin: None,
+                    href: None,
+                },
+            },
+            MatchType::Host => InPageSpec {
+                kind: "host",
+                scheme,
+                domain: None,
+                host_equal: false,
+                origin: Some(origin_string(&self.url)),
+                href: None,
+            },
+            MatchType::StartsWith => InPageSpec {
+                kind: "starts_with",
+                scheme,
+                domain: None,
+                host_equal: false,
+                origin: Some(origin_string(&self.url)),
+                href: Some(self.url.to_string()),
+            },
+            MatchType::Exact => InPageSpec {
+                kind: "exact",
+                scheme,
+                domain: None,
+                host_equal: false,
+                origin: None,
+                href: Some(self.url.to_string()),
+            },
+            // Refused at the broker before any page code runs; the page
+            // treats `refused` as never matching (defense in depth).
+            MatchType::Regex | MatchType::Never => InPageSpec {
+                kind: "refused",
+                scheme,
+                domain: None,
+                host_equal: false,
+                origin: None,
+                href: None,
+            },
+        }
+    }
+}
+
 /// A parsed item URI plus its resolved match type.
 #[derive(Debug, Clone)]
 pub struct OriginMatcher {
@@ -373,6 +462,10 @@ pub fn in_page_match(
             }
         }
     }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn origin_string(u: &Url) -> String {

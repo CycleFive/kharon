@@ -5,4 +5,5 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod cdp;
 pub mod origin;

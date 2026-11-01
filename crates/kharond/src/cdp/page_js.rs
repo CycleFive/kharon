@@ -29,10 +29,14 @@
 ///    broker's frame-tree origin check already gated the fill, and
 ///    REQ-ORG-004's allowlist governs whether we are in this frame at
 ///    all.
+/// 4. `submitRequested` — REQ-API-008: after every field fills
+///    successfully, dispatch submit (`form.requestSubmit()` on the
+///    last element's form, else Enter key events). Never reached on
+///    any refusal: failures throw before this point.
 ///
 /// Returns `{ results: [{ kind, filled: true }] }` by value.
 pub const FILL_IN_PAGE: &str = r#"
-function fillInPage(specs, fields, expectedTopOrigin) {
+function fillInPage(specs, fields, expectedTopOrigin, submitRequested) {
   "use strict";
 
   function fail(code) {
@@ -121,11 +125,37 @@ function fillInPage(specs, fields, expectedTopOrigin) {
   }
 
   const results = [];
+  let lastFilledElement = null;
   for (const f of fields) {
     const el = resolveField(f.kind, f.selector);
     if (!el) fail("field_not_found:" + f.kind);
     setNativeValue(el, f.value);
     results.push({ kind: f.kind, filled: true });
+    lastFilledElement = el;
+  }
+
+  // REQ-API-008: reachable only after every field filled — any
+  // failure above threw out of the function. `requestSubmit` honors
+  // constraint validation and fires one submit event; the Enter
+  // fallback synthesizes what a real keyboard press delivers.
+  if (submitRequested && lastFilledElement) {
+    const last = lastFilledElement;
+    const form = last.form || (last.closest ? last.closest("form") : null);
+    if (form && typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+    } else {
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        last.dispatchEvent(
+          new KeyboardEvent(type, {
+            key: "Enter",
+            code: "Enter",
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+          })
+        );
+      }
+    }
   }
   return { results };
 }
@@ -269,5 +299,149 @@ console.log("ok");
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    }
+
+    /// REQ-API-008: submit is dispatched exactly once, and only when
+    /// every field filled. Executes the shipped `FILL_IN_PAGE`
+    /// verbatim against a stubbed DOM, covering three cases:
+    ///   A. all fields present + submit=true → one requestSubmit,
+    ///      after both values are written (event order checked);
+    ///   B. a field missing + submit=true → no submit at all;
+    ///   C. no form on the last element → Enter fallback delivers
+    ///      keydown/keypress/keyup on that element.
+    #[test]
+    fn req_api_008_submit_once_after_all_filled() {
+        let mut script = String::new();
+        script.push_str(
+            r#"
+class HTMLInputElement {
+  constructor(name) {
+    this._v = "";
+    this.name = name;
+    this.events = [];
+    this.form = null;
+  }
+  dispatchEvent(ev) { this.events.push(ev); return true; }
+  closest() { return null; }
+}
+Object.defineProperty(HTMLInputElement.prototype, "value", {
+  get() { return this._v; },
+  set(v) { this._v = v; },
+});
+class HTMLTextAreaElement extends HTMLInputElement {}
+class Event { constructor(type, opts) { this.type = type; this.bubbles = !!(opts && opts.bubbles); } }
+class KeyboardEvent extends Event {
+  constructor(type, opts) { super(type, opts);
+    this.key = opts.key; this.code = opts.code; this.keyCode = opts.keyCode; this.which = opts.which;
+  }
+}
+"#,
+        );
+        script.push_str(FILL_IN_PAGE);
+        script.push_str(
+            r#"
+const specs = [{ kind: "host", scheme: "https", origin: "https://accounts.example.com" }];
+const origin = "https://accounts.example.com";
+const originEnv = () => {
+  globalThis.window = { isSecureContext: true, top: { location: { origin: origin } } };
+  globalThis.location = {
+    protocol: "https:", hostname: "accounts.example.com", origin, href: origin + "/login",
+  };
+};
+
+// A. requestSubmit once, after all fills.
+{
+  originEnv();
+  const userEl = new HTMLInputElement("user");
+  const passEl = new HTMLInputElement("pass");
+  let submits = 0;
+  const form = { requestSubmit: () => { submits += 1; } };
+  userEl.form = form;
+  passEl.form = form;
+  globalThis.document = {
+    querySelector: (sel) => {
+      if (sel.includes("password")) return passEl;
+      if (sel.includes("email") || sel.includes("username")) return userEl;
+      return null;
+    },
+  };
+  const fields = [
+    { kind: "username", selector: null, value: "alice" },
+    { kind: "password", selector: null, value: "s3cret" },
+  ];
+  const r = fillInPage(specs, fields, origin, true);
+  if (submits !== 1) throw new Error(`expected exactly one submit, got ${submits}`);
+  if (r.results.length !== 2) throw new Error(`expected two results: ${JSON.stringify(r)}`);
+  if (userEl._v !== "alice" || passEl._v !== "s3cret") throw new Error("values not written before submit");
+  console.log("case A ok");
+}
+
+// B. missing field: no submit.
+{
+  originEnv();
+  const userEl = new HTMLInputElement("user");
+  let submits = 0;
+  const form = { requestSubmit: () => { submits += 1; } };
+  userEl.form = form;
+  globalThis.document = {
+    querySelector: (sel) =>
+      sel.includes("email") || sel.includes("username") ? userEl : null,
+  };
+  const fields = [
+    { kind: "username", selector: null, value: "alice" },
+    { kind: "password", selector: null, value: "s3cret" },
+  ];
+  let code = "none";
+  try {
+    fillInPage(specs, fields, origin, true);
+  } catch (e) { code = (e && e.kharonCode) || e.message; }
+  if (code !== "field_not_found:password") throw new Error(`expected field_not_found, got ${code}`);
+  if (submits !== 0) throw new Error("submit dispatched despite missing field");
+  console.log("case B ok");
+}
+
+// C. no form: Enter fallback on the last element.
+{
+  originEnv();
+  const passEl = new HTMLInputElement("pass"); // form stays null
+  globalThis.document = { querySelector: (sel) => (sel.includes("password") ? passEl : null) };
+  const fields = [{ kind: "password", selector: null, value: "s3cret" }];
+  const r = fillInPage(specs, fields, origin, true);
+  const types = passEl.events.map((e) => e.type).join(",");
+  if (types !== "input,change,keydown,keypress,keyup")
+    throw new Error(`unexpected event sequence: ${types}`);
+  for (const ev of passEl.events) {
+    if (ev.type.startsWith("key") && (ev.key !== "Enter" || ev.keyCode !== 13 || !ev.bubbles))
+      throw new Error(`bad keyboard event: ${JSON.stringify(ev)}`);
+  }
+  if (r.results.length !== 1) throw new Error(`unexpected results: ${JSON.stringify(r)}`);
+  console.log("case C ok");
+}
+console.log("ok");
+"#,
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kharon_fill_submit_{}.js", std::process::id()));
+        std::fs::write(&path, &script).expect("write harness");
+        let output = std::process::Command::new("node").arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        let output = match output {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node not on PATH; skipping submit harness test");
+                return;
+            }
+            Err(e) => panic!("spawn node: {e}"),
+        };
+        assert!(
+            output.status.success(),
+            "harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for case in ["case A ok", "case B ok", "case C ok"] {
+            assert!(stdout.contains(case), "missing {case} in {stdout}");
+        }
     }
 }

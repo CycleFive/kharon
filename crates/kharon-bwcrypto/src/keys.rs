@@ -72,6 +72,14 @@ pub fn decrypt_item_field(
 /// harvesting RSA timing samples, so exceeding the cap poisons the
 /// session (same as a failed unwrap). The allow-list
 /// ([`OrgKeyUnwrapper::with_allowed_orgs`]) normally binds tighter.
+///
+/// The cap is **shared across all orgs** in the session, not per org:
+/// an account that is a member of more than 16 organizations, all
+/// listed in its profile, would hit it during one unlock and poison
+/// the session (every later type-4 unwrap refused until re-unlock).
+/// kharon's dedicated-org design (SPEC §2) syncs one org, so this is
+/// not expected in practice; raise the constant, don't special-case
+/// orgs, if a real deployment needs more.
 pub const MAX_ORG_UNWRAPS_PER_UNLOCK: usize = 16;
 
 /// One cached org key plus the protected ciphertext it came from, so a
@@ -101,15 +109,21 @@ pub struct OrgKeyUnwrapper {
 }
 
 impl OrgKeyUnwrapper {
-    /// Start a fresh unlock session with the unwrapped private key,
-    /// without an organization allow-list (the per-unlock decrypt cap
-    /// still applies). Prefer [`OrgKeyUnwrapper::with_allowed_orgs`]
-    /// whenever the profile's organization list is known.
-    pub fn new(private_key: RsaPrivateKey) -> Self {
+    /// Test-only: a session without an organization allow-list (only
+    /// the per-unlock cap applies). Production code must go through
+    /// [`OrgKeyUnwrapper::with_allowed_orgs`] with the profile's
+    /// `organizations` list (#42), so the allow-list is never optional
+    /// outside unit tests.
+    #[cfg(test)]
+    pub(crate) fn new(private_key: RsaPrivateKey) -> Self {
+        Self::build(private_key, None)
+    }
+
+    fn build(private_key: RsaPrivateKey, allowed_orgs: Option<HashSet<String>>) -> Self {
         Self {
             private_key,
             cache: HashMap::new(),
-            allowed_orgs: None,
+            allowed_orgs,
             decrypt_count: 0,
             mismatched_orgs: HashSet::new(),
             poisoned: false,
@@ -125,15 +139,15 @@ impl OrgKeyUnwrapper {
         private_key: RsaPrivateKey,
         allowed_orgs: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Self {
-        Self {
-            allowed_orgs: Some(
+        Self::build(
+            private_key,
+            Some(
                 allowed_orgs
                     .into_iter()
                     .map(|id| normalize_org_id(id.as_ref()))
                     .collect(),
             ),
-            ..Self::new(private_key)
-        }
+        )
     }
 
     /// Unwrap an organization's key (type 4). A second call for the
@@ -215,6 +229,16 @@ impl OrgKeyUnwrapper {
     /// audit-log this.
     pub fn ciphertext_mismatch(&self, org_id: &str) -> bool {
         self.mismatched_orgs.contains(&normalize_org_id(org_id))
+    }
+
+    /// Every org flagged by [`OrgKeyUnwrapper::ciphertext_mismatch`]
+    /// so far, as normalized IDs in sorted order. The sync client (#8)
+    /// drains this after each sync to emit one audit event per
+    /// newly-mismatched org (REQ-AUD); nothing in this crate logs.
+    pub fn mismatched_orgs(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self.mismatched_orgs.iter().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// How many type-4 decrypts this session has performed.
@@ -334,6 +358,20 @@ mod tests {
         assert!(!unwrapper.is_poisoned());
         assert_eq!(unwrapper.decrypt_count(), 1);
         assert!(unwrapper.ciphertext_mismatch("org-fixture"));
+    }
+
+    #[test]
+    fn req_cry_011_mismatched_orgs_lists_flagged_orgs_for_audit() {
+        let (_user, mut unwrapper) = full_chain();
+        let protected = EncString::parse(PROTECTED_ORG_KEY).unwrap();
+        unwrapper.unwrap_org_key("Org-Fixture", &protected).unwrap();
+        assert!(unwrapper.mismatched_orgs().is_empty());
+        let garbage = EncString::parse(&format!("4.{}==", "A".repeat(342))).unwrap();
+        unwrapper.unwrap_org_key("org-fixture", &garbage).unwrap();
+        // Normalized ID, exactly once even if flagged repeatedly.
+        unwrapper.unwrap_org_key("ORG-FIXTURE", &garbage).unwrap();
+        assert_eq!(unwrapper.mismatched_orgs(), vec!["org-fixture"]);
+        assert_eq!(unwrapper.decrypt_count(), 1);
     }
 
     #[test]

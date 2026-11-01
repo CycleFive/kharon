@@ -9,6 +9,7 @@ on:
     paths:
       - "crates/kharon-bwcrypto/tests/fixtures/vaultwarden/**"
       - "crates/kharon-bwcrypto/tests/req_dep_002_fixture.rs"
+      - "crates/kharon-bwcrypto/src/**"
       - ".github/workflows/fixture.yml"
 permissions: { contents: read }
 jobs:
@@ -25,22 +26,53 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install "cryptography==43.0.3"
+      - name: Generate the throwaway loopback TLS cert
+        # bw refuses plain-HTTP servers (InsecureUrlNotAllowedError),
+        # so the fixture serves HTTPS on 127.0.0.1 with a self-signed
+        # cert generated per run (gitignored, never committed).
+        run: |
+          mkdir -p tls
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout tls/key.pem -out tls/cert.pem -days 2 \
+            -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
       - name: Start Vaultwarden fixture
         run: docker compose up -d
       - name: Seed org / collection / items and capture sync
-        run: python3 seed.py --live --base-url http://127.0.0.1:8222 --out "${{ runner.temp }}/sync.live.json"
+        run: >-
+          python3 seed.py --live --base-url https://127.0.0.1:8222
+          --ca-cert "$PWD/tls/cert.pem"
+          --out "${{ runner.temp }}/sync.live.json"
       - name: Oracle check with the official bw CLI
-        env:
-          BW_EMAIL: kharon-fixture@example.com
-          BW_PASSWORD: "kharon fixture password 10"
+        # bw get item for BOTH seeded items, compared field-by-field
+        # (name, username, password, URI) against fixture.json — the
+        # manifest is read here, credentials are not duplicated in env.
         run: |
+          export NODE_EXTRA_CA_CERTS="$PWD/tls/cert.pem"
           npm install -g @bitwarden/cli
-          bw config server http://127.0.0.1:8222
+          bw config server https://127.0.0.1:8222
+          read -r BW_EMAIL BW_PASSWORD <<< "$(python3 -c '
+          import json
+          a = json.load(open("fixture.json"))["account"]
+          print(a["email"], a["password"])')"
           export BW_SESSION="$(bw login "$BW_EMAIL" "$BW_PASSWORD" --raw)"
           bw sync
-          # Both seeded items must decrypt via bw to the manifest names.
-          bw list items --organizationid "$(bw list organizations | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')" \
-            | python3 -c 'import json,sys; names=sorted(i["name"] for i in json.load(sys.stdin)); assert names==["fixture-no-cipher-key","fixture-with-cipher-key"], names'
+          bw list items > "${{ runner.temp }}/bw-items.json"
+          python3 - "${{ runner.temp }}/bw-items.json" <<'EOF'
+          import json, subprocess, sys
+          manifest = json.load(open("fixture.json"))
+          listed = {i["name"]: i["id"] for i in json.load(open(sys.argv[1]))}
+          for want in manifest["items"]:
+              assert want["name"] in listed, f"bw did not list {want['name']}"
+              got = json.loads(subprocess.run(
+                  ["bw", "get", "item", listed[want["name"]]],
+                  capture_output=True, text=True, check=True).stdout)
+              login = got["login"]
+              assert got["name"] == want["name"], got["name"]
+              assert login["username"] == want["username"], want["name"]
+              assert login["password"] == want["password"], want["name"]
+              assert login["uris"][0]["uri"] == want["uri"], want["name"]
+          print("bw oracle: both items match fixture.json (name/username/password/uri)")
+          EOF
       - name: Live REQ-CRY-004 decrypt against the captured sync
         working-directory: ${{ github.workspace }}
         env:

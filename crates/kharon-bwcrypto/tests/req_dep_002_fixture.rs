@@ -76,7 +76,8 @@ fn req_dep_002_manifest_has_one_cipher_key_item_and_one_without() {
 }
 
 /// The compose file must pin the Vaultwarden image (no `latest`),
-/// bind loopback only, and allow signups so the seeder can register
+/// bind loopback only, serve TLS (the official `bw` CLI refuses
+/// plain-HTTP servers), and allow signups so the seeder can register
 /// the fixture account — while staying a throwaway test stack.
 #[test]
 fn req_dep_002_compose_pins_vaultwarden_loopback_only() {
@@ -90,8 +91,16 @@ fn req_dep_002_compose_pins_vaultwarden_loopback_only() {
         "fixture image must not float on latest"
     );
     assert!(
-        compose.contains("127.0.0.1:8222:80"),
-        "fixture port must bind loopback only"
+        compose.contains("127.0.0.1:8222:443"),
+        "fixture port must bind loopback only, to the TLS port"
+    );
+    assert!(
+        compose.contains("ROCKET_TLS"),
+        "bw refuses insecure URLs: the fixture must serve HTTPS on loopback"
+    );
+    assert!(
+        compose.contains("https://127.0.0.1:8222"),
+        "DOMAIN must match the https base URL seed.py and bw use"
     );
     assert!(
         compose.contains("SIGNUPS_ALLOWED"),
@@ -99,21 +108,12 @@ fn req_dep_002_compose_pins_vaultwarden_loopback_only() {
     );
 }
 
-/// The seed script is the deterministic half of the harness: it must
-/// construct the cipher-key distinction itself rather than hoping the
-/// creating client happens to set (or omit) `cipher.key`.
-#[test]
-fn req_dep_002_seed_constructs_both_cipher_key_shapes() {
-    let seed = read_fixture("seed.py");
-    assert!(
-        seed.contains("cipher_key"),
-        "seed keys off the manifest flag"
-    );
-    assert!(
-        seed.contains("protected_cipher_key = None"),
-        "the without half must send key: null explicitly"
-    );
-}
+// Note: an earlier `req_dep_002_seed_constructs_both_cipher_key_shapes`
+// test grepped seed.py's source for the shape construction. It was
+// dropped on Nyx's review (PR #44): the decrypt tests below enforce
+// the shape behaviorally — each manifest item only matches a cipher
+// whose `key` presence agrees with its `cipher_key` flag — which a
+// source grep cannot add anything to.
 
 /// Walk a `/api/sync`-shaped payload through the full REQ-CRY-004
 /// chain and assert every manifest item decrypts to its expected
@@ -162,12 +162,51 @@ fn decrypt_sync_payload(sync: &Value) {
     // org key from the unwrapper for each use (never re-decrypts).
     let org_key = unwrapper.org_key(&org_id).expect("org key cached");
 
+    // The fixture collection: its name must decrypt under the org key
+    // to the manifest value (a plaintext name here would mean the
+    // live seeder sent `collectionName` unencrypted — PR #44 review),
+    // and every cipher must actually belong to it, so the fixture
+    // exercises #8's collection filter rather than bypassing it.
+    let collections = sync
+        .get("collections")
+        .and_then(Value::as_array)
+        .expect("sync collections");
+    assert_eq!(collections.len(), 1, "fixture has exactly one collection");
+    let collection_id = str_field(&collections[0], "id");
+    let collection_name_pt = decrypt_item_field(
+        &EncString::parse(str_field(&collections[0], "name")).unwrap(),
+        org_key,
+        None,
+    )
+    .expect("decrypt collection name");
+    let want_collection_name = m
+        .get("organization")
+        .and_then(|o| o.get("collection_name"))
+        .and_then(Value::as_str)
+        .expect("manifest organization.collection_name");
+    assert_eq!(
+        collection_name_pt.as_slice(),
+        want_collection_name.as_bytes(),
+        "collection name must decrypt to the manifest value under the org key"
+    );
+
     let items = m.get("items").and_then(Value::as_array).unwrap();
     let ciphers = sync
         .get("ciphers")
         .and_then(Value::as_array)
         .expect("sync ciphers");
     assert_eq!(ciphers.len(), items.len(), "one cipher per manifest item");
+    for cipher in ciphers {
+        let ids = cipher
+            .get("collectionIds")
+            .and_then(Value::as_array)
+            .expect("cipher collectionIds");
+        assert!(
+            ids.iter().any(|v| v.as_str() == Some(collection_id)),
+            "cipher {} must belong to the fixture collection {collection_id}",
+            str_field(cipher, "id")
+        );
+    }
 
     for item in items {
         let want_name = str_field(item, "name");
@@ -217,6 +256,24 @@ fn decrypt_sync_payload(sync: &Value) {
                 "{want_name} {field} must match the manifest / `bw get item` plaintext"
             );
         }
+        // The URI too: it is the field the origin matcher consumes,
+        // and the cheapest one to leave silently undecrypted.
+        let uris = login
+            .get("uris")
+            .and_then(Value::as_array)
+            .expect("login uris");
+        assert_eq!(uris.len(), 1, "fixture logins carry exactly one URI");
+        let uri_pt = decrypt_item_field(
+            &EncString::parse(str_field(&uris[0], "uri")).unwrap(),
+            org_key,
+            cipher_key.as_ref(),
+        )
+        .unwrap_or_else(|e| panic!("decrypt {want_name} uri: {e}"));
+        assert_eq!(
+            uri_pt.as_slice(),
+            str_field(item, "uri").as_bytes(),
+            "{want_name} uri must match the manifest plaintext"
+        );
     }
 }
 

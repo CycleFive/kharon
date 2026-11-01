@@ -18,6 +18,10 @@ stand-in for the live server payload:
               test then decrypts that capture the same way, and the
               fixture CI job cross-checks with `bw get item`
               (the official CLI as an arms-length program, per OQ-2).
+              The live server speaks HTTPS with a throwaway
+              self-signed cert (see docker-compose.yml): pass
+              --ca-cert <cert.pem> (or set KHARON_FIXTURE_CA_CERT)
+              so the seed trusts it.
 
 Why ciphers are constructed here instead of via `bw create item`:
 the fixture's contract is *exactly one* cipher with a per-cipher key
@@ -43,6 +47,7 @@ import hashlib
 import hmac as hmac_mod
 import json
 import os
+import ssl
 import sys
 import time
 import urllib.parse
@@ -198,7 +203,19 @@ class Fixture:
 
 # ---------------------------------------------------------------- live API
 
-def http_json(method: str, url: str, body=None, token: str = None, form: bool = False):
+def tls_context(ca_cert: str = None):
+    """SSL context trusting the fixture's throwaway self-signed cert.
+
+    None when no CA is given (plain system trust — e.g. a future
+    real-cert deployment); the fixture always passes its cert.
+    """
+    if not ca_cert:
+        return None
+    return ssl.create_default_context(cafile=ca_cert)
+
+
+def http_json(method: str, url: str, body=None, token: str = None, form: bool = False,
+              context=None):
     if form:
         data = urllib.parse.urlencode(body).encode()
         ctype = "application/x-www-form-urlencoded"
@@ -214,16 +231,16 @@ def http_json(method: str, url: str, body=None, token: str = None, form: bool = 
         req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Device-Type", "9")  # 9 = CLI, as official clients send
     req.add_header("Bitwarden-Client-Name", "kharon-fixture-seed")
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=30, context=context) as resp:
         raw = resp.read().decode()
         return json.loads(raw) if raw else {}
 
 
-def wait_ready(base: str, timeout_s: int = 60) -> None:
+def wait_ready(base: str, timeout_s: int = 60, context=None) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(base + "/alive", timeout=5) as resp:
+            with urllib.request.urlopen(base + "/alive", timeout=5, context=context) as resp:
                 if resp.status == 200:
                     return
         except Exception:
@@ -231,11 +248,12 @@ def wait_ready(base: str, timeout_s: int = 60) -> None:
     raise SystemExit(f"Vaultwarden at {base} did not become ready in {timeout_s}s")
 
 
-def seed_live(base: str, out_path: str) -> None:
+def seed_live(base: str, out_path: str, ca_cert: str = None) -> None:
     with open(MANIFEST_PATH) as f:
         manifest = json.load(f)
     fx = Fixture(manifest)
-    wait_ready(base)
+    ctx = tls_context(ca_cert)
+    wait_ready(base, context=ctx)
 
     # 1. Register the fixture account.
     http_json(
@@ -254,6 +272,7 @@ def seed_live(base: str, out_path: str) -> None:
             "kdf": manifest["account"]["kdf"],
             "kdfIterations": fx.iterations,
         },
+        context=ctx,
     )
 
     # 2. Password-grant token (official-client flow).
@@ -271,6 +290,7 @@ def seed_live(base: str, out_path: str) -> None:
             "deviceIdentifier": str(uuid.uuid4()),
         },
         form=True,
+        context=ctx,
     )
     token = tok["access_token"]
 
@@ -283,32 +303,47 @@ def seed_live(base: str, out_path: str) -> None:
             "name": org["name"],
             "billingEmail": fx.email,
             "planType": 0,
-            "collectionName": org["collection_name"],
+            # Official clients send collectionName as an EncString
+            # under the new org key (OrganizationCreateRequest); the
+            # server stores it verbatim and sync hands it back, so a
+            # plaintext name would be undecryptable downstream.
+            "collectionName": fx.protected_collection_name,
             "key": fx.protected_org_key,
         },
         token=token,
+        context=ctx,
     )
     org_id = created.get("id") or created.get("Id")
     if not org_id:
         raise SystemExit(f"organization creation returned no id: {created}")
 
     # Resolve the real org / collection IDs from a sync.
-    sync = http_json("GET", base + "/api/sync", token=token)
+    sync = http_json("GET", base + "/api/sync", token=token, context=ctx)
     collections = [c for c in sync.get("collections", []) if c.get("organizationId") == org_id]
     if not collections:
         raise SystemExit("sync after org creation shows no collection for the fixture org")
     collection_id = collections[0]["id"]
 
-    # 4. Create both ciphers with server-assigned IDs replaced.
+    # 4. Create both ciphers through POST /api/ciphers/create — the
+    # endpoint official clients use for org ciphers, which takes
+    # {cipher, collectionIds}; plain POST /api/ciphers does not apply
+    # collection membership (review on PR #44). The Rust decrypt test
+    # asserts every captured cipher carries the fixture collection.
     for item in manifest["items"]:
         payload = fx.cipher_payload(item)
         payload.pop("id", None)
+        payload.pop("collectionIds", None)
         payload["organizationId"] = org_id
-        payload["collectionIds"] = [collection_id]
-        http_json("POST", base + "/api/ciphers", payload, token=token)
+        http_json(
+            "POST",
+            base + "/api/ciphers/create",
+            {"cipher": payload, "collectionIds": [collection_id]},
+            token=token,
+            context=ctx,
+        )
 
     # 5. Capture the sync payload the live Rust test will decrypt.
-    sync = http_json("GET", base + "/api/sync", token=token)
+    sync = http_json("GET", base + "/api/sync", token=token, context=ctx)
     with open(out_path, "w") as f:
         json.dump(sync, f, indent=2)
     print(f"seeded {base}; sync captured to {out_path}")
@@ -321,7 +356,13 @@ def main() -> int:
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--offline", action="store_true", help="write a sync-shaped fixture payload")
     mode.add_argument("--live", action="store_true", help="seed a running Vaultwarden, capture sync")
-    ap.add_argument("--base-url", default="http://127.0.0.1:8222")
+    ap.add_argument("--base-url", default="https://127.0.0.1:8222")
+    ap.add_argument(
+        "--ca-cert",
+        default=os.environ.get("KHARON_FIXTURE_CA_CERT"),
+        help="CA cert to trust for the live server (the fixture's "
+        "throwaway self-signed cert); default: $KHARON_FIXTURE_CA_CERT",
+    )
     ap.add_argument("--out", default=os.path.join(HERE, "sync_fixture.json"))
     args = ap.parse_args()
 
@@ -333,7 +374,7 @@ def main() -> int:
             json.dump(payload, f, indent=2)
         print(f"offline sync fixture written to {args.out}")
         return 0
-    seed_live(args.base_url, args.out)
+    seed_live(args.base_url, args.out, ca_cert=args.ca_cert)
     return 0
 
 

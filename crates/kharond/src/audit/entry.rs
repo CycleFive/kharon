@@ -34,6 +34,10 @@ pub enum Event {
     KeyRotated,
     ExportLoaded,
     Abandoned,
+    /// REQ-API-009: a fill, fill_totp, or fill_and_submit exceeded its
+    /// end-to-end deadline. Written before the timeout response is
+    /// returned, after the plaintext buffers are zeroized.
+    FillTimeout,
     /// The log itself truncated a torn (partially written) tail line during
     /// open and recovered to `recovered_seq`. See [`crate::audit::AuditLog`].
     LogTruncated,
@@ -62,6 +66,7 @@ impl Event {
             Event::KeyRotated => "key_rotated",
             Event::ExportLoaded => "export_loaded",
             Event::Abandoned => "abandoned",
+            Event::FillTimeout => "fill_timeout",
             Event::LogTruncated => "log_truncated",
         }
     }
@@ -97,6 +102,7 @@ impl<'de> Deserialize<'de> for Event {
             "key_rotated" => Event::KeyRotated,
             "export_loaded" => Event::ExportLoaded,
             "abandoned" => Event::Abandoned,
+            "fill_timeout" => Event::FillTimeout,
             "log_truncated" => Event::LogTruncated,
             other => {
                 return Err(serde::de::Error::custom(format!(

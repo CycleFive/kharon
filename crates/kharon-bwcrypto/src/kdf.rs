@@ -38,6 +38,10 @@ const KDF_TYPE_ARGON2ID: u32 = 1;
 /// explicitly: anything below it is refused, anything at or above it is
 /// a (possibly legacy) account setting, not an attack signal by itself.
 pub const PBKDF2_MIN_ITERATIONS: u32 = 5_000;
+/// Current Bitwarden default and recommended minimum for PBKDF2.
+/// Accounts between [`PBKDF2_MIN_ITERATIONS`] and this derive fine but
+/// are legacy-weak; see [`Kdf::is_legacy_weak`] (#42).
+pub const PBKDF2_RECOMMENDED_ITERATIONS: u32 = 600_000;
 /// PBKDF2 iteration ceiling (Bitwarden's documented maximum): bounds
 /// the CPU a hostile prelogin response can make the client burn.
 pub const PBKDF2_MAX_ITERATIONS: u32 = 2_000_000;
@@ -111,6 +115,16 @@ impl Kdf {
         };
         kdf.validate()?;
         Ok(kdf)
+    }
+
+    /// Whether these parameters are accepted but below the current
+    /// recommendation: PBKDF2 under [`PBKDF2_RECOMMENDED_ITERATIONS`].
+    /// Derivation still succeeds (legacy accounts are legitimate); the
+    /// daemon should log a warning and surface this in `status` so the
+    /// owner knows to raise the account's KDF iterations. Argon2id
+    /// within the validated bounds is never flagged.
+    pub fn is_legacy_weak(&self) -> bool {
+        matches!(*self, Self::Pbkdf2 { iterations } if iterations < PBKDF2_RECOMMENDED_ITERATIONS)
     }
 
     /// Range-check the parameters against Bitwarden's client bounds
@@ -263,6 +277,22 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn req_cry_001_legacy_pbkdf2_is_accepted_but_flagged() {
+        for (iterations, weak) in [
+            (PBKDF2_MIN_ITERATIONS, true),
+            (100_000, true),
+            (PBKDF2_RECOMMENDED_ITERATIONS - 1, true),
+            (PBKDF2_RECOMMENDED_ITERATIONS, false),
+            (PBKDF2_MAX_ITERATIONS, false),
+        ] {
+            let kdf = Kdf::from_prelogin(0, iterations, None, None).unwrap();
+            assert_eq!(kdf.is_legacy_weak(), weak, "pbkdf2 {iterations}");
+        }
+        let argon = Kdf::from_prelogin(1, 2, Some(16), Some(1)).unwrap();
+        assert!(!argon.is_legacy_weak());
     }
 
     #[test]

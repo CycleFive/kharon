@@ -73,12 +73,17 @@ function fillInPage(specs, fields, expectedTopOrigin) {
   // Top-frame liveness (SPEC §6 step 2): when the top is readable it
   // must still be the origin the broker saw. A SecurityError means a
   // cross-origin top — the broker's step-1 frame-tree check stands.
+  // Coded refusals raised by fail() inside the try must propagate:
+  // without the rethrow, the catch below swallows the origin_mismatch
+  // the comparison just raised (review finding 2 — this check was
+  // dead code until the rethrow landed).
   try {
     if (window.top && window.top.location) {
       const topOrigin = window.top.location.origin;
       if (topOrigin !== expectedTopOrigin) fail("origin_mismatch");
     }
   } catch (e) {
+    if (e && e.kharonCode) throw e;
     /* cross-origin top: see doc comment */
   }
 
@@ -178,5 +183,91 @@ mod tests {
         for code in ["origin_mismatch", "non_secure", "field_not_found"] {
             assert!(FILL_IN_PAGE.contains(code), "missing {code}");
         }
+    }
+
+    /// Regression (review finding 2): the top-frame origin check must
+    /// actually fire. Executes the shipped `FILL_IN_PAGE` verbatim in
+    /// node against a stubbed DOM: a same-origin-readable top frame
+    /// whose origin differs from the broker-observed one must refuse
+    /// with `origin_mismatch` and write nothing; a matching top must
+    /// fill. Skipped (with a note) when node is not on PATH.
+    #[test]
+    fn req_org_003_top_frame_check_pins() {
+        let mut script = String::new();
+        script.push_str(
+            r#"
+class HTMLInputElement { constructor() { this._v = ""; } dispatchEvent() {} }
+Object.defineProperty(HTMLInputElement.prototype, "value", {
+  get() { return this._v; },
+  set(v) { this._v = v; },
+});
+class HTMLTextAreaElement extends HTMLInputElement {}
+class Event { constructor(type, opts) { this.type = type; this.bubbles = !!(opts && opts.bubbles); } }
+"#,
+        );
+        script.push_str(FILL_IN_PAGE);
+        script.push_str(
+            r#"
+const specs = [{ kind: "host", scheme: "https", origin: "https://accounts.example.com" }];
+const fields = [{ kind: "password", selector: null, value: "s3cret" }];
+
+function setEnv(topOrigin) {
+  const el = new HTMLInputElement();
+  globalThis.window = { isSecureContext: true, top: { location: { origin: topOrigin } } };
+  globalThis.location = {
+    protocol: "https:",
+    hostname: "accounts.example.com",
+    origin: "https://accounts.example.com",
+    href: "https://accounts.example.com/login",
+  };
+  globalThis.document = {
+    querySelector: (sel) => (sel.includes("password") ? el : null),
+  };
+  return el;
+}
+
+// 1. Readable top with a wrong origin: must refuse, must not write.
+let el = setEnv("https://evil.example");
+let outcome = "returned";
+try {
+  fillInPage(specs, fields, "https://accounts.example.com");
+} catch (e) {
+  outcome = (e && e.kharonCode) || e.message;
+}
+if (outcome !== "origin_mismatch") {
+  throw new Error(`top-check did not fire: got ${outcome}`);
+}
+if (el._v !== "") throw new Error("secret was written despite refusal");
+
+// 2. Matching top origin: must fill and report both fields.
+el = setEnv("https://accounts.example.com");
+const r = fillInPage(specs, fields, "https://accounts.example.com");
+if (r.results.length !== 1 || r.results[0].kind !== "password" || r.results[0].filled !== true) {
+  throw new Error(`unexpected results: ${JSON.stringify(r)}`);
+}
+if (el._v !== "s3cret") throw new Error(`value not set: ${el._v}`);
+console.log("ok");
+"#,
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kharon_fill_topcheck_{}.js", std::process::id()));
+        std::fs::write(&path, &script).expect("write harness");
+        let output = std::process::Command::new("node").arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        let output = match output {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node not on PATH; skipping top-frame harness test");
+                return;
+            }
+            Err(e) => panic!("spawn node: {e}"),
+        };
+        assert!(
+            output.status.success(),
+            "harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
     }
 }

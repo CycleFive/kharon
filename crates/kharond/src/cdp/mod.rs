@@ -17,5 +17,5 @@ pub mod tls;
 
 pub use browser::{AgentContext, Browser, OwnershipError, TargetInfo};
 pub use client::{CdpClient, CdpError, CdpSession};
-pub use endpoint::{CertSha256, CdpEndpoint, EndpointError, Tunnel};
+pub use endpoint::{CdpEndpoint, CertSha256, EndpointError, Tunnel};
 pub use fill::{FieldFill, FieldKind, FillEngine, FillOutcome, FillPlan};

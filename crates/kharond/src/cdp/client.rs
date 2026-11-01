@@ -16,18 +16,19 @@
 //! page-level commands (`Page.*`, `Runtime.*`) reach a specific tab.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::sync::{oneshot, Mutex};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use zeroize::Zeroizing;
 
 type WsSplitSink = SplitSink<WebSocketStream<MaybeTls>, Message>;
 
@@ -293,10 +294,14 @@ impl CdpClient {
         if let Some(session_id) = session_id {
             message["sessionId"] = Value::String(session_id.to_string());
         }
-        let text = serde_json::to_string(&message).expect("Value serializes");
+        let text = Zeroizing::new(serde_json::to_string(&message).expect("Value serializes"));
         {
             let mut write = self.write.lock().await;
-            if let Err(e) = write.send(Message::Text(text)).await {
+            // REQ-CRY-006: our serialized copy is zeroized on drop.
+            // tungstenite's internal send buffer is the one remaining
+            // plaintext copy — a documented limitation (it is freed by
+            // the library, not zeroized).
+            if let Err(e) = write.send(Message::Text((*text).clone())).await {
                 self.pending.lock().await.remove(&id);
                 return Err(CdpError::from(e));
             }
@@ -375,7 +380,10 @@ impl CdpSession {
     pub async fn detach(self) {
         let _ = self
             .client
-            .request("Target.detachFromTarget", json!({ "sessionId": self.session_id }))
+            .request(
+                "Target.detachFromTarget",
+                json!({ "sessionId": self.session_id }),
+            )
             .await;
     }
 }
@@ -405,7 +413,6 @@ mod tests {
             let _task = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
-                let mut next_id = 1u64;
                 while let Some(Ok(Message::Text(text))) = ws.next().await {
                     let msg: Value = serde_json::from_str(&text).unwrap();
                     received_task.lock().unwrap().push(msg.clone());
@@ -414,14 +421,15 @@ mod tests {
                         .get(method)
                         .cloned()
                         .unwrap_or_else(|| json!({ "ok": true }));
-                    let mut reply = json!({ "id": next_id, "result": result });
-                    next_id += 1;
+                    // Echo the request's own id: a correlation bug
+                    // must fail this test, not a counter (review
+                    // finding 8 — the old counter would pass under
+                    // reordering).
+                    let mut reply = json!({ "id": msg["id"], "result": result });
                     if let Some(session_id) = msg.get("sessionId") {
                         reply["sessionId"] = session_id.clone();
                     }
-                    ws.send(Message::Text(reply.to_string()))
-                        .await
-                        .unwrap();
+                    ws.send(Message::Text(reply.to_string())).await.unwrap();
                 }
             });
             Self {
@@ -439,7 +447,10 @@ mod tests {
             "Target.attachToTarget".to_string(),
             json!({ "sessionId": "sess-1" }),
         );
-        script.insert("Browser.getVersion".to_string(), json!({ "product": "HeadlessChrome/1" }));
+        script.insert(
+            "Browser.getVersion".to_string(),
+            json!({ "product": "HeadlessChrome/1" }),
+        );
         let peer = MockPeer::start(script).await;
 
         let endpoint = super::super::endpoint::CdpEndpoint::validate(
@@ -450,12 +461,18 @@ mod tests {
         .unwrap();
         let client = CdpClient::connect(&endpoint).await.unwrap();
 
-        let version = client.request("Browser.getVersion", json!({})).await.unwrap();
+        let version = client
+            .request("Browser.getVersion", json!({}))
+            .await
+            .unwrap();
         assert_eq!(version["product"], "HeadlessChrome/1");
 
         let session = client.attach("target-1").await.unwrap();
         assert_eq!(session.session_id(), "sess-1");
-        let ack = session.request("Page.getFrameTree", json!({})).await.unwrap();
+        let ack = session
+            .request("Page.getFrameTree", json!({}))
+            .await
+            .unwrap();
         assert_eq!(ack["ok"], true);
 
         // The sessionId must ride on the wire for session-scoped calls.
@@ -494,10 +511,10 @@ mod tests {
         )
         .unwrap();
         let client = CdpClient::connect(&endpoint).await.unwrap();
-        let err = client.request("Target.attachToTarget", json!({})).await.unwrap_err();
-        assert!(matches!(
-            err,
-            CdpError::Protocol { code: -32000, .. }
-        ));
+        let err = client
+            .request("Target.attachToTarget", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CdpError::Protocol { code: -32000, .. }));
     }
 }

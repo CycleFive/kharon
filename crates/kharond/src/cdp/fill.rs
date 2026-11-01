@@ -20,8 +20,8 @@
 //! requesting agent's browser context, or the default context when
 //! `allow_default` is set.
 
-use serde_json::{json, Value};
-use zeroize::Zeroizing;
+use serde_json::{Value, json};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::origin::{MismatchReason, OriginConfig, OriginMatcher};
 
@@ -163,7 +163,7 @@ impl FillEngine {
             .iter()
             .map(|m| serde_json::to_value(m.in_page_spec()).expect("spec serializes"))
             .collect();
-        let field_args: Vec<Value> = plan
+        let mut field_args: Vec<Value> = plan
             .fields
             .iter()
             .map(|f| {
@@ -182,21 +182,28 @@ impl FillEngine {
 
         let session = match self.browser.client().attach(&plan.target_id).await {
             Ok(s) => s,
-            Err(CdpError::Protocol {
-                code: -32000, ..
-            }) => return FillOutcome::UnknownTarget,
+            Err(CdpError::Protocol { code: -32000, .. }) => return FillOutcome::UnknownTarget,
             Err(e) => return FillOutcome::Error(e.to_string()),
         };
 
         let outcome = self
-            .fill_attached(
-                &session,
-                &specs,
-                &field_args,
-                &clear_args,
-                &info.url,
-            )
+            .fill_attached(&session, &specs, &field_args, &clear_args, &info.url)
             .await;
+
+        // REQ-CRY-006: the plan's values are Zeroizing and the wire
+        // copy is zeroized in `request_inner`; these serde_json copies
+        // are the broker's remaining plaintext secrets — wipe them
+        // before the Vec drops.
+        for arg in &mut field_args {
+            if let Some(obj) = arg.as_object_mut() {
+                if let Some(Value::String(s)) = obj.get_mut("value") {
+                    s.zeroize();
+                }
+                if let Some(v) = obj.get_mut("value") {
+                    *v = Value::Null;
+                }
+            }
+        }
 
         session.detach().await;
         outcome
@@ -214,9 +221,7 @@ impl FillEngine {
         // Step 1's frame-tree read: the loader id we'll re-check against.
         let tree = match session.request("Page.getFrameTree", json!({})).await {
             Ok(t) => t,
-            Err(CdpError::Protocol {
-                code: -32000, ..
-            }) => return FillOutcome::Navigated,
+            Err(CdpError::Protocol { code: -32000, .. }) => return FillOutcome::Navigated,
             Err(e) => return FillOutcome::Error(e.to_string()),
         };
         let frame = match tree_frame(&tree) {
@@ -227,7 +232,10 @@ impl FillEngine {
             Some(id) => id.to_string(),
             None => return FillOutcome::Error("frame has no id".into()),
         };
-        let loader_before = frame.get("loaderId").and_then(Value::as_str).map(String::from);
+        let loader_before = frame
+            .get("loaderId")
+            .and_then(Value::as_str)
+            .map(String::from);
         let expected_top_origin = expected_origin(live_url);
 
         // Step 2: isolated world + one synchronous check-and-set call.
@@ -239,9 +247,7 @@ impl FillEngine {
             .await
         {
             Ok(w) => w,
-            Err(CdpError::Protocol {
-                code: -32000, ..
-            }) => return FillOutcome::Navigated,
+            Err(CdpError::Protocol { code: -32000, .. }) => return FillOutcome::Navigated,
             Err(e) => return FillOutcome::Error(e.to_string()),
         };
         let context_id = match world.get("executionContextId").and_then(Value::as_u64) {
@@ -268,9 +274,7 @@ impl FillEngine {
             .await;
 
         let result = match call {
-            Err(CdpError::Protocol { code, message }) => {
-                return map_context_error(code, &message)
-            }
+            Err(CdpError::Protocol { code, message }) => return map_context_error(code, &message),
             Err(CdpError::Timeout) => return FillOutcome::Error("fill call timed out".into()),
             Err(e) => return FillOutcome::Error(e.to_string()),
             Ok(r) => r,
@@ -294,24 +298,29 @@ impl FillEngine {
             .and_then(|f| f.get("loaderId"))
             .and_then(Value::as_str)
             .map(String::from);
-        if loader_before.is_some() && loader_after.is_some() && loader_before != loader_after {
-            // Best-effort scrub in the old world (SPEC step 4).
-            let _ = session
-                .request_with_timeout(
-                    "Runtime.callFunctionOn",
-                    json!({
-                        "functionDeclaration": CLEAR_IN_PAGE,
-                        "executionContextId": context_id,
-                        "arguments": [ { "value": clear_args } ],
-                        "returnByValue": true,
-                    }),
-                    std::time::Duration::from_secs(5),
-                )
-                .await;
-            return FillOutcome::Navigated;
+        // Fail closed (per review): a missing loaderId on either side
+        // is not a pass. Real frame trees carry one; absence means the
+        // tree we are reading is not the tree we filled.
+        match (&loader_before, &loader_after) {
+            (Some(before), Some(after)) if before != after => {
+                // Best-effort scrub in the old world (SPEC step 4).
+                let _ = session
+                    .request_with_timeout(
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "functionDeclaration": CLEAR_IN_PAGE,
+                            "executionContextId": context_id,
+                            "arguments": [ { "value": clear_args } ],
+                            "returnByValue": true,
+                        }),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await;
+                FillOutcome::Navigated
+            }
+            (Some(_), Some(_)) => parse_fill_results(&result),
+            _ => FillOutcome::Error("frame tree loader id missing after fill".into()),
         }
-
-        parse_fill_results(&result)
     }
 }
 
@@ -326,7 +335,18 @@ fn tree_frame(tree: &Value) -> Option<&Value> {
 }
 
 fn parse_fill_results(result: &Value) -> FillOutcome {
-    let results = match result.get("result").and_then(|r| r.get("results")).and_then(Value::as_array) {
+    // `Runtime.callFunctionOn` with returnByValue replies
+    // `{ result: RemoteObject, exceptionDetails? }`; the returned JS
+    // object lives at RemoteObject.value. Muse's review caught the
+    // first version reading `result.results` off the RemoteObject
+    // itself, which can never exist — every successful fill was
+    // misreported as an error. The envelope test below pins this.
+    let results = match result
+        .get("result")
+        .and_then(|remote| remote.get("value"))
+        .and_then(|value| value.get("results"))
+        .and_then(Value::as_array)
+    {
         Some(a) => a,
         None => return FillOutcome::Error("fill reply lacked results".into()),
     };
@@ -375,7 +395,11 @@ fn map_context_error(code: i64, message: &str) -> FillOutcome {
 }
 
 fn url_host(href: &str) -> Option<String> {
-    href.split("://").nth(1)?.split(&['/', ':'][..]).next().map(String::from)
+    // Trust boundary (per review): parse, don't string-split — the
+    // hand-rolled split mishandled userinfo ("https://user@host/").
+    url::Url::parse(href)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
 }
 
 fn expected_origin(href: &str) -> String {
@@ -413,9 +437,67 @@ mod tests {
 
     #[test]
     fn helper_urls() {
-        assert_eq!(url_host("https://sub.example.com/x?y#z"), Some("sub.example.com".into()));
-        assert_eq!(url_host("https://example.com:8443/a"), Some("example.com".into()));
-        assert_eq!(expected_origin("https://a.b.example.com/p"), "https://a.b.example.com");
+        assert_eq!(
+            url_host("https://sub.example.com/x?y#z"),
+            Some("sub.example.com".into())
+        );
+        assert_eq!(
+            url_host("https://example.com:8443/a"),
+            Some("example.com".into())
+        );
+        // userinfo must not confuse the host extraction (per review).
+        assert_eq!(
+            url_host("https://user@example.com/"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            expected_origin("https://a.b.example.com/p"),
+            "https://a.b.example.com"
+        );
         assert_eq!(expected_origin("not a url"), "");
+    }
+
+    /// Regression (review finding 1): the callFunctionOn reply carries
+    /// the returned object at `result.result.value` — the first parser
+    /// read `result.result.results`, so no successful fill could ever
+    /// report `Filled`. This feeds a realistic envelope through the
+    /// parser, which no test did before.
+    #[test]
+    fn req_org_003_fill_reply_envelope() {
+        let envelope = json!({
+            "result": {
+                "type": "object",
+                "value": {
+                    "results": [
+                        { "kind": "username", "filled": true },
+                        { "kind": "password", "filled": true },
+                    ],
+                },
+            },
+        });
+        assert_eq!(
+            parse_fill_results(&envelope),
+            FillOutcome::Filled {
+                kinds: vec![FieldKind::Username, FieldKind::Password],
+            }
+        );
+        // exceptionDetails rides next to RemoteObject, not inside it.
+        let exceptional = json!({
+            "result": { "type": "object", "value": null },
+            "exceptionDetails": {
+                "exception": { "description": "Error: kharon:non_secure" },
+            },
+        });
+        assert!(matches!(
+            classify_exception(
+                exceptional
+                    .get("exceptionDetails")
+                    .and_then(|e| e.get("exception"))
+                    .and_then(|e| e.get("description"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ),
+            FillOutcome::NonSecureContext
+        ));
     }
 }

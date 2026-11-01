@@ -57,7 +57,9 @@ pub enum EndpointError {
     NotWebSocketUrl,
     /// `via = direct` with a non-loopback host: plaintext CDP on the
     /// network, refused at config load (REQ-ARCH-002).
-    #[error("plain ws:// to a non-loopback address refused (via = direct); use wireguard, ssh, or mtls")]
+    #[error(
+        "plain ws:// to a non-loopback address refused (via = direct); use wireguard, ssh, or mtls"
+    )]
     PlainWsNonLoopback,
     /// `via = mtls` speaks TLS in-crate, so the endpoint must be `wss://`.
     #[error("via = mtls requires a wss:// endpoint")]

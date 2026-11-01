@@ -6,11 +6,17 @@
 //! stock TLS 1.2/1.3 via rustls (aws-lc-rs provider). A peer presenting
 //! any other key fails the handshake — that is the REQ-ARCH-002 tunnel
 //! acceptance test (`req_arch_002_wrong_peer_key_fails_to_connect`).
+//!
+//! Deliberate choice (review finding 5): the pin verifier does NOT
+//! check the certificate validity window. An expired-but-pinned cert
+//! remains trusted, because rotation is manual and out-of-band — the
+//! pin is the entire trust statement. Do not "fix" this without a
+//! rotation story, and do not rely on expiry being enforced: it isn't.
 
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use sha2::Digest;
@@ -135,11 +141,13 @@ impl ServerCertVerifier for PinVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    async fn spawn_echo_server(cert_key: CertifiedKey) -> (std::net::SocketAddr, Arc<tokio::task::JoinHandle<()>>) {
+    async fn spawn_echo_server(
+        cert_key: CertifiedKey,
+    ) -> (std::net::SocketAddr, Arc<tokio::task::JoinHandle<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = rustls::ServerConfig::builder()
@@ -169,15 +177,11 @@ mod tests {
 
     #[tokio::test]
     async fn req_arch_002_right_peer_key_connects() {
-        let CertifiedKey { cert, key_pair } = generate_simple_self_signed(
-            vec!["localhost".to_string(), "127.0.0.1".to_string()],
-        )
-        .unwrap();
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let cert_der = cert.der().clone();
-        let server_key = CertifiedKey {
-            cert,
-            key_pair,
-        };
+        let server_key = CertifiedKey { cert, key_pair };
         let (addr, _server) = spawn_echo_server(server_key).await;
 
         let stream = TcpStream::connect(addr).await.unwrap();

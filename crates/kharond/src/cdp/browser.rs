@@ -8,7 +8,7 @@
 //! browser's shared context) are refused unless `allow_default_context`
 //! is set — the single-agent escape hatch from the spec.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use super::client::{CdpClient, CdpError};
@@ -263,7 +263,10 @@ mod tests {
         let mock = MockBrowser::start(script).await;
         let browser = Browser::new(mock.client().await);
         let ctx_a = browser.create_agent_context("agent-A").await.unwrap();
-        let err = browser.check_ownership("t-1", &ctx_a, false).await.unwrap_err();
+        let err = browser
+            .check_ownership("t-1", &ctx_a, false)
+            .await
+            .unwrap_err();
         assert_eq!(err, OwnershipError::TargetNotOwned);
     }
 
@@ -282,7 +285,10 @@ mod tests {
         let browser = Browser::new(mock.client().await);
         let ctx = browser.create_agent_context("agent-A").await.unwrap();
 
-        let err = browser.check_ownership("t-1", &ctx, false).await.unwrap_err();
+        let err = browser
+            .check_ownership("t-1", &ctx, false)
+            .await
+            .unwrap_err();
         assert_eq!(err, OwnershipError::DefaultContextRefused);
 
         // allow_default_context = true: single-agent setups may fill

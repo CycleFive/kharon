@@ -1,0 +1,37 @@
+# Vaultwarden fixture for kharon (issue #10; REQ-DEP-002 part).
+#
+# Throwaway test server ONLY: signups are open so seed.py can register
+# the fixture account, the admin panel is disabled, and all data lives
+# in a named volume that the fixture workflow deletes afterwards.
+# Never deploy this file as a real vault.
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.33.0
+    container_name: kharon-vaultwarden-fixture
+    restart: "no"
+    environment:
+      # Registration of the single fixture account (seed.py).
+      SIGNUPS_ALLOWED: "true"
+      # No invitations / SMTP in the fixture.
+      INVITATIONS_ALLOWED: "false"
+      # Admin panel off: nothing to harden, nothing to leak.
+      DISABLE_ADMIN_TOKEN: "true"
+      # The fixture is reached over plain HTTP on loopback only.
+      DOMAIN: "http://127.0.0.1:8222"
+      # Quiet, structured logs are easier to assert on in CI.
+      LOG_LEVEL: "info"
+    ports:
+      # Loopback only: the fixture must never be reachable off-host.
+      - "127.0.0.1:8222:80"
+    volumes:
+      - vaultwarden-fixture-data:/data
+    healthcheck:
+      test: ["CMD", "/vaultwarden", "--help"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+volumes:
+  vaultwarden-fixture-data:
+    name: kharon-vaultwarden-fixture-data

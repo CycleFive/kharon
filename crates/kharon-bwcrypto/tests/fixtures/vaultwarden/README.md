@@ -18,6 +18,22 @@ fresh randomness and UUIDs. Covers REQ-DEP-002 **(part)** per SPEC
 | `sync_fixture.json` | Checked-in output of `seed.py --offline`; decrypted end-to-end by the Rust fixture tests on every `cargo test` run. Regenerate with the pinned env below. |
 | `../../req_dep_002_fixture.rs` | The Rust tests: harness-contract checks (`req_dep_002_*`), the offline chain decrypt (`req_cry_004_fixture_*`), and the ignored live decrypt (`req_cry_004_live_*`). |
 
+## Pinned versions
+
+Both external components are pinned, and the pins move together:
+
+| Component | Pin | Where |
+|---|---|---|
+| Vaultwarden server | `vaultwarden/server:1.33.0` | `docker-compose.yml` |
+| `bw` CLI (oracle) | `@bitwarden/cli@2026.1.0` | `.github/workflows/fixture.yml` |
+
+The CLI pin is load-bearing, not cosmetic: 2026.2+ moved password
+login into the Rust SDK, whose prelogin call (`POST
+/identity/accounts/prelogin/password`) Vaultwarden 1.33.0 does not
+route — `bw login` dies with a 404 before it starts. 2026.1.0 is the
+last release whose prelogin is `POST /api/accounts/prelogin`, which
+1.33.0 serves. Unpin the CLI only together with the server pin.
+
 ## Why the seed constructs ciphers itself
 
 The REQ-CRY-004 contract is *exactly one* cipher with a per-cipher

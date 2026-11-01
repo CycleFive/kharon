@@ -61,7 +61,13 @@ jobs:
           import json
           a = json.load(open("fixture.json"))["account"]
           print(a["email"], a["password"])')"
-          export BW_SESSION="$(bw login "$BW_EMAIL" "$BW_PASSWORD" --raw)"
+          # Password via env, not argv; session capture split from the
+          # export so a login failure fails at the login (export alone
+          # succeeds under bash -e and masks the exit status).
+          export BW_PASSWORD
+          BW_SESSION="$(bw login "$BW_EMAIL" --passwordenv BW_PASSWORD --raw)"
+          export BW_SESSION
+          unset BW_PASSWORD
           bw sync
           bw list items > "${{ runner.temp }}/bw-items.json"
           python3 - "${{ runner.temp }}/bw-items.json" <<'EOF'

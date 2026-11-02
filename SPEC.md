@@ -349,7 +349,10 @@ collection_ids = ["uuid"]
 token_hash = "$argon2id$..."
 cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 [policy]
-idle_lock = "30m"; max_unlocked = "12h"; default_grant = "once"; allow_standing = false
+idle_lock = "30m"
+max_unlocked = "12h"
+default_grant = "once"
+allow_standing = false
 [approval]
 ntfy = { url = "https://ntfy.example.net", topic = "kharon", token_file = "/run/secrets/ntfy" }
 ```

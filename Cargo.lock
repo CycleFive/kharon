@@ -932,6 +932,7 @@ dependencies = [
  "rand",
  "rcgen",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

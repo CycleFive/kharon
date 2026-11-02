@@ -62,6 +62,8 @@ struct RawBitwarden {
     collection_ids: Vec<String>,
     #[serde(default)]
     allow_extra_orgs: bool,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -344,6 +346,7 @@ fn validate_bitwarden(bw: RawBitwarden) -> Result<BitwardenConfig, ConfigError> 
             .map(|c| c.to_ascii_lowercase())
             .collect(),
         allow_extra_orgs: bw.allow_extra_orgs,
+        ca_file: bw.ca_file,
     })
 }
 

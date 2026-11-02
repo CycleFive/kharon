@@ -27,6 +27,22 @@ ntfy = {{ url = "https://ntfy.example.net", topic = "kharon", token_file = "/run
     )
 }
 
+/// The spec example with `api_key_file` pointing at a real key file, for
+/// tests that run [`Config::check_startup`].
+fn spec_example_with_key() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("key.json");
+    std::fs::write(
+        &key,
+        r#"{"client_id":"user.6b1e0c52-0a3e-4a8e-9a4f-1f0e2d3c4b5a","client_secret":"s"}"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let text = spec_example().replace("/run/secrets/kharon_bw_api_key", key.to_str().unwrap());
+    (dir, text)
+}
+
 #[test]
 fn req_dep_003_spec_example_loads_with_defaults() {
     let cfg = Config::from_toml_str(&spec_example()).unwrap();
@@ -90,7 +106,8 @@ fn req_dep_003_debug_never_shows_token_hash() {
 
 #[test]
 fn req_dep_003_mlock_check_is_injected() {
-    let cfg = Config::from_toml_str(&spec_example()).unwrap();
+    let (_dir, text) = spec_example_with_key();
+    let cfg = Config::from_toml_str(&text).unwrap();
     cfg.check_startup(&StaticMlockProbe(Ok(()))).unwrap();
     let err = cfg
         .check_startup(&StaticMlockProbe(Err("no CAP_IPC_LOCK".into())))
@@ -98,7 +115,7 @@ fn req_dep_003_mlock_check_is_injected() {
     assert_eq!(err.code(), "mlock_unavailable");
 
     // require_mlock = false skips the probe, with a startup warning.
-    let off = format!("{}\n[memory]\nrequire_mlock = false\n", spec_example());
+    let off = format!("{text}\n[memory]\nrequire_mlock = false\n");
     let cfg = Config::from_toml_str(&off).unwrap();
     cfg.check_startup(&StaticMlockProbe(Err("no".into())))
         .unwrap();

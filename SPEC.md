@@ -303,7 +303,7 @@ Audit: append-only JSONL at `/data/audit/audit.jsonl`, opened `O_APPEND`, with `
 
 - Start state is always `locked`. The master password is supplied only by the owner via CLI (tty, no echo) or web UI after WebAuthn. It is never stored on disk, in env, or in config.
 - Unlock derives the master key, decrypts the user key, then zeroizes the master key and password immediately. In memory it keeps the user key, the RSA private key (zeroized once org keys are unwrapped), and the org key(s). Cipher fields are decrypted per fill into `Zeroizing` buffers and dropped after CDP write.
-- The API key (`client_id`/`client_secret`) is in a root-only file or Docker secret. On its own it yields ciphertext only.
+- The API key (`client_id`/`client_secret`) is in a file or Docker secret readable by kharond, which runs non-root (REQ-DEP-008). On its own it yields ciphertext only: another local user or process that reads it can authenticate as the kharon account and sync ciphertext and metadata, but cannot decrypt without the master password.
 - Process hardening: `prctl(PR_SET_DUMPABLE,0)`, `setrlimit(RLIMIT_CORE,0)`, `mlockall(MCL_CURRENT|MCL_FUTURE)` (needs `CAP_IPC_LOCK`, or memlock ulimit), `madvise(MADV_DONTDUMP)` on key arenas, `secrecy` + `zeroize` crates, `panic = "abort"`, no swap or encrypted swap, seccomp profile. Allocations holding key material live in a dedicated mlocked arena (OQ-10: `memsec`/custom allocator).
 - Idle lock: `idle_lock = 30m` since last fill (configurable), plus `max_unlocked = 12h` absolute. Lock zeroizes keys and closes CDP sessions.
 - Restart, crash, or OOM → locked. Pending requests are dropped and audited on next start as `abandoned`.
@@ -367,6 +367,7 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 | REQ-DEP-004 | Official Bitwarden compatibility tested. | A manual or nightly job against a cloud test account passes REQ-CRY-005. Result recorded in `COMPAT.md`. |
 | REQ-DEP-006 | Agent API binds only to the configured WireGuard interface address. Owner API binds to loopback or a unix socket. Wildcard binds are refused. | Config with `0.0.0.0` → startup error. `ss -ltn` in E2E shows only the expected addresses. |
 | REQ-DEP-007 | The kharon account master password is generated with ≥ 128 bits of entropy and stored by the owner outside the kharon org. The API-key file plus server access reduces to an offline attack on it. | Guide documents it. `kharon init` generates the password and prints it once to the tty. |
+| REQ-DEP-008 | `api_key_file` should be owned by kharond's effective uid with mode 0400 or 0600. Startup fails (exit 78, `EX_CONFIG`) if it is not a regular file or is group- or world-writable. If it is group- or world-readable or owned by another uid, kharond logs a warning and continues; this accommodates Docker secrets mounted 0444 inside a single-purpose container. | Tempfile tests: 0600/0400 → ok; 0444 → warning; 0620/0602 → exit 78 `api_key_file`; directory → exit 78; foreign owner → warning. |
 | REQ-DEP-005 | Agent-host guide: Chromium as `browser` user, `ptrace_scope=1`, WireGuard peer, password manager disabled. | The doc exists and an Ansible/shell snippet is tested in a VM. |
 
 ## 10. Open questions

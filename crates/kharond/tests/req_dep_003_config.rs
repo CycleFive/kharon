@@ -32,8 +32,9 @@ impl Parts {
             top: String::new(),
             bitwarden: format!(
                 "[bitwarden]\nserver = \"https://vault.example.net\"\nemail = \"kharon@example.net\"\n\
-                 api_key_file = \"/run/secrets/kharon_bw_api_key\"\norganization_id = \"{ORG}\"\n\
-                 collection_ids = [\"{COLL}\"]\n"
+                 api_key_file = \"{}\"\norganization_id = \"{ORG}\"\n\
+                 collection_ids = [\"{COLL}\"]\n",
+                api_key_path().display()
             ),
             export: String::new(),
             agents: agent("assistant", "ws://10.66.0.2:9222", "wireguard"),
@@ -62,6 +63,44 @@ impl Parts {
         .collect::<Vec<_>>()
         .join("\n")
     }
+}
+
+/// Per-binary scratch dir for fixture files referenced from configs.
+fn fixture_dir() -> &'static std::path::Path {
+    static D: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    D.get_or_init(|| tempfile::tempdir().unwrap().keep())
+}
+
+fn fixture_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
+    let p = fixture_dir().join(name);
+    std::fs::write(&p, contents).unwrap();
+    // REQ-DEP-008: key files must not be group/world-writable; pin the
+    // mode so the host umask cannot matter.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    p
+}
+
+const CLIENT_ID: &str = "user.6b1e0c52-0a3e-4a8e-9a4f-1f0e2d3c4b5a";
+
+/// A valid personal API-key file (canary secret `xyz...`).
+fn api_key_path() -> &'static std::path::Path {
+    static P: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        fixture_file(
+            "bw_api_key.json",
+            format!(r#"{{"client_id":"{CLIENT_ID}","client_secret":"xyzCANARYsecret"}}"#)
+                .as_bytes(),
+        )
+    })
+}
+
+fn set_bw(p: &mut Parts, extra: &str, key: &std::path::Path) {
+    p.bitwarden = format!(
+        "[bitwarden]\nserver = \"https://vault.example.net\"\nemail = \"kharon@example.net\"\n\
+         api_key_file = \"{}\"\norganization_id = \"{ORG}\"\ncollection_ids = [\"{COLL}\"]\n{extra}",
+        key.display()
+    );
 }
 
 fn agent(id: &str, endpoint: &str, via: &str) -> String {
@@ -199,6 +238,49 @@ fn bad_configs() -> Vec<Row> {
             p.approval.clear()
         }),
     ];
+    // Sync-client wiring (#8): the files behind the config must be usable.
+    rows.push(row("api key file missing", "api_key_file", |p| {
+        set_bw(p, "", &fixture_dir().join("does-not-exist.json"))
+    }));
+    rows.push(row("api key file not a key", "api_key_file", |p| {
+        let k = fixture_file(
+            "bad_key.json",
+            br#"{"client_id":"user.x","password":"hunter2"}"#,
+        );
+        set_bw(p, "", &k)
+    }));
+    rows.push(row("api key is an org key", "api_key_file", |p| {
+        let k = fixture_file(
+            "org_key.json",
+            br#"{"client_id":"organization.6b1e0c52-0a3e-4a8e-9a4f-1f0e2d3c4b5a","client_secret":"xyz"}"#,
+        );
+        set_bw(p, "", &k)
+    }));
+    rows.push(row("api key file world-writable", "api_key_file", |p| {
+        use std::os::unix::fs::PermissionsExt;
+        let k = fixture_file(
+            "ww_key.json",
+            format!(r#"{{"client_id":"{CLIENT_ID}","client_secret":"xyz"}}"#).as_bytes(),
+        );
+        std::fs::set_permissions(&k, std::fs::Permissions::from_mode(0o602)).unwrap();
+        set_bw(p, "", &k)
+    }));
+    rows.push(row("ca file missing", "ca_file", |p| {
+        let ca = fixture_dir().join("no-ca.pem");
+        set_bw(
+            p,
+            &format!("ca_file = \"{}\"\n", ca.display()),
+            api_key_path(),
+        )
+    }));
+    rows.push(row("ca file not PEM", "ca_file", |p| {
+        let ca = fixture_file("junk-ca.pem", b"hunter2 is not a certificate\n");
+        set_bw(
+            p,
+            &format!("ca_file = \"{}\"\n", ca.display()),
+            api_key_path(),
+        )
+    }));
     let mut mlock = row("missing mlock", "mlock_unavailable", |p| {
         p.memory = "[memory]\nrequire_mlock = true\n".into()
     });
@@ -332,4 +414,51 @@ fn req_dep_003_load_for_startup_reads_file() {
     let path = dir.path().join("kharon.toml");
     std::fs::write(&path, Parts::good().render()).unwrap();
     load_for_startup(&path, &StaticMlockProbe(Ok(()))).unwrap();
+}
+
+fn ca_pem() -> String {
+    rcgen::generate_simple_self_signed(vec!["vault.example.net".into()])
+        .unwrap()
+        .cert
+        .pem()
+}
+
+#[test]
+fn req_dep_003_sync_client_built_from_config() {
+    let mut p = Parts::good();
+    let ca = fixture_file("ca.pem", ca_pem().as_bytes());
+    set_bw(
+        &mut p,
+        &format!("ca_file = \"{}\"\n", ca.display()),
+        api_key_path(),
+    );
+    let cfg = check(&p.render(), &StaticMlockProbe(Ok(()))).unwrap();
+    let kharond::config::Source::Sync(bw) = &cfg.source else {
+        panic!("sync mode");
+    };
+    assert_eq!(bw.ca_file.as_deref(), Some(ca.as_path()));
+    assert!(bw.tls_trust().unwrap().extra_ca_pem.is_some());
+    assert_eq!(bw.api_key().unwrap().client_id(), CLIENT_ID);
+    let scope = bw.scope();
+    assert!(
+        format!("{scope:?}").contains(&ORG.to_ascii_lowercase()),
+        "{scope:?}"
+    );
+    bw.sync_client().unwrap();
+
+    // The daemon accepts the same config.
+    let (code, stderr) = run_daemon(&p.render());
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+#[test]
+fn req_dep_003_ca_file_is_not_a_secret_key() {
+    // `ca_file` passes the secret-shaped-key refusal; without it the
+    // trust is OS roots only.
+    let cfg = check(&Parts::good().render(), &StaticMlockProbe(Ok(()))).unwrap();
+    let kharond::config::Source::Sync(bw) = &cfg.source else {
+        panic!("sync mode");
+    };
+    assert!(bw.ca_file.is_none());
+    assert!(bw.tls_trust().unwrap().extra_ca_pem.is_none());
 }

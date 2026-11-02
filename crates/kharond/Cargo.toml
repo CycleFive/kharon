@@ -41,9 +41,12 @@ kharon-bwcrypto = { version = "0.0.0", path = "../kharon-bwcrypto" }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "http2"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }
-# Safe geteuid() for the api_key_file ownership check (SPEC §8,
-# REQ-DEP-008); already in the tree via tempfile.
-rustix = { version = "1", default-features = false, features = ["std", "process"] }
+# Safe wrappers only — kharond forbids unsafe code, so no direct libc
+# FFI: geteuid() for the api_key_file ownership check (SPEC §8,
+# REQ-DEP-008), prctl/setrlimit/mlockall for process memory hardening
+# (issue #11, REQ-MEM-001/002), and clock_gettime(CLOCK_BOOTTIME) for
+# the lock timers (REQ-MEM-004). Already in the tree via tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "process", "mm", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use rsa::RsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
-use zeroize::Zeroizing;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::encstring::{EncError, EncString, SymmetricKey};
 
@@ -107,6 +107,14 @@ pub struct OrgKeyUnwrapper {
     mismatched_orgs: HashSet<String>,
     poisoned: bool,
 }
+
+/// Every key-bearing field wipes on drop: `RsaPrivateKey` is itself
+/// `ZeroizeOnDrop`, and cached org keys are [`SymmetricKey`]s wrapping
+/// `Zeroizing` buffers. There is no in-place `Zeroize` (the RSA key
+/// cannot provide one), so destruction is by drop — the contract the
+/// lock state machine's `S: ZeroizeOnDrop` bound relies on
+/// (REQ-MEM-003).
+impl ZeroizeOnDrop for OrgKeyUnwrapper {}
 
 impl OrgKeyUnwrapper {
     /// Test-only: a session without an organization allow-list (only

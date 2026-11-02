@@ -22,7 +22,7 @@ use kharon_bwcrypto::{
     EncError, EncString, Kdf, OrgKeyUnwrapper, SymmetricKey, decrypt_item_field, derive_master_key,
     unwrap_cipher_key, unwrap_private_key, unwrap_user_key,
 };
-use zeroize::Zeroizing;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::SyncError;
 use super::wire::{CIPHER_TYPE_LOGIN, Cipher, SyncResponse};
@@ -200,6 +200,14 @@ pub struct Session {
     scope: Scope,
     orgs: OrgKeyUnwrapper,
 }
+
+/// The session's keys live in `orgs`, which is `ZeroizeOnDrop`, and
+/// `Scope` holds only ids — so dropping a `Session` wipes its key
+/// material. That is the destruction contract the lock state machine
+/// relies on (REQ-MEM-003): it cannot wipe the session in place,
+/// because `RsaPrivateKey` implements `ZeroizeOnDrop` but not
+/// `Zeroize`.
+impl ZeroizeOnDrop for Session {}
 
 fn parse(s: Option<&str>) -> Result<EncString, SyncError> {
     EncString::parse(s.ok_or(SyncError::Malformed("sync"))?).map_err(SyncError::Crypto)

@@ -16,6 +16,8 @@ hex = "0.4"
 ed25519-dalek = "2.1"
 rand = "0.8"
 thiserror = "2"
+# Config loader (issue #5, REQ-DEP-003).
+toml = "1"
 time = { version = "0.3", features = ["formatting"] }
 fs2 = "0.4"
 publicsuffix = "2.3"

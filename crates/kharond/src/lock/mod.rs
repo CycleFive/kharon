@@ -5,33 +5,71 @@
 //! it (REQ-MEM-005). [`LockController`] owns the one unlocked
 //! session — the key material produced by an unlock — and the two
 //! timers that end it: idle (default 30m since the last activity)
-//! and absolute (default 12h since unlock) (REQ-MEM-004). Locking,
-//! for any reason, zeroizes the session's keys before dropping it
-//! (REQ-MEM-003).
+//! and absolute (default 12h since unlock) (REQ-MEM-004). The
+//! timers are enforced at the fill gate itself
+//! ([`LockController::require_unlocked`]), not only by
+//! [`LockController::poll`]: an expired session is locked before it
+//! can be handed out, and activity can never revive one (review
+//! #50, blocking item 1). Locking, for any reason, destroys the
+//! session (REQ-MEM-003): the session type is bounded by
+//! [`ZeroizeOnDrop`], so dropping it wipes its keys. That bound is
+//! deliberate — the real session (`sync::Session`) holds an
+//! `RsaPrivateKey`, which implements `ZeroizeOnDrop` but cannot
+//! implement `Zeroize` (review #50, blocking item 2).
 //!
 //! Unlock is deliberately ordered so key material cannot exist
 //! before the host is ready for it:
 //!
-//! 1. If the policy requires mlock (`require_mlock = true`, the
-//!    default), `mlockall` must succeed first; otherwise unlock is
-//!    refused with [`UnlockError::MlockUnavailable`] and the
-//!    derivation closure is never called (REQ-MEM-002).
+//! 1. `mlockall` runs first. When the policy requires it
+//!    (`require_mlock = true`, the default), failure refuses the
+//!    unlock with [`UnlockError::MlockUnavailable`] and the
+//!    derivation closure is never called (REQ-MEM-002). When it
+//!    does not, mlock is still attempted best-effort and a failure
+//!    is reported as [`LockEvent::MlockBestEffortFailed`] rather
+//!    than silently running swappable. Two caveats for the daemon
+//!    (#14): the syscall is authoritative for *refusal* at unlock
+//!    time, but with `MCL_FUTURE` and a finite memlock limit a
+//!    successful `mlockall` on a small footprint can still abort
+//!    the process on a later allocation past the limit — so #14
+//!    must refuse unlock if *either* the config loader's
+//!    `ProcfsMlockProbe` (#47) or the syscall says no. And the
+//!    master password is captured by the derivation closure
+//!    *before* this step runs, so #14 closes that window by calling
+//!    `lock_memory()` once at startup, right after
+//!    `harden_process()`, whenever `require_mlock` is set.
 //! 2. The caller's derivation closure runs (prelogin → login → sync
 //!    → master key → user key → private key → org key, i.e.
-//!    `sync::Session::unlock` once #49 lands). Its contract: the
-//!    master password and master key are zeroized inside the closure
-//!    before it returns (REQ-MEM-003); only the session it returns
-//!    may hold keys.
-//! 3. The controller records the unlock instant and starts both
-//!    timers.
+//!    `sync::Session::unlock`). Its contract: the master password
+//!    and master key are zeroized inside the closure before it
+//!    returns (REQ-MEM-003); only the session it returns may hold
+//!    keys. Composition with master's async sync (review #50,
+//!    item 8): run `prelogin` + `sync` — network only, no key
+//!    material — *before* `unlock()`, then `Session::unlock` +
+//!    `apply_sync` inside the closure. The closure runs
+//!    synchronously (the KDF is CPU work) while `&mut
+//!    LockController` is held, so the daemon must guard the
+//!    controller with a `std::sync::Mutex` inside `spawn_blocking`,
+//!    never a tokio mutex across `.await`; a `lock` request that
+//!    arrives mid-unlock then serializes after it, which is
+//!    correct.
+//! 3. The `Unlocked` audit entry is written (REQ-AUD-003: write
+//!    failure fails closed — if the sink rejects it, the fresh
+//!    session is destroyed and the unlock reports
+//!    [`UnlockError::Audit`]). Only then are the timers recorded
+//!    as started.
 //!
-//! Forced locks (REQ-MEM-006): the sync layer reports a rotated org
-//! key or an unknown crypto version and the controller locks with
-//! the matching [`LockReason`]; the audit event name for the
-//! rotation case is `key_rotated`, as the AC names it.
+//! Forced locks (REQ-MEM-006, REQ-CRY-008): the sync layer reports
+//! a rotated org key, an unknown crypto version, or a widened
+//! dedicated-org scope, and the controller locks with the matching
+//! [`LockReason`]; the audit event names are `key_rotated` and
+//! `scope_widened`, as the ACs name them. A `Locked` audit entry is
+//! written best-effort: the lock stands regardless of whether the
+//! write succeeds (REQ-AUD-003's fail-closed rule governs the
+//! request path, and there is no request left to fail once the
+//! session is gone).
 //!
-//! Every transition is reported to an optional event sink as a
-//! [`LockEvent`]; the daemon wires the sink to the audit log
+//! Every transition is reported to an optional fallible event sink
+//! as a [`LockEvent`]; the daemon wires the sink to the audit log
 //! (REQ-AUD-003), tests wire it to a `Vec`.
 //!
 //! Field classes (REQ-CRY-006) are enforced by the session type
@@ -43,9 +81,11 @@
 mod clock;
 mod hardening;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use zeroize::Zeroize;
+use zeroize::ZeroizeOnDrop;
+
+use crate::config::{MemoryConfig, PolicyConfig};
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use hardening::{
@@ -55,7 +95,7 @@ pub use hardening::{
 
 /// SPEC §8 / §9 defaults: idle lock 30m, absolute 12h, mlock
 /// required. The daemon overrides these from `[policy]` / `[memory]`
-/// config once the config loader (#47) is wired in.
+/// config via [`LockPolicy::from`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockPolicy {
     /// Lock after this much time with no fill activity.
@@ -76,9 +116,30 @@ impl Default for LockPolicy {
     }
 }
 
+impl From<(&PolicyConfig, &MemoryConfig)> for LockPolicy {
+    /// Wire the config loader's validated values (#47/#51) into the
+    /// lock policy: timers from `[policy]`, `require_mlock` from
+    /// `[memory]`.
+    fn from((policy, memory): (&PolicyConfig, &MemoryConfig)) -> Self {
+        Self {
+            idle_lock: policy.idle_lock,
+            max_unlocked: policy.max_unlocked,
+            require_mlock: memory.require_mlock,
+        }
+    }
+}
+
+/// The audit sink refused an entry (REQ-AUD-003). Carries no detail:
+/// the sink owns its error text, and audit payloads never carry
+/// secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("audit write failed")]
+pub struct AuditError;
+
 /// Why the broker locked. The audit event name for a lock is
-/// `locked_<audit_name>`, except rotation, whose audit entry the
-/// REQ-MEM-006 AC names directly: `key_rotated`.
+/// `locked_<audit_name>`, except the two forced locks whose audit
+/// entries the ACs name directly: `key_rotated` (REQ-MEM-006) and
+/// `scope_widened` (REQ-CRY-008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockReason {
     /// Owner action (`kharon lock`, web UI, `kharon panic`).
@@ -92,10 +153,14 @@ pub enum LockReason {
     /// A payload used a crypto version kharon does not know
     /// (REQ-MEM-006).
     UnknownCryptoVersion,
+    /// The account's view widened past the dedicated org mid-run
+    /// (REQ-CRY-008).
+    ScopeWidened,
 }
 
 impl LockReason {
-    /// The audit event name for this lock (REQ-AUD-003, REQ-MEM-006).
+    /// The audit event name for this lock (REQ-AUD-003, REQ-MEM-006,
+    /// REQ-CRY-008).
     pub fn audit_event(self) -> &'static str {
         match self {
             Self::Manual => "locked_manual",
@@ -103,6 +168,7 @@ impl LockReason {
             Self::AbsoluteTimeout => "locked_absolute_timeout",
             Self::KeyRotated => "key_rotated",
             Self::UnknownCryptoVersion => "locked_unknown_crypto_version",
+            Self::ScopeWidened => "scope_widened",
         }
     }
 }
@@ -114,7 +180,11 @@ pub enum LockEvent {
     Unlocked,
     /// Unlock was refused before any key derivation ran.
     UnlockRefusedMlock,
-    /// The broker locked; the session was zeroized and dropped.
+    /// `require_mlock = false` and the best-effort `mlockall` still
+    /// failed: the unlock proceeds, but the session's pages are
+    /// swappable and the operator should know.
+    MlockBestEffortFailed,
+    /// The broker locked; the session was destroyed.
     Locked {
         /// Why.
         reason: LockReason,
@@ -136,6 +206,11 @@ pub enum UnlockError<E> {
     /// crypto error, …). The broker stays locked.
     #[error("unlock derivation failed: {0}")]
     DeriveFailed(#[source] E),
+    /// The audit sink refused the `Unlocked` entry, so the unlock
+    /// was rolled back and the fresh session destroyed
+    /// (REQ-AUD-003: write failure fails closed).
+    #[error("audit write failed; unlock rolled back (REQ-AUD-003)")]
+    Audit(#[source] AuditError),
 }
 
 /// The broker is locked (the fill gate: REQ-MEM-007's seam — any
@@ -147,25 +222,30 @@ pub struct LockedError;
 
 struct Unlocked<S> {
     session: S,
-    unlocked_at: Instant,
-    last_activity_at: Instant,
+    unlocked_at: Duration,
+    last_activity_at: Duration,
 }
+
+/// The audit sink signature: fallible, so REQ-AUD-003's fail-closed
+/// rule can be enforced at the transitions it governs.
+type EventSink = Box<dyn FnMut(LockEvent) -> Result<(), AuditError> + Send>;
 
 /// Owns the lock state and (while unlocked) the session's keys.
 ///
-/// `S` is the session type produced by an unlock (the sync layer's
-/// session once #49 lands). It must implement [`Zeroize`]: locking
-/// calls `zeroize()` on it and then drops it, so key material is
-/// wiped, not merely released (REQ-MEM-003).
-pub struct LockController<S: Zeroize, C: Clock = SystemClock> {
+/// `S` is the session type produced by an unlock (`sync::Session`
+/// in the daemon). It must implement [`ZeroizeOnDrop`]: locking
+/// drops the session, and the type's own drop wipes its key
+/// material (REQ-MEM-003). In-place `Zeroize` is *not* required —
+/// the real session's `RsaPrivateKey` cannot provide it.
+pub struct LockController<S: ZeroizeOnDrop, C: Clock = SystemClock> {
     policy: LockPolicy,
     clock: C,
     hardening: Box<dyn MemoryHardening>,
     unlocked: Option<Unlocked<S>>,
-    sink: Option<Box<dyn FnMut(LockEvent) + Send>>,
+    sink: Option<EventSink>,
 }
 
-impl<S: Zeroize, C: Clock> LockController<S, C> {
+impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
     /// A locked controller (REQ-MEM-005: boots locked; nothing is
     /// persisted, so a restart constructs exactly this).
     pub fn new(policy: LockPolicy, clock: C, hardening: Box<dyn MemoryHardening>) -> Self {
@@ -179,35 +259,61 @@ impl<S: Zeroize, C: Clock> LockController<S, C> {
     }
 
     /// Report every transition to `sink` (the daemon's audit log).
-    pub fn set_event_sink(&mut self, sink: Box<dyn FnMut(LockEvent) + Send>) {
+    /// The sink is fallible: see the module docs for which
+    /// transitions fail closed on a write error (REQ-AUD-003).
+    pub fn set_event_sink(&mut self, sink: EventSink) {
         self.sink = Some(sink);
     }
 
-    fn emit(&mut self, event: LockEvent) {
-        if let Some(sink) = &mut self.sink {
-            sink(event);
+    fn emit(&mut self, event: LockEvent) -> Result<(), AuditError> {
+        match &mut self.sink {
+            Some(sink) => sink(event),
+            None => Ok(()),
         }
     }
 
-    /// Whether the broker is locked.
+    /// Whether the broker is locked. Note this reflects the last
+    /// enforced state: an expired-but-not-yet-checked session still
+    /// reports unlocked until [`Self::poll`] or
+    /// [`Self::require_unlocked`] runs the expiry check. The fill
+    /// path always goes through `require_unlocked`, so the timers
+    /// are enforced where they matter (REQ-MEM-004).
     pub fn is_locked(&self) -> bool {
         self.unlocked.is_none()
     }
 
-    /// The current session, if unlocked.
+    /// The current session, if any is held. This is *not* the fill
+    /// gate: it does not run the expiry check. Fill code must use
+    /// [`Self::require_unlocked`].
     pub fn session(&self) -> Option<&S> {
         self.unlocked.as_ref().map(|u| &u.session)
     }
 
-    /// When the current unlock began, if unlocked.
-    pub fn unlocked_at(&self) -> Option<Instant> {
+    /// When the current unlock began (on the controller's clock),
+    /// if unlocked.
+    pub fn unlocked_at(&self) -> Option<Duration> {
         self.unlocked.as_ref().map(|u| u.unlocked_at)
+    }
+
+    /// The lock reason if the held session has expired at `now`:
+    /// the absolute timer dominates when both have expired.
+    fn expiry_reason(&self) -> Option<LockReason> {
+        let u = self.unlocked.as_ref()?;
+        let now = self.clock.now();
+        if now.saturating_sub(u.unlocked_at) >= self.policy.max_unlocked {
+            Some(LockReason::AbsoluteTimeout)
+        } else if now.saturating_sub(u.last_activity_at) >= self.policy.idle_lock {
+            Some(LockReason::IdleTimeout)
+        } else {
+            None
+        }
     }
 
     /// Attempt to unlock. See the module docs for the ordering:
     /// mlock first (REQ-MEM-002), derivation second (its closure
     /// zeroizes password and master key before returning,
-    /// REQ-MEM-003), timers last.
+    /// REQ-MEM-003), the `Unlocked` audit entry third (REQ-AUD-003),
+    /// timers last.
     pub fn unlock<E>(
         &mut self,
         derive: impl FnOnce() -> Result<S, E>,
@@ -215,9 +321,19 @@ impl<S: Zeroize, C: Clock> LockController<S, C> {
         if self.unlocked.is_some() {
             return Err(UnlockError::AlreadyUnlocked);
         }
-        if self.policy.require_mlock && self.hardening.lock_memory().is_err() {
-            self.emit(LockEvent::UnlockRefusedMlock);
-            return Err(UnlockError::MlockUnavailable);
+        match self.hardening.lock_memory() {
+            Ok(()) => {}
+            Err(_) if self.policy.require_mlock => {
+                // The refusal is itself a transition; its audit
+                // entry is best-effort (the refusal stands either
+                // way, exactly like a lock).
+                let _ = self.emit(LockEvent::UnlockRefusedMlock);
+                return Err(UnlockError::MlockUnavailable);
+            }
+            Err(_) => {
+                // Best-effort mlock failed: proceed, but say so.
+                let _ = self.emit(LockEvent::MlockBestEffortFailed);
+            }
         }
         let session = derive().map_err(UnlockError::DeriveFailed)?;
         let now = self.clock.now();
@@ -226,13 +342,26 @@ impl<S: Zeroize, C: Clock> LockController<S, C> {
             unlocked_at: now,
             last_activity_at: now,
         });
-        self.emit(LockEvent::Unlocked);
+        if let Err(e) = self.emit(LockEvent::Unlocked) {
+            // REQ-AUD-003 fail-closed: an unlock that cannot be
+            // audited does not stand. Dropping the session wipes
+            // its keys (ZeroizeOnDrop).
+            drop(self.unlocked.take());
+            return Err(UnlockError::Audit(e));
+        }
         Ok(())
     }
 
     /// Record fill activity: resets the idle timer (REQ-MEM-004).
-    /// A no-op while locked.
+    /// A no-op while locked — and a no-op that *locks* on an
+    /// already-expired session: activity arriving after the idle or
+    /// absolute deadline must not revive the unlock (review #50,
+    /// blocking item 1).
     pub fn touch_activity(&mut self) {
+        if let Some(reason) = self.expiry_reason() {
+            self.lock(reason);
+            return;
+        }
         if let Some(u) = &mut self.unlocked {
             u.last_activity_at = self.clock.now();
         }
@@ -240,31 +369,25 @@ impl<S: Zeroize, C: Clock> LockController<S, C> {
 
     /// Check both timers against the clock and lock if either has
     /// expired. Returns the reason when this call locked. The
-    /// absolute timer dominates: if both have expired, the reason
-    /// is [`LockReason::AbsoluteTimeout`].
+    /// daemon polls this on its own cadence; the fill gate enforces
+    /// the same check independently, so correctness does not depend
+    /// on poll cadence (REQ-MEM-004).
     pub fn poll(&mut self) -> Option<LockReason> {
-        let u = self.unlocked.as_ref()?;
-        let now = self.clock.now();
-        let reason = if now.duration_since(u.unlocked_at) >= self.policy.max_unlocked {
-            LockReason::AbsoluteTimeout
-        } else if now.duration_since(u.last_activity_at) >= self.policy.idle_lock {
-            LockReason::IdleTimeout
-        } else {
-            return None;
-        };
+        let reason = self.expiry_reason()?;
         self.lock(reason);
         Some(reason)
     }
 
-    /// Lock now, zeroizing and dropping the session (REQ-MEM-003).
-    /// Returns whether there was a session to destroy.
+    /// Lock now, destroying the session (REQ-MEM-003). Returns
+    /// whether there was a session to destroy. The `Locked` audit
+    /// entry is best-effort: the lock stands even if the write
+    /// fails, because the keys are already gone.
     pub fn lock(&mut self, reason: LockReason) -> bool {
-        let Some(mut u) = self.unlocked.take() else {
+        let Some(u) = self.unlocked.take() else {
             return false;
         };
-        u.session.zeroize();
         drop(u);
-        self.emit(LockEvent::Locked { reason });
+        let _ = self.emit(LockEvent::Locked { reason });
         true
     }
 
@@ -280,20 +403,34 @@ impl<S: Zeroize, C: Clock> LockController<S, C> {
         self.lock(LockReason::UnknownCryptoVersion)
     }
 
+    /// REQ-CRY-008: the sync layer's scope check saw the account's
+    /// view widen past the dedicated org mid-run. Lock with audit
+    /// event `scope_widened` (the same forced-lock path the sync
+    /// loop's `LockReason::ScopeWidened` feeds into).
+    pub fn on_scope_widened(&mut self) -> bool {
+        self.lock(LockReason::ScopeWidened)
+    }
+
     /// The fill gate: the session, or [`LockedError`] — checked
-    /// before any grant (REQ-MEM-007).
-    pub fn require_unlocked(&self) -> Result<&S, LockedError> {
+    /// before any grant (REQ-MEM-007). Runs the expiry check first
+    /// and locks an expired session with the right reason, so at
+    /// T+30m idle (or T+12h absolute) a fill is refused `locked`
+    /// even if `poll()` has not run since the deadline
+    /// (REQ-MEM-004; review #50, blocking item 1).
+    pub fn require_unlocked(&mut self) -> Result<&S, LockedError> {
+        if let Some(reason) = self.expiry_reason() {
+            self.lock(reason);
+        }
         self.session().ok_or(LockedError)
     }
 }
 
-impl<S: Zeroize, C: Clock> Drop for LockController<S, C> {
+impl<S: ZeroizeOnDrop, C: Clock> Drop for LockController<S, C> {
     fn drop(&mut self) {
         // A controller dropped while unlocked (daemon shutdown,
-        // panic path) must not release key material un-wiped.
-        if let Some(mut u) = self.unlocked.take() {
-            u.session.zeroize();
-        }
+        // panic path) must not release key material un-wiped: the
+        // session's own Drop does the wiping (ZeroizeOnDrop).
+        drop(self.unlocked.take());
     }
 }
 

@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::*;
 
@@ -43,6 +43,18 @@ impl Zeroize for CanarySession {
         self.private_key.lock().unwrap().zeroize();
     }
 }
+
+/// The session contract (REQ-MEM-003): the controller destroys the
+/// session by dropping it, and the type's own drop wipes the keys —
+/// the shape `sync::Session` has (its `RsaPrivateKey` is
+/// `ZeroizeOnDrop` only, so in-place `Zeroize` is impossible there).
+impl Drop for CanarySession {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for CanarySession {}
 
 fn controller(
     clock: ManualClock,
@@ -151,12 +163,16 @@ fn req_mem_004_idle_and_absolute_timers_with_mocked_clock() {
         Box::new(StaticHardening::all_ok()),
     );
     unlock_ok(&mut c);
-    for _ in 0..11 {
-        clock.advance(Duration::from_secs(60 * 60));
+    // Activity every 10m (inside the 30m idle window — activity
+    // arriving after the idle deadline would lock, per the gate
+    // semantics pinned in
+    // req_mem_004_expired_session_cannot_be_used_or_revived).
+    for _ in 0..(12 * 6 - 1) {
+        clock.advance(Duration::from_secs(10 * 60));
         c.touch_activity();
         assert_eq!(c.poll(), None);
     }
-    clock.advance(Duration::from_secs(60 * 60));
+    clock.advance(Duration::from_secs(10 * 60));
     assert_eq!(c.poll(), Some(LockReason::AbsoluteTimeout));
 }
 
@@ -183,7 +199,10 @@ fn req_mem_events_are_emitted_in_order() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let log = events.clone();
     let mut c = controller(ManualClock::new(), StaticHardening::all_ok());
-    c.set_event_sink(Box::new(move |e| log.lock().unwrap().push(e)));
+    c.set_event_sink(Box::new(move |e| {
+        log.lock().unwrap().push(e);
+        Ok(())
+    }));
     unlock_ok(&mut c);
     c.lock(LockReason::Manual);
     assert_eq!(
@@ -200,7 +219,10 @@ fn req_mem_events_are_emitted_in_order() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let log = events.clone();
     let mut c = controller(ManualClock::new(), StaticHardening::mlock_unavailable());
-    c.set_event_sink(Box::new(move |e| log.lock().unwrap().push(e)));
+    c.set_event_sink(Box::new(move |e| {
+        log.lock().unwrap().push(e);
+        Ok(())
+    }));
     let _ = c.unlock(|| Ok::<_, std::io::Error>(CanarySession::new()));
     assert_eq!(*events.lock().unwrap(), [LockEvent::UnlockRefusedMlock]);
 }
@@ -219,4 +241,205 @@ fn req_mem_unlock_twice_and_failed_derivation_stay_consistent() {
         .unlock(|| Ok::<_, std::io::Error>(CanarySession::new()))
         .unwrap_err();
     assert!(matches!(err, UnlockError::AlreadyUnlocked));
+}
+
+#[test]
+fn req_mem_004_expired_session_cannot_be_used_or_revived() {
+    // Review #50, blocking item 1, Nyx's exact sequence: unlock ->
+    // advance past idle -> the fill gate must refuse (and lock),
+    // without any poll() in between.
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    clock.advance(Duration::from_secs(31 * 60));
+    assert!(
+        c.require_unlocked().is_err(),
+        "expired session handed out by the fill gate"
+    );
+    assert!(c.is_locked(), "the gate locked the expired session");
+    assert_eq!(c.poll(), None, "already locked; nothing left to poll");
+
+    // touch_activity on an expired session locks it instead of
+    // resetting the idle timer and reviving it.
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    clock.advance(Duration::from_secs(31 * 60));
+    c.touch_activity();
+    assert!(c.is_locked(), "activity revived an expired session");
+    assert_eq!(c.poll(), None);
+
+    // Absolute expiry is enforced at the gate too (T+13h, active use
+    // throughout does not matter).
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    clock.advance(Duration::from_secs(13 * 60 * 60));
+    assert!(c.require_unlocked().is_err());
+    assert!(c.is_locked());
+}
+
+#[test]
+fn req_mem_002_best_effort_mlock_failure_is_reported_not_silent() {
+    // Review #50, item 3: require_mlock = false must still attempt
+    // mlockall and surface its failure as an event.
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let log = events.clone();
+    let policy = LockPolicy {
+        require_mlock: false,
+        ..LockPolicy::default()
+    };
+    let mut c = LockController::new(
+        policy,
+        ManualClock::new(),
+        Box::new(StaticHardening::mlock_unavailable()),
+    );
+    c.set_event_sink(Box::new(move |e| {
+        log.lock().unwrap().push(e);
+        Ok(())
+    }));
+    unlock_ok(&mut c);
+    assert!(!c.is_locked());
+    assert_eq!(
+        *events.lock().unwrap(),
+        [LockEvent::MlockBestEffortFailed, LockEvent::Unlocked]
+    );
+}
+
+#[test]
+fn req_aud_003_unlock_rolls_back_when_the_audit_write_fails() {
+    // Review #50, item 5: the Unlocked entry failing to write must
+    // fail the unlock closed; the fresh session is destroyed.
+    let mut c = controller(ManualClock::new(), StaticHardening::all_ok());
+    c.set_event_sink(Box::new(|e| {
+        if e == LockEvent::Unlocked {
+            Err(AuditError)
+        } else {
+            Ok(())
+        }
+    }));
+    let canary = CanarySession::new();
+    let probe = canary.clone();
+    let err = c.unlock(|| Ok::<_, std::io::Error>(canary)).unwrap_err();
+    assert!(matches!(err, UnlockError::Audit(AuditError)));
+    assert!(c.is_locked(), "unauditable unlock must not stand");
+    assert!(probe.all_zero(), "rolled-back session was destroyed");
+
+    // A Locked entry failing to write never un-locks: the lock
+    // stands regardless.
+    let fail = Arc::new(Mutex::new(false));
+    let flag = fail.clone();
+    let mut c = controller(ManualClock::new(), StaticHardening::all_ok());
+    c.set_event_sink(Box::new(move |e| {
+        if *flag.lock().unwrap() && matches!(e, LockEvent::Locked { .. }) {
+            Err(AuditError)
+        } else {
+            Ok(())
+        }
+    }));
+    unlock_ok(&mut c);
+    *fail.lock().unwrap() = true;
+    assert!(c.lock(LockReason::Manual));
+    assert!(c.is_locked(), "lock stands despite the audit failure");
+}
+
+#[test]
+fn req_cry_008_scope_widened_forces_a_lock() {
+    // Review #50, item 6: ScopeWidened takes the same forced-lock
+    // path as KeyRotated, with the AC's audit event name.
+    let mut c = controller(ManualClock::new(), StaticHardening::all_ok());
+    let canary = unlock_ok(&mut c);
+    assert!(c.on_scope_widened());
+    assert!(c.is_locked());
+    assert!(canary.all_zero());
+    assert_eq!(LockReason::ScopeWidened.audit_event(), "scope_widened");
+    assert!(!c.on_scope_widened(), "already locked: no-op");
+}
+
+#[test]
+fn req_mem_lock_policy_wires_from_config() {
+    // Review #50, blocking item 2 (second half): LockPolicy is
+    // built from the config loader's [policy] + [memory] values.
+    let policy = PolicyConfig {
+        idle_lock: Duration::from_secs(5 * 60),
+        max_unlocked: Duration::from_secs(60 * 60),
+        ..PolicyConfig::default()
+    };
+    let memory = MemoryConfig {
+        require_mlock: false,
+    };
+    let lp = LockPolicy::from((&policy, &memory));
+    assert_eq!(
+        lp,
+        LockPolicy {
+            idle_lock: Duration::from_secs(5 * 60),
+            max_unlocked: Duration::from_secs(60 * 60),
+            require_mlock: false,
+        }
+    );
+}
+
+#[test]
+fn req_mem_real_sync_session_composes_with_the_controller() {
+    // Review #50, blocking item 2: the controller must hold master's
+    // real session type. Built from #49's recorded Vaultwarden
+    // fixture (no network): Session::unlock over the fixture sync
+    // payload, exactly as the daemon's closure will do.
+    use kharon_bwcrypto::Kdf;
+    use zeroize::Zeroizing;
+
+    use crate::sync::wire::{SyncResponse, normalize_keys};
+    use crate::sync::{Scope, Session};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../kharon-bwcrypto/tests/fixtures/vaultwarden");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("fixture.json")).unwrap()).unwrap();
+    let sync_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("sync_fixture.json")).unwrap())
+            .unwrap();
+    let sync: SyncResponse = serde_json::from_value(normalize_keys(sync_json)).unwrap();
+    let org = sync.profile.organizations.as_ref().unwrap()[0].id.clone();
+    let coll = sync.collections.as_ref().unwrap()[0].id.clone();
+    let email = manifest["account"]["email"].as_str().unwrap().to_owned();
+    let password = Zeroizing::new(manifest["account"]["password"].as_str().unwrap().to_owned());
+    let kdf = Kdf::from_prelogin(0, 600_000, None, None).unwrap();
+
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    c.unlock(|| {
+        Session::unlock(
+            &password,
+            &email,
+            &kdf,
+            &sync,
+            Scope::new(&org, [&coll]).unwrap(),
+        )
+    })
+    .unwrap();
+    assert!(!c.is_locked());
+    assert!(
+        c.require_unlocked().is_ok(),
+        "real session at the fill gate"
+    );
+    // The timers destroy the real session on expiry, like any other.
+    clock.advance(Duration::from_secs(31 * 60));
+    assert!(c.require_unlocked().is_err());
+    assert!(c.is_locked());
 }

@@ -15,7 +15,7 @@ use kharond::lock::{
     LockController, LockEvent, LockPolicy, LockReason, ManualClock, MemoryHardening,
     ProcessHardening, StaticHardening, process_status,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Canary key material behind a shared handle (zeroed in place, so
 /// the test can verify the wipe after lock).
@@ -41,6 +41,16 @@ impl Zeroize for CanarySession {
         self.keys.lock().unwrap().zeroize();
     }
 }
+
+/// The session contract (REQ-MEM-003): destruction is by drop, and
+/// the drop wipes — the same shape as `sync::Session`.
+impl Drop for CanarySession {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for CanarySession {}
 
 fn unlock(c: &mut LockController<CanarySession, Arc<ManualClock>>) -> CanarySession {
     let canary = CanarySession::new();
@@ -86,14 +96,31 @@ fn req_mem_001_process_is_non_dumpable_with_core_limit_zero() {
         ])
         .env(CHILD_ENV, "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Inherit stderr (review #50, nit 9): if the child panics,
+        // the reason must be visible in the test output, not nulled.
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();
+    // Read with a deadline: a child that hangs before READY must
+    // fail this test in 30s, not hang the suite (review #50, nit 9).
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line.unwrap_or_default()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut status = String::new();
     let mut coreline = String::new();
-    for line in BufReader::new(stdout).lines() {
-        let line = line.unwrap();
+    loop {
+        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remain.is_zero(), "child did not print READY within 30s");
+        let line = rx
+            .recv_timeout(remain)
+            .expect("child did not print READY within 30s");
         if let Some(s) = line.strip_prefix("STATUS ") {
             status = s.to_owned();
         } else if let Some(s) = line.strip_prefix("CORELINE ") {
@@ -101,6 +128,23 @@ fn req_mem_001_process_is_non_dumpable_with_core_limit_zero() {
         } else if line == "READY" {
             break;
         }
+    }
+    // The gcore half of the AC, as a same-uid stand-in: while the
+    // hardened child is alive, opening its /proc/<pid>/mem must fail
+    // (non-dumpable processes deny ptrace access) — unless this
+    // parent holds CAP_SYS_PTRACE (bit 19), which overrides it.
+    let cap_eff = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with("CapEff:"))
+        .and_then(|l| u64::from_str_radix(l[7..].trim(), 16).ok())
+        .unwrap_or(0);
+    if cap_eff & (1 << 19) == 0 {
+        let mem = std::fs::File::open(format!("/proc/{}/mem", child.id()));
+        assert!(
+            mem.is_err(),
+            "/proc/<child>/mem must not open for a non-dumpable child"
+        );
     }
     child.kill().unwrap();
     let _ = child.wait();
@@ -240,7 +284,10 @@ fn req_mem_006_rotated_org_key_locks_and_audits_key_rotated() {
         clock,
         Box::new(StaticHardening::all_ok()),
     );
-    c.set_event_sink(Box::new(move |e| log.lock().unwrap().push(e)));
+    c.set_event_sink(Box::new(move |e| {
+        log.lock().unwrap().push(e);
+        Ok(())
+    }));
     let canary = unlock(&mut c);
     assert!(c.on_org_key_changed());
     assert!(c.is_locked());

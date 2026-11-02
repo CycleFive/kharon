@@ -10,8 +10,9 @@
 //!   `mlockall(MCL_CURRENT | MCL_FUTURE)` keeps key pages out of swap.
 //!   When the config requires it (`require_mlock = true`, the default)
 //!   and it fails, unlock is refused with `MlockUnavailable`
-//!   (REQ-MEM-002). The lock controller calls this *before* any key
-//!   derivation runs.
+//!   (REQ-MEM-002); when it does not, the attempt is still made
+//!   best-effort and a failure is reported as a lock event. The lock
+//!   controller calls this *before* any key derivation runs.
 //!
 //! Everything goes through `rustix`'s safe wrappers: this crate
 //! forbids `unsafe` code. On non-Linux targets both steps report

@@ -7,13 +7,11 @@
 #
 # TLS on loopback (review on PR #44): the official `bw` CLI refuses
 # plain-HTTP servers outright (InsecureUrlNotAllowedError), so the
-# fixture serves HTTPS with a throwaway self-signed cert for
-# 127.0.0.1. Generate it before `docker compose up`:
+# fixture serves HTTPS with a throwaway cert for 127.0.0.1, signed by
+# a throwaway CA (clients trust tls/ca.pem). Generate both before
+# `docker compose up`:
 #
-#   mkdir -p tls
-#   openssl req -x509 -newkey rsa:2048 -nodes -keyout tls/key.pem \
-#     -out tls/cert.pem -days 2 -subj "/CN=127.0.0.1" \
-#     -addext "subjectAltName=IP:127.0.0.1"
+#   sh gen-tls.sh
 #
 # `tls/` is gitignored — the cert is per-run material, never committed.
 services:

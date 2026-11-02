@@ -59,18 +59,20 @@ cargo test -p kharon-bwcrypto --test req_dep_002_fixture
 Live (Docker required; this is what `.github/workflows/fixture.yml` does):
 
 ```sh
-# Throwaway self-signed cert for 127.0.0.1 (bw requires HTTPS).
-mkdir -p tls
-openssl req -x509 -newkey rsa:2048 -nodes -keyout tls/key.pem \
-  -out tls/cert.pem -days 2 -subj "/CN=127.0.0.1" \
-  -addext "subjectAltName=IP:127.0.0.1"
+# Throwaway CA + 127.0.0.1 cert (bw requires HTTPS; rustls rejects a
+# self-signed CA cert as the server cert, hence the tiny CA).
+sh gen-tls.sh
 docker compose -f docker-compose.yml up -d
 /tmp/kharon-fixture-venv/bin/python seed.py --live \
-  --base-url https://127.0.0.1:8222 --ca-cert "$PWD/tls/cert.pem" \
-  --out /tmp/sync.live.json
+  --base-url https://127.0.0.1:8222 --ca-cert "$PWD/tls/ca.pem" \
+  --out /tmp/sync.live.json --api-key-out /tmp/api-key.json
 KHARON_FIXTURE_SYNC_JSON=/tmp/sync.live.json \
   cargo test -p kharon-bwcrypto --test req_dep_002_fixture \
     req_cry_004_live -- --ignored
+KHARON_FIXTURE_BASE_URL=https://127.0.0.1:8222 \
+KHARON_FIXTURE_CA_CERT="$PWD/tls/ca.pem" \
+KHARON_FIXTURE_API_KEY_JSON=/tmp/api-key.json \
+  cargo test -p kharond --test req_cry_005_sync req_cry_005_live -- --ignored
 docker compose -f docker-compose.yml down -v
 ```
 

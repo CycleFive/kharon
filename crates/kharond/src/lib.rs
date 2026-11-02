@@ -6,5 +6,7 @@
 
 pub mod audit;
 pub mod cdp;
+pub mod config;
 pub mod lock;
 pub mod origin;
+pub mod sync;

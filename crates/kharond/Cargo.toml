@@ -16,6 +16,8 @@ hex = "0.4"
 ed25519-dalek = "2.1"
 rand = "0.8"
 thiserror = "2"
+# Config loader (issue #5, REQ-DEP-003).
+toml = "1"
 time = { version = "0.3", features = ["formatting"] }
 fs2 = "0.4"
 publicsuffix = "2.3"
@@ -31,11 +33,20 @@ futures-util = { version = "0.3", features = ["sink"] }
 
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
-# Process memory hardening (issue #11, REQ-MEM-001/002): safe wrappers
-# for prctl/setrlimit/mlockall — kharond forbids unsafe code, so no
-# direct libc FFI. Already in Cargo.lock transitively; the license is
-# on the cargo-deny allowlist.
-rustix = { version = "1", features = ["mm", "process"] }
+# Identity/sync client (issue #8, REQ-CRY-005/007). reqwest without a
+# bundled rustls provider: the client config is built in-crate on the
+# same aws_lc_rs provider as cdp::tls, with OS roots plus an optional
+# extra CA (self-hosted / fixture).
+kharon-bwcrypto = { version = "0.0.0", path = "../kharon-bwcrypto" }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "http2"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+# Safe wrappers only — kharond forbids unsafe code, so no direct libc
+# FFI: geteuid() for the api_key_file ownership check (SPEC §8,
+# REQ-DEP-008), prctl/setrlimit/mlockall for process memory hardening
+# (issue #11, REQ-MEM-001/002), and clock_gettime(CLOCK_BOOTTIME) for
+# the lock timers (REQ-MEM-004). Already in the tree via tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "process", "mm", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

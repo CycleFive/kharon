@@ -33,6 +33,15 @@ futures-util = { version = "0.3", features = ["sink"] }
 
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
+# Identity/sync client (issue #8, REQ-CRY-005/007). reqwest without a
+# bundled rustls provider: the client config is built in-crate on the
+# same aws_lc_rs provider as cdp::tls, with OS roots plus an optional
+# extra CA (self-hosted / fixture).
+kharon-bwcrypto = { version = "0.0.0", path = "../kharon-bwcrypto" }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "http2"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.13", features = ["crypto", "ring"] }

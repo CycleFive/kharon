@@ -266,7 +266,7 @@ def wait_ready(base: str, timeout_s: int = 60, context=None) -> None:
     raise SystemExit(f"Vaultwarden at {base} did not become ready in {timeout_s}s")
 
 
-def seed_live(base: str, out_path: str, ca_cert: str = None) -> None:
+def seed_live(base: str, out_path: str, ca_cert: str = None, api_key_out: str = None) -> None:
     with open(MANIFEST_PATH) as f:
         manifest = json.load(f)
     fx = Fixture(manifest)
@@ -366,6 +366,28 @@ def seed_live(base: str, out_path: str, ca_cert: str = None) -> None:
         json.dump(sync, f, indent=2)
     print(f"seeded {base}; sync captured to {out_path}")
 
+    # 6. Personal API key for the kharond sync client's live test
+    # (issue #8, REQ-CRY-005): POST /api/accounts/api-key with the
+    # master password hash returns the client_secret; the client_id is
+    # "user." + the account id. Written 0600, never printed.
+    if api_key_out:
+        resp = http_json(
+            "POST",
+            base + "/api/accounts/api-key",
+            {"masterPasswordHash": fx.auth_hash},
+            token=token,
+            context=ctx,
+        )
+        secret = resp.get("apiKey") or resp.get("ApiKey")
+        profile = sync.get("profile") or sync.get("Profile")
+        user_id = profile.get("id") or profile.get("Id")
+        if not secret or not user_id:
+            raise SystemExit("api-key response or profile id missing")
+        fd = os.open(api_key_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"client_id": f"user.{user_id}", "client_secret": secret}, f)
+        print(f"personal API key written to {api_key_out} (0600)")
+
 
 # ---------------------------------------------------------------- main
 
@@ -382,6 +404,11 @@ def main() -> int:
         "throwaway self-signed cert); default: $KHARON_FIXTURE_CA_CERT",
     )
     ap.add_argument("--out", default=os.path.join(HERE, "sync_fixture.json"))
+    ap.add_argument(
+        "--api-key-out",
+        help="--live only: also create the account's personal API key and "
+        "write {client_id, client_secret} JSON here (mode 0600)",
+    )
     args = ap.parse_args()
 
     if args.offline:
@@ -392,7 +419,7 @@ def main() -> int:
             json.dump(payload, f, indent=2)
         print(f"offline sync fixture written to {args.out}")
         return 0
-    seed_live(args.base_url, args.out, ca_cert=args.ca_cert)
+    seed_live(args.base_url, args.out, ca_cert=args.ca_cert, api_key_out=args.api_key_out)
     return 0
 
 

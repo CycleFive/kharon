@@ -11,6 +11,8 @@ on:
       - "crates/kharon-bwcrypto/tests/req_dep_002_fixture.rs"
       - "crates/kharon-bwcrypto/src/**"
       - ".github/workflows/fixture.yml"
+      - "crates/kharond/src/sync/**"
+      - "crates/kharond/tests/req_cry_005_sync.rs"
 permissions: { contents: read }
 jobs:
   vaultwarden-fixture:
@@ -28,26 +30,25 @@ jobs:
       - run: pip install "cryptography==43.0.3"
       - name: Generate the throwaway loopback TLS cert
         # bw refuses plain-HTTP servers (InsecureUrlNotAllowedError),
-        # so the fixture serves HTTPS on 127.0.0.1 with a self-signed
-        # cert generated per run (gitignored, never committed).
-        run: |
-          mkdir -p tls
-          openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout tls/key.pem -out tls/cert.pem -days 2 \
-            -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+        # so the fixture serves HTTPS on 127.0.0.1 with a per-run cert
+        # signed by a per-run CA (gitignored, never committed). A CA is
+        # needed because rustls rejects a self-signed CA:TRUE cert as
+        # the server cert (CaUsedAsEndEntity).
+        run: sh gen-tls.sh
       - name: Start Vaultwarden fixture
         run: docker compose up -d
       - name: Seed org / collection / items and capture sync
         run: >-
           python3 seed.py --live --base-url https://127.0.0.1:8222
-          --ca-cert "$PWD/tls/cert.pem"
+          --ca-cert "$PWD/tls/ca.pem"
           --out "${{ runner.temp }}/sync.live.json"
+          --api-key-out "${{ runner.temp }}/api-key.json"
       - name: Oracle check with the official bw CLI
         # bw get item for BOTH seeded items, compared field-by-field
         # (name, username, password, URI) against fixture.json — the
         # manifest is read here, credentials are not duplicated in env.
         run: |
-          export NODE_EXTRA_CA_CERTS="$PWD/tls/cert.pem"
+          export NODE_EXTRA_CA_CERTS="$PWD/tls/ca.pem"
           # bw is PINNED: 2026.2+ moved password login into the Rust
           # SDK, whose prelogin call (POST
           # /identity/accounts/prelogin/password) the spec-pinned
@@ -91,6 +92,13 @@ jobs:
         env:
           KHARON_FIXTURE_SYNC_JSON: ${{ runner.temp }}/sync.live.json
         run: cargo test -p kharon-bwcrypto --test req_dep_002_fixture req_cry_004_live -- --ignored
+      - name: Live REQ-CRY-005 API-key login + sync + scoped decrypt (kharond)
+        working-directory: ${{ github.workspace }}
+        env:
+          KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222
+          KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
+          KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
+        run: cargo test -p kharond --test req_cry_005_sync req_cry_005_live -- --ignored
       - name: Tear down fixture (including its data volume)
         if: always()
         run: docker compose down -v

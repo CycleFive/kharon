@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use zeroize::Zeroizing;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::vault::norm_id;
 use super::wire::SyncResponse;
@@ -187,6 +187,14 @@ pub struct LiveSync {
     organization_id: String,
     last_sync: Instant,
 }
+
+/// So the lock controller can own a `LiveSync` (the API's session,
+/// `api::VaultView`): every key-bearing field wipes itself on drop.
+/// `session` is `ZeroizeOnDrop` (org and user keys); the client's API
+/// key secret is a `Secret` and its access token a `Zeroizing` buffer;
+/// `vault` holds only item metadata and encrypted protected fields
+/// (REQ-CRY-006), which are not key material.
+impl ZeroizeOnDrop for LiveSync {}
 
 impl LiveSync {
     /// Unlock: prelogin, sync, REQ-CRY-008 check (before any key is

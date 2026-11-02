@@ -78,8 +78,9 @@ impl Checkpoint {
 
 /// Where checkpoints go. Production pushes to ntfy or remote syslog
 /// (deployment wiring is a later milestone); tests and dev runs use
-/// [`FileCheckpointSink`].
-pub trait CheckpointSink {
+/// [`FileCheckpointSink`]. `Send` so the daemon can share the log
+/// between tasks behind a mutex (the agent API, #14).
+pub trait CheckpointSink: Send {
     fn push(&mut self, cp: &Checkpoint) -> io::Result<()>;
 }
 

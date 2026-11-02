@@ -47,6 +47,11 @@ rustls-pki-types = { version = "1", features = ["std"] }
 # (issue #11, REQ-MEM-001/002), and clock_gettime(CLOCK_BOOTTIME) for
 # the lock timers (REQ-MEM-004). Already in the tree via tempfile.
 rustix = { version = "1", default-features = false, features = ["std", "process", "mm", "time"] }
+# Agent API (issue #14, REQ-API-002..004/006): HTTP/1.1 server on the
+# hyper 1 / tokio stack reqwest already pulls in, and Argon2id agent
+# token hashes (same argon2 crate kharon-bwcrypto uses for the KDF).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+argon2 = { version = "0.5", features = ["std", "zeroize"] }
 
 [dev-dependencies]
 tempfile = "3"

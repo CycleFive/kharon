@@ -1,0 +1,105 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "kharon agent API",
+    "version": "0.1.0",
+    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools (issue #15). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Fill routes arrive with issue #18.",
+    "license": { "name": "MIT OR Apache-2.0" }
+  },
+  "security": [{ "agentToken": [] }],
+  "paths": {
+    "/v1/status": {
+      "get": {
+        "operationId": "kharon_status",
+        "summary": "Lock state and the caller's grants. Does not require unlock.",
+        "responses": {
+          "200": { "description": "Status", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/items": {
+      "get": {
+        "operationId": "kharon_list_search",
+        "summary": "List (no q) or search (q) in-scope items as ItemMeta, optionally filtered by origin. Requires unlock.",
+        "parameters": [
+          { "name": "q", "in": "query", "required": false, "description": "Search text: case-insensitive substring of the item name or a URI host. Presence selects kharon_search. 1–256 bytes, not blank.", "schema": { "type": "string", "minLength": 1, "maxLength": 256 } },
+          { "name": "origin", "in": "query", "required": false, "description": "Absolute http(s) origin or page URL. Keeps items with a URI the SPEC §6 matcher would allow to fill there (REQ-API-004).", "schema": { "type": "string", "format": "uri", "maxLength": 2048 } }
+        ],
+        "responses": {
+          "200": { "description": "Matching items", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ItemMeta" } } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "423": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "summary": "This document.",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI document", "content": { "application/json": {} } } }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "agentToken": { "type": "http", "scheme": "bearer", "description": "kh_agent_<id>_<64 lowercase hex>. Only its Argon2id hash is stored (REQ-API-003)." }
+    },
+    "responses": {
+      "Error": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Unauthorized": {
+        "description": "Missing or invalid agent token",
+        "headers": { "WWW-Authenticate": { "schema": { "type": "string" } } },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Status": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["locked", "agent_id", "grants"],
+        "properties": {
+          "locked": { "type": "boolean" },
+          "agent_id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+          "grants": { "type": "array", "description": "SPEC §4 Grant; always empty until the grant model lands (issue #15).", "items": { "type": "object" }, "maxItems": 0 }
+        }
+      },
+      "ItemMeta": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "uris", "has_password", "has_totp"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "username_hint": { "type": "string", "description": "Masked (OQ-4): first character, ***, then @domain for email addresses." },
+          "uris": { "type": "array", "items": { "$ref": "#/components/schemas/UriMeta" } },
+          "has_password": { "type": "boolean" },
+          "has_totp": { "type": "boolean" },
+          "revision": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UriMeta": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "match"],
+        "properties": {
+          "host": { "type": "string" },
+          "match": { "type": "string", "enum": ["domain", "host", "exact", "starts_with"] }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error", "detail"],
+        "properties": {
+          "error": { "type": "string", "enum": ["unauthorized", "locked", "bad_request", "not_found", "method_not_allowed", "audit_failed"] },
+          "detail": { "type": "string", "description": "Fixed text from a closed enum; never contains request or vault values (REQ-API-006)." }
+        }
+      }
+    }
+  }
+}

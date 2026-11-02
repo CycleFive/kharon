@@ -31,6 +31,12 @@ futures-util = { version = "0.3", features = ["sink"] }
 
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
+# Process memory hardening (issue #11, REQ-MEM-001/002): safe wrappers
+# for prctl/setrlimit/mlockall — kharond forbids unsafe code, so no
+# direct libc FFI. Already in Cargo.lock transitively; the license is
+# on the cargo-deny allowlist.
+rustix = { version = "1", features = ["mm", "process"] }
+
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.13", features = ["crypto", "ring"] }

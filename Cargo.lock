@@ -762,6 +762,7 @@ dependencies = [
  "publicsuffix",
  "rand",
  "rcgen",
+ "rustix",
  "rustls",
  "serde",
  "serde_jcs",

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use argon2::Argon2;
 use kharon_bwcrypto::Kdf;
-use kharond::api::token::{TokenStore, generate_with};
+use kharond::api::token::{ParamFloor, TokenStore, generate_with};
 use kharond::api::{AuditSink, Broker, VaultView};
 use kharond::audit::Entry;
 use kharond::lock::{AuditError, LockController, LockPolicy, ManualClock, StaticHardening};
@@ -159,6 +159,14 @@ impl RecordingAudit {
     }
 }
 
+/// The floor [`cheap_argon`] hashes clear. Production stores use
+/// `ParamFloor::PRODUCTION`, which refuses these hashes.
+pub const CHEAP_FLOOR: ParamFloor = ParamFloor {
+    m_cost: 8,
+    t_cost: 1,
+    p_cost: 1,
+};
+
 /// Cheap Argon2id for test tokens (production: `Argon2::default()`).
 pub fn cheap_argon() -> Argon2<'static> {
     Argon2::new(
@@ -183,7 +191,11 @@ impl Harness {
     pub fn new(locked: bool) -> Self {
         let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
         let (beta, hb) = generate_with(&cheap_argon(), "beta");
-        let tokens = TokenStore::new([("alpha", ha.as_str()), ("beta", hb.as_str())]).unwrap();
+        let tokens = TokenStore::with_floor(
+            [("alpha", ha.as_str()), ("beta", hb.as_str())],
+            &CHEAP_FLOOR,
+        )
+        .unwrap();
         let clock = Arc::new(ManualClock::new());
         let mut lock = LockController::new(
             LockPolicy::default(),

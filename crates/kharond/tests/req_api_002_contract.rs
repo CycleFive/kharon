@@ -13,9 +13,9 @@ mod api_support;
 use std::collections::BTreeSet;
 
 use api_support::*;
-use kharond::api::core::parse_items_query;
+use kharond::api::core::{Operation, parse_request};
 use kharond::api::http::OPENAPI_JSON;
-use kharond::api::{ApiError, Detail, ErrorCode, Request};
+use kharond::api::{ApiError, Detail, ErrorCode};
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug)]
@@ -82,11 +82,12 @@ async fn call(t: Transport, h: &Harness, case: &Case) -> Outcome {
                 Ok(a) => a,
                 Err(e) => return err(e),
             };
-            let req = match case.tool {
-                Tool::Status if case.params.is_empty() => Ok(Request::Status),
-                Tool::Status => Err(ApiError::bad_request(Detail::UnknownParameter)),
-                Tool::Items => parse_items_query(case.params.iter().copied()),
+            // The same validation entry point the HTTP adapter uses.
+            let op = match case.tool {
+                Tool::Status => Operation::Status,
+                Tool::Items => Operation::Items,
             };
+            let req = parse_request(op, case.params.iter().copied());
             match req.and_then(|r| h.broker.dispatch(&agent, r)) {
                 Ok(o) => ("ok".into(), o.body()),
                 Err(e) => err(e),

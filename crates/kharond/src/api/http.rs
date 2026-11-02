@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
-use super::core::{AgentId, Broker, Request as ApiRequest, VaultView, parse_items_query};
+use super::core::{AgentId, Broker, Operation, Request as ApiRequest, VaultView, parse_request};
 use super::error::{ApiError, Detail, ErrorCode};
 use crate::lock::Clock;
 
@@ -64,6 +64,23 @@ where
     C: Clock + Send + 'static,
 {
     axum::serve(listener, router(broker)).await
+}
+
+/// [`serve`], returning once `shutdown` resolves and in-flight
+/// requests have finished (the daemon's SIGTERM/SIGINT path).
+pub async fn serve_with_shutdown<S, C, F>(
+    listener: TcpListener,
+    broker: Arc<Broker<S, C>>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, router(broker))
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 enum Route {
@@ -102,14 +119,12 @@ where
         Ok(a) => a,
         Err(e) => return error(e),
     };
-    let api_req = match route {
-        Route::Status => match query.as_deref() {
-            None | Some("") => Ok(ApiRequest::Status),
-            Some(_) => Err(ApiError::bad_request(Detail::UnknownParameter)),
-        },
-        Route::Items => parse_query(query.as_deref().unwrap_or("")),
+    let op = match route {
+        Route::Status => Operation::Status,
+        Route::Items => Operation::Items,
         Route::OpenApi => unreachable!("handled above"),
     };
+    let api_req = parse_query(op, query.as_deref().unwrap_or(""));
     let outcome = api_req.and_then(|r| state.broker.dispatch(&agent, r));
     match outcome {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
@@ -117,7 +132,7 @@ where
     }
 }
 
-fn parse_query(raw: &str) -> Result<ApiRequest, ApiError> {
+fn parse_query(op: Operation, raw: &str) -> Result<ApiRequest, ApiError> {
     // Decode strictly: `form_urlencoded` replaces invalid UTF-8 with
     // U+FFFD, which would silently change a search, so refuse it.
     let mut pairs = Vec::new();
@@ -127,7 +142,7 @@ fn parse_query(raw: &str) -> Result<ApiRequest, ApiError> {
         }
         pairs.push((k, v));
     }
-    parse_items_query(pairs.iter().map(|(k, v)| (k.as_ref(), v.as_ref())))
+    parse_request(op, pairs.iter().map(|(k, v)| (k.as_ref(), v.as_ref())))
 }
 
 /// The bearer token, if exactly one well-formed `Authorization:

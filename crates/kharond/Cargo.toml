@@ -23,7 +23,7 @@ fs2 = "0.4"
 publicsuffix = "2.3"
 url = "2"
 # CDP client (issue #17, REQ-ARCH-002/003/005, REQ-ORG-002..005).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync", "signal"] }
 # TLS is terminated in-crate (cdp::tls, pinned peer certs) before the
 # websocket handshake, so the client needs no TLS feature of its own.
 tokio-tungstenite = "0.24"

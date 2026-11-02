@@ -14,6 +14,7 @@ on:
       - "crates/kharond/src/sync/**"
       - "crates/kharond/tests/req_cry_005_sync.rs"
       - "crates/kharond/tests/req_cry_008_009_live_sync.rs"
+      - "crates/kharond/tests/req_cry_009_notifications_hub.rs"
 permissions: { contents: read }
 jobs:
   vaultwarden-fixture:
@@ -107,6 +108,22 @@ jobs:
           KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
           KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
         run: cargo test -p kharond --test req_cry_008_009_live_sync live -- --ignored
+      - name: Live REQ-CRY-009 notifications hub push (add/edit/delete within 10 s)
+        working-directory: ${{ github.workspace }}
+        env:
+          KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222
+          KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
+          KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
+        run: cargo test -p kharond --test req_cry_009_notifications_hub req_cry_009_live -- --ignored
+      - name: Live REQ-CRY-008 second org while unlocked locks (widens the fixture; keep last)
+        working-directory: ${{ github.workspace }}
+        env:
+          KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222
+          KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
+          KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
+        run: >-
+          cargo test -p kharond --test req_cry_009_notifications_hub
+          req_cry_008_live_second_org_while_unlocked_locks -- --ignored --exact
       - name: Tear down fixture (including its data volume)
         if: always()
         run: docker compose down -v

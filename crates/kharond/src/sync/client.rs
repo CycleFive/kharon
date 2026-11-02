@@ -17,7 +17,10 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
+use tokio::sync::watch;
+
 use super::SyncError;
+use super::push::{HubToken, NotificationsHub};
 use super::wire::{PreloginResponse, SyncResponse, TokenResponse, normalize_keys};
 
 /// `Device-Type` sent on every request: Bitwarden `DeviceType.LinuxCLI`.
@@ -104,6 +107,9 @@ impl ApiKey {
 pub struct Endpoints {
     pub identity: Url,
     pub api: Url,
+    /// Notifications service base (REQ-CRY-009 push); the hub is
+    /// `<notifications>hub`.
+    pub notifications: Url,
 }
 
 impl Endpoints {
@@ -125,13 +131,24 @@ impl Endpoints {
             return Ok(Self {
                 identity: parse(format!("https://identity.{domain}/"))?,
                 api: parse(format!("https://api.{domain}/"))?,
+                notifications: parse(format!("https://notifications.{domain}/"))?,
             });
         }
         let base = server.as_str().trim_end_matches('/');
         Ok(Self {
             identity: parse(format!("{base}/identity/"))?,
             api: parse(format!("{base}/api/"))?,
+            notifications: parse(format!("{base}/notifications/"))?,
         })
+    }
+
+    /// The notifications hub as a `ws(s)://` URL (REQ-CRY-009).
+    pub fn hub(&self) -> Url {
+        let http = self
+            .notifications
+            .join("hub")
+            .expect("invariant: static relative path");
+        super::push::ws_url(http).expect("invariant: endpoints are http(s)")
     }
 
     fn identity(&self, path: &str) -> Url {
@@ -206,7 +223,7 @@ fn tls_config(trust: &TlsTrust) -> Result<rustls::ClientConfig, SyncError> {
 }
 
 struct AccessToken {
-    value: Zeroizing<String>,
+    value: Arc<Zeroizing<String>>,
     refresh_after: Instant,
 }
 
@@ -218,6 +235,11 @@ pub struct SyncClient {
     api_key: ApiKey,
     device_id: String,
     token: Option<AccessToken>,
+    /// The rustls config `http` uses, kept for the hub's WebSocket.
+    tls: Arc<rustls::ClientConfig>,
+    /// Publishes the current access token to the notifications hub
+    /// client. Dropped with the client, which ends the push task.
+    token_tx: watch::Sender<Option<HubToken>>,
 }
 
 impl SyncClient {
@@ -238,8 +260,9 @@ impl SyncClient {
             "Bitwarden-Client-Version",
             header::HeaderValue::from_static(CLIENT_VERSION),
         );
+        let tls = tls_config(trust)?;
         let http = reqwest::Client::builder()
-            .use_preconfigured_tls(tls_config(trust)?)
+            .use_preconfigured_tls(tls.clone())
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
@@ -255,7 +278,24 @@ impl SyncClient {
             api_key,
             device_id,
             token: None,
+            tls: Arc::new(tls),
+            token_tx: watch::Sender::new(None),
         })
+    }
+
+    /// The REQ-CRY-009 push source for this account: the hub URL, the
+    /// same TLS trust as the HTTP client, and a view of the access
+    /// token this client keeps fresh. Run it with
+    /// [`super::run_push`].
+    pub fn notifications_hub(&self) -> NotificationsHub {
+        let mut tls = (*self.tls).clone();
+        // HTTP/1.1 only: the WebSocket upgrade does not run over h2.
+        tls.alpn_protocols.clear();
+        NotificationsHub::new(
+            self.endpoints.hub(),
+            Arc::new(tls),
+            self.token_tx.subscribe(),
+        )
     }
 
     pub fn endpoints(&self) -> &Endpoints {
@@ -317,10 +357,15 @@ impl SyncClient {
             return Err(SyncError::Malformed(EP));
         }
         let lifetime = Duration::from_secs(t.expires_in.unwrap_or(3600));
-        self.token = Some(AccessToken {
-            value: Zeroizing::new(t.access_token),
+        let token = AccessToken {
+            value: Arc::new(Zeroizing::new(t.access_token)),
             refresh_after: Instant::now() + lifetime.saturating_sub(TOKEN_SKEW),
-        });
+        };
+        self.token_tx.send_replace(Some(HubToken::new(
+            Arc::clone(&token.value),
+            token.refresh_after,
+        )));
+        self.token = Some(token);
         Ok(())
     }
 
@@ -361,6 +406,7 @@ impl SyncClient {
     /// Drop the access token (lock).
     pub fn forget_token(&mut self) {
         self.token = None;
+        self.token_tx.send_replace(None);
     }
 }
 
@@ -404,10 +450,15 @@ mod tests {
         let e = Endpoints::for_server(&Url::parse("http://vaultwarden:80").unwrap()).unwrap();
         assert_eq!(e.identity.as_str(), "http://vaultwarden/identity/");
         assert_eq!(e.api("sync").as_str(), "http://vaultwarden/api/sync");
+        assert_eq!(e.hub().as_str(), "ws://vaultwarden/notifications/hub");
         let e = Endpoints::for_server(&Url::parse("https://vw.example.net/sub/").unwrap()).unwrap();
         assert_eq!(
             e.identity("connect/token").as_str(),
             "https://vw.example.net/sub/identity/connect/token"
+        );
+        assert_eq!(
+            e.hub().as_str(),
+            "wss://vw.example.net/sub/notifications/hub"
         );
         let e = Endpoints::for_server(&Url::parse("https://vault.bitwarden.com").unwrap()).unwrap();
         assert_eq!(
@@ -415,6 +466,7 @@ mod tests {
             "https://identity.bitwarden.com/accounts/prelogin"
         );
         assert_eq!(e.api("sync").as_str(), "https://api.bitwarden.com/sync");
+        assert_eq!(e.hub().as_str(), "wss://notifications.bitwarden.com/hub");
         let e = Endpoints::for_server(&Url::parse("https://vault.bitwarden.eu").unwrap()).unwrap();
         assert_eq!(e.api.as_str(), "https://api.bitwarden.eu/");
         assert!(Endpoints::for_server(&Url::parse("ftp://x").unwrap()).is_err());

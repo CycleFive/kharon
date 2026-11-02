@@ -67,7 +67,9 @@ impl From<WsError> for CdpError {
 /// One in-flight request.
 type Reply = oneshot::Sender<Result<Value, CdpError>>;
 
-enum MaybeTls {
+/// A plain or TLS TCP stream under a WebSocket. Shared with the
+/// notifications hub client (`sync::push`).
+pub(crate) enum MaybeTls {
     Plain(TcpStream),
     // Boxed: the TLS variant is ~1.1 KB and this enum crosses every
     // websocket poll.

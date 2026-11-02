@@ -1,0 +1,50 @@
+# Vaultwarden fixture for kharon (issue #10; REQ-DEP-002 part).
+#
+# Throwaway test server ONLY: signups are open so seed.py can register
+# the fixture account, the admin panel is disabled, and all data lives
+# in a named volume that the fixture workflow deletes afterwards.
+# Never deploy this file as a real vault.
+#
+# TLS on loopback (review on PR #44): the official `bw` CLI refuses
+# plain-HTTP servers outright (InsecureUrlNotAllowedError), so the
+# fixture serves HTTPS with a throwaway self-signed cert for
+# 127.0.0.1. Generate it before `docker compose up`:
+#
+#   mkdir -p tls
+#   openssl req -x509 -newkey rsa:2048 -nodes -keyout tls/key.pem \
+#     -out tls/cert.pem -days 2 -subj "/CN=127.0.0.1" \
+#     -addext "subjectAltName=IP:127.0.0.1"
+#
+# `tls/` is gitignored — the cert is per-run material, never committed.
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.33.0
+    container_name: kharon-vaultwarden-fixture
+    restart: "no"
+    environment:
+      # Registration of the single fixture account (seed.py).
+      SIGNUPS_ALLOWED: "true"
+      # No invitations / SMTP in the fixture.
+      INVITATIONS_ALLOWED: "false"
+      # Admin panel off: nothing to harden, nothing to leak.
+      DISABLE_ADMIN_TOKEN: "true"
+      # Served over HTTPS on loopback; must match the seed/bw base URL.
+      DOMAIN: "https://127.0.0.1:8222"
+      # Rocket serves TLS itself on 443 inside the container with the
+      # throwaway cert mounted at /ssl.
+      ROCKET_PORT: "443"
+      ROCKET_TLS: '{certs="/ssl/cert.pem",key="/ssl/key.pem"}'
+      # Quiet, structured logs are easier to assert on in CI.
+      LOG_LEVEL: "info"
+    ports:
+      # Loopback only: the fixture must never be reachable off-host.
+      - "127.0.0.1:8222:443"
+    volumes:
+      - vaultwarden-fixture-data:/data
+      - ./tls:/ssl:ro
+    # No healthcheck: the image has no HTTP client to probe with, and
+    # seed.py's /alive wait already covers readiness.
+
+volumes:
+  vaultwarden-fixture-data:
+    name: kharon-vaultwarden-fixture-data

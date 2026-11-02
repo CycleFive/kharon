@@ -1,0 +1,96 @@
+name: fixture
+# Live Vaultwarden fixture job (issue #10, REQ-DEP-002 part /
+# REQ-CRY-004 live half). Manual + fixture-path changes only: the
+# normal `ci` job already covers the offline fixture tests, and this
+# job needs Docker service startup + the official `bw` CLI oracle.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/kharon-bwcrypto/tests/fixtures/vaultwarden/**"
+      - "crates/kharon-bwcrypto/tests/req_dep_002_fixture.rs"
+      - "crates/kharon-bwcrypto/src/**"
+      - ".github/workflows/fixture.yml"
+permissions: { contents: read }
+jobs:
+  vaultwarden-fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install "cryptography==43.0.3"
+      - name: Generate the throwaway loopback TLS cert
+        # bw refuses plain-HTTP servers (InsecureUrlNotAllowedError),
+        # so the fixture serves HTTPS on 127.0.0.1 with a self-signed
+        # cert generated per run (gitignored, never committed).
+        run: |
+          mkdir -p tls
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout tls/key.pem -out tls/cert.pem -days 2 \
+            -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+      - name: Start Vaultwarden fixture
+        run: docker compose up -d
+      - name: Seed org / collection / items and capture sync
+        run: >-
+          python3 seed.py --live --base-url https://127.0.0.1:8222
+          --ca-cert "$PWD/tls/cert.pem"
+          --out "${{ runner.temp }}/sync.live.json"
+      - name: Oracle check with the official bw CLI
+        # bw get item for BOTH seeded items, compared field-by-field
+        # (name, username, password, URI) against fixture.json — the
+        # manifest is read here, credentials are not duplicated in env.
+        run: |
+          export NODE_EXTRA_CA_CERTS="$PWD/tls/cert.pem"
+          # bw is PINNED: 2026.2+ moved password login into the Rust
+          # SDK, whose prelogin call (POST
+          # /identity/accounts/prelogin/password) the spec-pinned
+          # Vaultwarden 1.33.0 does not route — login dies with a 404
+          # before it starts. 2026.1.0 is the last release whose
+          # prelogin is POST /api/accounts/prelogin, which 1.33.0
+          # serves. Unpin only together with the server pin.
+          npm install -g @bitwarden/cli@2026.1.0
+          bw config server https://127.0.0.1:8222
+          read -r BW_EMAIL BW_PASSWORD <<< "$(python3 -c '
+          import json
+          a = json.load(open("fixture.json"))["account"]
+          print(a["email"], a["password"])')"
+          # Password via env, not argv; session capture split from the
+          # export so a login failure fails at the login (export alone
+          # succeeds under bash -e and masks the exit status).
+          export BW_PASSWORD
+          BW_SESSION="$(bw login "$BW_EMAIL" --passwordenv BW_PASSWORD --raw)"
+          export BW_SESSION
+          unset BW_PASSWORD
+          bw sync
+          bw list items > "${{ runner.temp }}/bw-items.json"
+          python3 - "${{ runner.temp }}/bw-items.json" <<'EOF'
+          import json, subprocess, sys
+          manifest = json.load(open("fixture.json"))
+          listed = {i["name"]: i["id"] for i in json.load(open(sys.argv[1]))}
+          for want in manifest["items"]:
+              assert want["name"] in listed, f"bw did not list {want['name']}"
+              got = json.loads(subprocess.run(
+                  ["bw", "get", "item", listed[want["name"]]],
+                  capture_output=True, text=True, check=True).stdout)
+              login = got["login"]
+              assert got["name"] == want["name"], got["name"]
+              assert login["username"] == want["username"], want["name"]
+              assert login["password"] == want["password"], want["name"]
+              assert login["uris"][0]["uri"] == want["uri"], want["name"]
+          print("bw oracle: both items match fixture.json (name/username/password/uri)")
+          EOF
+      - name: Live REQ-CRY-004 decrypt against the captured sync
+        working-directory: ${{ github.workspace }}
+        env:
+          KHARON_FIXTURE_SYNC_JSON: ${{ runner.temp }}/sync.live.json
+        run: cargo test -p kharon-bwcrypto --test req_dep_002_fixture req_cry_004_live -- --ignored
+      - name: Tear down fixture (including its data volume)
+        if: always()
+        run: docker compose down -v

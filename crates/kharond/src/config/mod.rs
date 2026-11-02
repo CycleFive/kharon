@@ -7,10 +7,13 @@
 //!    unknown keys and secret-shaped keys, apply SPEC defaults, and check
 //!    every self-contained rule (CDP transport per REQ-ARCH-002, standing
 //!    grants need `allow_standing`, durations, IDs, …).
-//! 2. [`Config::check_startup`] checks the config against the host. Today
-//!    that is the mlock rule: `require_mlock = true` (the default) with
-//!    mlock unavailable is refused (REQ-MEM-002). The probe is injected
-//!    ([`MlockProbe`]) so tests need no `CAP_IPC_LOCK`.
+//! 2. [`Config::check_startup`] checks the config against the host: the
+//!    mlock rule (`require_mlock = true`, the default, with mlock
+//!    unavailable is refused, REQ-MEM-002; the probe is injected via
+//!    [`MlockProbe`] so tests need no `CAP_IPC_LOCK`), and in sync mode
+//!    that the sync client can be built: `api_key_file` is readable and
+//!    holds a personal API key, and `ca_file` (if set) is PEM with at
+//!    least one certificate. No network I/O happens here.
 //!
 //! Every refusal is a distinct [`ConfigError`] variant with a stable
 //! [`ConfigError::code`]; the daemon prints the code and exits non-zero.
@@ -27,6 +30,7 @@
 //! api_key_file = "/run/secrets/kharon_bw_api_key"
 //! organization_id = "00000000-0000-0000-0000-000000000001"
 //! collection_ids = ["00000000-0000-0000-0000-000000000002"]
+//! # ca_file = "/etc/kharon/vault-ca.pem"   # optional extra trust anchor
 //!
 //! [agents.assistant]
 //! token_hash = "$argon2id$..."
@@ -55,6 +59,7 @@ use url::Url;
 
 use crate::cdp::{CdpEndpoint, EndpointError, Tunnel};
 use crate::origin::OriginConfig;
+use crate::sync::{ApiKey, Scope, SyncClient, SyncError, TlsTrust};
 
 pub use duration::parse_duration;
 pub use mlock::{MlockProbe, ProcfsMlockProbe, StaticMlockProbe};
@@ -221,6 +226,20 @@ pub enum ConfigError {
         "audit checkpoints need an off-host sink ([approval].ntfy) or audit.checkpoint_local_only = true"
     )]
     AuditNoOffHostSink,
+    /// `bitwarden.api_key_file` is unreadable or not a personal API key
+    /// (`{"client_id": "user.<uuid>", "client_secret": ...}`). The
+    /// reason is fixed text; file content is never echoed.
+    #[error("bitwarden.api_key_file: {reason}")]
+    ApiKeyFile {
+        /// Fixed-text reason.
+        reason: &'static str,
+    },
+    /// `bitwarden.ca_file` is unreadable or holds no PEM certificate.
+    #[error("bitwarden.ca_file: {reason}")]
+    CaFile {
+        /// Fixed-text reason.
+        reason: &'static str,
+    },
     /// `require_mlock = true` but mlock is not available (REQ-MEM-002).
     #[error("require_mlock = true but mlock is unavailable: {reason}")]
     MlockUnavailable {
@@ -261,6 +280,8 @@ impl ConfigError {
             Self::StandingGrantsDisabled => "standing_grants_disabled",
             Self::DefaultContextMultiAgent => "default_context_multi_agent",
             Self::AuditNoOffHostSink => "audit_no_off_host_sink",
+            Self::ApiKeyFile { .. } => "api_key_file",
+            Self::CaFile { .. } => "ca_file",
             Self::MlockUnavailable { .. } => "mlock_unavailable",
         }
     }
@@ -323,6 +344,69 @@ pub struct BitwardenConfig {
     pub collection_ids: Vec<String>,
     /// REQ-CRY-008 escape hatch. Default false.
     pub allow_extra_orgs: bool,
+    /// Extra PEM trust anchor(s) for `server`, in addition to the OS
+    /// roots (self-hosted server with a private CA). Not in the SPEC §9
+    /// example; optional.
+    pub ca_file: Option<PathBuf>,
+}
+
+impl BitwardenConfig {
+    /// The REQ-CRY-007 item scope.
+    pub fn scope(&self) -> Scope {
+        Scope::new(&self.organization_id, &self.collection_ids)
+            .expect("invariant: validated non-empty org and collections")
+    }
+
+    /// Read and parse `api_key_file`.
+    pub fn api_key(&self) -> Result<ApiKey, ConfigError> {
+        ApiKey::from_file(&self.api_key_file).map_err(|e| ConfigError::ApiKeyFile {
+            reason: match e {
+                SyncError::ApiKey(r) => r,
+                _ => "unusable",
+            },
+        })
+    }
+
+    /// TLS trust: OS roots plus `ca_file`, which must hold at least one
+    /// PEM certificate.
+    pub fn tls_trust(&self) -> Result<TlsTrust, ConfigError> {
+        let Some(path) = &self.ca_file else {
+            return Ok(TlsTrust::default());
+        };
+        let pem = std::fs::read(path).map_err(|_| ConfigError::CaFile {
+            reason: "unreadable",
+        })?;
+        use rustls_pki_types::pem::PemObject;
+        let mut n = 0;
+        for c in rustls_pki_types::CertificateDer::pem_slice_iter(&pem) {
+            c.map_err(|_| ConfigError::CaFile {
+                reason: "not valid PEM",
+            })?;
+            n += 1;
+        }
+        if n == 0 {
+            return Err(ConfigError::CaFile {
+                reason: "no PEM certificate found",
+            });
+        }
+        Ok(TlsTrust {
+            extra_ca_pem: Some(pem),
+        })
+    }
+
+    /// Build the sync client (#8) for this config. Reads both files;
+    /// does no network I/O.
+    pub fn sync_client(&self) -> Result<SyncClient, ConfigError> {
+        let trust = self.tls_trust()?;
+        let key = self.api_key()?;
+        SyncClient::new(&self.server, &self.email, key, &trust).map_err(|e| match e {
+            SyncError::Tls(reason) => ConfigError::CaFile { reason },
+            SyncError::ApiKey(reason) => ConfigError::ApiKeyFile { reason },
+            _ => ConfigError::InvalidUrl {
+                key: "bitwarden.server".to_owned(),
+            },
+        })
+    }
 }
 
 /// `[export]` (mode = "export").
@@ -507,6 +591,9 @@ impl Config {
             probe
                 .mlock_available()
                 .map_err(|reason| ConfigError::MlockUnavailable { reason })?;
+        }
+        if let Source::Sync(bw) = &self.source {
+            bw.sync_client()?;
         }
         Ok(())
     }

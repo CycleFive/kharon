@@ -31,8 +31,8 @@ fn main() -> ExitCode {
     }
 
     match config::load_for_startup(&path, &ProcfsMlockProbe) {
-        Ok(cfg) => {
-            for w in cfg.warnings() {
+        Ok((cfg, warnings)) => {
+            for w in warnings {
                 eprintln!("kharond: warning: {w}");
             }
             eprintln!(

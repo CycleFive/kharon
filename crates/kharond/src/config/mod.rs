@@ -11,8 +11,10 @@
 //!    mlock rule (`require_mlock = true`, the default, with mlock
 //!    unavailable is refused, REQ-MEM-002; the probe is injected via
 //!    [`MlockProbe`] so tests need no `CAP_IPC_LOCK`), and in sync mode
-//!    that the sync client can be built: `api_key_file` is readable and
-//!    holds a personal API key, and `ca_file` (if set) is PEM with at
+//!    that the sync client can be built: `api_key_file` passes the
+//!    SPEC §8 permission check (REQ-DEP-008: a regular file, not group-
+//!    or world-writable; group/world-readable or foreign-owned only
+//!    warns), is readable, and holds a personal API key, and `ca_file` (if set) is PEM with at
 //!    least one certificate. No network I/O happens here.
 //!
 //! Every refusal is a distinct [`ConfigError`] variant with a stable
@@ -47,6 +49,7 @@
 //! ```
 
 mod duration;
+mod keyfile;
 mod mlock;
 mod raw;
 
@@ -300,6 +303,12 @@ pub enum ConfigWarning {
     HttpAllowed,
     /// `bitwarden.allow_extra_orgs = true` (REQ-CRY-008 escape hatch).
     ExtraOrgsAllowed,
+    /// `bitwarden.api_key_file` is group- or world-readable (REQ-DEP-008;
+    /// tolerated for Docker secrets mounted 0444).
+    ApiKeyFileReadableByOthers,
+    /// `bitwarden.api_key_file` is not owned by kharond's effective uid
+    /// (REQ-DEP-008).
+    ApiKeyFileForeignOwner,
 }
 
 impl fmt::Display for ConfigWarning {
@@ -315,6 +324,12 @@ impl fmt::Display for ConfigWarning {
             Self::HttpAllowed => "policy.allow_http = true: http:// localhost/IP fills permitted",
             Self::ExtraOrgsAllowed => {
                 "bitwarden.allow_extra_orgs = true: dedicated-org scope check disabled"
+            }
+            Self::ApiKeyFileReadableByOthers => {
+                "bitwarden.api_key_file is group- or world-readable; use mode 0400 or 0600 unless it is a container-private secret"
+            }
+            Self::ApiKeyFileForeignOwner => {
+                "bitwarden.api_key_file is not owned by kharond's effective uid"
             }
         })
     }
@@ -336,7 +351,8 @@ pub struct BitwardenConfig {
     pub server: Url,
     /// kharon account email (KDF salt; not secret).
     pub email: String,
-    /// Root-only file holding the personal API key (SPEC §8).
+    /// File holding the personal API key: owned by kharond's euid, mode
+    /// 0400/0600 (SPEC §8, REQ-DEP-008).
     pub api_key_file: PathBuf,
     /// The dedicated kharon org (REQ-CRY-008).
     pub organization_id: String,
@@ -591,17 +607,23 @@ impl Config {
         raw::parse(text)
     }
 
-    /// Host-dependent startup checks (phase 2): REQ-MEM-002 mlock.
-    pub fn check_startup(&self, probe: &dyn MlockProbe) -> Result<(), ConfigError> {
+    /// Host-dependent startup checks (phase 2): REQ-MEM-002 mlock and,
+    /// in sync mode, the REQ-DEP-008 `api_key_file` permission check.
+    /// Returns host-dependent warnings (in addition to
+    /// [`Config::warnings`]) for the daemon to print.
+    pub fn check_startup(&self, probe: &dyn MlockProbe) -> Result<Vec<ConfigWarning>, ConfigError> {
         if self.memory.require_mlock {
             probe
                 .mlock_available()
                 .map_err(|reason| ConfigError::MlockUnavailable { reason })?;
         }
+        let mut warnings = Vec::new();
         if let Source::Sync(bw) = &self.source {
+            warnings = keyfile::check_api_key_file(&bw.api_key_file)
+                .map_err(|reason| ConfigError::ApiKeyFile { reason })?;
             bw.sync_client()?;
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Startup warnings to print (never fatal).
@@ -629,10 +651,15 @@ impl Config {
 }
 
 /// Load, validate, and run startup checks: what the daemon does at boot.
-pub fn load_for_startup(path: &Path, probe: &dyn MlockProbe) -> Result<Config, ConfigError> {
+/// Returns the config and every startup warning (config and host).
+pub fn load_for_startup(
+    path: &Path,
+    probe: &dyn MlockProbe,
+) -> Result<(Config, Vec<ConfigWarning>), ConfigError> {
     let cfg = Config::load(path)?;
-    cfg.check_startup(probe)?;
-    Ok(cfg)
+    let mut warnings = cfg.warnings();
+    warnings.extend(cfg.check_startup(probe)?);
+    Ok((cfg, warnings))
 }
 
 /// Re-exported for [`raw`]: a `Tunnel` from its config string.

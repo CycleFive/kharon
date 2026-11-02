@@ -773,6 +773,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "toml",
  "url",
  "zeroize",
 ]

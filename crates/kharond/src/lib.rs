@@ -4,6 +4,7 @@
 //! exists so that daemon subsystems are developed and tested as a library.
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod audit;
 pub mod cdp;
 pub mod config;

@@ -74,7 +74,7 @@ pub enum AppendError {
 /// `File` implements it with `fdatasync` — append-only data, enough metadata
 /// to retrieve the file after a crash. Test doubles can fail either half
 /// independently.
-pub(crate) trait AuditWriter: Write {
+pub(crate) trait AuditWriter: Write + Send {
     fn sync(&mut self) -> io::Result<()>;
 }
 

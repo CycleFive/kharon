@@ -59,7 +59,7 @@ use url::Url;
 
 use crate::cdp::{CdpEndpoint, EndpointError, Tunnel};
 use crate::origin::OriginConfig;
-use crate::sync::{ApiKey, Scope, SyncClient, SyncError, TlsTrust};
+use crate::sync::{ApiKey, Scope, SyncClient, SyncError, SyncPolicy, TlsTrust};
 
 pub use duration::parse_duration;
 pub use mlock::{MlockProbe, ProcfsMlockProbe, StaticMlockProbe};
@@ -355,6 +355,12 @@ impl BitwardenConfig {
     pub fn scope(&self) -> Scope {
         Scope::new(&self.organization_id, &self.collection_ids)
             .expect("invariant: validated non-empty org and collections")
+    }
+
+    /// REQ-CRY-008/009 live-sync policy: `allow_extra_orgs` and the
+    /// 5-minute poll ([`crate::sync::MAX_SYNC_INTERVAL`]).
+    pub fn sync_policy(&self) -> SyncPolicy {
+        SyncPolicy::new(self.allow_extra_orgs, crate::sync::MAX_SYNC_INTERVAL)
     }
 
     /// Read and parse `api_key_file`.

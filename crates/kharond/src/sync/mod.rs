@@ -9,12 +9,17 @@
 //! (REQ-CRY-011).
 
 mod client;
+mod live;
 mod vault;
 pub mod wire;
 
 pub use client::{
     ApiKey, CLIENT_NAME, CLIENT_VERSION, DEVICE_NAME, DEVICE_TYPE, Endpoints, MAX_RESPONSE_BYTES,
     SyncClient, TlsTrust, device_identifier,
+};
+pub use live::{
+    LiveSync, LockReason, MAX_SYNC_INTERVAL, ScopeViolation, SyncOutcome, SyncPolicy,
+    check_dedicated_scope, preflight, run, scope_violation,
 };
 pub use vault::{Item, ItemUri, Scope, SecretField, Session, SyncReport, Vault};
 
@@ -48,6 +53,14 @@ pub enum SyncError {
     AccountMismatch,
     #[error("configured organization is not visible to the account")]
     OrgNotVisible,
+    /// REQ-CRY-008: the account sees more than the configured org.
+    #[error(
+        "ScopeTooBroad: account sees {other_orgs} other organization(s) and {outside_items} item(s) outside organization_id"
+    )]
+    ScopeTooBroad {
+        other_orgs: usize,
+        outside_items: usize,
+    },
     #[error("organization_id and collection_ids must be non-empty")]
     EmptyScope,
     #[error("item not found")]

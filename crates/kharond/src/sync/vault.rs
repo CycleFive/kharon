@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 use super::SyncError;
 use super::wire::{CIPHER_TYPE_LOGIN, Cipher, SyncResponse};
 
-fn norm_id(s: &str) -> String {
+pub(super) fn norm_id(s: &str) -> String {
     s.trim().to_ascii_lowercase()
 }
 

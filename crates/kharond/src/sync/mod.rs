@@ -7,9 +7,13 @@
 //! [`Vault`]. Re-syncs reuse the session: `client.sync()` then
 //! `session.apply_sync()`, so the org key is never unwrapped again
 //! (REQ-CRY-011).
+//!
+//! Live sync (REQ-CRY-009): [`run`] polls and syncs on nudges;
+//! [`run_push`] feeds those nudges from the notifications hub.
 
 mod client;
 mod live;
+pub mod push;
 mod vault;
 pub mod wire;
 
@@ -21,6 +25,7 @@ pub use live::{
     LiveSync, LockReason, MAX_SYNC_INTERVAL, ScopeViolation, SyncOutcome, SyncPolicy,
     check_dedicated_scope, preflight, run, scope_violation,
 };
+pub use push::{HubError, HubStatus, HubTiming, NotificationsHub, UpdateType, run_push};
 pub use vault::{Item, ItemUri, Scope, SecretField, Session, SyncReport, Vault};
 
 use kharon_bwcrypto::{EncError, KdfError};

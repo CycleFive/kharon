@@ -15,7 +15,8 @@
 //! `scope_widened`) or the org key changed (REQ-MEM-006, audit
 //! `key_rotated`). [`run`] polls every `interval` (at most 5 minutes)
 //! and on each nudge from its channel, until it must lock; the push
-//! source (`/notifications/hub`) feeds that channel.
+//! source (`/notifications/hub`, [`super::run_push`]) feeds that
+//! channel.
 
 use std::time::Duration;
 
@@ -219,6 +220,13 @@ impl LiveSync {
 
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// The push source for this session (REQ-CRY-009): pair
+    /// [`super::run_push`] on it with [`run`] on the same channel. It
+    /// stops when this `LiveSync` is dropped (the lock).
+    pub fn notifications_hub(&self) -> super::NotificationsHub {
+        self.client.notifications_hub()
     }
 
     pub fn policy(&self) -> SyncPolicy {

@@ -16,6 +16,7 @@ pub(crate) mod page_js;
 pub mod tls;
 
 pub use browser::{AgentContext, Browser, OwnershipError, TargetInfo};
+pub(crate) use client::MaybeTls;
 pub use client::{CdpClient, CdpError, CdpSession};
 pub use endpoint::{CdpEndpoint, CertSha256, EndpointError, Tunnel};
 pub use fill::{FieldFill, FieldKind, FillEngine, FillOutcome, FillPlan};

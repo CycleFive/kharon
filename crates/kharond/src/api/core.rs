@@ -242,7 +242,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     ) -> Result<Outcome, ApiError> {
         let result = {
             let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-            // The gate, not `session()`: it enforces the timers. Listing
+            // The gate (`require_unlocked` is the only way to get
+            // `&S`, #54): it enforces the timers. Listing
             // is not fill activity, so it does not touch the idle timer.
             lock.require_unlocked().map(|session| {
                 session

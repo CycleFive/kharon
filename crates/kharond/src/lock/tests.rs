@@ -74,14 +74,14 @@ fn unlock_ok<C: Clock>(c: &mut LockController<CanarySession, C>) -> CanarySessio
 fn req_mem_005_boots_locked_and_lock_is_terminal_for_the_session() {
     let mut c = controller(ManualClock::new(), StaticHardening::all_ok());
     assert!(c.is_locked(), "boots locked");
-    assert!(c.session().is_none());
+    assert!(!c.has_session());
     assert!(matches!(c.require_unlocked(), Err(LockedError)));
 
     let canary = unlock_ok(&mut c);
     assert!(!c.is_locked());
     assert!(c.lock(LockReason::Manual));
     assert!(c.is_locked());
-    assert!(c.session().is_none(), "no session survives lock");
+    assert!(!c.has_session(), "no session survives lock");
     assert!(canary.all_zero());
     // A second lock is a no-op, and re-unlock needs a fresh derive.
     assert!(!c.lock(LockReason::Manual));
@@ -183,7 +183,9 @@ fn req_mem_006_forced_locks_carry_the_right_reason_and_audit_event() {
     assert!(c.on_org_key_changed());
     assert!(c.is_locked());
     assert!(canary.all_zero());
-    assert_eq!(LockReason::KeyRotated.audit_event(), "key_rotated");
+    let e = LockReason::KeyRotated.audit_entry();
+    assert_eq!(e.event, crate::audit::Event::KeyRotated);
+    assert_eq!(e.detail_code, None);
 
     let mut c = controller(ManualClock::new(), StaticHardening::all_ok());
     unlock_ok(&mut c);
@@ -364,7 +366,9 @@ fn req_cry_008_scope_widened_forces_a_lock() {
     assert!(c.on_scope_widened());
     assert!(c.is_locked());
     assert!(canary.all_zero());
-    assert_eq!(LockReason::ScopeWidened.audit_event(), "scope_widened");
+    let e = LockReason::ScopeWidened.audit_entry();
+    assert_eq!(e.event, crate::audit::Event::ScopeWidened);
+    assert_eq!(e.detail_code, None);
     assert!(!c.on_scope_widened(), "already locked: no-op");
 }
 
@@ -442,4 +446,138 @@ fn req_mem_real_sync_session_composes_with_the_controller() {
     clock.advance(Duration::from_secs(31 * 60));
     assert!(c.require_unlocked().is_err());
     assert!(c.is_locked());
+}
+
+#[test]
+fn issue_54_audit_entries_use_the_real_audit_vocabulary() {
+    // Item 2: every lock reason builds a typed audit::Entry whose
+    // event is a real audit::Event (deserialization accepts it) —
+    // no `locked_*` strings remain.
+    use crate::audit::Event;
+    let cases = [
+        (LockReason::Manual, Event::Lock, Some("manual")),
+        (LockReason::IdleTimeout, Event::Lock, Some("idle_timeout")),
+        (
+            LockReason::AbsoluteTimeout,
+            Event::Lock,
+            Some("absolute_timeout"),
+        ),
+        (LockReason::KeyRotated, Event::KeyRotated, None),
+        (
+            LockReason::UnknownCryptoVersion,
+            Event::Lock,
+            Some("unknown_crypto_version"),
+        ),
+        (LockReason::ScopeWidened, Event::ScopeWidened, None),
+    ];
+    for (reason, event, detail) in cases {
+        let entry = reason.audit_entry();
+        assert_eq!(entry.event, event, "{reason:?}");
+        assert_eq!(entry.detail_code.as_deref(), detail, "{reason:?}");
+        // Round-trip through JSON: an unknown event name would be a
+        // deserialize error (audit::entry), so this pins the entry
+        // to the real vocabulary.
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: crate::audit::Entry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event, event);
+    }
+    // LockEvent::Unlocked maps to Event::Unlock the same way.
+    let entry = LockEvent::Unlocked.audit_entry().unwrap();
+    assert_eq!(entry.event, Event::Unlock);
+    assert_eq!(
+        LockEvent::Locked {
+            reason: LockReason::Manual
+        }
+        .audit_entry()
+        .unwrap()
+        .detail_code
+        .as_deref(),
+        Some("manual")
+    );
+    // Mlock transitions have no audit event and invent none.
+    assert!(LockEvent::UnlockRefusedMlock.audit_entry().is_none());
+    assert!(LockEvent::MlockBestEffortFailed.audit_entry().is_none());
+}
+
+#[test]
+fn issue_54_unlock_after_expiry_locks_the_expired_session_then_proceeds() {
+    // Item 4: unlock() runs the expiry check first — an
+    // expired-but-unpolled session does not block re-unlock with
+    // AlreadyUnlocked; it is locked with its expiry reason (old
+    // session wiped, Locked event emitted), then the new unlock
+    // proceeds.
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let log = events.clone();
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    c.set_event_sink(Box::new(move |e| {
+        log.lock().unwrap().push(e);
+        Ok(())
+    }));
+    let first = unlock_ok(&mut c);
+    clock.advance(Duration::from_secs(31 * 60));
+    let second = unlock_ok(&mut c);
+    assert!(!c.is_locked());
+    assert!(c.has_session());
+    assert!(first.all_zero(), "expired session was destroyed");
+    assert!(second.untouched());
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            LockEvent::Unlocked,
+            LockEvent::Locked {
+                reason: LockReason::IdleTimeout
+            },
+            LockEvent::Unlocked,
+        ]
+    );
+
+    // A live (unexpired) session still refuses with AlreadyUnlocked.
+    let err = c
+        .unlock(|| Ok::<_, std::io::Error>(CanarySession::new()))
+        .unwrap_err();
+    assert!(matches!(err, UnlockError::AlreadyUnlocked));
+
+    // Absolute expiry takes the same path.
+    clock.advance(Duration::from_secs(13 * 60 * 60));
+    unlock_ok(&mut c);
+    assert!(!c.is_locked());
+}
+
+#[test]
+fn issue_54_sync_lock_reason_has_one_path_into_the_controller() {
+    // Item 3: From<&sync::live::LockReason> and on_sync_lock.
+    use crate::sync::{LockReason as SyncLockReason, ScopeViolation};
+    assert_eq!(
+        LockReason::from(&SyncLockReason::KeyRotated),
+        LockReason::KeyRotated
+    );
+    let widened = SyncLockReason::ScopeWidened(ScopeViolation {
+        other_orgs: vec!["other".into()],
+        outside_items: Vec::new(),
+    });
+    assert_eq!(LockReason::from(&widened), LockReason::ScopeWidened);
+    // The sync side keeps its finer detail codes.
+    assert_eq!(
+        widened.audit_entry().detail_code.as_deref(),
+        Some("other_org_visible")
+    );
+    assert_eq!(
+        SyncLockReason::KeyRotated
+            .audit_entry()
+            .detail_code
+            .as_deref(),
+        Some("org_key_changed")
+    );
+
+    let mut c = controller(ManualClock::new(), StaticHardening::all_ok());
+    let canary = unlock_ok(&mut c);
+    assert!(c.on_sync_lock(&SyncLockReason::KeyRotated));
+    assert!(c.is_locked());
+    assert!(canary.all_zero());
+    assert!(!c.on_sync_lock(&widened), "already locked: no-op");
 }

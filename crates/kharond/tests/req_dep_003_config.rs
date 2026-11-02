@@ -74,6 +74,10 @@ fn fixture_dir() -> &'static std::path::Path {
 fn fixture_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
     let p = fixture_dir().join(name);
     std::fs::write(&p, contents).unwrap();
+    // REQ-DEP-008: key files must not be group/world-writable; pin the
+    // mode so the host umask cannot matter.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     p
 }
 
@@ -250,6 +254,15 @@ fn bad_configs() -> Vec<Row> {
             "org_key.json",
             br#"{"client_id":"organization.6b1e0c52-0a3e-4a8e-9a4f-1f0e2d3c4b5a","client_secret":"xyz"}"#,
         );
+        set_bw(p, "", &k)
+    }));
+    rows.push(row("api key file world-writable", "api_key_file", |p| {
+        use std::os::unix::fs::PermissionsExt;
+        let k = fixture_file(
+            "ww_key.json",
+            format!(r#"{{"client_id":"{CLIENT_ID}","client_secret":"xyz"}}"#).as_bytes(),
+        );
+        std::fs::set_permissions(&k, std::fs::Permissions::from_mode(0o602)).unwrap();
         set_bw(p, "", &k)
     }));
     rows.push(row("ca file missing", "ca_file", |p| {

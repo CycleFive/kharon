@@ -37,6 +37,8 @@ fn spec_example_with_key() -> (tempfile::TempDir, String) {
         r#"{"client_id":"user.6b1e0c52-0a3e-4a8e-9a4f-1f0e2d3c4b5a","client_secret":"s"}"#,
     )
     .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
     let text = spec_example().replace("/run/secrets/kharon_bw_api_key", key.to_str().unwrap());
     (dir, text)
 }

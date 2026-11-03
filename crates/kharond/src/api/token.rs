@@ -20,6 +20,15 @@
 //! parameters, so a failure costs one Argon2id evaluation whatever
 //! its cause and response timing does not reveal which agent ids
 //! exist. Every failure is the same [`AuthError`], with no detail.
+//!
+//! Parameter floor: a stored hash must cost at least what
+//! `Argon2::default()` costs ([`ParamFloor::PRODUCTION`]: m = 19456 KiB,
+//! t = 2, p = 1). A weaker `token_hash` is refused when the config is
+//! loaded (REQ-DEP-003, `token_hash_weak_params`) and again by
+//! [`TokenStore::new`] / [`TokenStore::from_agents`], so the daemon
+//! never serves against a cheaply brute-forceable hash.
+//! [`TokenStore::with_floor`] takes an explicit floor; only tests use a
+//! lower one (debug-build Argon2id at the production cost is slow).
 
 use std::collections::BTreeMap;
 
@@ -51,6 +60,71 @@ pub enum TokenStoreError {
         /// Agent id (a config table name, not a secret).
         agent: String,
     },
+    /// The hash's Argon2 parameters are below the floor.
+    #[error(
+        "agents.{agent}.token_hash Argon2id parameters are below the minimum (m >= {m_cost} KiB, t >= {t_cost}, p >= {p_cost})"
+    )]
+    WeakParams {
+        /// Agent id.
+        agent: String,
+        /// Floor memory cost (KiB).
+        m_cost: u32,
+        /// Floor time cost.
+        t_cost: u32,
+        /// Floor parallelism.
+        p_cost: u32,
+    },
+}
+
+/// Minimum Argon2id cost a stored `token_hash` must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamFloor {
+    /// Memory cost, KiB.
+    pub m_cost: u32,
+    /// Iterations.
+    pub t_cost: u32,
+    /// Lanes.
+    pub p_cost: u32,
+}
+
+impl ParamFloor {
+    /// What `Argon2::default()` produces (OWASP's minimum Argon2id
+    /// profile): m = 19456 KiB, t = 2, p = 1. The daemon's floor.
+    pub const PRODUCTION: Self = Self {
+        m_cost: argon2::Params::DEFAULT_M_COST,
+        t_cost: argon2::Params::DEFAULT_T_COST,
+        p_cost: argon2::Params::DEFAULT_P_COST,
+    };
+
+    fn admits(&self, p: &argon2::Params) -> bool {
+        p.m_cost() >= self.m_cost && p.t_cost() >= self.t_cost && p.p_cost() >= self.p_cost
+    }
+}
+
+/// Why a `token_hash` is unusable, without the agent id (the config
+/// loader and [`TokenStore`] attach their own context).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashProblem {
+    /// Not a parseable Argon2id PHC string with usable parameters.
+    Invalid,
+    /// Parameters below the floor.
+    WeakParams,
+}
+
+/// Check one stored hash: Argon2id, parseable, parameters argon2
+/// accepts and at least `floor`. Cheap (no hashing).
+pub fn check_token_hash(phc: &str, floor: &ParamFloor) -> Result<(), HashProblem> {
+    let parsed = PasswordHash::new(phc).map_err(|_| HashProblem::Invalid)?;
+    if parsed.algorithm != argon2::Algorithm::Argon2id.ident() || parsed.hash.is_none() {
+        return Err(HashProblem::Invalid);
+    }
+    // Parameters must be ones argon2 accepts, or every verify would
+    // fail at request time instead of at startup.
+    let params = argon2::Params::try_from(&parsed).map_err(|_| HashProblem::Invalid)?;
+    if !floor.admits(&params) {
+        return Err(HashProblem::WeakParams);
+    }
+    Ok(())
 }
 
 /// Whether `id` is a valid agent id (`[a-z0-9-]{1,64}`, the rule the
@@ -127,22 +201,35 @@ impl std::fmt::Debug for TokenStore {
 }
 
 impl TokenStore {
-    /// From `(agent id, PHC hash)` pairs. Each hash must be Argon2id.
+    /// From `(agent id, PHC hash)` pairs. Each hash must be Argon2id
+    /// at or above [`ParamFloor::PRODUCTION`].
     pub fn new<'a>(
         hashes: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<Self, TokenStoreError> {
+        Self::with_floor(hashes, &ParamFloor::PRODUCTION)
+    }
+
+    /// [`TokenStore::new`] with an explicit parameter floor. The daemon
+    /// always uses [`ParamFloor::PRODUCTION`] (via [`TokenStore::new`] /
+    /// [`TokenStore::from_agents`]); a lower floor is for tests.
+    pub fn with_floor<'a>(
+        hashes: impl IntoIterator<Item = (&'a str, &'a str)>,
+        floor: &ParamFloor,
+    ) -> Result<Self, TokenStoreError> {
         let mut map = BTreeMap::new();
         for (agent, phc) in hashes {
-            let invalid = || TokenStoreError::InvalidHash {
-                agent: agent.to_owned(),
-            };
-            let parsed = PasswordHash::new(phc).map_err(|_| invalid())?;
-            if parsed.algorithm != argon2::Algorithm::Argon2id.ident() || parsed.hash.is_none() {
-                return Err(invalid());
-            }
-            // Parameters must be ones argon2 accepts, or every verify
-            // would fail at request time instead of at startup.
-            argon2::Params::try_from(&parsed).map_err(|_| invalid())?;
+            check_token_hash(phc, floor).map_err(|p| match p {
+                HashProblem::Invalid => TokenStoreError::InvalidHash {
+                    agent: agent.to_owned(),
+                },
+                HashProblem::WeakParams => TokenStoreError::WeakParams {
+                    agent: agent.to_owned(),
+                    m_cost: floor.m_cost,
+                    t_cost: floor.t_cost,
+                    p_cost: floor.p_cost,
+                },
+            })?;
+            let parsed = PasswordHash::new(phc).expect("invariant: checked above");
             map.insert(agent.to_owned(), parsed.serialize());
         }
         // The decoy is a hash of a fresh random value nobody knows, with
@@ -163,7 +250,8 @@ impl TokenStore {
         Ok(Self { hashes: map, decoy })
     }
 
-    /// From the config's `[agents.*]` tables (REQ-API-003).
+    /// From the config's `[agents.*]` tables (REQ-API-003), at the
+    /// production floor.
     pub fn from_agents(agents: &BTreeMap<String, AgentConfig>) -> Result<Self, TokenStoreError> {
         Self::new(
             agents
@@ -208,6 +296,13 @@ mod tests {
         )
     }
 
+    /// The floor the unit tests' cheap hashes clear.
+    const TEST_FLOOR: ParamFloor = ParamFloor {
+        m_cost: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+
     #[test]
     fn req_api_003_token_format_round_trips() {
         let (token, hash) = generate_with(&cheap(), "assistant");
@@ -217,7 +312,7 @@ mod tests {
         assert_eq!(claimed_agent_id(t), Some("assistant"));
         assert!(hash.starts_with("$argon2id$"));
         assert!(!hash.contains(t.as_str()));
-        let store = TokenStore::new([("assistant", hash.as_str())]).unwrap();
+        let store = TokenStore::with_floor([("assistant", hash.as_str())], &TEST_FLOOR).unwrap();
         assert_eq!(store.authenticate(t).unwrap(), "assistant");
     }
 
@@ -225,7 +320,11 @@ mod tests {
     fn req_api_003_rejects_wrong_unknown_and_malformed_tokens() {
         let (a, ha) = generate_with(&cheap(), "agent-a");
         let (b, hb) = generate_with(&cheap(), "agent-b");
-        let store = TokenStore::new([("agent-a", ha.as_str()), ("agent-b", hb.as_str())]).unwrap();
+        let store = TokenStore::with_floor(
+            [("agent-a", ha.as_str()), ("agent-b", hb.as_str())],
+            &TEST_FLOOR,
+        )
+        .unwrap();
         // A's random part under B's id, and vice versa.
         let a_rand = a.expose_secret().rsplit_once('_').unwrap().1;
         let swapped = format!("kh_agent_agent-b_{a_rand}");
@@ -252,15 +351,75 @@ mod tests {
             "$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ",
             "$argon2id$v=19$m=1,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo",
         ] {
-            assert!(TokenStore::new([("a", bad)]).is_err(), "{bad}");
+            assert_eq!(
+                TokenStore::with_floor([("a", bad)], &TEST_FLOOR).unwrap_err(),
+                TokenStoreError::InvalidHash { agent: "a".into() },
+                "{bad}"
+            );
         }
     }
 
     #[test]
     fn req_api_003_debug_shows_ids_only() {
         let (_, h) = generate_with(&cheap(), "a");
-        let store = TokenStore::new([("a", h.as_str())]).unwrap();
+        let store = TokenStore::with_floor([("a", h.as_str())], &TEST_FLOOR).unwrap();
         let dbg = format!("{store:?}");
         assert!(!dbg.contains("argon2"), "{dbg}");
+    }
+
+    #[test]
+    fn req_api_003_production_floor_matches_argon2_default() {
+        let d = argon2::Params::default();
+        assert_eq!(
+            ParamFloor::PRODUCTION,
+            ParamFloor {
+                m_cost: d.m_cost(),
+                t_cost: d.t_cost(),
+                p_cost: d.p_cost(),
+            }
+        );
+        assert_eq!(
+            (d.m_cost(), d.t_cost(), d.p_cost()),
+            (19456, 2, 1),
+            "SPEC floor"
+        );
+    }
+
+    #[test]
+    fn req_api_003_weak_params_refused_at_production_floor() {
+        // Hash strings only: `check_token_hash` never hashes, so these
+        // need no real digest computation.
+        let salt = "c2FsdHNhbHQ";
+        let out = "aGFzaGhhc2hoYXNoaGFzaA";
+        for (params, ok) in [
+            ("m=19456,t=2,p=1", true),
+            ("m=65536,t=3,p=4", true),
+            ("m=19455,t=2,p=1", false),
+            ("m=19456,t=1,p=1", false),
+            ("m=8,t=1,p=1", false),
+            ("m=4096,t=3,p=1", false),
+        ] {
+            let phc = format!("$argon2id$v=19${params}${salt}${out}");
+            let got = check_token_hash(&phc, &ParamFloor::PRODUCTION);
+            assert_eq!(got.is_ok(), ok, "{params}");
+            if !ok {
+                // (Accepted rows are not built into a store: that
+                // computes a decoy hash at the production cost.)
+                assert_eq!(got, Err(HashProblem::WeakParams), "{params}");
+                assert!(
+                    matches!(
+                        TokenStore::new([("a", phc.as_str())]),
+                        Err(TokenStoreError::WeakParams { ref agent, .. }) if agent == "a"
+                    ),
+                    "{params}"
+                );
+            }
+        }
+        // A cheap generated hash is refused by the production store.
+        let (_, cheap_hash) = generate_with(&cheap(), "a");
+        assert!(matches!(
+            TokenStore::new([("a", cheap_hash.as_str())]),
+            Err(TokenStoreError::WeakParams { .. })
+        ));
     }
 }

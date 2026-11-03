@@ -6,7 +6,7 @@
 mod api_support;
 
 use api_support::*;
-use kharond::api::token::{TOKEN_PREFIX, generate_with};
+use kharond::api::token::{TOKEN_PREFIX, generate, generate_with};
 use kharond::api::{ApiError, TokenStore};
 use kharond::config::Config;
 
@@ -77,8 +77,9 @@ async fn req_api_003_bad_token_is_401_with_fixed_body() {
 #[test]
 fn req_api_003_token_store_has_no_plaintext_token() {
     // The token store is the config file. Write a real one with a
-    // freshly minted token's hash, then grep it for the token.
-    let (token, hash) = generate_with(&cheap_argon(), "assistant");
+    // freshly minted token's hash (production Argon2id parameters:
+    // the loader refuses anything below the floor), then grep it.
+    let (token, hash) = generate("assistant");
     let token = token.expose_secret().clone();
     let random = token.rsplit_once('_').unwrap().1.to_owned();
     let dir = tempfile::tempdir().unwrap();
@@ -123,4 +124,27 @@ fn req_api_003_token_store_has_no_plaintext_token() {
             .authenticate(&format!("kh_agent_assistant_{}", "0".repeat(64)))
             .is_err()
     );
+}
+
+/// REQ-API-003 floor at config load: a hash minted with weak Argon2id
+/// parameters is a startup refusal, not a working token.
+#[test]
+fn req_api_003_config_refuses_weak_token_hash() {
+    let (_token, weak) = generate_with(&cheap_argon(), "assistant");
+    let toml = |hash: &str| {
+        format!(
+            "mode = \"export\"\n[export]\nfile = \"/data/export.json\"\n\
+             [agents.assistant]\ntoken_hash = \"{hash}\"\n\
+             cdp = {{ endpoint = \"ws://127.0.0.1:9222\" }}\n\
+             [audit]\ncheckpoint_local_only = true\n"
+        )
+    };
+    let err = Config::from_toml_str(&toml(&weak)).unwrap_err();
+    assert_eq!(err.code(), "token_hash_weak_params", "{err:?}");
+    assert!(!err.to_string().contains(&weak));
+    // The floor itself (m=19456, t=2, p=1) is accepted.
+    Config::from_toml_str(&toml(
+        "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo",
+    ))
+    .unwrap();
 }

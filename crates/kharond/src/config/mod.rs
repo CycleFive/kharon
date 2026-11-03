@@ -47,6 +47,19 @@
 //! [approval]
 //! ntfy = { url = "https://ntfy.example.net", topic = "kharon", token_file = "/run/secrets/ntfy" }
 //! ```
+//!
+//! plus two keys the SPEC §9 example does not show yet (#14):
+//!
+//! ```toml
+//! data_dir = "/data"          # top level; absolute; default "/data" (§9 compose volume)
+//!
+//! [api]
+//! listen = "10.66.0.1:8787"   # agent API; an IP literal, never a wildcard (REQ-DEP-006)
+//! ```
+//!
+//! `[api]` is optional at parse time (so `kharond --check` can validate a
+//! file before the bind address is decided), but the daemon refuses to
+//! serve without it rather than guess an address.
 
 mod duration;
 mod keyfile;
@@ -55,6 +68,7 @@ mod raw;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -249,6 +263,30 @@ pub enum ConfigError {
         /// Why the probe failed (no secret content).
         reason: String,
     },
+    /// An agent's `token_hash` is Argon2id but below the parameter floor
+    /// (REQ-API-003: m ≥ 19456 KiB, t ≥ 2, p ≥ 1).
+    #[error(
+        "agent `{agent}`: token_hash Argon2id parameters are below the floor \
+         (need m >= 19456, t >= 2, p >= 1); regenerate the token"
+    )]
+    TokenHashWeakParams {
+        /// The agent whose hash is weak.
+        agent: String,
+    },
+    /// `api.listen` is not `<ip>:<port>` with an IP literal.
+    #[error(
+        "`api.listen` must be an IP literal and port, e.g. \"10.66.0.1:8787\" or \"[fd00::1]:8787\""
+    )]
+    ApiListenInvalid,
+    /// `api.listen` is a wildcard (unspecified) address (REQ-DEP-006).
+    #[error("`api.listen` is a wildcard address; bind the WireGuard interface address instead")]
+    ApiWildcardBind,
+    /// `api.listen` is a multicast or broadcast address.
+    #[error("`api.listen` must be a unicast address")]
+    ApiListenNotUnicast,
+    /// `data_dir` is not an absolute path.
+    #[error("`data_dir` must be an absolute path")]
+    DataDirNotAbsolute,
 }
 
 impl ConfigError {
@@ -286,6 +324,11 @@ impl ConfigError {
             Self::ApiKeyFile { .. } => "api_key_file",
             Self::CaFile { .. } => "ca_file",
             Self::MlockUnavailable { .. } => "mlock_unavailable",
+            Self::TokenHashWeakParams { .. } => "token_hash_weak_params",
+            Self::ApiListenInvalid => "api_listen_invalid",
+            Self::ApiWildcardBind => "api_wildcard_bind",
+            Self::ApiListenNotUnicast => "api_listen_not_unicast",
+            Self::DataDirNotAbsolute => "data_dir_not_absolute",
         }
     }
 }
@@ -590,6 +633,23 @@ pub struct Config {
     pub audit: AuditConfig,
     /// Memory hardening knobs.
     pub memory: MemoryConfig,
+    /// `[api]`: the agent API listener. `None` = not configured; the
+    /// daemon refuses to serve (it never picks an address itself).
+    pub api: Option<ApiConfig>,
+    /// `data_dir`: persistent state (audit log and keys under `audit/`).
+    pub data_dir: PathBuf,
+}
+
+/// Default `data_dir`: the SPEC §9 compose volume (`./kharon/data:/data`).
+pub const DEFAULT_DATA_DIR: &str = "/data";
+
+/// `[api]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiConfig {
+    /// Agent API listen address (REQ-DEP-006): a specific unicast IP —
+    /// the WireGuard interface address in deployment, loopback in dev.
+    /// Never a wildcard; port 0 (ephemeral) is accepted.
+    pub listen: SocketAddr,
 }
 
 impl Config {

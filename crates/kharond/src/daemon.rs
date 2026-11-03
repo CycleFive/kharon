@@ -22,6 +22,9 @@
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
+//! In `mode = "sync"` it also runs the REQ-API-007 clock probe in the
+//! background (see [`clock_probe`]): startup is not delayed by, and
+//! does not depend on, the Vaultwarden server being reachable.
 
 use std::future::Future;
 use std::io;
@@ -35,9 +38,11 @@ use crate::api::core::Broker;
 use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
 use crate::audit::{AuditConfig as LogConfig, AuditLog, FileCheckpointSink, OpenError};
-use crate::config::Config;
+use crate::config::{Config, Source};
 use crate::lock::{HardeningError, LockController, LockPolicy, MemoryHardening, SystemClock};
 use crate::sync::LiveSync;
+use crate::sync::SyncClient;
+use crate::totp::{SkewPolicy, SkewVerdict};
 
 /// `sysexits.h` `EX_CONFIG`: a configuration refusal.
 pub const EX_CONFIG: u8 = 78;
@@ -139,6 +144,7 @@ pub fn check(cfg: &Config) -> Result<SocketAddr, StartupError> {
 pub struct Daemon {
     listener: TcpListener,
     broker: Arc<DaemonBroker>,
+    clock: Option<SyncClient>,
 }
 
 /// Assemble the daemon (see the module docs for the order). Must run
@@ -177,12 +183,17 @@ pub async fn start(
         SystemClock,
         hardening,
     );
-    let broker = Arc::new(Broker::new(
-        tokens,
-        lock,
-        Box::new(audit),
-        cfg.policy.origin_config(),
-    ));
+    let broker = Arc::new(
+        Broker::new(tokens, lock, Box::new(audit), cfg.policy.origin_config())
+            .with_clock_skew_policy(SkewPolicy::from(&cfg.policy)),
+    );
+    // REQ-API-007: the server whose `Date` the clock is checked
+    // against. Building the client does no I/O; config validation has
+    // already read both files, so a failure here only skips the probe.
+    let clock = match &cfg.source {
+        Source::Sync(bw) => bw.sync_client().ok(),
+        _ => None,
+    };
 
     let listener = TcpListener::bind(listen)
         .await
@@ -190,7 +201,11 @@ pub async fn start(
             addr: listen,
             kind: e.kind().to_string(),
         })?;
-    Ok(Daemon { listener, broker })
+    Ok(Daemon {
+        listener,
+        broker,
+        clock,
+    })
 }
 
 impl Daemon {
@@ -204,7 +219,62 @@ impl Daemon {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        http::serve_with_shutdown(self.listener, self.broker, shutdown).await
+        let probe = self
+            .clock
+            .map(|client| tokio::spawn(clock_probe(client, Arc::clone(&self.broker))));
+        let served = http::serve_with_shutdown(self.listener, self.broker, shutdown).await;
+        if let Some(p) = probe {
+            p.abort();
+        }
+        served
+    }
+}
+
+/// How often the clock probe retries while the server is unreachable
+/// or the skew is above `clock_skew_refuse` ("until resolved").
+pub const CLOCK_PROBE_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// REQ-API-007 startup clock check: compare the system clock with the
+/// Vaultwarden `Date` header and feed the broker's gate. One sample at
+/// startup; repeated every [`CLOCK_PROBE_RETRY`] while the server is
+/// unreachable or the verdict is `refuse`, so fixing the clock reopens
+/// `fill_totp` without a restart. Warnings go to stderr in the same
+/// `kharond: warning:` form as config warnings, once per change.
+pub async fn clock_probe(client: SyncClient, broker: Arc<DaemonBroker>) {
+    let mut reported_unreachable = false;
+    let mut last_warning: Option<SkewVerdict> = None;
+    loop {
+        match client.clock_sample().await {
+            Ok(sample) => {
+                let (obs, appended) = broker.observe_clock(sample);
+                if appended.is_err() {
+                    eprintln!("kharond: warning: clock_skew audit entry could not be written");
+                }
+                if let Some(w) = &obs.warning
+                    && last_warning != Some(obs.verdict)
+                {
+                    eprintln!("kharond: warning: {w}");
+                }
+                if obs.verdict == SkewVerdict::Ok && last_warning.is_some() {
+                    eprintln!("kharond: clock skew resolved ({:+} s)", obs.skew_secs);
+                }
+                last_warning = (obs.verdict != SkewVerdict::Ok).then_some(obs.verdict);
+                if obs.verdict != SkewVerdict::Refuse {
+                    return;
+                }
+            }
+            Err(e) => {
+                if !reported_unreachable {
+                    eprintln!(
+                        "kharond: warning: clock skew check against the server failed ({e}); \
+                         retrying every {} s",
+                        CLOCK_PROBE_RETRY.as_secs()
+                    );
+                    reported_unreachable = true;
+                }
+            }
+        }
+        tokio::time::sleep(CLOCK_PROBE_RETRY).await;
     }
 }
 

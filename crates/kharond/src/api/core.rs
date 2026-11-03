@@ -33,6 +33,8 @@ use crate::audit::{AuditLog, Entry, Event};
 use crate::lock::{AuditError, Clock, LockController, SystemClock};
 use crate::origin::OriginConfig;
 use crate::sync::{LiveSync, Vault};
+use crate::totp::skew::Observation;
+use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy};
 
 /// Longest accepted `origin` (bytes).
 pub const MAX_ORIGIN_LEN: usize = 2048;
@@ -230,6 +232,7 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     lock: Mutex<LockController<S, C>>,
     audit: Mutex<Box<dyn AuditSink>>,
     origin_cfg: OriginConfig,
+    clock_skew: ClockSkewGate,
 }
 
 impl<S: VaultView, C: Clock> Broker<S, C> {
@@ -245,7 +248,39 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             lock: Mutex::new(lock),
             audit: Mutex::new(audit),
             origin_cfg,
+            clock_skew: ClockSkewGate::default(),
         }
+    }
+
+    /// Use `[policy] clock_skew_warn` / `clock_skew_refuse` instead of
+    /// the 30 s / 90 s defaults (REQ-API-007).
+    pub fn with_clock_skew_policy(mut self, policy: SkewPolicy) -> Self {
+        self.clock_skew = ClockSkewGate::new(policy);
+        self
+    }
+
+    /// The REQ-API-007 clock gate `fill_totp` consults.
+    pub fn clock_skew(&self) -> &ClockSkewGate {
+        &self.clock_skew
+    }
+
+    /// Record a server clock sample (REQ-API-007): update the gate and
+    /// append the `clock_skew` audit entry if the sample warrants one.
+    /// The gate is updated even if the append fails (a refusal must not
+    /// depend on the log being writable); the append result is returned
+    /// alongside so the caller can report it.
+    pub fn observe_clock(&self, sample: ClockSample) -> (Observation, Result<(), ApiError>) {
+        let obs = self.clock_skew.observe(sample);
+        let appended = match obs.audit.clone() {
+            Some(entry) => self
+                .audit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .append(entry)
+                .map_err(|_| ApiError::AUDIT_FAILED),
+            None => Ok(()),
+        };
+        (obs, appended)
     }
 
     /// The lock controller (owner unlock, sync, tests). A

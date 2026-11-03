@@ -13,3 +13,4 @@ pub mod export;
 pub mod lock;
 pub mod origin;
 pub mod sync;
+pub mod totp;

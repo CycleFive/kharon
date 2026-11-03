@@ -299,6 +299,12 @@ pub enum ConfigError {
     /// The export file's KDF parameters are unsupported or out of range.
     #[error("export file KDF parameters are invalid")]
     ExportKdfInvalid,
+    /// Startup classification returned the unlock-only auth failure:
+    /// unreachable in practice (classification never authenticates),
+    /// but a typed error instead of a panic in the startup path
+    /// (PR #59 review, non-blocking b).
+    #[error("export startup classification failed authentication (ExportAuthFailed)")]
+    ExportAuthFailed,
     /// The export file could not be read.
     #[error("cannot read export file {path}: {kind}")]
     ExportRead {
@@ -351,6 +357,7 @@ impl ConfigError {
             Self::DataDirNotAbsolute => "data_dir_not_absolute",
             Self::ExportNotPasswordEncrypted => "export_not_password_encrypted",
             Self::ExportKdfInvalid => "export_kdf_invalid",
+            Self::ExportAuthFailed => "export_auth_failed",
             Self::ExportRead { .. } => "export_read",
         }
     }
@@ -709,8 +716,15 @@ impl Config {
         if let Source::Export(exp) = &self.source {
             // REQ-EXP-002: the export file must classify as a
             // password-protected encrypted export at startup, before
-            // any unlock exists. The parsed envelope is dropped here;
-            // the unlock path loads its own copy.
+            // any unlock exists. This call is classification only,
+            // and dropping the parsed envelope here is safe ONLY
+            // because no unlock path exists yet: under the
+            // REQ-EXP-004 load-once contract, when the unlock channel
+            // lands the daemon must keep the startup `ExportFile`
+            // and use it for every unlock — re-reading the file at
+            // unlock would let a replaced file take effect without a
+            // restart, and would reopen a classify/use gap
+            // (PR #59 review, non-blocking a).
             crate::export::ExportFile::load(&exp.file).map_err(|e| match e {
                 crate::export::ExportError::NotPasswordEncrypted => {
                     ConfigError::ExportNotPasswordEncrypted
@@ -719,9 +733,7 @@ impl Config {
                 crate::export::ExportError::Read { path, kind } => {
                     ConfigError::ExportRead { path, kind }
                 }
-                crate::export::ExportError::AuthFailed => {
-                    unreachable!("invariant: startup classification never authenticates")
-                }
+                crate::export::ExportError::AuthFailed => ConfigError::ExportAuthFailed,
             })?;
         }
         Ok(warnings)

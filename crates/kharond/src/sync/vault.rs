@@ -111,7 +111,7 @@ impl Item {
     /// text under the export session's per-unlock key, so an `Item`
     /// never holds a plaintext secret in either mode.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         id: String,
         name: String,
         username: Option<String>,
@@ -153,12 +153,12 @@ impl Item {
     /// The protected (EncString) password text, for the session that
     /// owns the key for it (the export loader's wrap key). Ciphertext,
     /// never plaintext.
-    pub fn protected_password(&self) -> Option<&str> {
+    pub(crate) fn protected_password(&self) -> Option<&str> {
         self.protected_password.as_deref()
     }
     /// The protected (EncString) TOTP text; see
     /// [`Item::protected_password`].
-    pub fn protected_totp(&self) -> Option<&str> {
+    pub(crate) fn protected_totp(&self) -> Option<&str> {
         self.protected_totp.as_deref()
     }
     pub fn has_password(&self) -> bool {
@@ -208,7 +208,7 @@ pub struct Vault {
 impl Vault {
     /// Build a vault from items constructed outside the sync path
     /// (the export loader, issue #12), with the loader's own report.
-    pub fn with_report(items: Vec<Item>, report: SyncReport) -> Self {
+    pub(crate) fn with_report(items: Vec<Item>, report: SyncReport) -> Self {
         let items = items.into_iter().map(|i| (i.id.clone(), i)).collect();
         Self { items, report }
     }

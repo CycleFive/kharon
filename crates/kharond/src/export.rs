@@ -40,8 +40,12 @@
 //!   parse has succeeded.
 //!
 //! Field classes (REQ-CRY-006) survive the plaintext source: the
-//! decrypted export is held in a zeroizing buffer only for the
-//! duration of `unlock`. Name, username and URIs are metadata and are
+//! decrypted export bytes stay in a zeroizing buffer, are parsed
+//! with `serde_json::from_slice` straight from that buffer (no
+//! `String`/`Vec` copy), and `login.password` / `login.totp`
+//! deserialize into `Zeroizing<String>` fields that `build_session`
+//! `take()`s — never clones — into the re-wrap step (PR #59 review).
+//! Name, username and URIs are metadata and are
 //! held as such; password and TOTP are immediately re-wrapped as
 //! type-2 EncStrings under a fresh per-unlock symmetric key
 //! ([`ExportSession`]'s wrap key, OS-random, zeroized on drop), so
@@ -165,10 +169,14 @@ struct PlaintextItem {
 struct PlaintextLogin {
     #[serde(default)]
     username: Option<String>,
+    // Secrets deserialize into zeroizing buffers (zeroize's `serde`
+    // feature) and are taken, not cloned, by `build_session`, so no
+    // un-wiped copy is left in freed heap memory (REQ-CRY-006,
+    // REQ-EXP-003; PR #59 review, blocking item 1).
     #[serde(default)]
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
     #[serde(default)]
-    totp: Option<String>,
+    totp: Option<Zeroizing<String>>,
     #[serde(default)]
     uris: Option<Vec<PlaintextUri>>,
 }
@@ -288,11 +296,13 @@ impl ExportFile {
             .decrypt_symmetric(&key)
             .map_err(|_| ExportError::AuthFailed)?;
         drop(key);
-        let text =
-            Zeroizing::new(String::from_utf8(data.to_vec()).map_err(|_| ExportError::AuthFailed)?);
-        drop(data);
+        // Parse straight from the zeroizing buffer: no `to_vec()` /
+        // `String::from_utf8` copy (whose error path would also drop
+        // a plain `Vec` copy unwiped). Invalid UTF-8 fails JSON
+        // parsing here and collapses to AuthFailed, as before.
         let plain: PlaintextExport =
-            serde_json::from_str(&text).map_err(|_| ExportError::AuthFailed)?;
+            serde_json::from_slice(&data).map_err(|_| ExportError::AuthFailed)?;
+        drop(data);
         build_session(plain, &self.sha256_hex)
     }
 }
@@ -318,15 +328,15 @@ fn build_session(plain: PlaintextExport, sha256_hex: &str) -> Result<ExportSessi
     let wrap_key = SymmetricKey::from_slice(&key_bytes[..])
         .expect("invariant: 64 random bytes are a valid symmetric key");
     drop(key_bytes);
+    // `encrypt_symmetric` draws its own OS-random IV per call.
     let wrap = |secret: &str| -> String {
-        let mut iv = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut iv);
-        EncString::encrypt_symmetric(secret.as_bytes(), &wrap_key, &iv).to_wire_string()
+        EncString::encrypt_symmetric(secret.as_bytes(), &wrap_key).to_wire_string()
     };
-    let nonempty = |s: Option<String>| s.filter(|s| !s.is_empty());
+    let nonempty = |s: Option<Zeroizing<String>>| s.filter(|s| !s.is_empty());
 
     let mut report = SyncReport::default();
     let mut items = Vec::new();
+    let mut seen_ids = std::collections::BTreeSet::new();
     for raw in plain.items.into_iter().flatten() {
         if raw.kind != CIPHER_TYPE_LOGIN || raw.deleted_date.is_some() {
             report.skipped += 1;
@@ -335,7 +345,15 @@ fn build_session(plain: PlaintextExport, sha256_hex: &str) -> Result<ExportSessi
         // A login item without a name is a corrupt export: fail the
         // whole load rather than emit a partial vault (REQ-EXP-005).
         let name = raw.name.ok_or(ExportError::AuthFailed)?;
-        let login = raw.login;
+        // A duplicate id (after normalization) is likewise corrupt:
+        // refuse it rather than let the last copy silently win in
+        // the vault map while `report.kept` counts both (PR #59
+        // review, non-blocking f).
+        let id = crate::sync::norm_id(&raw.id);
+        if !seen_ids.insert(id.clone()) {
+            return Err(ExportError::AuthFailed);
+        }
+        let mut login = raw.login;
         let username = login.as_ref().and_then(|l| l.username.clone());
         let uris = login
             .as_ref()
@@ -349,12 +367,14 @@ fn build_session(plain: PlaintextExport, sha256_hex: &str) -> Result<ExportSessi
                 })
             })
             .collect();
+        // Take the secrets out of the login (no clone): each
+        // Zeroizing buffer moves into the re-wrap and the plaintext
+        // is wiped when that buffer drops at the end of the map call.
         let protected_password =
-            nonempty(login.as_ref().and_then(|l| l.password.clone())).map(|p| wrap(&p));
-        let protected_totp =
-            nonempty(login.as_ref().and_then(|l| l.totp.clone())).map(|t| wrap(&t));
+            nonempty(login.as_mut().and_then(|l| l.password.take())).map(|p| wrap(&p));
+        let protected_totp = nonempty(login.as_mut().and_then(|l| l.totp.take())).map(|t| wrap(&t));
         items.push(Item::from_parts(
-            crate::sync::norm_id(&raw.id),
+            id,
             name,
             username,
             uris,
@@ -478,6 +498,30 @@ mod tests {
         // The vault's Debug surface (id only, per `Item`) carries no
         // plaintext secret.
         assert!(!format!("{:?}", session.vault()).contains(CANARY_PASSWORD));
+    }
+
+    #[test]
+    fn duplicate_item_ids_are_refused_not_silently_overwritten() {
+        let item = |name: &str| PlaintextItem {
+            id: "11111111-2222-3333-4444-555555555555".to_string(),
+            kind: CIPHER_TYPE_LOGIN,
+            name: Some(name.to_string()),
+            login: Some(PlaintextLogin {
+                username: None,
+                password: Some(Zeroizing::new("secret".to_string())),
+                totp: None,
+                uris: None,
+            }),
+            revision_date: None,
+            deleted_date: None,
+        };
+        let plain = PlaintextExport {
+            items: Some(vec![item("One"), item("Two")]),
+        };
+        assert!(matches!(
+            build_session(plain, "00"),
+            Err(ExportError::AuthFailed)
+        ));
     }
 
     #[test]

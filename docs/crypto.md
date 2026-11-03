@@ -33,6 +33,16 @@ What kharon wipes, and what it cannot (accepted limits, PR #34 review):
   `Zeroizing` and wipe on drop. Argon2's working memory (the m-KiB
   block array derived from the password) is wiped because the
   `argon2` crate is built with its `zeroize` feature.
+- The export loader (REQ-EXP-003 / REQ-CRY-006, PR #59 review):
+  the decrypted export bytes stay in a `Zeroizing<Vec<u8>>` and are
+  parsed with `serde_json::from_slice` straight from it — no
+  `String`/`Vec` copy of the plaintext exists. `login.password` and
+  `login.totp` deserialize into `Zeroizing<String>` fields (zeroize's
+  `serde` feature) and are `take()`n, never cloned, into the re-wrap
+  step. Remaining residue, accepted on the same basis as the KDF
+  internals below: `serde_json`'s internal scratch buffer for strings
+  containing escape sequences is allocated and freed by `serde_json`
+  without a wipe hook.
 - Inside the RustCrypto KDF/HMAC constructions (PBKDF2, HKDF-Expand),
   internal states hold copies of the password / PRK that those crates
   do not expose zeroization hooks for. Those copies live for the

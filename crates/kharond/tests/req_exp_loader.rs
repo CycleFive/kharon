@@ -125,6 +125,11 @@ fn req_exp_002_refuses_plaintext_json_csv_and_account_restricted() {
     // `passwordProtected` false, no salt/KDF/validation envelope.
     let account_restricted =
         r#"{"encrypted": true, "passwordProtected": false, "data": "2.AAAA|BBBB|CCCC"}"#;
+    // Account-restricted, the real shape users actually have
+    // (PR #59 review, non-blocking g): the validation EncString at
+    // top level, folders/items in the clear, no `passwordProtected`
+    // and no `data` at all.
+    let account_restricted_real = r#"{"encrypted": true, "encKeyValidation_DO_NOT_EDIT": "2.AAAA|BBBB|CCCC", "folders": [], "items": []}"#;
     // Encrypted but the passwordProtected flag is absent entirely.
     let flag_absent = r#"{"encrypted": true, "salt": "x", "data": "2.AAAA|BBBB|CCCC"}"#;
     // Envelope flags set, but the data field is not an EncString.
@@ -134,6 +139,7 @@ fn req_exp_002_refuses_plaintext_json_csv_and_account_restricted() {
         ("plaintext json", plaintext),
         ("csv", csv),
         ("account-restricted", account_restricted),
+        ("account-restricted (real shape)", account_restricted_real),
         ("passwordProtected absent", flag_absent),
         ("data not an encstring", data_not_encstring),
     ] {
@@ -210,16 +216,19 @@ fn req_exp_003_session_carries_no_plaintext_password_or_secret() {
     assert!(!audit.contains(PASSWORD));
     assert!(!audit.contains(CANARY));
     assert!(!format!("{:?}", session.vault()).contains(CANARY));
-    // The stored password field is an EncString (it parses, and its
-    // wire form differs from the plaintext it protects).
+    // The stored password field is an EncString, not the plaintext:
+    // it decrypts through the session's wrap key (and only there) —
+    // `Item::protected_password` is crate-private (PR #59 review,
+    // non-blocking e), so the check goes through `decrypt_secret`.
     let item = session
         .vault()
         .items()
         .find(|i| i.name() == "Example Login")
         .unwrap();
-    let stored = item.protected_password().unwrap();
-    assert!(stored.starts_with("2."));
-    assert!(!stored.contains(CANARY));
+    let pt = session
+        .decrypt_secret(item.id(), SecretField::Password)
+        .unwrap();
+    assert_eq!(&pt[..], CANARY.as_bytes());
 }
 
 #[test]
@@ -297,14 +306,33 @@ fn req_exp_005_wrong_password_and_tampered_fields_fail_without_partial_load() {
         Err(ExportError::AuthFailed)
     ));
 
-    // Tampered data (the correct password, a flipped ciphertext
-    // character near the end of the data segment): AuthFailed, and
-    // by construction no session — hence no partial item set — is
-    // ever returned on this path.
+    // Tampered data, MAC segment (the correct password, one flipped
+    // character near the end of the file, which lands inside the
+    // data EncString's MAC segment): AuthFailed.
     let mut bytes = FIXTURE_A.as_bytes().to_vec();
     let pos = bytes.len() - 30;
     bytes[pos] = if bytes[pos] == b'A' { b'B' } else { b'A' };
     let tampered = String::from_utf8(bytes).unwrap();
+    let file = ExportFile::from_bytes(tampered.as_bytes()).unwrap();
+    assert!(matches!(
+        file.unlock(&password()),
+        Err(ExportError::AuthFailed)
+    ));
+
+    // Tampered data, ciphertext segment (PR #59 review, non-blocking
+    // c: the case above flips the MAC, not the ct): flip one base64
+    // character inside the data EncString's ct segment itself.
+    // AuthFailed, and by construction no session — hence no partial
+    // item set — is ever returned on this path.
+    let mut v: serde_json::Value = serde_json::from_str(FIXTURE_A).unwrap();
+    let data = v["data"].as_str().unwrap().to_owned();
+    let mut segs: Vec<String> = data.split('|').map(str::to_owned).collect();
+    assert_eq!(segs.len(), 3, "type-2 wire form is iv|ct|mac");
+    let ct_first = segs[1].as_bytes()[0];
+    segs[1].replace_range(..1, if ct_first == b'A' { "B" } else { "A" });
+    v["data"] = serde_json::Value::String(segs.join("|"));
+    let tampered = v.to_string();
+    assert_ne!(tampered, FIXTURE_A);
     let file = ExportFile::from_bytes(tampered.as_bytes()).unwrap();
     let err = file.unlock(&password()).unwrap_err();
     assert!(matches!(err, ExportError::AuthFailed));

@@ -977,7 +977,11 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "kharond",
+ "rustix",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

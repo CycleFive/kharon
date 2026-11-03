@@ -219,7 +219,7 @@ async fn req_dep_006_loopback_listen_serves_status() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(
         r.json(),
-        json!({"locked": true, "agent_id": "assistant", "grants": []})
+        json!({"locked": true, "agent_id": "assistant", "grants": [], "browser_context_id": null})
     );
     // REQ-MEM-005: booted locked, so vault calls are 423.
     let r = get(addr, "/v1/items", Some(&token)).await;
@@ -313,7 +313,7 @@ async fn req_dep_006_daemon_binary_serves_status_on_loopback() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(
         r.json(),
-        json!({"locked": true, "agent_id": "assistant", "grants": []})
+        json!({"locked": true, "agent_id": "assistant", "grants": [], "browser_context_id": null})
     );
     assert_eq!(get(addr, "/v1/items?q=x", Some(&token)).await.status, 423);
 

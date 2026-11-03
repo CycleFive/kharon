@@ -6,7 +6,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Whether the broker is locked, the calling agent's id, and its active grants. Same body as GET /v1/status.",
+    "description": "Whether the broker is locked, the calling agent's id, its active grants, and its cached browser_context_id (null until kharon_context or a fill opened one, and after a lock or browser restart; reading status never connects). Same body as GET /v1/status.",
     "inputSchema": {
       "additionalProperties": false,
       "description": "`kharon_status` arguments: none.",
@@ -331,5 +331,23 @@
     },
     "name": "kharon_fill_totp",
     "title": "Fill a TOTP code"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Your own browser context id (browser_context_id, the CDP browserContextId): connects to your configured browser if needed and creates your context, or returns the one already open. Open the tabs you want filled in it (Target.createTarget with this browserContextId); tabs elsewhere are target_not_owned. The same id until the connection ends: after a browser restart or a broker lock you get a new one. Requires unlock. Bounded by the fill deadline (10 s). Audited. Same body as POST /v1/context.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "`kharon_context` arguments: none (#65).",
+      "properties": {},
+      "title": "ContextArgs",
+      "type": "object"
+    },
+    "name": "kharon_context",
+    "title": "Your browser context"
   }
 ]

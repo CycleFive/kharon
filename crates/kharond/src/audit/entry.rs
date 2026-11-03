@@ -50,6 +50,18 @@ pub enum Event {
     /// Best effort: written from a drop guard, so a lost append leaves the
     /// orphan `fill_dispatch` as the evidence.
     FillAborted,
+    /// REQ-ARCH-005 / REQ-AUD-003† (#65): `kharon_context` /
+    /// `POST /v1/context` is about to connect to the agent's browser or
+    /// return its cached context. Appended before any CDP write; if the
+    /// append fails the call is refused and the browser is not touched.
+    /// Carries the request id. Exactly one `context` outcome entry with
+    /// the same `request_id` follows it.
+    ContextOpen,
+    /// REQ-ARCH-005 / REQ-AUD-003† (#65): the outcome of a context
+    /// request: result `ok`, `timeout` (`deadline_expired`), `error`
+    /// (`cdp_error`, `fill_unavailable`), `locked`, or `aborted`
+    /// (`handler_dropped`, best effort from a drop guard).
+    Context,
     /// REQ-API-007: the system clock differs from the Vaultwarden
     /// server's `Date` by more than `clock_skew_warn` (result `warn` or
     /// `refuse`), or a previous skew was resolved (result `resolved`).
@@ -85,6 +97,8 @@ impl Event {
             Event::FillTimeout => "fill_timeout",
             Event::FillDispatch => "fill_dispatch",
             Event::FillAborted => "fill_aborted",
+            Event::ContextOpen => "context_open",
+            Event::Context => "context",
             Event::ClockSkew => "clock_skew",
             Event::LogTruncated => "log_truncated",
         }
@@ -124,6 +138,8 @@ impl<'de> Deserialize<'de> for Event {
             "fill_timeout" => Event::FillTimeout,
             "fill_dispatch" => Event::FillDispatch,
             "fill_aborted" => Event::FillAborted,
+            "context_open" => Event::ContextOpen,
+            "context" => Event::Context,
             "clock_skew" => Event::ClockSkew,
             "log_truncated" => Event::LogTruncated,
             other => {

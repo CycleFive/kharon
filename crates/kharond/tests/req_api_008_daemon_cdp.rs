@@ -22,6 +22,14 @@
 //!   the browser; the first fill after unlock reconnects with a fresh
 //!   context; a fill racing a lock leaves nothing cached.
 //!
+//! - The context handoff (REQ-ARCH-005, #65): `POST /v1/context`
+//!   connects lazily and returns the agent's cached context id
+//!   (idempotent: one connection, one `createBrowserContext`); status
+//!   reports it from the cache only (`null` before and after
+//!   invalidation, never connecting); a reconnect or a lock gives a new
+//!   id, tabs of the old context stay `target_not_owned`; `context_open`
+//!   is written before any CDP I/O and the deadline bounds the call.
+//!
 //! The browser-level E2E (a real Chromium and form) is #24.
 
 mod api_support;
@@ -88,7 +96,8 @@ impl Stub {
 
 /// A CDP peer: every connection gets context `ctx-<n>` from
 /// `createBrowserContext`, and page `t1` on `URL` lives in the latest
-/// context.
+/// context; page `t-ctx1` on `URL` always lives in `ctx-1` (a tab the
+/// agent opened in its first context).
 async fn cdp_stub(mode: Mode) -> (String, Stub) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -117,6 +126,12 @@ async fn cdp_stub(mode: Mode) -> (String, Stub) {
                     }
                     let result = match method.as_str() {
                         "Target.createBrowserContext" => json!({ "browserContextId": ctx }),
+                        "Target.getTargetInfo" if msg["params"]["targetId"] == "t-ctx1" => {
+                            json!({ "targetInfo": {
+                                "targetId": "t-ctx1", "browserContextId": "ctx-1",
+                                "url": URL, "title": "", "type": "page",
+                            } })
+                        }
                         "Target.getTargetInfo" => json!({ "targetInfo": {
                             "targetId": "t1", "browserContextId": ctx,
                             "url": URL, "title": "", "type": "page",
@@ -276,13 +291,33 @@ async fn run_with_backend(
 
 impl Run {
     async fn fill(&self, submit: bool) -> RawResponse {
+        self.fill_target("t1", submit).await
+    }
+
+    async fn fill_target(&self, target: &str, submit: bool) -> RawResponse {
         let body = json!({
             "item_id": self.item_id,
-            "target": {"cdp_target_id": "t1", "expected_origin": "https://example.com"},
+            "target": {"cdp_target_id": target, "expected_origin": "https://example.com"},
             "fields": [{"kind": "username"}, {"kind": "password"}],
             "submit": submit,
         });
         post_json(self.addr, "/v1/fill", Some(&self.token), &body.to_string()).await
+    }
+
+    /// `POST /v1/context` with an empty body (#65).
+    async fn context(&self) -> RawResponse {
+        let head = format!(
+            "POST /v1/context HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            self.token
+        );
+        api_support::raw_request(self.addr, head.as_bytes()).await
+    }
+
+    /// `browser_context_id` from `GET /v1/status`.
+    async fn status_context(&self) -> Value {
+        let r = get(self.addr, "/v1/status", Some(&self.token)).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()["browser_context_id"].clone()
     }
 
     /// Owner lock (`kharon lock`): returns whether a session was
@@ -783,4 +818,201 @@ async fn req_mem_007_fill_racing_a_lock_leaves_no_cached_context() {
     assert_eq!(r.fill(false).await.json(), filled());
     assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
     assert_eq!(stub.methods("Target.createBrowserContext"), 2);
+}
+
+// ---- context handoff (REQ-ARCH-005, #65) ------------------------------
+
+fn context_ok(id: &str) -> Value {
+    json!({"status": "ok", "browser_context_id": id})
+}
+
+fn context_pair(result: &str) -> Vec<Value> {
+    vec![
+        json!(["context_open", "alpha", null, "dispatched"]),
+        json!(["context", "alpha", null, result]),
+    ]
+}
+
+/// Each `context_open` and the outcome after it share a request id.
+fn assert_paired(e: &[Value]) {
+    for (i, x) in e.iter().enumerate() {
+        if x["event"] == "context_open" {
+            assert_eq!(e[i + 1]["event"], "context", "{e:?}");
+            assert_eq!(x["request_id"], e[i + 1]["request_id"], "{e:?}");
+            assert!(x["request_id"].is_string());
+        }
+    }
+}
+
+/// #65: lazy until the first call; the call connects and creates the
+/// context; a second call returns the same id over the same connection
+/// (one `createBrowserContext`); status reads the cache only, `null`
+/// before; a fill then lands in that context without a second one.
+#[tokio::test]
+async fn req_arch_005_context_is_lazy_idempotent_and_in_status() {
+    let (url, stub) = cdp_stub(Mode::Normal).await;
+    let r = run(&url, DEADLINE).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(r.status_context().await, Value::Null);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        stub.connections.load(Ordering::SeqCst),
+        0,
+        "status never connects"
+    );
+
+    for _ in 0..2 {
+        let resp = r.context().await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(resp.header("cache-control"), Some("no-store"));
+        assert_eq!(resp.json(), context_ok("ctx-1"));
+    }
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(stub.methods("Target.createBrowserContext"), 1);
+    assert_eq!(stub.frame_count(), 1, "nothing but createBrowserContext");
+    assert_eq!(r.status_context().await, json!("ctx-1"));
+
+    assert_eq!(r.fill(false).await.json(), filled());
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(stub.methods("Target.createBrowserContext"), 1);
+    let mut want = context_pair("ok");
+    want.extend(context_pair("ok"));
+    want.extend(dispatch_then("fill", "filled"));
+    assert_eq!(r.audit.summary(), want);
+    assert_paired(&r.entries());
+}
+
+/// #65: a reconnect invalidates the id (status `null` once the
+/// connection ended), the next call returns the new context's id, and a
+/// tab of the old context is `target_not_owned`.
+#[tokio::test]
+async fn req_arch_005_reconnect_gives_a_new_id() {
+    let (url, stub) = cdp_stub(Mode::CloseAfterFill).await;
+    let r = run(&url, DEADLINE).await;
+    assert_eq!(r.context().await.json(), context_ok("ctx-1"));
+    // The old-context tab is owned while ctx-1 is live.
+    assert_eq!(r.fill_target("t-ctx1", false).await.json(), filled());
+    eventually("connection closed", || {
+        stub.closed.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(r.status_context().await, Value::Null, "invalidated");
+
+    assert_eq!(r.context().await.json(), context_ok("ctx-2"));
+    assert_eq!(r.status_context().await, json!("ctx-2"));
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
+    let resp = r.fill_target("t-ctx1", false).await;
+    assert_eq!(
+        resp.json(),
+        json!({"status": "target_not_owned", "fields_filled": []}),
+        "{}",
+        resp.body
+    );
+    assert_eq!(
+        r.context().await.json(),
+        context_ok("ctx-2"),
+        "still cached"
+    );
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
+}
+
+/// #65 + #66: a lock invalidates the id at once (status `null`), the
+/// call is 423 while locked (one `context`/`locked` entry, no
+/// `context_open`, no CDP), and after unlock a new context is created.
+#[tokio::test]
+async fn req_arch_005_lock_gates_and_invalidates_the_context() {
+    let (url, stub) = cdp_stub(Mode::Normal).await;
+    let r = run(&url, DEADLINE).await;
+    assert_eq!(r.context().await.json(), context_ok("ctx-1"));
+    assert!(r.lock());
+    assert_eq!(r.status_context().await, Value::Null, "invalidated by lock");
+    eventually("connection closed", || {
+        stub.closed.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let sent = stub.frame_count();
+    let resp = r.context().await;
+    assert_eq!(resp.status, 423, "{}", resp.body);
+    assert_eq!(resp.json()["error"], "locked");
+    assert_eq!(stub.frame_count(), sent);
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 1);
+    let mut want = context_pair("ok");
+    want.push(json!(["context", "alpha", null, "locked"]));
+    assert_eq!(r.audit.summary(), want);
+
+    r.unlock();
+    assert_eq!(r.status_context().await, Value::Null);
+    assert_eq!(r.context().await.json(), context_ok("ctx-2"));
+    assert_eq!(r.status_context().await, json!("ctx-2"));
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(stub.methods("Target.createBrowserContext"), 2);
+}
+
+/// REQ-AUD-003† for the handoff: `context_open` is appended before any
+/// CDP I/O (no connection, no frame at that moment), and a failed
+/// append is `audit_failed` with no connection at all.
+#[tokio::test]
+async fn req_aud_003_context_open_precedes_any_cdp_io() {
+    let (url, stub) = cdp_stub(Mode::Normal).await;
+    let r = run(&url, DEADLINE).await;
+
+    *r.audit.fail_event.lock().unwrap() = Some("context_open");
+    let resp = r.context().await;
+    assert_eq!(resp.status, 500, "{}", resp.body);
+    assert_eq!(resp.json()["error"], "audit_failed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 0);
+    assert!(r.audit.summary().is_empty());
+    *r.audit.fail_event.lock().unwrap() = None;
+
+    let seen: Arc<Mutex<Vec<(String, usize, usize)>>> = Arc::default();
+    let (s, st) = (Arc::clone(&seen), stub.clone());
+    *r.audit.on_append.lock().unwrap() = Some(Box::new(move |e| {
+        let ev = serde_json::to_value(&e.event).unwrap();
+        s.lock().unwrap().push((
+            ev.as_str().unwrap().to_owned(),
+            st.connections.load(Ordering::SeqCst),
+            st.frame_count(),
+        ));
+    }));
+    assert_eq!(r.context().await.json(), context_ok("ctx-1"));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            ("context_open".to_owned(), 0, 0),
+            ("context".to_owned(), 1, 1)
+        ]
+    );
+    assert_paired(&r.entries());
+}
+
+/// REQ-API-009 for the handoff: a stalled `createBrowserContext` is cut
+/// off at the fill deadline: `timeout`, no CDP frame after expiry, and
+/// `context_open` plus exactly one `context`/`timeout`
+/// (`deadline_expired`, same request id). Status stays `null`.
+#[tokio::test]
+async fn req_api_009_context_respects_fill_deadline() {
+    let (url, stub) = cdp_stub(Mode::Stall("Target.createBrowserContext")).await;
+    let r = run(&url, Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let resp = r.context().await;
+    let took = started.elapsed();
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(resp.json(), json!({"status": "timeout"}));
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    let sent = stub.frame_count();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(stub.frame_count(), sent, "no CDP frame after expiry");
+    let e = r.entries();
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!(e[0]["event"], "context_open");
+    assert_eq!(e[1]["event"], "context");
+    assert_eq!(e[1]["result"], "timeout");
+    assert_eq!(e[1]["detail_code"], "deadline_expired");
+    assert_paired(&e);
+    assert_eq!(r.status_context().await, Value::Null);
 }

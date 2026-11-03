@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use argon2::Argon2;
 use kharon_bwcrypto::Kdf;
-use kharond::api::fill::FillFuture;
+use kharond::api::fill::{ContextFuture, FillFuture};
 use kharond::api::token::{ParamFloor, TokenStore, generate_with};
 use kharond::api::{AuditSink, Broker, FillBackend, VaultView};
 use kharond::audit::Entry;
@@ -161,7 +161,13 @@ pub struct RecordingAudit {
     pub fail: Arc<Mutex<bool>>,
     /// Refuse only entries whose serialized `event` is this.
     pub fail_event: Arc<Mutex<Option<&'static str>>>,
+    /// Called with every accepted entry, at append time (so a test can
+    /// observe what had happened when the entry was written).
+    pub on_append: Arc<Mutex<Option<OnAppend>>>,
 }
+
+/// [`RecordingAudit::on_append`] hook.
+pub type OnAppend = Box<dyn Fn(&Entry) + Send>;
 
 impl AuditSink for RecordingAudit {
     fn append(&mut self, entry: Entry) -> Result<(), AuditError> {
@@ -172,6 +178,9 @@ impl AuditSink for RecordingAudit {
             && serde_json::to_value(&entry.event).unwrap() == ev
         {
             return Err(AuditError);
+        }
+        if let Some(hook) = &*self.on_append.lock().unwrap() {
+            hook(&entry);
         }
         self.entries.lock().unwrap().push(entry);
         Ok(())
@@ -469,6 +478,9 @@ pub struct FakeFill {
     /// `live_origin` slot, as the engine does after the ownership
     /// check) before answering. `None` observes nothing.
     pub live_url: Option<&'static str>,
+    /// Agents whose context was requested (`kharon_context`, #65), in
+    /// call order; a `Stall` answer stalls these calls too.
+    pub context_calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeFill {
@@ -477,6 +489,7 @@ impl FakeFill {
             seen: Arc::default(),
             answer,
             live_url: None,
+            context_calls: Arc::default(),
         }
     }
 
@@ -526,6 +539,28 @@ impl FillBackend for FakeFill {
                 FakeAnswer::Stall => std::future::pending().await,
             }
         })
+    }
+
+    /// `ctx-<agent>`, cached once handed out (no generations here).
+    fn context_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        _generation: u64,
+    ) -> ContextFuture<'a> {
+        self.context_calls.lock().unwrap().push(agent_id.to_owned());
+        let answer = self.answer;
+        Box::pin(async move {
+            if matches!(answer, FakeAnswer::Stall) {
+                std::future::pending::<()>().await;
+            }
+            Ok(format!("ctx-{agent_id}"))
+        })
+    }
+
+    fn cached_context_id(&self, agent_id: &str) -> Option<String> {
+        let calls = self.context_calls.lock().unwrap();
+        (!matches!(self.answer, FakeAnswer::Stall) && calls.iter().any(|a| a == agent_id))
+            .then(|| format!("ctx-{agent_id}"))
     }
 }
 

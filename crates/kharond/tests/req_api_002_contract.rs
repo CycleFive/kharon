@@ -646,7 +646,7 @@ enum FillTool {
 struct FillCase {
     name: &'static str,
     locked: bool,
-    /// `None`: no fill backend (the daemon today).
+    /// `None`: no fill backend (a broker built without one).
     backend: Option<FakeAnswer>,
     who: Who,
     tool: FillTool,

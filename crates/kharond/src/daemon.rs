@@ -18,7 +18,11 @@
 //! 5. Audit log under `<data_dir>/audit` (REQ-AUD-001), exclusive.
 //! 6. Lock controller, **locked** (REQ-MEM-005): there is no unlock
 //!    channel yet, so every vault-touching call answers 423.
-//! 7. Bind the listener last.
+//! 7. Fill backend: each agent's `cdp` endpoint (REQ-API-008). No
+//!    browser I/O here: an agent's connection and browser context
+//!    (REQ-ARCH-005) are made by its first fill, so startup does not
+//!    depend on the browser being reachable.
+//! 8. Bind the listener last.
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
@@ -35,7 +39,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::api::core::Broker;
-use crate::api::fill::FillPolicy;
+use crate::api::fill::{ConnectingCdpBackend, FillPolicy};
 use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
 use crate::audit::{AuditConfig as LogConfig, AuditLog, FileCheckpointSink, OpenError};
@@ -188,10 +192,12 @@ pub async fn start(
         Broker::new(tokens, lock, Box::new(audit), cfg.policy.origin_config())
             .with_clock_skew_policy(SkewPolicy::from(&cfg.policy))
             // REQ-API-009 `fill_deadline` and the fill origin policy.
-            // No fill backend yet: the CDP connection and per-agent
-            // browser contexts are wired by a follow-up to #18, so
-            // until then every fill is `error`/`fill_unavailable`.
-            .with_fill_policy(FillPolicy::from(&cfg.policy)),
+            .with_fill_policy(FillPolicy::from(&cfg.policy))
+            // REQ-API-008: each agent's configured CDP endpoint,
+            // connected (and its browser context created, REQ-ARCH-005)
+            // on its first fill, after the `fill_dispatch` entry and
+            // inside the deadline. Startup does not need the browser.
+            .with_fill_backend(Box::new(ConnectingCdpBackend::from_agents(&cfg.agents))),
     );
     // REQ-API-007: the server whose `Date` the clock is checked
     // against. Building the client does no I/O; config validation has

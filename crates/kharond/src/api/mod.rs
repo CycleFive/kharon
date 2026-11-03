@@ -23,8 +23,8 @@ pub mod token;
 pub use self::core::{AgentId, AuditSink, Broker, Outcome, Request, StatusBody, VaultView};
 pub use error::{ApiError, Detail, ErrorCode};
 pub use fill::{
-    CdpFillBackend, FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus,
-    parse_fill,
+    CdpFillBackend, ConnectingCdpBackend, FillBackend, FillOperation, FillPolicy, FillRequest,
+    FillResult, FillStatus, parse_fill,
 };
 pub use meta::ItemMeta;
 pub use token::{ParamFloor, TokenStore};

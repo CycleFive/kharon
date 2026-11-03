@@ -191,6 +191,13 @@ pub struct Entry {
     /// Number of fields a `fill_dispatch` is about to fill (1..=3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_count: Option<u64>,
+    /// The target's live origin as the browser reported it during the
+    /// fill (only on fill outcome entries: `fill`, `fill_totp`,
+    /// `fill_timeout`, `fill_aborted`; REQ-AUD-003†, #67). Absent when
+    /// the fill never got that far. `origin` on `fill_dispatch` is the
+    /// agent's claim; this is the evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_origin: Option<String>,
 }
 
 impl Entry {
@@ -214,6 +221,7 @@ impl Entry {
             file_sha256: None,
             request_id: None,
             field_count: None,
+            live_origin: None,
         }
     }
 
@@ -280,10 +288,38 @@ impl Entry {
         self
     }
 
+    /// The live origin a fill observed (outcome entries, #67).
+    pub fn live_origin(mut self, v: impl Into<String>) -> Self {
+        self.live_origin = Some(v.into());
+        self
+    }
+
     /// Machine-readable detail code. Never interpolate values here
     /// (REQ-API-006 applies to everything the daemon emits).
     pub fn detail_code(mut self, v: impl Into<String>) -> Self {
         self.detail_code = Some(v.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #67: `live_origin` serializes only when set, so entries written
+    /// before it existed hash and verify unchanged.
+    #[test]
+    fn live_origin_is_omitted_when_unset() {
+        let e = Entry::new(Event::Fill).result("filled");
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("live_origin").is_none());
+        let e = e.live_origin("https://login.example.com");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["live_origin"], "https://login.example.com");
+        let back: Entry = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.live_origin.as_deref(),
+            Some("https://login.example.com")
+        );
     }
 }

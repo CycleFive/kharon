@@ -20,6 +20,7 @@
 //! requesting agent's browser context, or the default context when
 //! `allow_default` is set.
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -81,6 +82,44 @@ pub struct FillPlan {
     /// (REQ-APR-007's "claims A while the tab is on B"). `None` skips
     /// the comparison (engine-level callers).
     pub expected_origin: Option<String>,
+    /// Where the engine records the target's live origin once it has
+    /// read it from the browser (REQ-AUD-003†, #67). The broker copies
+    /// it into the fill's outcome audit entry.
+    pub live_origin: LiveOrigin,
+}
+
+/// The live origin one fill observed (REQ-AUD-003†, #67): the
+/// serialized origin (`scheme://host[:port]`, or `null` for an opaque
+/// origin such as `about:blank`) of the target's URL as the browser
+/// reported it in step 1, after the ownership check passed. Never the
+/// full URL: path, query and fragment can carry tokens.
+///
+/// A write-once slot shared by every clone of the [`FillPlan`] that
+/// carries it, so the broker can still read what was observed when the
+/// fill future was dropped (deadline, client disconnect). Empty when
+/// the fill stopped before the read or the target was not the agent's
+/// (another context's page is never recorded).
+#[derive(Debug, Clone, Default)]
+pub struct LiveOrigin(Arc<OnceLock<String>>);
+
+impl LiveOrigin {
+    /// An empty slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the origin of `href` (first write wins; an unparsable
+    /// URL records nothing).
+    pub fn record_href(&self, href: &str) {
+        if let Ok(u) = url::Url::parse(href) {
+            let _ = self.0.set(u.origin().ascii_serialization());
+        }
+    }
+
+    /// The recorded origin, if any.
+    pub fn get(&self) -> Option<String> {
+        self.0.get().cloned()
+    }
 }
 
 /// The outcome of one fill attempt, one-to-one with `FillResult.status`
@@ -210,6 +249,9 @@ impl FillEngine {
             Ok(info) => info,
             Err(e) => return FillOutcome::from(e),
         };
+        // Owned target: its live origin is audit evidence from here on,
+        // whatever the outcome (REQ-AUD-003†, #67).
+        plan.live_origin.record_href(&info.url);
 
         // The agent's claim can only narrow: claim ≠ live → refuse.
         if let Some(claimed) = &plan.expected_origin
@@ -594,10 +636,11 @@ impl<'a> DeadlineFiller<'a> {
                 for f in &mut plan.fields {
                     f.value.zeroize();
                 }
-                let entry = Entry::new(Event::FillTimeout)
+                let mut entry = Entry::new(Event::FillTimeout)
                     .agent_id(agent_ctx.agent_id())
                     .result("timeout")
                     .detail_code("deadline_expired");
+                entry.live_origin = plan.live_origin.get();
                 // REQ-AUD-003 wants append errors to fail the operation, but
                 // the operation has already failed: the response is `timeout`
                 // regardless. A poisoned log stays poisoned (the audit module
@@ -845,6 +888,7 @@ mod tests {
             cross_origin_iframe_hosts: Vec::new(),
             submit: true, // even a requested submit must never be dispatched
             expected_origin: None,
+            live_origin: LiveOrigin::new(),
         };
         let secret = plan.fields[0].value.clone();
 
@@ -879,6 +923,17 @@ mod tests {
         // REQ-GOAL-001 (partial, for this path): no canary bytes in the
         // audit log or anywhere in the response-reachable state.
         assert!(!audit_text.contains("CANARY"));
+        // #67: the live origin read before the stall is on the timeout
+        // entry, as an origin (the page path is not recorded).
+        assert_eq!(
+            plan.live_origin.get().as_deref(),
+            Some("https://accounts.example.com")
+        );
+        assert!(
+            audit_text.contains("\"live_origin\":\"https://accounts.example.com\""),
+            "audit tail: {audit_text}"
+        );
+        assert!(!audit_text.contains("/login"), "no path in the log");
 
         // No later write reaches the stub after the deadline: the fill
         // future is dropped, so nothing further is sent. Give the peer a
@@ -901,6 +956,37 @@ mod tests {
         drop(calls);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #67: the live origin is recorded as a serialized origin only
+    /// (no path, query, fragment or userinfo), keeps a non-default
+    /// port, is `null` for an opaque origin, ignores an unparsable URL,
+    /// is shared by plan clones, and the first observation wins.
+    #[test]
+    fn req_aud_003_live_origin_slot() {
+        let o = LiveOrigin::new();
+        assert_eq!(o.get(), None);
+        o.record_href("not a url");
+        assert_eq!(o.get(), None, "unparsable records nothing");
+        let shared = o.clone();
+        o.record_href("https://user:pw@Login.Example.com:8443/a/b?token=t#frag");
+        assert_eq!(
+            shared.get().as_deref(),
+            Some("https://login.example.com:8443"),
+            "clones share the slot"
+        );
+        o.record_href("https://evil.test/");
+        assert_eq!(
+            o.get().as_deref(),
+            Some("https://login.example.com:8443"),
+            "first write wins"
+        );
+        let o = LiveOrigin::new();
+        o.record_href("https://example.com:443/x");
+        assert_eq!(o.get().as_deref(), Some("https://example.com"));
+        let o = LiveOrigin::new();
+        o.record_href("about:blank");
+        assert_eq!(o.get().as_deref(), Some("null"), "opaque origin");
     }
 
     #[test]

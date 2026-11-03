@@ -50,7 +50,7 @@ use super::fill::{FillBackend, FillOperation, FillPolicy, FillRequest, FillResul
 use super::meta::{ItemMeta, matches_origin, matches_query};
 use super::token::TokenStore;
 use crate::audit::{AuditLog, Entry, Event};
-use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan};
+use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin};
 use crate::lock::{AuditError, Clock, LockController, SystemClock};
 use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::{LiveSync, SecretField, SyncError, Vault};
@@ -312,7 +312,8 @@ impl Drop for DispatchGuard<'_> {
         if let Some(hook) = self.plan_wiped {
             hook(&self.plan);
         }
-        if let Some(entry) = self.abort_entry.take() {
+        if let Some(mut entry) = self.abort_entry.take() {
+            entry.live_origin = self.plan.live_origin.get();
             let _ = self
                 .audit
                 .lock()
@@ -516,7 +517,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// fails the plan is wiped and the call is
     /// [`ApiError::AUDIT_FAILED`] with no CDP write. After the backend,
     /// exactly one outcome entry (`fill` / `fill_totp` / `fill_timeout`,
-    /// same `request_id`) is appended; its failure is also
+    /// same `request_id`, plus the `live_origin` the engine read if the
+    /// fill got that far, #67) is appended; its failure is also
     /// [`ApiError::AUDIT_FAILED`]. A refusal before the browser (locked,
     /// unknown item, ...) writes only the outcome entry.
     ///
@@ -549,6 +551,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 .item_id(req.item_id.clone())
                 .request_id(request_id.clone())
         };
+        // The live origin the engine read, if the fill got that far
+        // (REQ-AUD-003†, #67); copied into the outcome entry.
+        let mut live_origin = None;
         let status = match self.resolve_fill(agent, &req) {
             Err(Unresolved::Locked) => {
                 self.append(base(event).result("locked"))?;
@@ -584,6 +589,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     );
                     let status = self.run_fill(agent, &guard.plan, deadline).await;
                     guard.abort_entry = None;
+                    live_origin = guard.plan.live_origin.get();
                     drop(guard);
                     status
                 }
@@ -599,6 +605,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 e = e.detail_code(d);
             }
             e
+        };
+        let entry = match live_origin {
+            Some(o) => entry.live_origin(o),
+            None => entry,
         };
         self.append(entry)?;
         Ok(Outcome::Fill(status.result()))
@@ -702,6 +712,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             cross_origin_iframe_hosts: self.fill_policy.cross_origin_iframe_hosts.clone(),
             submit: req.submit,
             expected_origin: Some(req.expected_origin.clone()),
+            live_origin: LiveOrigin::new(),
         })
     }
 }

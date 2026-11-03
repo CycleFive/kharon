@@ -26,6 +26,7 @@ pub use live::{
     check_dedicated_scope, preflight, run, scope_violation,
 };
 pub use push::{HubError, HubStatus, HubTiming, NotificationsHub, UpdateType, run_push};
+pub(crate) use vault::norm_id;
 pub use vault::{Item, ItemUri, Scope, SecretField, Session, SyncReport, Vault};
 
 use kharon_bwcrypto::{EncError, KdfError};

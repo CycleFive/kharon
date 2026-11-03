@@ -16,7 +16,7 @@
 //! type-2 string to the decryptor that skips verification.
 
 use base64ct::{Base64, Encoding};
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use rsa::RsaPrivateKey;
 use sha2::Sha256;
@@ -188,6 +188,62 @@ impl EncString {
         match self {
             Self::AesCbc256WithMac { .. } => TYPE_AES_CBC256_HMAC_SHA256,
             Self::Rsa2048OaepSha1 { .. } => TYPE_RSA2048_OAEP_SHA1,
+        }
+    }
+
+    /// Encrypt `plaintext` as a type-2 EncString under `key`. The IV
+    /// is drawn from the OS RNG inside this function — there is no
+    /// caller-supplied IV in the public API, because under CBC a
+    /// reused IV leaks equal plaintext prefixes (PR #59 review).
+    /// The MAC is `HMAC-SHA256(mac_key, iv || ct)`, exactly what
+    /// [`EncString::decrypt_symmetric`] verifies (REQ-CRY-003).
+    ///
+    /// kharon is overwhelmingly a decryptor; this exists for the
+    /// export loader (REQ-EXP-001), which re-wraps the plaintext
+    /// secrets of a decrypted export under a per-unlock key so the
+    /// vault holds no plaintext secret cache (REQ-CRY-006).
+    pub fn encrypt_symmetric(plaintext: &[u8], key: &SymmetricKey) -> Self {
+        let mut iv = [0u8; 16];
+        getrandom::getrandom(&mut iv)
+            .expect("invariant: OS RNG failure is unrecoverable for encryption");
+        Self::encrypt_symmetric_with_iv(plaintext, key, &iv)
+    }
+
+    /// Fixed-IV encrypt, for the independent-vector test only. Not
+    /// part of the public API: production code must go through
+    /// [`EncString::encrypt_symmetric`], which draws a fresh IV.
+    fn encrypt_symmetric_with_iv(plaintext: &[u8], key: &SymmetricKey, iv: &[u8; 16]) -> Self {
+        // `enc_key` is 32 bytes by construction and `iv` is `[u8; 16]`,
+        // so construction cannot fail; `expect` states the invariant.
+        let ct = cbc::Encryptor::<aes::Aes256>::new_from_slices(key.enc_key(), iv)
+            .expect("invariant: 32-byte enc_key and 16-byte iv")
+            .encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext);
+        let mut h = <HmacSha256 as Mac>::new_from_slice(key.mac_key())
+            .expect("invariant: HMAC-SHA256 accepts keys of any length");
+        h.update(iv);
+        h.update(&ct);
+        let mac = h.finalize().into_bytes().to_vec();
+        Self::AesCbc256WithMac {
+            iv: iv.to_vec(),
+            ct,
+            mac,
+        }
+    }
+
+    /// The wire form, `<type>.<base64 segments joined by '|'>` — the
+    /// inverse of [`EncString::parse`].
+    pub fn to_wire_string(&self) -> String {
+        match self {
+            Self::AesCbc256WithMac { iv, ct, mac } => format!(
+                "{}.{}|{}|{}",
+                TYPE_AES_CBC256_HMAC_SHA256,
+                Base64::encode_string(iv),
+                Base64::encode_string(ct),
+                Base64::encode_string(mac)
+            ),
+            Self::Rsa2048OaepSha1 { ct } => {
+                format!("{}.{}", TYPE_RSA2048_OAEP_SHA1, Base64::encode_string(ct))
+            }
         }
     }
 
@@ -426,6 +482,49 @@ mod tests {
         let parsed = EncString::parse(TYPE2_VECTOR).unwrap();
         parsed.decrypt_symmetric(&key).unwrap();
         assert_eq!(CBC_DECRYPT_CALLS.with(|c| c.get()), 1);
+    }
+
+    /// Encrypt vector, generated with `cryptography` (OpenSSL) by the
+    /// export fixture generator in kharond
+    /// (`crates/kharond/tests/fixtures/gen/gen_export_fixture.py`):
+    /// key bytes 0x00..0x40, IV bytes 0xa0..0xb0.
+    const TYPE2_ENCRYPT_VECTOR: &str = "2.oKGio6SlpqeoqaqrrK2urw==|OXR0qMBvVEVtueooqZgu7ZqJ8Xt0fUNJh69VfZ6Rm44=|MD4EvRsFgl5x78fsl83amUzH+LgEVKhBHBhTKrfNeX8=";
+    const TYPE2_ENCRYPT_PLAINTEXT: &[u8] = b"kharon type-2 encrypt vector";
+
+    #[test]
+    fn req_cry_002_type2_encrypt_matches_independent_vector() {
+        let iv: [u8; 16] = std::array::from_fn(|i| 0xa0 + i as u8);
+        let enc = EncString::encrypt_symmetric_with_iv(
+            TYPE2_ENCRYPT_PLAINTEXT,
+            &test_symmetric_key(),
+            &iv,
+        );
+        assert_eq!(enc.to_wire_string(), TYPE2_ENCRYPT_VECTOR);
+        // And the vector decrypts back through the MAC-verified path.
+        let parsed = EncString::parse(TYPE2_ENCRYPT_VECTOR).unwrap();
+        let pt = parsed.decrypt_symmetric(&test_symmetric_key()).unwrap();
+        assert_eq!(&pt[..], TYPE2_ENCRYPT_PLAINTEXT);
+    }
+
+    #[test]
+    fn req_cry_002_encrypt_decrypt_round_trip_and_wire_round_trip() {
+        let key = test_symmetric_key();
+        for pt in [b"".as_slice(), b"x".as_slice(), &[7u8; 100][..]] {
+            let enc = EncString::encrypt_symmetric(pt, &key);
+            let wire = enc.to_wire_string();
+            let parsed = EncString::parse(&wire).unwrap();
+            assert_eq!(parsed, enc);
+            let back = parsed.decrypt_symmetric(&key).unwrap();
+            assert_eq!(&back[..], pt);
+            // The public API draws its own IV: encrypting the same
+            // plaintext twice must not produce the same wire form
+            // (a reused IV under CBC would leak equal prefixes).
+            let enc2 = EncString::encrypt_symmetric(pt, &key);
+            assert_ne!(enc2.to_wire_string(), wire);
+        }
+        // Type 4 wire round trip.
+        let t4 = EncString::parse(&format!("4.{TYPE4_CT_B64}")).unwrap();
+        assert_eq!(EncString::parse(&t4.to_wire_string()).unwrap(), t4);
     }
 
     #[test]

@@ -208,6 +208,42 @@ fn normalized_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
+/// Derive the raw 32-byte key from a password and an explicit salt:
+/// PBKDF2-HMAC-SHA256 over the salt bytes as given, or Argon2id over
+/// `SHA-256(salt)`. This is Bitwarden's `deriveKeyFromPassword` shape,
+/// shared by the master key (salt = normalized email) and the
+/// password-protected export key (salt = the export file's `salt`
+/// string, verbatim).
+fn derive_raw_key(
+    password: &Zeroizing<String>,
+    salt: &[u8],
+    kdf: &Kdf,
+) -> Result<MasterKey, KdfError> {
+    kdf.validate()?;
+    let mut out = Zeroizing::new([0u8; 32]);
+    match *kdf {
+        Kdf::Pbkdf2 { iterations } => {
+            pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut out[..]);
+        }
+        Kdf::Argon2id {
+            iterations,
+            memory_mib,
+            parallelism,
+        } => {
+            let memory_kib = memory_mib
+                .checked_mul(1024)
+                .ok_or(KdfError::InvalidParams("argon2id memory overflows KiB"))?;
+            let params = Params::new(memory_kib, iterations, parallelism, Some(32))
+                .map_err(|_| KdfError::InvalidParams("argon2id parameters out of range"))?;
+            let salt_hash = Sha256::digest(salt);
+            Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+                .hash_password_into(password.as_bytes(), &salt_hash, &mut out[..])
+                .map_err(|_| KdfError::DerivationFailed)?;
+        }
+    }
+    Ok(MasterKey(out))
+}
+
 /// Derive the 32-byte master key from the master password, the account
 /// email, and the prelogin KDF parameters (REQ-CRY-001).
 ///
@@ -222,35 +258,27 @@ pub fn derive_master_key(
     email: &str,
     kdf: &Kdf,
 ) -> Result<MasterKey, KdfError> {
-    kdf.validate()?;
-    let email = normalized_email(email);
-    let mut out = Zeroizing::new([0u8; 32]);
-    match *kdf {
-        Kdf::Pbkdf2 { iterations } => {
-            pbkdf2::pbkdf2_hmac::<Sha256>(
-                password.as_bytes(),
-                email.as_bytes(),
-                iterations,
-                &mut out[..],
-            );
-        }
-        Kdf::Argon2id {
-            iterations,
-            memory_mib,
-            parallelism,
-        } => {
-            let memory_kib = memory_mib
-                .checked_mul(1024)
-                .ok_or(KdfError::InvalidParams("argon2id memory overflows KiB"))?;
-            let params = Params::new(memory_kib, iterations, parallelism, Some(32))
-                .map_err(|_| KdfError::InvalidParams("argon2id parameters out of range"))?;
-            let salt = Sha256::digest(email.as_bytes());
-            Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-                .hash_password_into(password.as_bytes(), &salt, &mut out[..])
-                .map_err(|_| KdfError::DerivationFailed)?;
-        }
-    }
-    Ok(MasterKey(out))
+    derive_raw_key(password, normalized_email(email).as_bytes(), kdf)
+}
+
+/// Derive the symmetric key of a password-protected Bitwarden export
+/// (REQ-EXP-001): the export password, derived with the KDF parameters
+/// stored in the export file, salted with the file's `salt` string,
+/// then stretched exactly like a master key (HKDF-Expand `enc`/`mac`)
+/// into the 64-byte key that decrypts the file's type-2 EncStrings.
+///
+/// The salt is used **verbatim** as UTF-8 — unlike the account email
+/// it is a base64 string and case-sensitive, so no normalization of
+/// any kind is applied. (Verified against the official clients'
+/// behaviour: the export service passes its random base64 salt string
+/// to the same derive-then-stretch path as the master password; see
+/// the Bitwarden help centre, "Encrypted Exports".)
+pub fn derive_export_key(
+    password: &Zeroizing<String>,
+    salt: &str,
+    kdf: &Kdf,
+) -> Result<SymmetricKey, KdfError> {
+    Ok(derive_raw_key(password, salt.as_bytes(), kdf)?.stretch())
 }
 
 #[cfg(test)]
@@ -442,5 +470,53 @@ mod tests {
             derive_master_key(&password(), EMAIL, &huge),
             Err(KdfError::InvalidParams(_))
         ));
+    }
+
+    // Export-key vectors (REQ-EXP-001): generated with the independent
+    // Python implementation in kharond's fixture generator
+    // (`crates/kharond/tests/fixtures/gen/gen_export_fixture.py`):
+    // PBKDF2 / Argon2id over the verbatim salt string, then the same
+    // HKDF-Expand stretch as the master key. Salt is the base64 string
+    // the export service generates (`base64("kharon-export-16")`);
+    // password and non-default KDF params match the export fixtures.
+    const EXPORT_PASSWORD: &str = "kharon export fixture password 9";
+    const EXPORT_SALT: &str = "a2hhcm9uLWV4cG9ydC0xNg==";
+
+    fn export_password() -> Zeroizing<String> {
+        Zeroizing::new(EXPORT_PASSWORD.to_string())
+    }
+
+    #[test]
+    fn req_exp_001_export_key_pbkdf2_matches_vector() {
+        let kdf = Kdf::from_prelogin(0, 123_456, None, None).unwrap();
+        let key = derive_export_key(&export_password(), EXPORT_SALT, &kdf).unwrap();
+        assert_eq!(
+            hex(key.as_bytes_for_test()),
+            "e1133f39a07f54b50638c9b68b04ac03b92abc8c28cdf71670ed9d255908ca20\
+             5eb24bc282e68e8dc6f195e548347403c1ccd6606bf08ce02b955cafa3fb0264"
+        );
+    }
+
+    #[test]
+    fn req_exp_001_export_key_argon2id_matches_vector() {
+        let kdf = Kdf::from_prelogin(1, 2, Some(32), Some(2)).unwrap();
+        let key = derive_export_key(&export_password(), EXPORT_SALT, &kdf).unwrap();
+        assert_eq!(
+            hex(key.as_bytes_for_test()),
+            "4043131795e6a22a1ff2f853abefa0daf1d6bee245cdd021a5d64811b916e562\
+             ab3bfe433bc1fbd26589169338dfa336bde289c362725108850c6d924f80a075"
+        );
+    }
+
+    #[test]
+    fn req_exp_003_export_salt_is_verbatim_not_normalized() {
+        // The export salt is a base64 string: case matters. Deriving
+        // with a differently-cased salt (what email normalization
+        // would do to it) must give a different key, or real exports
+        // with uppercase in their salt would never decrypt.
+        let kdf = Kdf::Pbkdf2 { iterations: 5_000 };
+        let a = derive_export_key(&export_password(), EXPORT_SALT, &kdf).unwrap();
+        let b = derive_export_key(&export_password(), &EXPORT_SALT.to_lowercase(), &kdf).unwrap();
+        assert_ne!(a.as_bytes_for_test(), b.as_bytes_for_test());
     }
 }

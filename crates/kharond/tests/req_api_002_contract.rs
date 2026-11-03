@@ -886,7 +886,18 @@ fn check_fill(case: &FillCase, (code, body): &Outcome, seen: &[SeenPlan], audit:
                 Some("https://login.example.com")
             );
             assert!(p.matchers > 0, "the item's URIs are the matchers");
-            assert_eq!(audit, [json!(["fill", "alpha", null, "filled"])]);
+            assert_eq!(
+                audit,
+                [
+                    json!([
+                        "fill_dispatch",
+                        "alpha",
+                        "https://login.example.com",
+                        "dispatched"
+                    ]),
+                    json!(["fill", "alpha", null, "filled"])
+                ]
+            );
         }
         "fill username+password and submit" => {
             result("filled", &["username", "password"], None);
@@ -899,7 +910,18 @@ fn check_fill(case: &FillCase, (code, body): &Outcome, seen: &[SeenPlan], audit:
         }
         "fill origin mismatch" => {
             result("origin_mismatch", &[], None);
-            assert_eq!(audit, [json!(["fill", "alpha", null, "origin_mismatch"])]);
+            assert_eq!(
+                audit,
+                [
+                    json!([
+                        "fill_dispatch",
+                        "alpha",
+                        "https://login.example.com",
+                        "dispatched"
+                    ]),
+                    json!(["fill", "alpha", null, "origin_mismatch"])
+                ]
+            );
         }
         "fill locked" => {
             error(ApiError::LOCKED);

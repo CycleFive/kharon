@@ -4,12 +4,13 @@
 use ed25519_dalek::VerifyingKey;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
 
 use super::checkpoint::Checkpoint;
-use super::entry::{Entry, GENESIS_PREV_HASH};
+use super::entry::{Entry, Event, GENESIS_PREV_HASH};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
@@ -54,6 +55,17 @@ pub enum VerifyOutcome {
     /// A well-signed checkpoint whose `log_id` belongs to a different
     /// deployment — replayed across logs that share a key.
     CheckpointWrongLog { seq: u64 },
+    /// REQ-AUD-003†: a `fill_dispatch` with no later outcome entry
+    /// (`fill`, `fill_totp`, `fill_timeout`, `fill_aborted`) carrying its
+    /// `request_id`. The fill may have written to a page without its
+    /// result being logged (crash, lost `fill_aborted`), or is still in
+    /// flight if the log was read from a running daemon. `seq` is the
+    /// first such dispatch.
+    UnmatchedFillDispatch { seq: u64 },
+    /// REQ-AUD-003†: a second outcome entry for a `request_id` whose
+    /// `fill_dispatch` already has one ("exactly one entry per
+    /// transition"). `seq` is the duplicate.
+    DuplicateFillOutcome { seq: u64 },
 }
 
 impl fmt::Display for VerifyOutcome {
@@ -76,6 +88,15 @@ impl fmt::Display for VerifyOutcome {
             VerifyOutcome::CheckpointWrongLog { seq } => {
                 write!(f, "checkpoint at seq {seq} belongs to a different log")
             }
+            VerifyOutcome::UnmatchedFillDispatch { seq } => {
+                write!(f, "fill_dispatch at seq {seq} has no outcome entry")
+            }
+            VerifyOutcome::DuplicateFillOutcome { seq } => {
+                write!(
+                    f,
+                    "entry seq {seq} is a second outcome for one fill_dispatch"
+                )
+            }
         }
     }
 }
@@ -87,6 +108,8 @@ pub(crate) struct Chain {
     /// match it: a checkpoint from another deployment sharing the signing key
     /// must never satisfy truncation detection here.
     log_id: Option<String>,
+    /// REQ-AUD-003† pairing finding (first one), if any.
+    fill_finding: Option<VerifyOutcome>,
 }
 
 impl Chain {
@@ -104,6 +127,9 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
     let data = fs::read_to_string(path)?;
     let mut hashes: Vec<String> = Vec::new();
     let mut log_id: Option<String> = None;
+    // request_id → (dispatch seq, outcome seen).
+    let mut dispatches: HashMap<String, (u64, bool)> = HashMap::new();
+    let mut duplicate: Option<u64> = None;
     for (i, line) in data.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -155,8 +181,40 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
             return Err(VerifyError::BadHash(entry.seq));
         }
         hashes.push(hash);
+
+        if let Some(rid) = &entry.request_id {
+            match entry.event {
+                Event::FillDispatch => {
+                    dispatches.entry(rid.clone()).or_insert((entry.seq, false));
+                }
+                Event::Fill | Event::FillTotp | Event::FillTimeout | Event::FillAborted => {
+                    if let Some((_, seen)) = dispatches.get_mut(rid) {
+                        if *seen {
+                            duplicate.get_or_insert(entry.seq);
+                        }
+                        *seen = true;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    Ok(Chain { hashes, log_id })
+    let unmatched = dispatches
+        .values()
+        .filter(|(_, seen)| !seen)
+        .map(|(seq, _)| *seq)
+        .min();
+    let fill_finding = match (unmatched, duplicate) {
+        (Some(u), Some(d)) if d < u => Some(VerifyOutcome::DuplicateFillOutcome { seq: d }),
+        (Some(seq), _) => Some(VerifyOutcome::UnmatchedFillDispatch { seq }),
+        (None, Some(seq)) => Some(VerifyOutcome::DuplicateFillOutcome { seq }),
+        (None, None) => None,
+    };
+    Ok(Chain {
+        hashes,
+        log_id,
+        fill_finding,
+    })
 }
 
 /// Verify `log_path` against the checkpoint stream from the off-host sink.
@@ -167,6 +225,10 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
 ///   [`VerifyOutcome::Truncated`].
 /// * Forged or mismatched checkpoints → [`VerifyOutcome::CheckpointBadSig`] /
 ///   [`VerifyOutcome::CheckpointMismatch`].
+/// * Otherwise, a `fill_dispatch` without exactly one outcome entry →
+///   [`VerifyOutcome::UnmatchedFillDispatch`] /
+///   [`VerifyOutcome::DuplicateFillOutcome`] (REQ-AUD-003†). Checkpoint
+///   findings take precedence: truncation explains missing outcomes.
 pub fn verify(
     log_path: &Path,
     checkpoints: &[Checkpoint],
@@ -193,6 +255,9 @@ pub fn verify(
         if chain.hashes[cp.seq as usize - 1] != cp.hash {
             return Ok(VerifyOutcome::CheckpointMismatch { seq: cp.seq });
         }
+    }
+    if let Some(finding) = chain.fill_finding {
+        return Ok(finding);
     }
     Ok(VerifyOutcome::Ok { head_seq: head })
 }
@@ -521,5 +586,103 @@ mod tests {
         let cp = Checkpoint::new(100, wrong_hash, keys);
         let outcome = verify(&dir.path().join("audit.jsonl"), &[cp], &vk).unwrap();
         assert_eq!(outcome, VerifyOutcome::CheckpointMismatch { seq: 100 });
+    }
+
+    fn dispatch(rid: &str) -> Entry {
+        Entry::new(Event::FillDispatch)
+            .agent_id("alpha")
+            .request_id(rid)
+            .origin("https://login.example.com")
+            .field_count(2)
+            .result("dispatched")
+    }
+
+    fn outcome(ev: Event, rid: &str) -> Entry {
+        Entry::new(ev).agent_id("alpha").request_id(rid).result("x")
+    }
+
+    fn verify_dir(dir: &Path, log: &AuditLog) -> VerifyOutcome {
+        let vk = log.keys().verifying_key();
+        verify(&dir.join("audit.jsonl"), &[], &vk).unwrap()
+    }
+
+    #[test]
+    fn req_aud_003_matched_dispatches_verify() {
+        let dir = tempdir();
+        let mut log = open(dir.path());
+        // Interleaved pairs, every outcome kind, plus a refusal (outcome
+        // without dispatch) and legacy entries without a request id.
+        append_n(&mut log, 2);
+        log.append(dispatch("a")).unwrap();
+        log.append(dispatch("b")).unwrap();
+        log.append(outcome(Event::Fill, "b")).unwrap();
+        log.append(outcome(Event::FillTimeout, "a")).unwrap();
+        log.append(dispatch("c")).unwrap();
+        log.append(outcome(Event::FillAborted, "c")).unwrap();
+        log.append(dispatch("d")).unwrap();
+        log.append(outcome(Event::FillTotp, "d")).unwrap();
+        log.append(outcome(Event::Fill, "refused")).unwrap();
+        assert_eq!(
+            verify_dir(dir.path(), &log),
+            VerifyOutcome::Ok { head_seq: 11 }
+        );
+    }
+
+    #[test]
+    fn req_aud_003_unmatched_dispatch_is_flagged() {
+        let dir = tempdir();
+        let mut log = open(dir.path());
+        append_n(&mut log, 1);
+        log.append(dispatch("a")).unwrap(); // seq 2, never closed
+        log.append(dispatch("b")).unwrap(); // seq 3, never closed
+        log.append(dispatch("c")).unwrap();
+        log.append(outcome(Event::Fill, "c")).unwrap();
+        assert_eq!(
+            verify_dir(dir.path(), &log),
+            VerifyOutcome::UnmatchedFillDispatch { seq: 2 },
+            "earliest orphan reported"
+        );
+        // A crash-orphaned dispatch is evidence, not corruption: it is a
+        // `verify` finding only; `read_chain` (and so `AuditLog::open`)
+        // still accepts the chain, so the daemon restarts.
+        assert!(read_chain(&dir.path().join("audit.jsonl")).is_ok());
+    }
+
+    #[test]
+    fn req_aud_003_second_outcome_for_one_dispatch_is_flagged() {
+        let dir = tempdir();
+        let mut log = open(dir.path());
+        log.append(dispatch("a")).unwrap();
+        log.append(outcome(Event::Fill, "a")).unwrap();
+        log.append(outcome(Event::FillAborted, "a")).unwrap(); // seq 3
+        assert_eq!(
+            verify_dir(dir.path(), &log),
+            VerifyOutcome::DuplicateFillOutcome { seq: 3 }
+        );
+    }
+
+    #[test]
+    fn req_aud_003_truncation_takes_precedence_over_unmatched_dispatch() {
+        let dir = tempdir();
+        let mut log = open(dir.path());
+        log.append(dispatch("a")).unwrap();
+        log.append(outcome(Event::Fill, "a")).unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last: Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        let cp = Checkpoint::new(2, last["hash"].as_str().unwrap().to_string(), log.keys());
+        let vk = log.keys().verifying_key();
+        drop(log);
+        // Cut the outcome off the end.
+        let first = text.lines().next().unwrap();
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let outcome = verify(&path, &[cp], &vk).unwrap();
+        assert_eq!(
+            outcome,
+            VerifyOutcome::Truncated {
+                local_head: 1,
+                checkpoint_seq: 2
+            }
+        );
     }
 }

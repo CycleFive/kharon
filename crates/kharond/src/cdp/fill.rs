@@ -530,11 +530,24 @@ pub const DEFAULT_FILL_DEADLINE: Duration = Duration::from_secs(10);
 /// end-to-end deadline. On expiry the fill fails closed:
 ///
 /// - the in-flight CDP future is dropped, so **no further CDP writes** are
-///   sent (any `Runtime.callFunctionOn` already dispatched stays in flight;
-///   submit is part of that same task and is never confirmed),
+///   sent by the broker. A `Runtime.callFunctionOn` already dispatched is
+///   *not* recalled: the in-page function (fill, then submit when
+///   `plan.submit`) runs to completion in the page, so a stall after
+///   dispatch can still fill **and submit after the timeout response**.
+///   REQ-API-009's "no further CDP writes, submit not dispatched" is
+///   enforced broker-side only at this layer (#46),
 /// - the caller-owned secret buffers in the returned [`FillPlan`] are
 ///   zeroized **before** the outcome is returned,
 /// - one `fill_timeout` audit entry is written before the response.
+///
+/// Audit scope: this is the engine-level wrapper (used by
+/// [`crate::totp::TotpFill`] and tests). The daemon's fill path is
+/// [`crate::api::Broker::fill`], which owns the REQ-AUD-003† dispatch /
+/// outcome pair: a `fill_dispatch` entry before any CDP write (append
+/// failure → `audit_failed`, no write) and one outcome entry after, with
+/// a failed `fill_timeout` append turning the reply into `audit_failed`.
+/// This wrapper writes only the `fill_timeout` entry and leaves the rest
+/// to its caller.
 ///
 /// Ownership note: secrets live canonically in `plan.fields[*].value`
 /// (`Zeroizing<String>`). Copies inside the cancelled fill future are freed
@@ -584,7 +597,9 @@ impl<'a> DeadlineFiller<'a> {
                 // regardless. A poisoned log stays poisoned (the audit module
                 // refuses further appends until reopen); nothing here can
                 // change the fill outcome, and inventing a new one would
-                // misreport the deadline expiry.
+                // misreport the deadline expiry. The daemon path
+                // (`Broker::fill`) does not swallow: a failed `fill_timeout`
+                // append there is `audit_failed` (#46 item 2).
                 let _ = self.audit.append(entry);
                 (plan, FillOutcome::Timeout)
             }

@@ -38,6 +38,18 @@ pub enum Event {
     /// end-to-end deadline. Written before the timeout response is
     /// returned, after the plaintext buffers are zeroized.
     FillTimeout,
+    /// REQ-AUD-003†: a fill is about to make its first CDP write. Appended
+    /// before anything touches the page; if the append fails the fill is
+    /// refused and no CDP write occurs. Carries the request id, item ref,
+    /// claimed origin and field count, never a value. Exactly one outcome
+    /// entry (`fill`, `fill_totp`, `fill_timeout` or `fill_aborted`) with
+    /// the same `request_id` follows it.
+    FillDispatch,
+    /// REQ-AUD-003†: the request handler was dropped after `fill_dispatch`
+    /// and before the outcome (e.g. the client disconnected mid-fill).
+    /// Best effort: written from a drop guard, so a lost append leaves the
+    /// orphan `fill_dispatch` as the evidence.
+    FillAborted,
     /// REQ-API-007: the system clock differs from the Vaultwarden
     /// server's `Date` by more than `clock_skew_warn` (result `warn` or
     /// `refuse`), or a previous skew was resolved (result `resolved`).
@@ -71,6 +83,8 @@ impl Event {
             Event::ExportLoaded => "export_loaded",
             Event::Abandoned => "abandoned",
             Event::FillTimeout => "fill_timeout",
+            Event::FillDispatch => "fill_dispatch",
+            Event::FillAborted => "fill_aborted",
             Event::ClockSkew => "clock_skew",
             Event::LogTruncated => "log_truncated",
         }
@@ -108,6 +122,8 @@ impl<'de> Deserialize<'de> for Event {
             "export_loaded" => Event::ExportLoaded,
             "abandoned" => Event::Abandoned,
             "fill_timeout" => Event::FillTimeout,
+            "fill_dispatch" => Event::FillDispatch,
+            "fill_aborted" => Event::FillAborted,
             "clock_skew" => Event::ClockSkew,
             "log_truncated" => Event::LogTruncated,
             other => {
@@ -168,6 +184,13 @@ pub struct Entry {
     /// `export_loaded` entry whose hash differs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_sha256: Option<String>,
+    /// Broker-generated random id tying a `fill_dispatch` to its single
+    /// outcome entry (REQ-AUD-003†). Not a secret and not agent-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Number of fields a `fill_dispatch` is about to fill (1..=3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_count: Option<u64>,
 }
 
 impl Entry {
@@ -189,6 +212,8 @@ impl Entry {
             detail_code: None,
             recovered_seq: None,
             file_sha256: None,
+            request_id: None,
+            field_count: None,
         }
     }
 
@@ -240,6 +265,18 @@ impl Entry {
     /// `Event::ExportLoaded` entries, REQ-EXP-004).
     pub fn file_sha256(mut self, v: impl Into<String>) -> Self {
         self.file_sha256 = Some(v.into());
+        self
+    }
+
+    /// The broker's id for one fill request (REQ-AUD-003†).
+    pub fn request_id(mut self, v: impl Into<String>) -> Self {
+        self.request_id = Some(v.into());
+        self
+    }
+
+    /// Fields a `fill_dispatch` is about to fill.
+    pub fn field_count(mut self, v: u64) -> Self {
+        self.field_count = Some(v);
         self
     }
 

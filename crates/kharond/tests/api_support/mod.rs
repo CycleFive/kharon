@@ -153,16 +153,24 @@ impl VaultView for TestSession {
     }
 }
 
-/// Records API audit entries; can be told to fail.
+/// Records API audit entries; can be told to fail (every append, or
+/// only appends of one event).
 #[derive(Clone, Default)]
 pub struct RecordingAudit {
     pub entries: Arc<Mutex<Vec<Entry>>>,
     pub fail: Arc<Mutex<bool>>,
+    /// Refuse only entries whose serialized `event` is this.
+    pub fail_event: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl AuditSink for RecordingAudit {
     fn append(&mut self, entry: Entry) -> Result<(), AuditError> {
         if *self.fail.lock().unwrap() {
+            return Err(AuditError);
+        }
+        if let Some(ev) = *self.fail_event.lock().unwrap()
+            && serde_json::to_value(&entry.event).unwrap() == ev
+        {
             return Err(AuditError);
         }
         self.entries.lock().unwrap().push(entry);

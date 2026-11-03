@@ -240,7 +240,18 @@ async fn req_api_008_fill_and_submit_dispatches_submit_only_when_asked() {
         assert_secret_free(&r.body, &[]);
         assert_secret_free(&e.audit_text(), &[]);
         let entries = e.audit.summary();
-        assert_eq!(entries, [json!(["fill", "alpha", null, "filled"])]);
+        assert_eq!(
+            entries,
+            [
+                json!([
+                    "fill_dispatch",
+                    "alpha",
+                    "https://example.com",
+                    "dispatched"
+                ]),
+                json!(["fill", "alpha", null, "filled"])
+            ]
+        );
     }
 }
 
@@ -273,7 +284,15 @@ async fn req_api_007_fill_totp_over_http_types_the_code_and_never_returns_it() {
     assert_secret_free(&e.audit_text(), &[code]);
     assert_eq!(
         e.audit.summary(),
-        [json!(["fill_totp", "alpha", null, "filled"])]
+        [
+            json!([
+                "fill_dispatch",
+                "alpha",
+                "https://example.com",
+                "dispatched"
+            ]),
+            json!(["fill_totp", "alpha", null, "filled"])
+        ]
     );
 }
 
@@ -331,7 +350,15 @@ async fn req_org_002_claimed_origin_differs_from_live_origin_is_refused() {
     assert!(e.fill_calls().is_empty(), "no page code ran");
     assert_eq!(
         e.audit.summary(),
-        [json!(["fill", "alpha", null, "origin_mismatch"])]
+        [
+            json!([
+                "fill_dispatch",
+                "alpha",
+                "https://other.example",
+                "dispatched"
+            ]),
+            json!(["fill", "alpha", null, "origin_mismatch"])
+        ]
     );
 }
 
@@ -382,4 +409,50 @@ async fn req_api_008_fill_routes_refuse_browser_origins_and_bad_bodies() {
     assert_secret_free(&r.body, &[]);
     assert!(e.fill_calls().is_empty());
     assert!(e.audit.summary().is_empty(), "refused before the broker");
+}
+
+/// REQ-AUD-003† with the real engine: when the `fill_dispatch` append
+/// fails, the reply is `audit_failed` and the CDP stub receives not a
+/// single frame for the request (no read, no write, no page code).
+#[tokio::test]
+async fn req_aud_003_failed_dispatch_append_reaches_no_cdp() {
+    let e = e2e().await;
+    let before = e.received.lock().unwrap().len();
+    *e.audit.fail_event.lock().unwrap() = Some("fill_dispatch");
+    let r = e
+        .fill(
+            "/v1/fill",
+            body(
+                &e.item_id,
+                json!([{"kind": "password"}]),
+                true,
+                "https://example.com",
+            ),
+        )
+        .await;
+    assert_eq!(r.status, 500);
+    assert_eq!(r.json()["error"], "audit_failed");
+    assert_eq!(
+        e.received.lock().unwrap().len(),
+        before,
+        "zero CDP calls after a failed dispatch append"
+    );
+    assert!(e.audit.summary().is_empty());
+
+    // The log recovers: the next fill dispatches and is audited twice.
+    *e.audit.fail_event.lock().unwrap() = None;
+    let r = e
+        .fill(
+            "/v1/fill",
+            body(
+                &e.item_id,
+                json!([{"kind": "password"}]),
+                false,
+                "https://example.com",
+            ),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(e.fill_calls().len(), 1);
+    assert_eq!(e.audit.summary().len(), 2);
 }

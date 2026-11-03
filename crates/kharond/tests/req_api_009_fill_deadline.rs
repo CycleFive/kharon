@@ -78,14 +78,29 @@ fn entries(r: &Run) -> Vec<Value> {
         .collect()
 }
 
-fn assert_one_timeout_entry(r: &Run) {
+/// Exactly one `fill_timeout` outcome entry; preceded by one
+/// `fill_dispatch` (same `request_id`) iff the backend was reached
+/// (REQ-AUD-003†: dispatch and outcome are separate transitions).
+fn assert_one_timeout_entry(r: &Run, dispatched: bool) {
     let e = entries(r);
-    assert_eq!(e.len(), 1, "exactly one audit entry: {e:?}");
-    assert_eq!(e[0]["event"], "fill_timeout");
-    assert_eq!(e[0]["agent_id"], "alpha");
-    assert_eq!(e[0]["item_id"], ITEM_A);
-    assert_eq!(e[0]["result"], "timeout");
-    assert_eq!(e[0]["detail_code"], "deadline_expired");
+    let outcome = if dispatched {
+        assert_eq!(e.len(), 2, "dispatch + exactly one outcome: {e:?}");
+        assert_eq!(e[0]["event"], "fill_dispatch");
+        assert_eq!(e[0]["agent_id"], "alpha");
+        assert_eq!(e[0]["item_id"], ITEM_A);
+        assert_eq!(e[0]["field_count"], 1);
+        assert_eq!(e[0]["request_id"], e[1]["request_id"]);
+        &e[1]
+    } else {
+        assert_eq!(e.len(), 1, "exactly one audit entry: {e:?}");
+        &e[0]
+    };
+    assert_eq!(e.iter().filter(|x| x["event"] == "fill_timeout").count(), 1);
+    assert_eq!(outcome["event"], "fill_timeout");
+    assert_eq!(outcome["agent_id"], "alpha");
+    assert_eq!(outcome["item_id"], ITEM_A);
+    assert_eq!(outcome["result"], "timeout");
+    assert_eq!(outcome["detail_code"], "deadline_expired");
     assert_no_canary(&serde_json::to_string(&e).unwrap());
 }
 
@@ -111,7 +126,7 @@ async fn req_api_009_default_deadline_is_10s_and_fails_closed() {
         wiped.iter().all(String::is_empty),
         "plan zeroized on expiry"
     );
-    assert_one_timeout_entry(&r);
+    assert_one_timeout_entry(&r, true);
 }
 
 #[tokio::test(start_paused = true)]
@@ -121,7 +136,7 @@ async fn req_api_009_configured_deadline_is_honoured() {
     let received = Instant::now();
     assert_eq!(fill(&r, received).await.unwrap(), TIMEOUT());
     assert_eq!(received.elapsed(), Duration::from_secs(2));
-    assert_one_timeout_entry(&r);
+    assert_one_timeout_entry(&r, true);
 }
 
 #[tokio::test(start_paused = true)]
@@ -135,7 +150,7 @@ async fn req_api_009_deadline_runs_from_receipt_not_from_dispatch() {
     tokio::time::advance(Duration::from_secs(11)).await;
     assert_eq!(fill(&r, received).await.unwrap(), TIMEOUT());
     assert!(r.fake.seen().is_empty(), "no CDP work after expiry");
-    assert_one_timeout_entry(&r);
+    assert_one_timeout_entry(&r, false);
 }
 
 #[tokio::test(start_paused = true)]
@@ -148,9 +163,10 @@ async fn req_api_009_fill_inside_the_deadline_is_not_cut() {
         json!({"status": "filled", "fields_filled": ["password"]})
     );
     let e = entries(&r);
-    assert_eq!(e.len(), 1);
-    assert_eq!(e[0]["event"], "fill");
-    assert_eq!(e[0]["result"], "filled");
+    assert_eq!(e.len(), 2);
+    assert_eq!(e[0]["event"], "fill_dispatch");
+    assert_eq!(e[1]["event"], "fill");
+    assert_eq!(e[1]["result"], "filled");
     assert!(r.wiped.lock().unwrap().iter().all(String::is_empty));
 }
 

@@ -26,8 +26,15 @@
 //! #20) the grant check, then resolve the item and decrypt the values
 //! into a [`FillPlan`], then the [`FillBackend`], all under one
 //! wall-clock fill deadline (REQ-API-009); then zeroize the plan, then
-//! append exactly one audit entry (`fill`, `fill_totp` or
-//! `fill_timeout`), then reply.
+//! append exactly one outcome entry (`fill`, `fill_totp` or
+//! `fill_timeout`), then reply. A fill that reaches the browser is two
+//! audited transitions (REQ-AUD-003†): a `fill_dispatch` entry is
+//! appended *before* the [`FillBackend`] is called (append failure →
+//! [`ApiError::AUDIT_FAILED`], no CDP write), and the outcome entry
+//! after it. If the handler future is dropped in between (client
+//! disconnect), a drop guard wipes the plan and appends a best-effort
+//! `fill_aborted`; `kharon audit verify` flags a `fill_dispatch` that
+//! has neither.
 
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -277,6 +284,44 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
 /// zeroized (tests prove the wipe; REQ-API-009).
 pub type PlanWipedHook = Arc<dyn Fn(&FillPlan) + Send + Sync>;
 
+/// A fresh broker-side request id: 128 random bits, hex. Ties a
+/// `fill_dispatch` to its outcome entry (REQ-AUD-003†).
+fn new_request_id() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+/// Owns a resolved [`FillPlan`] for the rest of [`Broker::fill`]. On
+/// drop, on every path (normal return, `?`, or the handler future being
+/// dropped mid-fill), the plan's values are zeroized and the wipe hook
+/// runs; if `abort_entry` is still set (dispatched, no outcome yet) it
+/// is appended best effort: the request is already gone, so there is
+/// nobody to fail, and a lost append leaves the orphan `fill_dispatch`
+/// for the verifier.
+struct DispatchGuard<'b> {
+    plan: FillPlan,
+    plan_wiped: Option<&'b PlanWipedHook>,
+    audit: &'b Mutex<Box<dyn AuditSink>>,
+    abort_entry: Option<Entry>,
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        for f in &mut self.plan.fields {
+            f.value.zeroize();
+        }
+        if let Some(hook) = self.plan_wiped {
+            hook(&self.plan);
+        }
+        if let Some(entry) = self.abort_entry.take() {
+            let _ = self
+                .audit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .append(entry);
+        }
+    }
+}
+
 /// Why a fill stopped before the browser.
 enum Unresolved {
     /// The lock gate refused: `423 locked`, like list/search.
@@ -463,13 +508,29 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     ///
     /// `received` is when the transport received the request: the
     /// REQ-API-009 deadline (`[policy] fill_deadline`, default 10 s)
-    /// runs from there over resolve and fill. On expiry the backend
-    /// future is dropped (no further CDP writes, submit never sent),
-    /// the plan is zeroized, a `fill_timeout` entry is appended, and
-    /// the result is `timeout`. Exactly one audit entry per call; an
-    /// audit failure is [`ApiError::AUDIT_FAILED`] (REQ-AUD-003),
-    /// including on the timeout path. A locked broker is
-    /// [`ApiError::LOCKED`], as for list/search.
+    /// runs from there over resolve and fill.
+    ///
+    /// Audit (REQ-AUD-003†): a resolved plan is announced by a
+    /// `fill_dispatch` entry (request id, item, claimed origin, field
+    /// count; no value) before the backend sees it. If that append
+    /// fails the plan is wiped and the call is
+    /// [`ApiError::AUDIT_FAILED`] with no CDP write. After the backend,
+    /// exactly one outcome entry (`fill` / `fill_totp` / `fill_timeout`,
+    /// same `request_id`) is appended; its failure is also
+    /// [`ApiError::AUDIT_FAILED`]. A refusal before the browser (locked,
+    /// unknown item, ...) writes only the outcome entry.
+    ///
+    /// On expiry the backend future is dropped (no further broker-side
+    /// CDP writes), the plan is zeroized, a `fill_timeout` entry is
+    /// appended, and the result is `timeout`. A `Runtime.callFunctionOn`
+    /// already dispatched is not recalled: the in-page function may
+    /// still fill, and submit, after the timeout reply (#46; REQ-API-009
+    /// is enforced broker-side only).
+    ///
+    /// If this future is dropped after `fill_dispatch` (the client went
+    /// away), the plan is still wiped and a `fill_aborted` entry is
+    /// appended best effort. A locked broker is [`ApiError::LOCKED`], as
+    /// for list/search.
     pub async fn fill(
         &self,
         agent: &AgentId,
@@ -477,44 +538,63 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         received: Instant,
     ) -> Result<Outcome, ApiError> {
         let deadline = received + self.fill_policy.deadline;
+        let request_id = new_request_id();
         let event = match req.operation {
             FillOperation::Fill => Event::Fill,
             FillOperation::FillTotp => Event::FillTotp,
         };
+        let base = |e: Event| {
+            Entry::new(e)
+                .agent_id(agent.0.clone())
+                .item_id(req.item_id.clone())
+                .request_id(request_id.clone())
+        };
         let status = match self.resolve_fill(agent, &req) {
             Err(Unresolved::Locked) => {
-                self.append(
-                    Entry::new(event)
-                        .agent_id(agent.0.clone())
-                        .item_id(req.item_id.clone())
-                        .result("locked"),
-                )?;
+                self.append(base(event).result("locked"))?;
                 return Err(ApiError::LOCKED);
             }
             Err(Unresolved::Refused(status)) => status,
-            Ok(mut plan) => {
-                let status = self.run_fill(agent, &plan, deadline).await;
-                for f in &mut plan.fields {
-                    f.value.zeroize();
+            Ok(plan) => {
+                let field_count = plan.fields.len() as u64;
+                // Owns the plan from here: every way out of this arm,
+                // including this future being dropped, wipes it.
+                let mut guard = DispatchGuard {
+                    plan,
+                    plan_wiped: self.plan_wiped.as_ref(),
+                    audit: &self.audit,
+                    abort_entry: None,
+                };
+                if Instant::now() >= deadline {
+                    // Expired before dispatch: no CDP write, no
+                    // dispatch entry, just the `fill_timeout` outcome.
+                    drop(guard);
+                    FillStatus::Engine(FillOutcome::Timeout)
+                } else {
+                    self.append(
+                        base(Event::FillDispatch)
+                            .origin(req.expected_origin.clone())
+                            .field_count(field_count)
+                            .result("dispatched"),
+                    )?;
+                    guard.abort_entry = Some(
+                        base(Event::FillAborted)
+                            .result("aborted")
+                            .detail_code("handler_dropped"),
+                    );
+                    let status = self.run_fill(agent, &guard.plan, deadline).await;
+                    guard.abort_entry = None;
+                    drop(guard);
+                    status
                 }
-                if let Some(hook) = &self.plan_wiped {
-                    hook(&plan);
-                }
-                drop(plan);
-                status
             }
         };
         let entry = if status == FillStatus::Engine(FillOutcome::Timeout) {
-            Entry::new(Event::FillTimeout)
-                .agent_id(agent.0.clone())
-                .item_id(req.item_id.clone())
+            base(Event::FillTimeout)
                 .result("timeout")
                 .detail_code("deadline_expired")
         } else {
-            let mut e = Entry::new(event)
-                .agent_id(agent.0.clone())
-                .item_id(req.item_id.clone())
-                .result(status.status());
+            let mut e = base(event).result(status.status());
             if let Some(d) = status.detail() {
                 e = e.detail_code(d);
             }
@@ -528,9 +608,6 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let Some(backend) = &self.fill_backend else {
             return FillStatus::Unavailable;
         };
-        if Instant::now() >= deadline {
-            return FillStatus::Engine(FillOutcome::Timeout);
-        }
         let fill = backend.fill(agent.as_str(), plan, self.fill_policy.allow_default_context);
         match tokio::time::timeout_at(deadline, fill).await {
             Ok(outcome) => FillStatus::Engine(outcome),

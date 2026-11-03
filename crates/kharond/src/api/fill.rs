@@ -443,18 +443,34 @@ impl FillBackend for CdpFillBackend {
 /// the agent's own browser context (REQ-ARCH-005) and keeps both. A
 /// connection that has ended (browser restart, tunnel drop) is replaced
 /// by the next fill, with a fresh context; the fill that saw it end
-/// reports `cdp_error`. A fill dropped by the deadline mid-connect leaves
-/// nothing cached, so the next fill starts over.
+/// reports `cdp_error`.
+///
+/// The connect step (TCP/TLS/WebSocket plus `Target.createBrowserContext`)
+/// runs as its own task, bounded by [`DEFAULT_CONNECT_TIMEOUT`], and is
+/// not cancelled by the fill deadline (issue #68). A fill whose deadline
+/// fires mid-connect returns `timeout` at once, but the connect finishes
+/// in the background: if the context arrives it is adopted (cached) for
+/// the next fill instead of being leaked, and no CDP command is sent on
+/// the dead fill's behalf (REQ-API-009). If the connect fails or runs out
+/// of budget after the socket opened, the connection is closed, which
+/// makes the browser dispose any context it created for it.
 ///
 /// Fills for one agent are serialised on the connect step only; the
 /// fill itself runs on a clone of the engine.
 pub struct ConnectingCdpBackend {
     agents: HashMap<String, AgentBrowser>,
+    connect_timeout: Duration,
 }
+
+/// Budget for one background connect (socket, handshake and
+/// `createBrowserContext`); matches the per-request CDP hang-guard.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+type Live = Option<(FillEngine, AgentContext)>;
 
 struct AgentBrowser {
     endpoint: CdpEndpoint,
-    live: tokio::sync::Mutex<Option<(FillEngine, AgentContext)>>,
+    live: std::sync::Arc<tokio::sync::Mutex<Live>>,
 }
 
 impl ConnectingCdpBackend {
@@ -472,12 +488,19 @@ impl ConnectingCdpBackend {
                         id.into(),
                         AgentBrowser {
                             endpoint,
-                            live: tokio::sync::Mutex::new(None),
+                            live: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                         },
                     )
                 })
                 .collect(),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
+    }
+
+    /// Override the background connect budget (tests).
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
     }
 
     /// Every `[agents.<id>]` with its validated `cdp` endpoint.
@@ -489,26 +512,61 @@ impl ConnectingCdpBackend {
 impl AgentBrowser {
     /// The live engine and context, connecting first if there is none
     /// or the last connection ended.
-    async fn engine(&self, agent_id: &str) -> Result<(FillEngine, AgentContext), FillOutcome> {
-        let mut live = self.live.lock().await;
+    ///
+    /// The connect runs in a spawned task that holds the lock and stores
+    /// its result itself, so dropping this future (the fill deadline)
+    /// neither cancels a `createBrowserContext` already on the wire nor
+    /// loses its reply: the context is adopted by the next fill.
+    async fn engine(
+        &self,
+        agent_id: &str,
+        budget: Duration,
+    ) -> Result<(FillEngine, AgentContext), FillOutcome> {
+        let mut live = std::sync::Arc::clone(&self.live).lock_owned().await;
         if let Some((engine, ctx)) = &*live
             && !engine.is_closed()
         {
             return Ok((engine.clone(), ctx.clone()));
         }
         *live = None;
-        let client = CdpClient::connect(&self.endpoint)
-            .await
-            .map_err(|e| FillOutcome::Error(e.to_string()))?;
-        let browser = Browser::new(client);
-        let ctx = browser
-            .create_agent_context(agent_id)
-            .await
-            .map_err(|e| FillOutcome::Error(e.to_string()))?;
-        let engine = FillEngine::new(browser);
-        *live = Some((engine.clone(), ctx.clone()));
-        Ok((engine, ctx))
+        let endpoint = self.endpoint.clone();
+        let agent_id = agent_id.to_owned();
+        let connect = tokio::spawn(async move {
+            let opened = open_agent_browser(&endpoint, &agent_id, budget).await?;
+            *live = Some(opened.clone());
+            Ok::<_, String>(opened)
+        });
+        match connect.await {
+            Ok(Ok(opened)) => Ok(opened),
+            Ok(Err(e)) => Err(FillOutcome::Error(e)),
+            Err(e) => Err(FillOutcome::Error(format!("cdp connect task: {e}"))),
+        }
     }
+}
+
+/// Connect to `endpoint` and create `agent_id`'s browser context within
+/// `budget`. On any failure after the socket opened the connection is
+/// closed, so a context whose reply was lost or late is disposed by the
+/// browser rather than left behind.
+async fn open_agent_browser(
+    endpoint: &CdpEndpoint,
+    agent_id: &str,
+    budget: Duration,
+) -> Result<(FillEngine, AgentContext), String> {
+    let until = tokio::time::Instant::now() + budget;
+    let client = match tokio::time::timeout_at(until, CdpClient::connect(endpoint)).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("cdp connect timed out".into()),
+    };
+    let browser = Browser::new(client.clone());
+    let error = match tokio::time::timeout_at(until, browser.create_agent_context(agent_id)).await {
+        Ok(Ok(ctx)) => return Ok((FillEngine::new(browser), ctx)),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "cdp createBrowserContext timed out".to_owned(),
+    };
+    client.close().await;
+    Err(error)
 }
 
 impl FillBackend for ConnectingCdpBackend {
@@ -526,7 +584,7 @@ impl FillBackend for ConnectingCdpBackend {
             let Some(agent) = self.agents.get(agent_id) else {
                 return FillOutcome::TargetNotOwned;
             };
-            match agent.engine(agent_id).await {
+            match agent.engine(agent_id, self.connect_timeout).await {
                 Ok((engine, ctx)) => engine.fill(plan, &ctx, allow_default).await,
                 Err(outcome) => outcome,
             }

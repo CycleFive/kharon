@@ -10,6 +10,10 @@
 //! - The fill deadline bounds the connect and the fill: on expiry the
 //!   reply is `timeout`, no further CDP frame is sent, and the audit is
 //!   `fill_dispatch` plus exactly one `fill_timeout`.
+//! - A deadline that fires mid-`createBrowserContext` does not leak the
+//!   context (#68): a late reply is adopted by the next fill (one
+//!   connection, one context), and a reply that never comes ends the
+//!   connection after the connect budget so the browser disposes it.
 //! - A failed `fill_dispatch` append opens no connection at all.
 //! - An unreachable endpoint is `error`/`cdp_error`, audited once.
 //!
@@ -49,6 +53,8 @@ enum Mode {
     Normal,
     /// Never answer this method.
     Stall(&'static str),
+    /// Answer this method only after a delay.
+    Delay(&'static str, Duration),
     /// Close the WebSocket right after answering the in-page fill.
     CloseAfterFill,
 }
@@ -56,6 +62,8 @@ enum Mode {
 #[derive(Clone, Default)]
 struct Stub {
     connections: Arc<AtomicUsize>,
+    /// Connections that have ended (the client closed or dropped them).
+    closed: Arc<AtomicUsize>,
     frames: Arc<Mutex<Vec<Value>>>,
 }
 
@@ -97,6 +105,11 @@ async fn cdp_stub(mode: Mode) -> (String, Stub) {
                     if matches!(mode, Mode::Stall(m) if m == method) {
                         continue;
                     }
+                    if let Mode::Delay(m, delay) = mode
+                        && m == method
+                    {
+                        tokio::time::sleep(delay).await;
+                    }
                     let result = match method.as_str() {
                         "Target.createBrowserContext" => json!({ "browserContextId": ctx }),
                         "Target.getTargetInfo" => json!({ "targetInfo": {
@@ -124,9 +137,11 @@ async fn cdp_stub(mode: Mode) -> (String, Stub) {
                     ws.send(Message::Text(reply.to_string())).await.unwrap();
                     if mode == Mode::CloseAfterFill && method == "Runtime.callFunctionOn" {
                         let _ = ws.close(None).await;
+                        s.closed.fetch_add(1, Ordering::SeqCst);
                         return;
                     }
                 }
+                s.closed.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
@@ -173,6 +188,11 @@ struct Run {
 /// The broker, unlocked with the export fixture, over the backend the
 /// daemon builds from `[agents]`.
 async fn run(cdp: &str, deadline: Duration) -> Run {
+    run_with(cdp, deadline, None).await
+}
+
+/// [`run`] with an optional background connect budget override.
+async fn run_with(cdp: &str, deadline: Duration, connect_timeout: Option<Duration>) -> Run {
     let data = tempfile::tempdir().unwrap();
     let cfg = Config::from_toml_str(&config_toml(
         "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo",
@@ -180,7 +200,10 @@ async fn run(cdp: &str, deadline: Duration) -> Run {
         cdp,
     ))
     .unwrap();
-    let backend = ConnectingCdpBackend::from_agents(&cfg.agents);
+    let mut backend = ConnectingCdpBackend::from_agents(&cfg.agents);
+    if let Some(t) = connect_timeout {
+        backend = backend.with_connect_timeout(t);
+    }
 
     let session: ExportSession = ExportFile::from_bytes(EXPORT)
         .unwrap()
@@ -338,6 +361,89 @@ async fn req_api_009_daemon_backend_respects_fill_deadline() {
         assert_eq!(e[1]["detail_code"], "deadline_expired");
         assert_eq!(e[0]["request_id"], e[1]["request_id"]);
     }
+}
+
+/// #68: the deadline fires after `createBrowserContext` was sent but
+/// before its reply. The fill is `timeout` with nothing sent after
+/// expiry, and the late context is adopted by the next fill rather than
+/// orphaned: still one connection and one `createBrowserContext`, and the
+/// second fill lands in that context.
+#[tokio::test]
+async fn req_api_009_context_created_after_deadline_is_adopted_not_leaked() {
+    let (url, stub) = cdp_stub(Mode::Delay(
+        "Target.createBrowserContext",
+        Duration::from_millis(600),
+    ))
+    .await;
+    let r = run(&url, Duration::from_millis(200)).await;
+    let resp = r.fill(true).await;
+    assert_eq!(
+        resp.json(),
+        json!({"status": "timeout", "fields_filled": []}),
+        "{}",
+        resp.body
+    );
+    let sent = stub.frame_count();
+    assert_eq!(stub.methods("Target.createBrowserContext"), 1);
+    // The reply arrives after the deadline; the background connect keeps
+    // it. No CDP frame goes out on the timed-out fill's behalf.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(stub.frame_count(), sent, "no CDP frame after expiry");
+    assert_eq!(stub.closed.load(Ordering::SeqCst), 0, "connection kept");
+
+    let r2 = r.fill(false).await;
+    assert_eq!(r2.json(), filled(), "{}", r2.body);
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        stub.methods("Target.createBrowserContext"),
+        1,
+        "the orphan was adopted, not replaced"
+    );
+    assert_eq!(stub.methods("Target.disposeBrowserContext"), 0);
+    let mut want = vec![
+        json!([
+            "fill_dispatch",
+            "alpha",
+            "https://example.com",
+            "dispatched"
+        ]),
+        json!(["fill_timeout", "alpha", null, "timeout"]),
+    ];
+    want.extend(dispatch_then("fill", "filled"));
+    assert_eq!(r.audit.summary(), want);
+}
+
+/// #68, reply never arrives: the background connect gives up after its
+/// budget and closes the connection (the browser disposes contexts with
+/// their connection) without sending any CDP command. The next fill
+/// starts over on a fresh connection.
+#[tokio::test]
+async fn req_api_009_unanswered_create_context_closes_the_connection() {
+    let (url, stub) = cdp_stub(Mode::Stall("Target.createBrowserContext")).await;
+    let r = run_with(
+        &url,
+        Duration::from_millis(200),
+        Some(Duration::from_millis(500)),
+    )
+    .await;
+    let resp = r.fill(false).await;
+    assert_eq!(resp.json()["status"], "timeout", "{}", resp.body);
+    let sent = stub.frame_count();
+    let mut waited = Duration::ZERO;
+    while stub.closed.load(Ordering::SeqCst) == 0 && waited < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += Duration::from_millis(50);
+    }
+    assert_eq!(
+        stub.closed.load(Ordering::SeqCst),
+        1,
+        "connection closed after the connect budget"
+    );
+    assert_eq!(stub.frame_count(), sent, "closing sends no CDP command");
+
+    let resp = r.fill(false).await;
+    assert_eq!(resp.json()["status"], "timeout", "{}", resp.body);
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
 }
 
 /// REQ-AUD-003†: a failed `fill_dispatch` append reaches no browser —

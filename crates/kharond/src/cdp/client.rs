@@ -150,7 +150,15 @@ pub struct CdpClient {
     /// protocol error). A closed client never recovers; callers that
     /// keep one (the daemon's fill backend) reconnect.
     closed: Arc<AtomicBool>,
+    /// The read task. It owns the read half, so the socket stays open
+    /// for as long as it runs — dropping every clone of the client does
+    /// not end the connection; [`Self::close`] does.
+    reader: Arc<tokio::task::AbortHandle>,
 }
+
+/// How long [`CdpClient::close`] waits to hand the browser a WebSocket
+/// close frame before dropping the socket anyway.
+const CLOSE_GRACE: Duration = Duration::from_millis(500);
 
 impl CdpClient {
     /// Whether the connection has ended. Every request on a closed
@@ -210,7 +218,7 @@ impl CdpClient {
         let pending_read = Arc::clone(&pending);
         let closed = Arc::new(AtomicBool::new(false));
         let closed_read = Arc::clone(&closed);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             loop {
                 let frame = match read.next().await {
                     Some(Ok(frame)) => frame,
@@ -262,6 +270,29 @@ impl CdpClient {
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
             closed,
+            reader: Arc::new(reader.abort_handle()),
+        }
+    }
+
+    /// End the connection: best-effort WebSocket close frame (bounded by
+    /// [`CLOSE_GRACE`]), then stop the read task so the socket is
+    /// released once the last clone drops, and fail anything in flight.
+    ///
+    /// This sends no CDP command. The browser disposes every browser
+    /// context this connection created when it sees the connection end,
+    /// which is how a context whose `createBrowserContext` reply never
+    /// arrived is cleaned up (issue #68).
+    pub async fn close(&self) {
+        let _ = tokio::time::timeout(CLOSE_GRACE, async {
+            let mut write = self.write.lock().await;
+            let _ = write.close().await;
+        })
+        .await;
+        self.reader.abort();
+        self.closed.store(true, Ordering::Release);
+        let mut pending = self.pending.lock().await;
+        for (_, reply) in pending.drain() {
+            let _ = reply.send(Err(CdpError::ConnectionClosed));
         }
     }
 

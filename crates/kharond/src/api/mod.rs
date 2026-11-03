@@ -5,13 +5,15 @@
 //! - [`error`]: fixed-text errors (REQ-API-006).
 //! - [`core`]: transport-independent dispatch (REQ-API-002).
 //! - [`http`]: the `/v1/*` HTTP transport and its OpenAPI document.
+//! - [`mcp`]: the MCP transport (`POST /mcp`, REQ-API-001), a second
+//!   adapter over [`core`] on the same listener.
 //!
-//! The MCP transport (REQ-API-001, issue #15) is a second adapter over
-//! [`core`]. Fill endpoints arrive with #18.
+//! Fill endpoints arrive with #18/#19, grants with #20.
 
 pub mod core;
 pub mod error;
 pub mod http;
+pub mod mcp;
 pub mod meta;
 pub mod token;
 

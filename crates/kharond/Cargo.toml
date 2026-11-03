@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 serde_jcs = "0.1"
 sha2 = "0.10"
 hmac = "0.12"
@@ -52,6 +52,13 @@ rustix = { version = "1", default-features = false, features = ["std", "process"
 # token hashes (same argon2 crate kharon-bwcrypto uses for the KDF).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 argon2 = { version = "0.5", features = ["std", "zeroize"] }
+# MCP transport (issue #15, REQ-API-001): tool input schemas generated
+# from Rust types (schemars, as SPEC §4 names); raw_value so tool
+# arguments keep duplicate keys (refused, as on HTTP); base64ct
+# (already in the tree via kharon-bwcrypto) decodes the `Mcp-Name`
+# header's `=?base64?…?=` form.
+schemars = "1"
+base64ct = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3"

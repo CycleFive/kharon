@@ -82,13 +82,19 @@ impl MatchKind {
 }
 
 /// OQ-4 default masking: first character, `***`, then the `@domain`
-/// part if the username is an email address. Empty → `***`.
+/// part if the username is an email address. Empty → `***`. A
+/// one-character local part is not revealed at all (`***@domain`):
+/// its first character would be the whole of it.
 pub fn mask_username(username: &str) -> String {
     let (local, domain) = match username.rsplit_once('@') {
-        Some((l, d)) if !d.is_empty() => (l, Some(d)),
-        _ => (username, None),
+        Some((l, d)) => (l, (!d.is_empty()).then_some(d)),
+        None => (username, None),
     };
-    let mut out: String = local.chars().take(1).collect();
+    let mut chars = local.chars();
+    let mut out = String::new();
+    if let (Some(first), Some(_)) = (chars.next(), chars.next()) {
+        out.push(first);
+    }
     out.push_str("***");
     if let Some(d) = domain {
         out.push('@');
@@ -159,5 +165,14 @@ mod tests {
         assert_eq!(mask_username("jane@"), "j***");
         assert_eq!(mask_username("ünï@x.y"), "ü***@x.y");
         assert_eq!(mask_username(""), "***");
+    }
+
+    #[test]
+    fn req_api_004_single_char_local_part_not_revealed() {
+        assert_eq!(mask_username("j@example.com"), "***@example.com");
+        assert_eq!(mask_username("j"), "***");
+        assert_eq!(mask_username("j@"), "***");
+        assert_eq!(mask_username("ü@x.y"), "***@x.y");
+        assert_eq!(mask_username("jo@example.com"), "j***@example.com");
     }
 }

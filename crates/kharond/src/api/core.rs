@@ -5,7 +5,8 @@
 //! extracts the bearer token and the request parameters, calls
 //! [`Broker::authenticate`] and [`Broker::dispatch`], and renders the
 //! [`Outcome`] or [`ApiError`]. Parameter validation
-//! ([`parse_items_query`]) lives here too, so a transport cannot
+//! ([`parse_request`], over [`parse_status_query`] and
+//! [`parse_items_query`]) lives here too, so a transport cannot
 //! accept a request another one refuses. HTTP is the only transport
 //! today (MCP is issue #15); the contract harness in
 //! `tests/req_api_002_contract.rs` runs every case against the core
@@ -128,6 +129,40 @@ impl Outcome {
             Self::Items(items) => serde_json::to_value(items),
         };
         v.expect("invariant: API bodies serialize")
+    }
+}
+
+/// The read operations, before their parameters are validated: what
+/// a transport recognizes from its route (HTTP path) or tool name
+/// (MCP), handed to [`parse_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    /// `kharon_status` / `GET /v1/status`.
+    Status,
+    /// `kharon_list` and `kharon_search` / `GET /v1/items`.
+    Items,
+}
+
+/// The single entry point for parameter validation: every transport
+/// decodes its parameters into `(name, value)` pairs and calls this.
+pub fn parse_request<'a>(
+    op: Operation,
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<Request, ApiError> {
+    match op {
+        Operation::Status => parse_status_query(pairs),
+        Operation::Items => parse_items_query(pairs),
+    }
+}
+
+/// Validate status parameters: there are none, so any parameter is
+/// refused rather than ignored.
+pub fn parse_status_query<'a>(
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<Request, ApiError> {
+    match pairs.into_iter().next() {
+        None => Ok(Request::Status),
+        Some(_) => Err(ApiError::bad_request(Detail::UnknownParameter)),
     }
 }
 

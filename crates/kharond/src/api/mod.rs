@@ -18,4 +18,4 @@ pub mod token;
 pub use self::core::{AgentId, AuditSink, Broker, Outcome, Request, StatusBody, VaultView};
 pub use error::{ApiError, Detail, ErrorCode};
 pub use meta::ItemMeta;
-pub use token::TokenStore;
+pub use token::{ParamFloor, TokenStore};

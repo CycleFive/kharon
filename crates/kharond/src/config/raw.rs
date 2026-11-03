@@ -1,6 +1,7 @@
 //! Serde-facing raw config and its conversion to the validated [`Config`].
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,10 +9,11 @@ use serde::Deserialize;
 use url::Url;
 
 use super::{
-    AgentConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config, ConfigError, ExportConfig,
-    FORBIDDEN_SECRET_KEYS, GrantKind, MemoryConfig, NtfyConfig, PolicyConfig, Redacted, Source,
-    parse_duration, tunnel_from_config,
+    AgentConfig, ApiConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config, ConfigError,
+    DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind, MemoryConfig, NtfyConfig,
+    PolicyConfig, Redacted, Source, parse_duration, tunnel_from_config,
 };
+use crate::api::token::{HashProblem, ParamFloor, check_token_hash};
 use crate::cdp::{CdpEndpoint, CertSha256};
 
 #[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +52,14 @@ struct RawConfig {
     audit: RawAudit,
     #[serde(default)]
     memory: RawMemory,
+    api: Option<RawApi>,
+    data_dir: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApi {
+    listen: String,
 }
 
 #[derive(Deserialize)]
@@ -278,6 +288,14 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         return Err(ConfigError::AuditNoOffHostSink);
     }
 
+    let api = raw.api.map(validate_api).transpose()?;
+    let data_dir = raw
+        .data_dir
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+    if !data_dir.is_absolute() {
+        return Err(ConfigError::DataDirNotAbsolute);
+    }
+
     Ok(Config {
         source,
         agents,
@@ -287,7 +305,38 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         memory: MemoryConfig {
             require_mlock: raw.memory.require_mlock,
         },
+        api,
+        data_dir,
     })
+}
+
+/// REQ-DEP-006: the agent API binds one specific unicast address.
+/// Hostnames are refused (no DNS at startup, and a name could resolve
+/// to a wildcard); `0.0.0.0`, `::` and `::ffff:0.0.0.0` are refused as
+/// wildcards.
+fn validate_api(raw: RawApi) -> Result<ApiConfig, ConfigError> {
+    let listen: SocketAddr = raw
+        .listen
+        .parse()
+        .map_err(|_| ConfigError::ApiListenInvalid)?;
+    check_listen_ip(listen.ip())?;
+    Ok(ApiConfig { listen })
+}
+
+fn check_listen_ip(ip: IpAddr) -> Result<(), ConfigError> {
+    let ip = match ip {
+        // `::ffff:a.b.c.d` binds as the v4 address on a dual-stack socket.
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
+    if ip.is_unspecified() {
+        return Err(ConfigError::ApiWildcardBind);
+    }
+    let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
+    if ip.is_multicast() || broadcast {
+        return Err(ConfigError::ApiListenNotUnicast);
+    }
+    Ok(())
 }
 
 fn http_url(key: &str, s: &str) -> Result<Url, ConfigError> {
@@ -363,6 +412,21 @@ fn validate_agent(id: &str, a: RawAgent) -> Result<AgentConfig, ConfigError> {
         return Err(ConfigError::TokenHashNotArgon2id {
             agent: id.to_owned(),
         });
+    }
+    // REQ-API-003: a full PHC parse plus the production parameter floor,
+    // so a weak or malformed hash is a config error, not a broker error.
+    match check_token_hash(&a.token_hash, &ParamFloor::PRODUCTION) {
+        Ok(()) => {}
+        Err(HashProblem::Invalid) => {
+            return Err(ConfigError::TokenHashNotArgon2id {
+                agent: id.to_owned(),
+            });
+        }
+        Err(HashProblem::WeakParams) => {
+            return Err(ConfigError::TokenHashWeakParams {
+                agent: id.to_owned(),
+            });
+        }
     }
     let via = tunnel_from_config(id, &a.cdp.via)?;
     let pin = a

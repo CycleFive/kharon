@@ -8,7 +8,7 @@ use kharond::config::{
     Config, ConfigError, MlockProbe, ProcfsMlockProbe, StaticMlockProbe, load_for_startup,
 };
 
-const TOKEN_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2g";
+const TOKEN_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo";
 const ORG: &str = "0f3c2a6e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
 const COLL: &str = "11111111-2222-3333-4444-555555555555";
 
@@ -24,6 +24,7 @@ struct Parts {
     approval: String,
     audit: String,
     memory: String,
+    api: String,
 }
 
 impl Parts {
@@ -42,8 +43,11 @@ impl Parts {
             approval:
                 "[approval]\nntfy = { url = \"https://ntfy.example.net\", topic = \"kharon\" }\n"
                     .to_owned(),
-            audit: String::new(),
+            // Off-host (ntfy) checkpoints are not implemented yet, so a
+            // config the daemon will actually serve is local-only (#14).
+            audit: "[audit]\ncheckpoint_local_only = true\n".to_owned(),
             memory: "[memory]\nrequire_mlock = false\n".to_owned(),
+            api: "[api]\nlisten = \"10.66.0.1:8787\"\n".to_owned(),
         }
     }
 
@@ -57,6 +61,7 @@ impl Parts {
             &self.approval,
             &self.audit,
             &self.memory,
+            &self.api,
         ]
         .iter()
         .map(|s| s.as_str())
@@ -235,7 +240,37 @@ fn bad_configs() -> Vec<Row> {
             },
         ),
         row("no off-host audit sink", "audit_no_off_host_sink", |p| {
-            p.approval.clear()
+            p.approval.clear();
+            p.audit.clear()
+        }),
+        // REQ-API-003: hashes below the Argon2id floor are refused at load.
+        row("weak token hash memory", "token_hash_weak_params", |p| {
+            p.agents = p.agents.replace("m=65536,t=3,p=4", "m=4096,t=3,p=1")
+        }),
+        row("weak token hash time", "token_hash_weak_params", |p| {
+            p.agents = p.agents.replace("m=65536,t=3,p=4", "m=65536,t=1,p=4")
+        }),
+        row("truncated token hash", "token_hash_not_argon2id", |p| {
+            p.agents = p.agents.replace("$aGFzaGhhc2hoYXNo", "$aGFzaA")
+        }),
+        // REQ-DEP-006: the agent API never binds a wildcard.
+        row("wildcard v4 listen", "api_wildcard_bind", |p| {
+            p.api = "[api]\nlisten = \"0.0.0.0:8787\"\n".into()
+        }),
+        row("wildcard v6 listen", "api_wildcard_bind", |p| {
+            p.api = "[api]\nlisten = \"[::]:8787\"\n".into()
+        }),
+        row("hostname listen", "api_listen_invalid", |p| {
+            p.api = "[api]\nlisten = \"localhost:8787\"\n".into()
+        }),
+        row("multicast listen", "api_listen_not_unicast", |p| {
+            p.api = "[api]\nlisten = \"224.0.0.1:8787\"\n".into()
+        }),
+        row("unknown api key", "parse", |p| {
+            p.api = "[api]\nlisten = \"10.66.0.1:8787\"\nport = 1\n".into()
+        }),
+        row("relative data dir", "data_dir_not_absolute", |p| {
+            p.top = "data_dir = \"data\"\n".into()
         }),
     ];
     // Sync-client wiring (#8): the files behind the config must be usable.
@@ -334,7 +369,9 @@ fn run_daemon(text: &str) -> (Option<i32>, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kharon.toml");
     std::fs::write(&path, text).unwrap();
+    // `--check`: validate and exit; without it a good config serves.
     let out = Command::new(env!("CARGO_BIN_EXE_kharond"))
+        .arg("--check")
         .arg("--config")
         .arg(&path)
         .output()

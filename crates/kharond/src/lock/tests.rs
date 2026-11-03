@@ -581,3 +581,68 @@ fn issue_54_sync_lock_reason_has_one_path_into_the_controller() {
     assert!(canary.all_zero());
     assert!(!c.on_sync_lock(&widened), "already locked: no-op");
 }
+
+/// SPEC §8 "lock … closes CDP sessions" (issue #66): every lock path
+/// runs the lock hook exactly once, after the keys are wiped and
+/// before the `Locked` audit entry; a no-op lock does not run it.
+#[test]
+fn req_mem_003_every_lock_path_runs_the_lock_hook_after_the_wipe() {
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let canary: Arc<Mutex<Option<CanarySession>>> = Arc::default();
+    let (log, probe) = (seen.clone(), canary.clone());
+    c.set_lock_hook(Box::new(move |reason| {
+        let wiped = probe.lock().unwrap().as_ref().is_some_and(|s| s.all_zero());
+        log.lock()
+            .unwrap()
+            .push(format!("hook {reason:?} wiped={wiped}"));
+    }));
+    let log = seen.clone();
+    c.set_event_sink(Box::new(move |e| {
+        if let LockEvent::Locked { reason } = e {
+            log.lock().unwrap().push(format!("audit {reason:?}"));
+        }
+        Ok(())
+    }));
+
+    type Ctl = LockController<CanarySession, Arc<ManualClock>>;
+    let lock_with = |c: &mut Ctl, how: &dyn Fn(&mut Ctl)| {
+        *canary.lock().unwrap() = Some(unlock_ok(c));
+        how(c);
+        assert!(c.is_locked());
+    };
+    lock_with(&mut c, &|c| assert!(c.lock(LockReason::Manual)));
+    lock_with(&mut c, &|c| {
+        clock.advance(Duration::from_secs(30 * 60));
+        assert!(c.require_unlocked().is_err());
+    });
+    lock_with(&mut c, &|c| {
+        clock.advance(Duration::from_secs(30 * 60));
+        assert_eq!(c.poll(), Some(LockReason::IdleTimeout));
+    });
+    lock_with(&mut c, &|c| assert!(c.on_org_key_changed()));
+    lock_with(&mut c, &|c| assert!(c.on_scope_widened()));
+    // Already locked: no hook.
+    assert!(!c.lock(LockReason::Manual));
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            "hook Manual wiped=true",
+            "audit Manual",
+            "hook IdleTimeout wiped=true",
+            "audit IdleTimeout",
+            "hook IdleTimeout wiped=true",
+            "audit IdleTimeout",
+            "hook KeyRotated wiped=true",
+            "audit KeyRotated",
+            "hook ScopeWidened wiped=true",
+            "audit ScopeWidened",
+        ]
+    );
+}

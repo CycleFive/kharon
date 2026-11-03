@@ -72,6 +72,16 @@
 //! as a [`LockEvent`]; the daemon wires the sink to the audit log
 //! (REQ-AUD-003), tests wire it to a `Vec`.
 //!
+//! Lock also closes CDP sessions (SPEC §8, issue #66). Every lock
+//! path (manual, idle/absolute expiry, forced) goes through
+//! [`LockController::lock`], which runs the optional lock hook
+//! ([`LockController::set_lock_hook`]) right after the session is
+//! dropped. The broker wires the hook to its fill backend, which
+//! invalidates cached browser contexts and connections and tears them
+//! down in the background. The hook is infallible and must not block:
+//! the lock (and the zeroization that comes with it) never depends on
+//! the browser answering.
+//!
 //! Field classes (REQ-CRY-006) are enforced by the session type
 //! (metadata decrypted at sync, secrets decrypted per fill into
 //! zeroizing buffers, no plaintext secret cache); the controller's
@@ -287,6 +297,10 @@ struct Unlocked<S> {
 /// rule can be enforced at the transitions it governs.
 type EventSink = Box<dyn FnMut(LockEvent) -> Result<(), AuditError> + Send>;
 
+/// Run on every lock, after the session is gone (issue #66). Cannot
+/// fail and must return promptly: it runs under the controller.
+pub type LockHook = Box<dyn FnMut(LockReason) + Send>;
+
 /// Owns the lock state and (while unlocked) the session's keys.
 ///
 /// `S` is the session type produced by an unlock (`sync::Session`
@@ -300,6 +314,7 @@ pub struct LockController<S: ZeroizeOnDrop, C: Clock = SystemClock> {
     hardening: Box<dyn MemoryHardening>,
     unlocked: Option<Unlocked<S>>,
     sink: Option<EventSink>,
+    lock_hook: Option<LockHook>,
 }
 
 impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
@@ -312,7 +327,19 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
             hardening,
             unlocked: None,
             sink: None,
+            lock_hook: None,
         }
+    }
+
+    /// Run `hook` on every lock, whatever the reason, right after the
+    /// session is dropped and before the `Locked` audit entry (SPEC §8
+    /// "lock … closes CDP sessions"; issue #66). It runs while the
+    /// controller is borrowed (in the daemon: under the broker's
+    /// `std::sync::Mutex`), so it must not block or `.await`; the
+    /// broker's hook only signals the fill backend, which tears its
+    /// CDP sessions down in the background.
+    pub fn set_lock_hook(&mut self, hook: LockHook) {
+        self.lock_hook = Some(hook);
     }
 
     /// Report every transition to `sink` (the daemon's audit log).
@@ -446,7 +473,8 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
     }
 
     /// Lock now, destroying the session (REQ-MEM-003). Returns
-    /// whether there was a session to destroy. The `Locked` audit
+    /// whether there was a session to destroy. The lock hook then
+    /// runs (closing CDP sessions, issue #66). The `Locked` audit
     /// entry is best-effort: the lock stands even if the write
     /// fails, because the keys are already gone.
     pub fn lock(&mut self, reason: LockReason) -> bool {
@@ -454,6 +482,9 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
             return false;
         };
         drop(u);
+        if let Some(hook) = &mut self.lock_hook {
+            hook(reason);
+        }
         let _ = self.emit(LockEvent::Locked { reason });
         true
     }

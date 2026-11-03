@@ -275,7 +275,7 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     audit: Mutex<Box<dyn AuditSink>>,
     origin_cfg: OriginConfig,
     clock_skew: ClockSkewGate,
-    fill_backend: Option<Box<dyn FillBackend>>,
+    fill_backend: Option<Arc<dyn FillBackend>>,
     fill_policy: FillPolicy,
     plan_wiped: Option<PlanWipedHook>,
 }
@@ -365,7 +365,18 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
 
     /// Fill through `backend` (without one every fill is
     /// `error`/`fill_unavailable`).
+    ///
+    /// Also installs the lock controller's lock hook (replacing any
+    /// earlier one): every lock, whatever its path, calls
+    /// [`FillBackend::on_lock`], which closes the backend's CDP sessions
+    /// (SPEC §8; issue #66).
     pub fn with_fill_backend(mut self, backend: Box<dyn FillBackend>) -> Self {
+        let backend: Arc<dyn FillBackend> = Arc::from(backend);
+        let hook = Arc::clone(&backend);
+        self.lock
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_lock_hook(Box::new(move |_| hook.on_lock()));
         self.fill_backend = Some(backend);
         self
     }
@@ -560,7 +571,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 return Err(ApiError::LOCKED);
             }
             Err(Unresolved::Refused(status)) => status,
-            Ok(plan) => {
+            Ok((plan, generation)) => {
                 let field_count = plan.fields.len() as u64;
                 // Owns the plan from here: every way out of this arm,
                 // including this future being dropped, wipes it.
@@ -587,7 +598,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                             .result("aborted")
                             .detail_code("handler_dropped"),
                     );
-                    let status = self.run_fill(agent, &guard.plan, deadline).await;
+                    let status = self
+                        .run_fill(agent, &guard.plan, generation, deadline)
+                        .await;
                     guard.abort_entry = None;
                     live_origin = guard.plan.live_origin.get();
                     drop(guard);
@@ -614,11 +627,22 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         Ok(Outcome::Fill(status.result()))
     }
 
-    async fn run_fill(&self, agent: &AgentId, plan: &FillPlan, deadline: Instant) -> FillStatus {
+    async fn run_fill(
+        &self,
+        agent: &AgentId,
+        plan: &FillPlan,
+        generation: u64,
+        deadline: Instant,
+    ) -> FillStatus {
         let Some(backend) = &self.fill_backend else {
             return FillStatus::Unavailable;
         };
-        let fill = backend.fill(agent.as_str(), plan, self.fill_policy.allow_default_context);
+        let fill = backend.fill_in_generation(
+            agent.as_str(),
+            plan,
+            self.fill_policy.allow_default_context,
+            generation,
+        );
         match tokio::time::timeout_at(deadline, fill).await {
             Ok(outcome) => FillStatus::Engine(outcome),
             Err(_) => FillStatus::Engine(FillOutcome::Timeout),
@@ -626,8 +650,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 
     /// The sync half: lock gate, grant seam, item, values. Holds the
-    /// lock mutex for the duration (no `.await` here).
-    fn resolve_fill(&self, agent: &AgentId, req: &FillRequest) -> Result<FillPlan, Unresolved> {
+    /// lock mutex for the duration (no `.await` here). Also returns the
+    /// backend's unlock generation, read under the same mutex as the
+    /// gate: a lock after this point advances it (the lock hook runs
+    /// under this mutex), so the backend can refuse to cache or write for
+    /// this fill (issue #66).
+    fn resolve_fill(
+        &self,
+        agent: &AgentId,
+        req: &FillRequest,
+    ) -> Result<(FillPlan, u64), Unresolved> {
         let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         // The fill gate first (REQ-MEM-007), then fill activity resets
         // the idle timer (REQ-MEM-004; a no-op that locks if expired).
@@ -648,10 +680,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // operation) → proceed; else `pending_approval` / `denied`.
         let _ = &req.grant_id;
 
-        match &self.fill_backend {
-            Some(b) if b.has_agent(agent.as_str()) => {}
+        let generation = match &self.fill_backend {
+            Some(b) if b.has_agent(agent.as_str()) => b.generation(),
             _ => return refuse(FillStatus::Unavailable),
-        }
+        };
 
         // Every requested kind must exist before anything is decrypted.
         for (kind, _) in &req.fields {
@@ -700,7 +732,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             });
         }
 
-        Ok(FillPlan {
+        let plan = FillPlan {
             target_id: req.target_id.clone(),
             fields,
             item_matchers: item
@@ -713,6 +745,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             submit: req.submit,
             expected_origin: Some(req.expected_origin.clone()),
             live_origin: LiveOrigin::new(),
-        })
+        };
+        Ok((plan, generation))
     }
 }

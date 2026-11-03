@@ -22,6 +22,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -394,6 +396,38 @@ pub trait FillBackend: Send + Sync {
         plan: &'a FillPlan,
         allow_default: bool,
     ) -> FillFuture<'a>;
+
+    /// The backend's unlock generation: a counter that
+    /// [`Self::on_lock`] advances (issue #66). The broker reads it under
+    /// the lock controller, in the same critical section as the fill
+    /// gate, and hands it to [`Self::fill_in_generation`], so a backend
+    /// can tell a fill that was admitted before a lock from one admitted
+    /// after it. Backends that cache nothing keep the default.
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    /// [`Self::fill`] for a fill admitted in unlock generation
+    /// `generation` (see [`Self::generation`]). A backend that caches
+    /// browser state must not cache anything for, or write to the page
+    /// on behalf of, a generation that has since been locked.
+    fn fill_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        plan: &'a FillPlan,
+        allow_default: bool,
+        generation: u64,
+    ) -> FillFuture<'a> {
+        let _ = generation;
+        self.fill(agent_id, plan, allow_default)
+    }
+
+    /// The broker locked (SPEC §8: "Lock zeroizes keys and closes CDP
+    /// sessions"; issue #66). Called from the lock controller's hook on
+    /// every lock path, with the controller borrowed: it must not block
+    /// and cannot fail. Teardown that needs the browser runs in the
+    /// background, best effort.
+    fn on_lock(&self) {}
 }
 
 /// The production backend: the CDP [`FillEngine`], one [`AgentContext`]
@@ -455,23 +489,61 @@ impl FillBackend for CdpFillBackend {
 /// of budget after the socket opened, the connection is closed, which
 /// makes the browser dispose any context it created for it.
 ///
+/// Lock closes CDP sessions (SPEC §8, issue #66). [`FillBackend::on_lock`]
+/// advances the unlock generation and, in the background, takes every
+/// cached connection, sends `Target.disposeBrowserContext` for its
+/// context (bounded by [`DEFAULT_TEARDOWN_TIMEOUT`]) and closes the
+/// connection. Nothing in the lock waits for the browser. Every cached
+/// entry is tagged with the generation it was connected in, and a fill
+/// carries the generation the broker admitted it in, so:
+///
+/// - a connect that finishes after a lock disposes and closes what it
+///   opened instead of caching it, and its fill makes no page write;
+/// - a cached entry from an earlier generation is never reused, even if
+///   its background teardown has not run yet;
+/// - a fill admitted before the lock that reaches the backend after it
+///   is refused (`cdp_error`) before any CDP I/O.
+///
+/// The first fill after unlock therefore reconnects and creates a fresh
+/// context.
+///
 /// Fills for one agent are serialised on the connect step only; the
 /// fill itself runs on a clone of the engine.
 pub struct ConnectingCdpBackend {
     agents: HashMap<String, AgentBrowser>,
     connect_timeout: Duration,
+    teardown_timeout: Duration,
+    generation: Arc<AtomicU64>,
 }
 
 /// Budget for one background connect (socket, handshake and
 /// `createBrowserContext`); matches the per-request CDP hang-guard.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-type Live = Option<(FillEngine, AgentContext)>;
+/// Budget for `Target.disposeBrowserContext` when a lock tears an
+/// agent's session down (issue #66). The connection is closed after it
+/// either way, and closing makes the browser dispose the context too.
+pub const DEFAULT_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One agent's live connection and context, and the unlock generation
+/// it was opened in.
+#[derive(Clone)]
+struct Cached {
+    browser: Browser,
+    engine: FillEngine,
+    ctx: AgentContext,
+    generation: u64,
+}
+
+type Live = Option<Cached>;
 
 struct AgentBrowser {
     endpoint: CdpEndpoint,
-    live: std::sync::Arc<tokio::sync::Mutex<Live>>,
+    live: Arc<tokio::sync::Mutex<Live>>,
 }
+
+/// Why the backend refused a fill admitted before a lock.
+const LOCKED_DURING_FILL: &str = "broker locked during fill";
 
 impl ConnectingCdpBackend {
     /// One lazily-connected browser per `(agent id, endpoint)`.
@@ -488,18 +560,26 @@ impl ConnectingCdpBackend {
                         id.into(),
                         AgentBrowser {
                             endpoint,
-                            live: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+                            live: Arc::new(tokio::sync::Mutex::new(None)),
                         },
                     )
                 })
                 .collect(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            teardown_timeout: DEFAULT_TEARDOWN_TIMEOUT,
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Override the background connect budget (tests).
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Override the lock-time `disposeBrowserContext` budget (tests).
+    pub fn with_teardown_timeout(mut self, timeout: Duration) -> Self {
+        self.teardown_timeout = timeout;
         self
     }
 
@@ -510,29 +590,54 @@ impl ConnectingCdpBackend {
 }
 
 impl AgentBrowser {
-    /// The live engine and context, connecting first if there is none
-    /// or the last connection ended.
+    /// The live engine and context for a fill admitted in `generation`,
+    /// connecting first if there is none, the last connection ended, or
+    /// the cached one belongs to an earlier (locked) generation.
     ///
     /// The connect runs in a spawned task that holds the lock and stores
     /// its result itself, so dropping this future (the fill deadline)
     /// neither cancels a `createBrowserContext` already on the wire nor
-    /// loses its reply: the context is adopted by the next fill.
+    /// loses its reply: the context is adopted by the next fill — unless
+    /// the broker locked meanwhile, in which case the task disposes it
+    /// and closes the connection (issue #66).
     async fn engine(
         &self,
         agent_id: &str,
         budget: Duration,
-    ) -> Result<(FillEngine, AgentContext), FillOutcome> {
-        let mut live = std::sync::Arc::clone(&self.live).lock_owned().await;
-        if let Some((engine, ctx)) = &*live
-            && !engine.is_closed()
-        {
-            return Ok((engine.clone(), ctx.clone()));
+        teardown_budget: Duration,
+        generation: u64,
+        current: &Arc<AtomicU64>,
+    ) -> Result<Cached, FillOutcome> {
+        let mut live = Arc::clone(&self.live).lock_owned().await;
+        if current.load(Ordering::Acquire) != generation {
+            return Err(FillOutcome::Error(LOCKED_DURING_FILL.into()));
         }
-        *live = None;
+        if let Some(c) = &*live
+            && c.generation == generation
+            && !c.engine.is_closed()
+        {
+            return Ok(c.clone());
+        }
+        if let Some(stale) = live.take()
+            && !stale.engine.is_closed()
+        {
+            // Normally the lock's own teardown got here first; this only
+            // covers a lock that ran without a runtime to spawn it on.
+            let agent = agent_id.to_owned();
+            tokio::spawn(async move { teardown(stale, &agent, teardown_budget).await });
+        }
         let endpoint = self.endpoint.clone();
         let agent_id = agent_id.to_owned();
+        let current = Arc::clone(current);
         let connect = tokio::spawn(async move {
-            let opened = open_agent_browser(&endpoint, &agent_id, budget).await?;
+            let opened = open_agent_browser(&endpoint, &agent_id, budget, generation).await?;
+            // Checked while holding the agent's lock: a lock that bumps
+            // the generation after this point queues its teardown behind
+            // us and finds the entry we store.
+            if current.load(Ordering::Acquire) != generation {
+                teardown(opened, &agent_id, teardown_budget).await;
+                return Err(LOCKED_DURING_FILL.to_owned());
+            }
             *live = Some(opened.clone());
             Ok::<_, String>(opened)
         });
@@ -544,6 +649,51 @@ impl AgentBrowser {
     }
 }
 
+/// Take `agent_id`'s cached session if it was opened before the lock that
+/// moved the generation to `lock_generation`, and tear it down (issue
+/// #66). Waits for an in-flight connect for this agent to finish first
+/// (that connect sees the new generation and tears down its own). A
+/// session opened after the lock (an unlock and a fill can overtake this
+/// task) is left alone.
+async fn close_cached(
+    live: Arc<tokio::sync::Mutex<Live>>,
+    agent_id: String,
+    lock_generation: u64,
+    budget: Duration,
+) {
+    let taken = {
+        let mut live = live.lock().await;
+        match &*live {
+            Some(c) if c.generation < lock_generation => live.take(),
+            _ => None,
+        }
+    };
+    if let Some(c) = taken {
+        teardown(c, &agent_id, budget).await;
+    }
+}
+
+/// Dispose `c`'s browser context (best effort, within `budget`) and close
+/// its connection. Failures are reported as `kharond: warning:` lines,
+/// never returned: a lock must not depend on the browser (issue #66).
+async fn teardown(c: Cached, agent_id: &str, budget: Duration) {
+    if !c.engine.is_closed() {
+        match tokio::time::timeout(budget, c.browser.close_agent_context(&c.ctx)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!(
+                "kharond: warning: lock: disposing agent {agent_id}'s browser context failed \
+                 ({e}); closing the connection"
+            ),
+            Err(_) => eprintln!(
+                "kharond: warning: lock: disposing agent {agent_id}'s browser context timed out \
+                 after {} ms; closing the connection",
+                budget.as_millis()
+            ),
+        }
+    }
+    c.browser.client().close().await;
+}
+
 /// Connect to `endpoint` and create `agent_id`'s browser context within
 /// `budget`. On any failure after the socket opened the connection is
 /// closed, so a context whose reply was lost or late is disposed by the
@@ -552,7 +702,8 @@ async fn open_agent_browser(
     endpoint: &CdpEndpoint,
     agent_id: &str,
     budget: Duration,
-) -> Result<(FillEngine, AgentContext), String> {
+    generation: u64,
+) -> Result<Cached, String> {
     let until = tokio::time::Instant::now() + budget;
     let client = match tokio::time::timeout_at(until, CdpClient::connect(endpoint)).await {
         Ok(Ok(client)) => client,
@@ -561,7 +712,14 @@ async fn open_agent_browser(
     };
     let browser = Browser::new(client.clone());
     let error = match tokio::time::timeout_at(until, browser.create_agent_context(agent_id)).await {
-        Ok(Ok(ctx)) => return Ok((FillEngine::new(browser), ctx)),
+        Ok(Ok(ctx)) => {
+            return Ok(Cached {
+                engine: FillEngine::new(browser.clone()),
+                browser,
+                ctx,
+                generation,
+            });
+        }
         Ok(Err(e)) => e.to_string(),
         Err(_) => "cdp createBrowserContext timed out".to_owned(),
     };
@@ -580,15 +738,65 @@ impl FillBackend for ConnectingCdpBackend {
         plan: &'a FillPlan,
         allow_default: bool,
     ) -> FillFuture<'a> {
+        self.fill_in_generation(agent_id, plan, allow_default, self.generation())
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn fill_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        plan: &'a FillPlan,
+        allow_default: bool,
+        generation: u64,
+    ) -> FillFuture<'a> {
         Box::pin(async move {
             let Some(agent) = self.agents.get(agent_id) else {
                 return FillOutcome::TargetNotOwned;
             };
-            match agent.engine(agent_id, self.connect_timeout).await {
-                Ok((engine, ctx)) => engine.fill(plan, &ctx, allow_default).await,
-                Err(outcome) => outcome,
+            let c = match agent
+                .engine(
+                    agent_id,
+                    self.connect_timeout,
+                    self.teardown_timeout,
+                    generation,
+                    &self.generation,
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(outcome) => return outcome,
+            };
+            // Last check before the first page-level CDP command: a lock
+            // after this point disposes the context under the fill, whose
+            // next command then fails (`cdp_error`).
+            if self.generation() != generation {
+                return FillOutcome::Error(LOCKED_DURING_FILL.into());
             }
+            c.engine.fill(plan, &c.ctx, allow_default).await
         })
+    }
+
+    /// Advance the generation (so nothing opened before this lock is
+    /// reused or cached) and tear every cached session down in the
+    /// background. Without a tokio runtime (sync callers) only the
+    /// generation moves; stale entries are then torn down by the next
+    /// fill that meets them.
+    fn on_lock(&self) {
+        let lock_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        for (agent_id, agent) in &self.agents {
+            rt.spawn(close_cached(
+                Arc::clone(&agent.live),
+                agent_id.clone(),
+                lock_generation,
+                self.teardown_timeout,
+            ));
+        }
     }
 }
 

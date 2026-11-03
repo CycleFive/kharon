@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 
 use api_support::*;
 use kharond::api::core::parse_items_query;
+use kharond::api::mcp::RpcError;
 use kharond::api::{ApiError, Detail, ErrorCode};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -74,6 +75,19 @@ fn req_api_006_lint_error_details_are_not_interpolated() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn req_api_006_lint_mcp_builds_no_strings_from_input() {
+    // The MCP adapter renders JSON-RPC errors from `RpcError` literals
+    // and tool errors from `ApiError`; it has no formatting at all.
+    let src = code_of(&format!("{API_SRC}/mcp.rs"));
+    for forbidden in ["format!", "format_args!", "write!", "Secret", "expose"] {
+        assert!(!src.contains(forbidden), "mcp.rs contains `{forbidden}`");
+    }
+    for e in RpcError::ALL {
+        assert!(e.message().is_ascii() && e.message().len() < 40);
     }
 }
 
@@ -209,6 +223,96 @@ async fn req_api_006_fuzz_http_no_canary_in_any_response() {
             if r.status != 200 {
                 assert!(
                     bodies.contains(&r.json()),
+                    "{}: body not from the enum: {}",
+                    r.status,
+                    r.body
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn req_api_006_fuzz_mcp_no_canary_in_any_response() {
+    let canaries = canaries();
+    let mut rng = StdRng::seed_from_u64(0x006d_6370);
+    let bodies = all_error_bodies();
+    let messages: Vec<&str> = RpcError::ALL.iter().map(|e| e.message()).collect();
+    let header_safe =
+        |s: String| -> String { s.chars().filter(|c| (' '..='~').contains(c)).collect() };
+    for locked in [false, true] {
+        let h = Harness::new(locked);
+        let addr = serve_http(h.broker.clone()).await;
+        for _ in 0..300 {
+            let tool = [
+                "kharon_status",
+                "kharon_list",
+                "kharon_search",
+                "kharon_fill",
+            ]
+            .choose(&mut rng)
+            .unwrap()
+            .to_string();
+            let tool = if rng.gen_bool(0.1) {
+                header_safe(fuzz_value(&mut rng, &canaries)).replace(['"', '\\'], "")
+            } else {
+                tool
+            };
+            let mut args = Vec::new();
+            for _ in 0..rng.gen_range(0..3) {
+                let k = if rng.gen_bool(0.2) {
+                    fuzz_value(&mut rng, &canaries)
+                } else {
+                    ["q", "origin", "x"].choose(&mut rng).unwrap().to_string()
+                };
+                let v = match rng.gen_range(0..5) {
+                    0 => serde_json::json!(null),
+                    1 => serde_json::json!([fuzz_value(&mut rng, &canaries)]),
+                    2 => serde_json::json!({ "v": fuzz_value(&mut rng, &canaries) }),
+                    _ => serde_json::json!(fuzz_value(&mut rng, &canaries)),
+                };
+                args.push(format!("{}:{v}", serde_json::json!(k)));
+            }
+            let args = format!("{{{}}}", args.join(","));
+            let r = if rng.gen_bool(0.8) {
+                mcp_call(addr, Some(&h.alpha), &tool, &args).await
+            } else {
+                // Mangled headers: wrong name, canary version.
+                let version = header_safe(fuzz_value(&mut rng, &canaries));
+                let name = header_safe(fuzz_value(&mut rng, &canaries));
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":{},"arguments":{args}}}}}"#,
+                    serde_json::json!(tool)
+                );
+                post_mcp_raw(
+                    addr,
+                    Some(&h.alpha),
+                    &[
+                        ("Content-Type", "application/json"),
+                        ("MCP-Protocol-Version", version.trim()),
+                        ("Mcp-Method", "tools/call"),
+                        ("Mcp-Name", name.trim()),
+                    ],
+                    &body,
+                )
+                .await
+            };
+            assert_no_canary(&r.body);
+            let v = r.json();
+            if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+                assert!(messages.contains(&err["message"].as_str().unwrap()), "{v}");
+            } else if let Some(res) = v.get("result") {
+                if res["isError"] == serde_json::json!(true) {
+                    let inner: Value =
+                        serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+                    assert!(
+                        bodies.contains(&inner),
+                        "tool error not from the enum: {inner}"
+                    );
+                }
+            } else {
+                assert!(
+                    bodies.contains(&v),
                     "{}: body not from the enum: {}",
                     r.status,
                     r.body

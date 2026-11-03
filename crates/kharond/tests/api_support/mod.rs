@@ -296,3 +296,89 @@ pub async fn get(addr: std::net::SocketAddr, target: &str, token: Option<&str>) 
         format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n");
     raw_request(addr, head.as_bytes()).await
 }
+
+/// MCP protocol version the helpers speak.
+pub const MCP_VERSION: &str = "2026-07-28";
+
+/// `POST /mcp` with `body`, an optional bearer token and extra headers
+/// (no defaults beyond Host, Content-Length and Connection).
+pub async fn post_mcp_raw(
+    addr: std::net::SocketAddr,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> RawResponse {
+    let mut head = String::from("POST /mcp HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(t) = token {
+        head.push_str(&format!("Authorization: Bearer {t}\r\n"));
+    }
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    raw_request(addr, head.as_bytes()).await
+}
+
+/// A 2026-07-28 MCP request: JSON-RPC envelope, `_meta` protocol
+/// version, and the `MCP-Protocol-Version` / `Mcp-Method` (/ `Mcp-Name`)
+/// headers. `params` is raw JSON text for an object without `_meta`
+/// (raw so tests can send duplicate keys).
+pub async fn mcp_request(
+    addr: std::net::SocketAddr,
+    token: Option<&str>,
+    method: &str,
+    params: &str,
+) -> RawResponse {
+    let meta = format!(r#""_meta":{{"io.modelcontextprotocol/protocolVersion":"{MCP_VERSION}"}}"#);
+    let inner = params
+        .trim()
+        .strip_prefix('{')
+        .and_then(|p| p.strip_suffix('}'))
+        .expect("params is a JSON object")
+        .trim();
+    let params = if inner.is_empty() {
+        format!("{{{meta}}}")
+    } else {
+        format!("{{{inner},{meta}}}")
+    };
+    let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
+    let name = (method == "tools/call").then(|| {
+        serde_json::from_str::<Value>(&params).unwrap()["name"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+    let mut headers = vec![
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json, text/event-stream"),
+        ("MCP-Protocol-Version", MCP_VERSION),
+        ("Mcp-Method", method),
+    ];
+    if let Some(n) = name.as_deref() {
+        headers.push(("Mcp-Name", n));
+    }
+    post_mcp_raw(addr, token, &headers, &body).await
+}
+
+/// `tools/call` of `tool` with raw JSON `arguments`.
+pub async fn mcp_call(
+    addr: std::net::SocketAddr,
+    token: Option<&str>,
+    tool: &str,
+    arguments: &str,
+) -> RawResponse {
+    let params = format!(r#"{{"name":"{tool}","arguments":{arguments}}}"#);
+    mcp_request(addr, token, "tools/call", &params).await
+}
+
+/// Raw JSON object text with `pairs` in order (duplicates kept).
+pub fn json_object(pairs: &[(&str, &str)]) -> String {
+    let fields: Vec<String> = pairs
+        .iter()
+        .map(|(k, v)| format!("{}:{}", json!(k), json!(v)))
+        .collect();
+    format!("{{{}}}", fields.join(","))
+}

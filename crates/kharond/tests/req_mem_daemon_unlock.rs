@@ -1,0 +1,473 @@
+//! Daemon-level acceptance tests for the owner unlock channel
+//! (issue #11) and the export-mode ACs that hang on it (issue #12):
+//!
+//! - REQ-EXP-003: unlock happens only through the owner socket;
+//!   restart → `locked`.
+//! - REQ-EXP-004 (restart level): replacing the export file does
+//!   nothing until a restart; after restart + unlock the audit log
+//!   holds a new `export_loaded` hash.
+//! - REQ-MEM-003: debug-build canary scan of the real daemon's
+//!   `/proc/self/mem` — the export password occurs 0 times after
+//!   unlock, the item-secret canary 0 times after unlock and after
+//!   lock (REQ-CRY-006).
+//! - REQ-MEM-005: kill -9 → restart comes up `locked`; `strings`
+//!   over `data_dir` finds no password or canary.
+//! - REQ-EXP-001: export mode fully works inside a network
+//!   namespace with no egress (loopback only).
+//!
+//! The in-process tests drive `daemon::start`; the canary tests
+//! drive the real `kharond` binary (the scan must run against a
+//! process that does not share the test harness's memory, and the
+//! binary is the thing that will be deployed).
+
+mod api_support;
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use api_support::get;
+use kharond::api::token::generate;
+use kharond::config::Config;
+use kharond::daemon;
+use kharond::export::ExportFile;
+use kharond::lock::StaticHardening;
+use serde_json::{Value, json};
+
+const FIXTURE_A: &[u8] = include_bytes!("fixtures/export/password_protected.json");
+const FIXTURE_B: &[u8] = include_bytes!("fixtures/export/password_protected_replaced.json");
+const PASSWORD: &str = "kharon export fixture password 9";
+const CANARY: &str = "CANARY-EXPORT-PASSWORD-7f3a";
+
+fn fixture_path(name: &str) -> PathBuf {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/export")).join(name)
+}
+
+fn config_toml(hash: &str, data_dir: &Path, export_file: &Path, listen: &str) -> String {
+    format!(
+        r#"mode = "export"
+data_dir = "{}"
+
+[export]
+file = "{}"
+
+[agents.alpha]
+token_hash = "{hash}"
+cdp = {{ endpoint = "ws://127.0.0.1:9/devtools/browser" }}
+
+[audit]
+checkpoint_local_only = true
+
+[memory]
+require_mlock = false
+
+[api]
+listen = "{listen}"
+"#,
+        data_dir.display(),
+        export_file.display()
+    )
+}
+
+/// One owner-socket round trip (blocking), with connect retries
+/// while the daemon is still starting.
+fn owner_op(socket: &Path, request: &Value) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stream = loop {
+        match UnixStream::connect(socket) {
+            Ok(s) => break s,
+            Err(e) => {
+                assert!(Instant::now() < deadline, "owner socket never came up: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    serde_json::from_str(reply.trim()).unwrap_or_else(|_| panic!("bad owner reply: {reply}"))
+}
+
+fn owner_unlock(socket: &Path, password: &str) -> Value {
+    owner_op(socket, &json!({"op": "unlock", "password": password}))
+}
+
+fn owner_status(socket: &Path) -> Value {
+    owner_op(socket, &json!({"op": "status"}))
+}
+
+fn owner_scan(socket: &Path, needle: &str) -> usize {
+    let reply = owner_op(socket, &json!({"op": "scan", "needle": needle}));
+    assert_eq!(reply["ok"], json!(true), "scan reply: {reply}");
+    reply["hits"].as_u64().unwrap() as usize
+}
+
+struct Running {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+    addr: std::net::SocketAddr,
+    socket: PathBuf,
+}
+
+async fn start_daemon(cfg: &Config) -> Running {
+    let d = daemon::start(cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    let addr = d.local_addr().unwrap();
+    let socket = d.owner_socket().to_path_buf();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(d.run(async {
+        let _ = stopped.await;
+    }));
+    Running {
+        stop: Some(stop),
+        server,
+        addr,
+        socket,
+    }
+}
+
+impl Running {
+    async fn shutdown(mut self) {
+        self.stop.take().unwrap().send(()).unwrap();
+        self.server.await.unwrap().unwrap();
+    }
+}
+
+fn audit_text(data_dir: &Path) -> String {
+    std::fs::read_to_string(data_dir.join("audit").join("audit.jsonl")).unwrap_or_default()
+}
+
+// ------------------------------------------------------------ REQ-EXP-003
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_exp_003_unlock_only_via_owner_socket_and_restart_boots_locked() {
+    let (token, hash) = generate("alpha");
+    let token = token.expose_secret().clone();
+    let data = tempfile::tempdir().unwrap();
+    let cfg = Config::from_toml_str(&config_toml(
+        &hash,
+        data.path(),
+        &fixture_path("password_protected.json"),
+        "127.0.0.1:0",
+    ))
+    .unwrap();
+
+    let run = start_daemon(&cfg).await;
+    // Boots locked: status says so on both surfaces, list is 423.
+    assert_eq!(get(run.addr, "/v1/status", Some(&token)).await.json()["locked"], json!(true));
+    assert_eq!(get(run.addr, "/v1/items", Some(&token)).await.status, 423);
+    assert_eq!(owner_status(&run.socket)["locked"], json!(true));
+
+    // Wrong password: refused with the fixed code, still locked.
+    let bad = owner_unlock(&run.socket, "kharon export fixture password 8");
+    assert_eq!(bad["ok"], json!(false));
+    assert_eq!(bad["error"], json!("unlock_failed"));
+    assert_eq!(owner_status(&run.socket)["locked"], json!(true));
+
+    // Right password via the owner socket: unlocked, list works,
+    // and the audit gained the unlock + export_loaded entries.
+    let ok = owner_unlock(&run.socket, PASSWORD);
+    assert_eq!(ok["ok"], json!(true), "{ok}");
+    assert_eq!(ok["locked"], json!(false));
+    let items = get(run.addr, "/v1/items", Some(&token)).await;
+    assert_eq!(items.status, 200, "{}", items.body);
+    assert!(items.body.contains("Example Login"), "{}", items.body);
+    assert!(!items.body.contains(CANARY), "no plaintext secret in list");
+    let audit = audit_text(data.path());
+    assert!(audit.contains("\"export_loaded\""), "{audit}");
+    assert!(audit.contains("\"unlock\""), "{audit}");
+    let sha = ExportFile::from_bytes(FIXTURE_A).unwrap().sha256_hex().to_owned();
+    assert!(audit.contains(&sha), "export_loaded carries the file hash");
+
+    // Lock via the owner socket: list is 423 again.
+    assert_eq!(owner_op(&run.socket, &json!({"op": "lock"}))["ok"], json!(true));
+    assert_eq!(owner_status(&run.socket)["locked"], json!(true));
+    assert_eq!(get(run.addr, "/v1/items", Some(&token)).await.status, 423);
+    run.shutdown().await;
+
+    // Restart with the same data dir: locked again (REQ-MEM-005's
+    // boot state), nothing about the unlock persisted.
+    let run = start_daemon(&cfg).await;
+    assert_eq!(owner_status(&run.socket)["locked"], json!(true));
+    assert_eq!(get(run.addr, "/v1/items", Some(&token)).await.status, 423);
+    run.shutdown().await;
+}
+
+// ------------------------------------------------------------ REQ-EXP-004
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_exp_004_restart_level_replace_file_and_new_audit_hash() {
+    let (token, hash) = generate("alpha");
+    let token = token.expose_secret().clone();
+    let data = tempfile::tempdir().unwrap();
+    let export_file = data.path().join("export.json");
+    std::fs::write(&export_file, FIXTURE_A).unwrap();
+    let cfg = Config::from_toml_str(&config_toml(&hash, data.path(), &export_file, "127.0.0.1:0"))
+        .unwrap();
+
+    let run = start_daemon(&cfg).await;
+    assert_eq!(owner_unlock(&run.socket, PASSWORD)["ok"], json!(true));
+    let items = get(run.addr, "/v1/items", Some(&token)).await;
+    assert!(items.body.contains("Example Login"), "{}", items.body);
+
+    // Replace the file under the running daemon: list must not
+    // change (no sync, no re-read — the startup load is the load).
+    std::fs::write(&export_file, FIXTURE_B).unwrap();
+    let items = get(run.addr, "/v1/items", Some(&token)).await;
+    assert!(items.body.contains("Example Login"), "{}", items.body);
+    assert!(!items.body.contains("Replaced Login"), "{}", items.body);
+    run.shutdown().await;
+
+    // Restart: the new file is loaded, and the audit's
+    // export_loaded entries show both hashes, oldest first.
+    let run = start_daemon(&cfg).await;
+    assert_eq!(owner_unlock(&run.socket, PASSWORD)["ok"], json!(true));
+    let items = get(run.addr, "/v1/items", Some(&token)).await;
+    assert!(items.body.contains("Replaced Login"), "{}", items.body);
+    assert!(!items.body.contains("Example Login"), "{}", items.body);
+    run.shutdown().await;
+
+    let audit = audit_text(data.path());
+    let hashes: Vec<String> = audit
+        .lines()
+        .filter(|l| l.contains("\"export_loaded\""))
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            v["file_sha256"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    let sha_a = ExportFile::from_bytes(FIXTURE_A).unwrap().sha256_hex().to_owned();
+    let sha_b = ExportFile::from_bytes(FIXTURE_B).unwrap().sha256_hex().to_owned();
+    assert_eq!(hashes, [sha_a, sha_b]);
+}
+
+// --------------------------------------- REQ-MEM-003 / REQ-MEM-005 (binary)
+
+struct DaemonChild {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        // Never leak a daemon: it inherits this test's stdio, and a
+        // leaked child would hold the harness's output pipes open.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Probe the owner socket with a short timeout (the file appears
+/// at bind time, slightly before the serve loop starts accepting).
+fn probe_status(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    if stream.write_all(b"{\"op\":\"status\"}\n").is_err() {
+        return false;
+    }
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).is_ok() && reply.contains("\"ok\":true")
+}
+
+fn spawn_kharond(config_path: &Path, data_dir: &Path) -> DaemonChild {
+    let child = Command::new(env!("CARGO_BIN_EXE_kharond"))
+        .args(["--config", config_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let socket = data_dir.join("owner.sock");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !probe_status(&socket) {
+        assert!(Instant::now() < deadline, "kharond did not start");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    DaemonChild { child, socket }
+}
+
+fn write_binary_config(dir: &Path) -> (PathBuf, String) {
+    let (token, hash) = generate("alpha");
+    let data_dir = dir.join("data");
+    let cfg = config_toml(
+        &hash,
+        &data_dir,
+        &fixture_path("password_protected.json"),
+        "127.0.0.1:0",
+    );
+    let path = dir.join("kharon.toml");
+    std::fs::write(&path, cfg).unwrap();
+    (path, token.expose_secret().clone())
+}
+
+/// The canary scan runs against the real binary: the password and
+/// the item secret must not be findable in the daemon's memory
+/// after unlock, nor the secret after lock.
+#[test]
+fn req_mem_003_canary_scan_of_the_running_daemon_finds_zero_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, _token) = write_binary_config(dir.path());
+    let mut d = spawn_kharond(&cfg, &dir.path().join("data"));
+
+    assert_eq!(owner_status(&d.socket)["locked"], json!(true));
+    assert_eq!(owner_unlock(&d.socket, PASSWORD)["ok"], json!(true));
+    assert_eq!(owner_status(&d.socket)["locked"], json!(false));
+
+    // Positive control: the scanner does find strings that are in
+    // the process (its own binary's name is in mapped .rodata).
+    // Retried briefly: under full-suite parallel load a scan can
+    // race the daemon's own mapping churn; a scanner that never
+    // finds it is broken and still fails here. (The zero-hit
+    // assertions below are single-shot — they are the AC.)
+    let mut control = 0;
+    for _ in 0..10 {
+        control = owner_scan(&d.socket, "kharond");
+        if control >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(control >= 1, "scanner control: hits={control}");
+    // The export password was zeroized after derivation.
+    assert_eq!(owner_scan(&d.socket, PASSWORD), 0, "password after unlock");
+    // No plaintext secret cache while unlocked (REQ-CRY-006).
+    assert_eq!(owner_scan(&d.socket, CANARY), 0, "item canary after unlock");
+
+    assert_eq!(owner_op(&d.socket, &json!({"op": "lock"}))["ok"], json!(true));
+    assert_eq!(owner_scan(&d.socket, CANARY), 0, "item canary after lock");
+    assert_eq!(owner_scan(&d.socket, PASSWORD), 0, "password after lock");
+
+    d.child.kill().unwrap();
+    let _ = d.child.wait();
+}
+
+/// REQ-MEM-005: kill -9 leaves nothing behind — the restart boots
+/// locked, and no file under `data_dir` contains a secret.
+#[test]
+fn req_mem_005_kill9_restart_locked_and_no_secret_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, _token) = write_binary_config(dir.path());
+    let data_dir = dir.path().join("data");
+    let mut d = spawn_kharond(&cfg, &data_dir);
+    assert_eq!(owner_unlock(&d.socket, PASSWORD)["ok"], json!(true));
+    assert_eq!(owner_status(&d.socket)["locked"], json!(false));
+
+    // kill -9 while unlocked: no shutdown path runs at all.
+    d.child.kill().unwrap();
+    let _ = d.child.wait();
+
+    // strings over data_dir: neither the password nor the canary.
+    let mut files = Vec::new();
+    collect_files(&data_dir, &mut files);
+    assert!(!files.is_empty(), "daemon wrote state under data_dir");
+    for f in &files {
+        let bytes = std::fs::read(f).unwrap();
+        assert!(
+            !contains(&bytes, PASSWORD.as_bytes()),
+            "password persisted in {f:?}"
+        );
+        assert!(
+            !contains(&bytes, CANARY.as_bytes()),
+            "item canary persisted in {f:?}"
+        );
+    }
+
+    // Restart (the stale owner socket must not block it): locked.
+    let mut d = spawn_kharond(&cfg, &data_dir);
+    assert_eq!(owner_status(&d.socket)["locked"], json!(true));
+    d.child.kill().unwrap();
+    let _ = d.child.wait();
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let e = e.unwrap();
+        let p = e.path();
+        let kind = e.file_type().unwrap();
+        if kind.is_dir() {
+            collect_files(&p, out);
+        } else if kind.is_file() {
+            // Regular files only: the stale owner socket is not
+            // readable state (and a socket has no contents to leak).
+            out.push(p);
+        }
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+// ------------------------------------------------------------ REQ-EXP-001
+
+const NETNS_CHILD_ENV: &str = "KHARON_REQ_EXP_001_CHILD";
+const NETNS_ADDR: &str = "127.0.0.1:18741";
+
+/// Inside `unshare -rn`: loopback only, no egress, no Bitwarden
+/// server anywhere in the config — export mode must still unlock
+/// and serve `list`.
+fn netns_child() {
+    let (token, hash) = generate("alpha");
+    let token = token.expose_secret().clone();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cfg = config_toml(
+        &hash,
+        &data_dir,
+        &fixture_path("password_protected.json"),
+        NETNS_ADDR,
+    );
+    let cfg_path = dir.path().join("kharon.toml");
+    std::fs::write(&cfg_path, cfg).unwrap();
+    let mut d = spawn_kharond(&cfg_path, &data_dir);
+    assert_eq!(owner_unlock(&d.socket, PASSWORD)["ok"], json!(true));
+
+    // Raw HTTP over loopback: GET /v1/items with the agent token.
+    let mut stream = std::net::TcpStream::connect(NETNS_ADDR).unwrap();
+    let req = format!(
+        "GET /v1/items HTTP/1.1\r\nhost: {NETNS_ADDR}\r\nauthorization: Bearer {token}\r\nconnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut body = String::new();
+    stream.read_to_string(&mut body).unwrap();
+    assert!(body.contains("200"), "list in netns: {body}");
+    assert!(body.contains("Example Login"), "list in netns: {body}");
+    d.child.kill().unwrap();
+    let _ = d.child.wait();
+    println!("NETNS_OK");
+}
+
+#[test]
+fn req_exp_001_export_mode_works_with_no_network_egress() {
+    if std::env::var_os(NETNS_CHILD_ENV).is_some() {
+        netns_child();
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let script = format!(
+        "ip link set lo up 2>/dev/null; exec {} req_exp_001_export_mode_works_with_no_network_egress --exact --nocapture",
+        exe.display()
+    );
+    let out = Command::new("unshare")
+        .args(["-rn", "sh", "-c", &script])
+        .env(NETNS_CHILD_ENV, "1")
+        .output()
+        .expect("unshare must be available for the netns AC");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("NETNS_OK"),
+        "netns child failed: status={} stdout={stdout} stderr={stderr}",
+        out.status
+    );
+}

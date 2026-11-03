@@ -3,7 +3,7 @@
   "info": {
     "title": "kharon agent API",
     "version": "0.1.0",
-    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools (issue #15). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Fill routes arrive with issue #18.",
+    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools served at POST /mcp on the same listener (REQ-API-001; tool schemas in docs/api/mcp-tools.json). The forbidden error code is only returned by /mcp (requests carrying an Origin header). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Fill routes arrive with issue #18.",
     "license": { "name": "MIT OR Apache-2.0" }
   },
   "security": [{ "agentToken": [] }],
@@ -65,7 +65,7 @@
         "properties": {
           "locked": { "type": "boolean" },
           "agent_id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
-          "grants": { "type": "array", "description": "SPEC §4 Grant; always empty until the grant model lands (issue #15).", "items": { "type": "object" }, "maxItems": 0 }
+          "grants": { "type": "array", "description": "SPEC §4 Grant; always empty until the grant model lands (issue #20).", "items": { "type": "object" }, "maxItems": 0 }
         }
       },
       "ItemMeta": {
@@ -96,7 +96,7 @@
         "additionalProperties": false,
         "required": ["error", "detail"],
         "properties": {
-          "error": { "type": "string", "enum": ["unauthorized", "locked", "bad_request", "not_found", "method_not_allowed", "audit_failed"] },
+          "error": { "type": "string", "enum": ["unauthorized", "forbidden", "locked", "bad_request", "not_found", "method_not_allowed", "audit_failed"] },
           "detail": { "type": "string", "description": "Fixed text from a closed enum; never contains request or vault values (REQ-API-006)." }
         }
       }

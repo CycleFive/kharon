@@ -16,6 +16,9 @@ use serde_json::{Value, json};
 pub enum ErrorCode {
     /// Missing or invalid agent token (HTTP 401).
     Unauthorized,
+    /// The request came from a browser context (an `Origin` header on
+    /// the MCP endpoint; HTTP 403).
+    Forbidden,
     /// The broker is locked (HTTP 423). The `locked` of SPEC §4.
     Locked,
     /// The request is malformed (HTTP 400).
@@ -34,6 +37,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
             Self::Locked => "locked",
             Self::BadRequest => "bad_request",
             Self::NotFound => "not_found",
@@ -46,6 +50,7 @@ impl ErrorCode {
     pub const fn http_status(self) -> u16 {
         match self {
             Self::Unauthorized => 401,
+            Self::Forbidden => 403,
             Self::Locked => 423,
             Self::BadRequest => 400,
             Self::NotFound => 404,
@@ -55,8 +60,9 @@ impl ErrorCode {
     }
 
     /// Every code (for the REQ-API-006 tests and the OpenAPI enum).
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Unauthorized,
+        Self::Forbidden,
         Self::Locked,
         Self::BadRequest,
         Self::NotFound,
@@ -93,6 +99,18 @@ pub enum Detail {
     MethodNotAllowed,
     /// The audit entry could not be written.
     AuditWriteFailed,
+    /// A required parameter is absent (`q` on `kharon_search`).
+    MissingParameter,
+    /// A tool argument is neither a string nor `null` (MCP).
+    InvalidParameterType,
+    /// Tool `arguments` is not a JSON object (MCP).
+    InvalidArguments,
+    /// The MCP endpoint refuses requests carrying `Origin`.
+    BrowserOriginRefused,
+    /// The MCP request body is not `application/json`.
+    UnsupportedContentType,
+    /// The MCP request body exceeds its cap.
+    BodyTooLarge,
 }
 
 impl Detail {
@@ -111,11 +129,17 @@ impl Detail {
             Self::NoSuchRoute => "no such route",
             Self::MethodNotAllowed => "method not allowed",
             Self::AuditWriteFailed => "audit write failed; request refused",
+            Self::MissingParameter => "required parameter missing",
+            Self::InvalidParameterType => "parameter value must be a string",
+            Self::InvalidArguments => "tool arguments must be a JSON object",
+            Self::BrowserOriginRefused => "browser origins are not accepted",
+            Self::UnsupportedContentType => "content type must be application/json",
+            Self::BodyTooLarge => "request body too large",
         }
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 18] = [
         Self::MissingToken,
         Self::InvalidToken,
         Self::Locked,
@@ -128,6 +152,12 @@ impl Detail {
         Self::NoSuchRoute,
         Self::MethodNotAllowed,
         Self::AuditWriteFailed,
+        Self::MissingParameter,
+        Self::InvalidParameterType,
+        Self::InvalidArguments,
+        Self::BrowserOriginRefused,
+        Self::UnsupportedContentType,
+        Self::BodyTooLarge,
     ];
 }
 

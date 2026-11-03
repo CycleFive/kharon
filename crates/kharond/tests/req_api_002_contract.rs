@@ -2,11 +2,13 @@
 //! transport, and has an OpenAPI document.
 //!
 //! The contract harness runs every case against each transport and
-//! requires identical results (outcome, body, and audit trail). Today
-//! the transports are the transport-independent core
-//! (`kharond::api::core`, which every adapter must be a thin shim over)
-//! and HTTP. The MCP transport (REQ-API-001, issue #15) adds one
-//! `Transport` variant here and inherits the whole suite.
+//! requires identical results (outcome, body, and audit trail). The
+//! transports are the transport-independent core (`kharond::api::core`,
+//! which every adapter must be a thin shim over), HTTP (`/v1/*`) and
+//! MCP (`POST /mcp`, REQ-API-001). On MCP a case maps to
+//! `kharon_status`, or `kharon_search` when it has a `q`, else
+//! `kharon_list`; its parameters become the tool arguments (duplicates
+//! kept), and the tool result's text must equal the HTTP body.
 
 mod api_support;
 
@@ -28,9 +30,10 @@ enum Tool {
 enum Transport {
     Core,
     Http,
+    Mcp,
 }
 
-const TRANSPORTS: [Transport; 2] = [Transport::Core, Transport::Http];
+const TRANSPORTS: [Transport; 3] = [Transport::Core, Transport::Http, Transport::Mcp];
 
 #[derive(Clone, Copy, Debug)]
 enum Who {
@@ -118,6 +121,34 @@ async fn call(t: Transport, h: &Harness, case: &Case) -> Outcome {
                     .unwrap();
                 assert_eq!(r.status, ec.http_status(), "{}", case.name);
                 (code, body)
+            }
+        }
+        Transport::Mcp => {
+            let addr = serve_http(h.broker.clone()).await;
+            let tool = match case.tool {
+                Tool::Status => "kharon_status",
+                Tool::Items if case.params.iter().any(|(k, _)| *k == "q") => "kharon_search",
+                Tool::Items => "kharon_list",
+            };
+            let r = mcp_call(addr, tok.as_deref(), tool, &json_object(case.params)).await;
+            let body = r.json();
+            if r.status == 401 {
+                // Authentication is the transport's, before JSON-RPC:
+                // same status and body as HTTP.
+                return (body["error"].as_str().unwrap().to_owned(), body);
+            }
+            assert_eq!(r.status, 200, "{}: {body}", case.name);
+            let result = &body["result"];
+            assert_eq!(result["resultType"], "complete", "{}", case.name);
+            let content = result["content"].as_array().unwrap();
+            assert_eq!(content.len(), 1, "{}", case.name);
+            assert_eq!(content[0]["type"], "text", "{}", case.name);
+            let inner: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+            if result["isError"] == json!(true) {
+                (inner["error"].as_str().unwrap().to_owned(), inner)
+            } else {
+                assert_eq!(result["isError"], json!(false), "{}", case.name);
+                ("ok".into(), inner)
             }
         }
     }

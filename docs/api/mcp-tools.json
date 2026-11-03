@@ -1,0 +1,85 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Whether the broker is locked, the calling agent's id, and its active grants. Same body as GET /v1/status.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "`kharon_status` arguments: none.",
+      "properties": {},
+      "title": "StatusArgs",
+      "type": "object"
+    },
+    "name": "kharon_status",
+    "title": "Broker status"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Item metadata (never secrets), optionally filtered by origin. Audited. Same body as GET /v1/items.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "`kharon_list` arguments.",
+      "properties": {
+        "origin": {
+          "description": "Only items whose URIs match this origin under the item's match\nrule (absolute http or https URL). Omitted or null: every item.",
+          "format": "uri",
+          "maxLength": 2048,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "ListArgs",
+      "type": "object"
+    },
+    "name": "kharon_list",
+    "title": "List items"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Item metadata (never secrets) whose name or URI host contains q, optionally filtered by origin. Audited. Same body as GET /v1/items?q=.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "`kharon_search` arguments.",
+      "properties": {
+        "origin": {
+          "description": "Only items whose URIs match this origin under the item's match\nrule (absolute http or https URL). Omitted or null: no filter.",
+          "format": "uri",
+          "maxLength": 2048,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "q": {
+          "description": "Case-insensitive substring of the item name or a URI host. Must\nnot be blank.",
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "title": "SearchArgs",
+      "type": "object"
+    },
+    "name": "kharon_search",
+    "title": "Search items"
+  }
+]

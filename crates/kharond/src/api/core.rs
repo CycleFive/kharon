@@ -7,11 +7,10 @@
 //! [`Outcome`] or [`ApiError`]. Parameter validation
 //! ([`parse_request`], over [`parse_status_query`] and
 //! [`parse_items_query`]) lives here too, so a transport cannot
-//! accept a request another one refuses. HTTP is the only transport
-//! today (MCP is issue #15); the contract harness in
-//! `tests/req_api_002_contract.rs` runs every case against the core
-//! directly and against every transport, so #15 adds one adapter
-//! there and inherits the suite.
+//! accept a request another one refuses. The transports are HTTP
+//! (`super::http`, `/v1/*`) and MCP (`super::mcp`, `POST /mcp`); the
+//! contract harness in `tests/req_api_002_contract.rs` runs every case
+//! against the core directly and against both transports.
 //!
 //! Ordering per request (SPEC §7, REQ-AUD-003): authenticate, then the
 //! lock gate ([`LockController::require_unlocked`], which enforces
@@ -95,7 +94,7 @@ pub enum Request {
     },
 }
 
-/// SPEC §4 `Grant` as status reports it. Grants arrive with issue #15's
+/// SPEC §4 `Grant` as status reports it. Grants arrive with issue #20's
 /// grant model; until then no grant can exist, so the type is empty
 /// and `grants` is always `[]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -139,8 +138,13 @@ impl Outcome {
 pub enum Operation {
     /// `kharon_status` / `GET /v1/status`.
     Status,
-    /// `kharon_list` and `kharon_search` / `GET /v1/items`.
+    /// `GET /v1/items`: `q` present → search, else list.
     Items,
+    /// `kharon_list`: the items parameters without `q` (a `q` is an
+    /// unknown parameter here, not a silent switch to search).
+    List,
+    /// `kharon_search`: the items parameters with `q` required.
+    Search,
 }
 
 /// The single entry point for parameter validation: every transport
@@ -152,6 +156,17 @@ pub fn parse_request<'a>(
     match op {
         Operation::Status => parse_status_query(pairs),
         Operation::Items => parse_items_query(pairs),
+        Operation::List => {
+            let pairs: Vec<_> = pairs.into_iter().collect();
+            if pairs.iter().any(|(k, _)| *k == "q") {
+                return Err(ApiError::bad_request(Detail::UnknownParameter));
+            }
+            parse_items_query(pairs)
+        }
+        Operation::Search => match parse_items_query(pairs)? {
+            r @ Request::Search { .. } => Ok(r),
+            _ => Err(ApiError::bad_request(Detail::MissingParameter)),
+        },
     }
 }
 

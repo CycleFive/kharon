@@ -327,6 +327,26 @@ impl SyncClient {
         )?)
     }
 
+    /// REQ-API-007 clock probe: `GET /api/alive` (unauthenticated, the
+    /// liveness endpoint official clients use) and read the response's
+    /// `Date` header. Any status is accepted — only the header matters,
+    /// and the body is not read.
+    pub async fn clock_sample(&self) -> Result<crate::totp::ClockSample, SyncError> {
+        const EP: &str = "alive";
+        let resp = self
+            .http
+            .request(Method::GET, self.endpoints.api("alive"))
+            .send()
+            .await
+            .map_err(|_| SyncError::Transport(EP))?;
+        let local = std::time::SystemTime::now();
+        resp.headers()
+            .get(header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| crate::totp::ClockSample::from_date_header(v, local))
+            .ok_or(SyncError::Malformed(EP))
+    }
+
     /// API-key login: `client_credentials` grant, `scope=api`.
     pub async fn login(&mut self) -> Result<(), SyncError> {
         const EP: &str = "token";

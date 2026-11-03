@@ -40,7 +40,7 @@ pub enum FieldKind {
 }
 
 impl FieldKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Username => "username",
             Self::Password => "password",
@@ -97,7 +97,67 @@ pub enum FillOutcome {
     /// dispatched, and the caller's secret buffers are zeroized by
     /// [`DeadlineFiller`] before this is returned.
     Timeout,
+    /// REQ-API-007: `fill_totp` refused because the last clock sample
+    /// exceeded `clock_skew_refuse`. No CDP call was made.
+    ClockSkew,
+    /// REQ-API-007: the item's TOTP field is not a supported
+    /// `otpauth://totp`, `steam://` or base32 secret. No CDP call was
+    /// made.
+    TotpUnsupported,
     Error(String),
+}
+
+impl FillOutcome {
+    /// SPEC §4 `FillResult.status`.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Filled { .. } => "filled",
+            Self::OriginMismatch | Self::NonSecureContext => "origin_mismatch",
+            Self::Navigated => "navigated",
+            Self::FieldNotFound { .. } => "field_not_found",
+            Self::TargetNotOwned | Self::DefaultContextRefused => "target_not_owned",
+            Self::UnknownTarget => "not_found",
+            Self::Timeout => "timeout",
+            Self::ClockSkew | Self::TotpUnsupported | Self::Error(_) => "error",
+        }
+    }
+
+    /// SPEC §4 `FillResult.detail`: fixed codes only, never a value
+    /// (REQ-API-006). `Error`'s CDP message is not exposed.
+    pub fn detail(&self) -> Option<&'static str> {
+        match self {
+            Self::NonSecureContext => Some("insecure_context"),
+            Self::DefaultContextRefused => Some("default_context_refused"),
+            Self::UnknownTarget => Some("unknown_target"),
+            Self::ClockSkew => Some("clock_skew"),
+            Self::TotpUnsupported => Some("totp_unsupported"),
+            Self::Error(_) => Some("cdp_error"),
+            _ => None,
+        }
+    }
+
+    /// SPEC §4 `FillResult.fields_filled`: kinds only.
+    pub fn fields_filled(&self) -> Vec<&'static str> {
+        match self {
+            Self::Filled { kinds } => kinds.iter().map(|k| k.as_str()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The SPEC §4 `FillResult` body for this outcome (`status`,
+    /// `fields_filled`, optional `detail`). Built from kinds and fixed
+    /// strings only: there is no field a value could travel in
+    /// (REQ-API-007 "the code is never returned"; G1).
+    pub fn result_body(&self) -> Value {
+        let mut body = json!({
+            "status": self.status(),
+            "fields_filled": self.fields_filled(),
+        });
+        if let Some(d) = self.detail() {
+            body["detail"] = json!(d);
+        }
+        body
+    }
 }
 
 impl From<OwnershipError> for FillOutcome {

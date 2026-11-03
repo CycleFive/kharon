@@ -38,6 +38,10 @@ pub enum Event {
     /// end-to-end deadline. Written before the timeout response is
     /// returned, after the plaintext buffers are zeroized.
     FillTimeout,
+    /// REQ-API-007: the system clock differs from the Vaultwarden
+    /// server's `Date` by more than `clock_skew_warn` (result `warn` or
+    /// `refuse`), or a previous skew was resolved (result `resolved`).
+    ClockSkew,
     /// The log itself truncated a torn (partially written) tail line during
     /// open and recovered to `recovered_seq`. See [`crate::audit::AuditLog`].
     LogTruncated,
@@ -67,6 +71,7 @@ impl Event {
             Event::ExportLoaded => "export_loaded",
             Event::Abandoned => "abandoned",
             Event::FillTimeout => "fill_timeout",
+            Event::ClockSkew => "clock_skew",
             Event::LogTruncated => "log_truncated",
         }
     }
@@ -103,6 +108,7 @@ impl<'de> Deserialize<'de> for Event {
             "export_loaded" => Event::ExportLoaded,
             "abandoned" => Event::Abandoned,
             "fill_timeout" => Event::FillTimeout,
+            "clock_skew" => Event::ClockSkew,
             "log_truncated" => Event::LogTruncated,
             other => {
                 return Err(serde::de::Error::custom(format!(

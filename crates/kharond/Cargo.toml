@@ -12,6 +12,8 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 serde_jcs = "0.1"
 sha2 = "0.10"
 hmac = "0.12"
+sha1 = "0.10"
+httpdate = "1"
 hex = "0.4"
 ed25519-dalek = "2.1"
 rand = "0.8"

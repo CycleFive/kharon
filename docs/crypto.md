@@ -22,6 +22,7 @@ and the RFC for each primitive. Code: `crates/kharon-bwcrypto`
 | Cipher key (optional, per item) | `cipher.key`: type 2 under the org key. When present, the cipher's fields are under the cipher key instead of the org key | [SPEC §3.1](../SPEC.md) |
 | Item fields | `name`, `login.username`, `login.password`, `login.totp`, `login.uris[].uri`, `notes`, `fields[]`: type 2 under the effective item key (cipher key if present, else org key) | [Bitwarden Security Whitepaper](https://bitwarden.com/help/bitwarden-security-white-paper/); [SPEC §3.1](../SPEC.md) |
 | Unknown crypto | EncString types other than 2 and 4 (including type 7, account-cryptography v2) are rejected with a typed error — fail closed (OQ-8) | [SPEC §3.1](../SPEC.md) |
+| Export key (64 B) | Password-protected export (REQ-EXP-001): the file's `salt` string is used **verbatim** (base64, case-sensitive — not lowercased like an email) as the KDF salt: PBKDF2-HMAC-SHA256(password, salt, `kdfIterations`) or Argon2id(password, SHA-256(salt), `kdfMemory`/`kdfIterations`/`kdfParallelism`), then the same HKDF-Expand stretch as the master key. `encKeyValidation_DO_NOT_EDIT` (a GUID) and `data` (the plaintext export JSON) are type 2 under the result. kharon re-wraps the decrypted items' secrets under a fresh per-unlock random key before they enter the vault, so no plaintext secret is cached (REQ-CRY-006) | [Encrypted exports](https://bitwarden.com/help/encrypted-export/); [SPEC §3.1a](../SPEC.md) |
 
 ## Zeroization limits
 
@@ -32,6 +33,16 @@ What kharon wipes, and what it cannot (accepted limits, PR #34 review):
   `Zeroizing` and wipe on drop. Argon2's working memory (the m-KiB
   block array derived from the password) is wiped because the
   `argon2` crate is built with its `zeroize` feature.
+- The export loader (REQ-EXP-003 / REQ-CRY-006, PR #59 review):
+  the decrypted export bytes stay in a `Zeroizing<Vec<u8>>` and are
+  parsed with `serde_json::from_slice` straight from it — no
+  `String`/`Vec` copy of the plaintext exists. `login.password` and
+  `login.totp` deserialize into `Zeroizing<String>` fields (zeroize's
+  `serde` feature) and are `take()`n, never cloned, into the re-wrap
+  step. Remaining residue, accepted on the same basis as the KDF
+  internals below: `serde_json`'s internal scratch buffer for strings
+  containing escape sequences is allocated and freed by `serde_json`
+  without a wipe hook.
 - Inside the RustCrypto KDF/HMAC constructions (PBKDF2, HKDF-Expand),
   internal states hold copies of the password / PRK that those crates
   do not expose zeroization hooks for. Those copies live for the
@@ -59,6 +70,11 @@ versions in their headers) and reproduce the committed constants —
   test-only), and the RSA-OAEP-SHA1 type-4 org-key ciphertext. The
   chain test walks password → master key → user key → private key →
   org key → item field, with and without `cipher.key`.
+- REQ-EXP-001: `crates/kharond/tests/fixtures/gen/gen_export_fixture.py`
+  (same pinned Python implementations) generates the export-key
+  vectors in `src/kdf.rs`, the type-2 encrypt vector in
+  `src/encstring.rs`, and the two password-protected export fixtures
+  under `crates/kharond/tests/fixtures/export/`.
 
 Open item, stated plainly: the REQ-CRY-004 acceptance text also asks
 for a live Vaultwarden fixture comparison against `bw get item`. That

@@ -47,6 +47,12 @@ type Received = Arc<Mutex<Vec<Value>>>;
 /// A CDP peer with one page `t1` on `URL` in context `ctx-A`; acks every
 /// in-page fill with the kinds asked for and records every frame.
 async fn cdp_stub() -> (String, Received) {
+    cdp_stub_in("ctx-A").await
+}
+
+/// [`cdp_stub`] with page `t1` in browser context `t1_context` (the
+/// agent's own context is always `ctx-A`).
+async fn cdp_stub_in(t1_context: &'static str) -> (String, Received) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let received: Received = Arc::default();
@@ -62,7 +68,7 @@ async fn cdp_stub() -> (String, Received) {
         script.insert(
             "Target.getTargetInfo",
             json!({ "targetInfo": {
-                "targetId": "t1", "browserContextId": "ctx-A",
+                "targetId": "t1", "browserContextId": t1_context,
                 "url": URL, "title": "", "type": "page",
             } }),
         );
@@ -109,7 +115,10 @@ struct E2e {
 }
 
 async fn e2e() -> E2e {
-    let (url, received) = cdp_stub().await;
+    e2e_with(cdp_stub().await).await
+}
+
+async fn e2e_with((url, received): (String, Received)) -> E2e {
     let endpoint = CdpEndpoint::validate(&url, Tunnel::Direct, None).unwrap();
     let browser = Browser::new(CdpClient::connect(&endpoint).await.unwrap());
     let ctx = browser.create_agent_context("alpha").await.unwrap();
@@ -252,6 +261,16 @@ async fn req_api_008_fill_and_submit_dispatches_submit_only_when_asked() {
                 json!(["fill", "alpha", null, "filled"])
             ]
         );
+        // #67: the outcome carries the origin the browser reported
+        // (URL is `.../login`; only the origin is recorded).
+        assert_eq!(
+            e.audit.live_origins(),
+            [
+                json!(["fill_dispatch", null]),
+                json!(["fill", "https://example.com"])
+            ]
+        );
+        assert!(!e.audit_text().contains("/login"));
     }
 }
 
@@ -359,6 +378,37 @@ async fn req_org_002_claimed_origin_differs_from_live_origin_is_refused() {
             ]),
             json!(["fill", "alpha", null, "origin_mismatch"])
         ]
+    );
+    // #67: claim on the dispatch, live origin on the outcome.
+    assert_eq!(
+        e.audit.live_origins()[1],
+        json!(["fill", "https://example.com"])
+    );
+}
+
+/// #67: a target in another browser context is `target_not_owned`, and
+/// its page origin is never recorded (no window into another agent's
+/// browsing).
+#[tokio::test]
+async fn req_aud_003_unowned_target_records_no_live_origin() {
+    let e = e2e_with(cdp_stub_in("ctx-B").await).await;
+    let r = e
+        .fill(
+            "/v1/fill",
+            body(
+                &e.item_id,
+                json!([{"kind": "password"}]),
+                false,
+                "https://example.com",
+            ),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["status"], "target_not_owned");
+    assert!(e.fill_calls().is_empty(), "no page code ran");
+    assert_eq!(
+        e.audit.live_origins(),
+        [json!(["fill_dispatch", null]), json!(["fill", null])]
     );
 }
 

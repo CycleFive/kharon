@@ -302,6 +302,7 @@ async fn req_api_007_skew_120s_refuses_totp_not_passwords() {
         cross_origin_iframe_hosts: Vec::new(),
         submit: false,
         expected_origin: None,
+        live_origin: kharond::cdp::LiveOrigin::new(),
     };
     let (_plan, outcome) = DeadlineFiller::new(&h.engine, &mut h.audit)
         .run(plan, &h.ctx, false)

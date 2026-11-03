@@ -142,6 +142,7 @@ impl<'a> TotpFill<'a> {
             cross_origin_iframe_hosts: target.cross_origin_iframe_hosts,
             submit: target.submit,
             expected_origin: None,
+            live_origin: crate::cdp::LiveOrigin::new(),
         };
         let (plan, outcome) = DeadlineFiller::new(self.engine, self.audit)
             .with_deadline(self.deadline)

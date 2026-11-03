@@ -192,6 +192,19 @@ impl RecordingAudit {
             })
             .collect()
     }
+
+    /// `[event, live_origin]` per entry (#67).
+    pub fn live_origins(&self) -> Vec<Value> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let v = serde_json::to_value(e).unwrap();
+                json!([v["event"], v["live_origin"]])
+            })
+            .collect()
+    }
 }
 
 /// The floor [`cheap_argon`] hashes clear. Production stores use
@@ -452,6 +465,10 @@ pub enum FakeAnswer {
 pub struct FakeFill {
     pub seen: Arc<Mutex<Vec<SeenPlan>>>,
     pub answer: FakeAnswer,
+    /// The page URL to report as observed (into the plan's
+    /// `live_origin` slot, as the engine does after the ownership
+    /// check) before answering. `None` observes nothing.
+    pub live_url: Option<&'static str>,
 }
 
 impl FakeFill {
@@ -459,7 +476,14 @@ impl FakeFill {
         Self {
             seen: Arc::default(),
             answer,
+            live_url: None,
         }
+    }
+
+    /// Observe `url` as the target's live page on every fill.
+    pub fn with_live_url(mut self, url: &'static str) -> Self {
+        self.live_url = Some(url);
+        self
     }
 
     pub fn seen(&self) -> Vec<SeenPlan> {
@@ -490,6 +514,9 @@ impl FillBackend for FakeFill {
             expected_origin: plan.expected_origin.clone(),
             matchers: plan.item_matchers.len(),
         });
+        if let Some(url) = self.live_url {
+            plan.live_origin.record_href(url);
+        }
         let answer = self.answer;
         let kinds: Vec<FieldKind> = plan.fields.iter().map(|f| f.kind).collect();
         Box::pin(async move {

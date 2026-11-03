@@ -42,7 +42,15 @@ struct Run {
 }
 
 fn harness(answer: FakeAnswer) -> Run {
-    let fake = FakeFill::new(answer);
+    harness_with(FakeFill::new(answer))
+}
+
+/// A fake that observes `url` as the target's live page (#67).
+fn harness_live(answer: FakeAnswer, url: &'static str) -> Run {
+    harness_with(FakeFill::new(answer).with_live_url(url))
+}
+
+fn harness_with(fake: FakeFill) -> Run {
     let wiped: Arc<Mutex<Vec<String>>> = Arc::default();
     let (f, w) = (fake.clone(), wiped.clone());
     let h = Harness::with(false, move |b| {
@@ -91,6 +99,10 @@ fn assert_dispatch(e: &Value) {
     assert_eq!(e["origin"], ORIGIN);
     assert_eq!(e["field_count"], 2);
     assert_eq!(e["result"], "dispatched");
+    assert!(
+        e.get("live_origin").is_none(),
+        "dispatch precedes the live read"
+    );
     let rid = e["request_id"].as_str().unwrap();
     assert_eq!(rid.len(), 32);
     assert!(rid.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -107,6 +119,10 @@ async fn req_aud_003_dispatch_entry_precedes_exactly_one_outcome() {
     assert_eq!(e[1]["event"], "fill");
     assert_eq!(e[1]["result"], "filled");
     assert_eq!(e[1]["request_id"], e[0]["request_id"]);
+    assert!(
+        e[1].get("live_origin").is_none(),
+        "nothing observed, nothing recorded"
+    );
     assert_no_canary(&serde_json::to_string(&e).unwrap());
     assert_wiped(&r);
 
@@ -159,6 +175,10 @@ async fn req_aud_003_refusal_before_the_browser_writes_no_dispatch() {
     assert_eq!(e.len(), 1, "{e:?}");
     assert_eq!(e[0]["event"], "fill");
     assert_eq!(e[0]["result"], "not_found");
+    assert!(
+        e[0].get("live_origin").is_none(),
+        "never reached the browser"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -213,5 +233,75 @@ async fn req_aud_003_dropped_fill_with_a_failing_log_still_wipes() {
     let e = entries(&r);
     assert_eq!(e.len(), 1);
     assert_dispatch(&e[0]);
+    assert_wiped(&r);
+}
+
+// ------------------------------------------------ live origin (#67)
+
+/// Path, query and fragment of the live page: must never reach the log.
+const LIVE_URL: &str = "https://login.example.com/signin?next=%2Fhome#step2";
+
+#[tokio::test]
+async fn req_aud_003_outcome_entry_records_the_live_origin() {
+    let r = harness_live(FakeAnswer::Filled, LIVE_URL);
+    assert_eq!(fill(&r).await.unwrap()["status"], "filled");
+    let e = entries(&r);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_dispatch(&e[0]);
+    assert_eq!(e[1]["event"], "fill");
+    assert_eq!(e[1]["live_origin"], "https://login.example.com");
+    assert!(e[1].get("origin").is_none(), "the claim stays on dispatch");
+    let text = serde_json::to_string(&e).unwrap();
+    assert!(
+        !text.contains("signin") && !text.contains("step2"),
+        "{text}"
+    );
+    assert_no_canary(&text);
+}
+
+#[tokio::test]
+async fn req_aud_003_origin_mismatch_outcome_records_where_the_tab_was() {
+    // REQ-APR-007's "claims A while the tab is on B": the dispatch
+    // entry has the claim (A), the outcome the evidence (B).
+    let r = harness_live(FakeAnswer::OriginMismatch, "https://evil.example/login");
+    assert_eq!(fill(&r).await.unwrap()["status"], "origin_mismatch");
+    let e = entries(&r);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!(e[0]["origin"], ORIGIN);
+    assert_eq!(e[1]["result"], "origin_mismatch");
+    assert_eq!(e[1]["live_origin"], "https://evil.example");
+}
+
+#[tokio::test(start_paused = true)]
+async fn req_aud_003_fill_timeout_records_the_live_origin_seen_before_expiry() {
+    fixture_vault();
+    let r = harness_live(FakeAnswer::Stall, LIVE_URL);
+    assert_eq!(fill(&r).await.unwrap()["status"], "timeout");
+    let e = entries(&r);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_dispatch(&e[0]);
+    assert_eq!(e[1]["event"], "fill_timeout");
+    assert_eq!(e[1]["live_origin"], "https://login.example.com");
+    assert_wiped(&r);
+}
+
+#[tokio::test(start_paused = true)]
+async fn req_aud_003_fill_aborted_records_the_live_origin() {
+    fixture_vault();
+    let r = harness_live(FakeAnswer::Stall, LIVE_URL);
+    let agent = r.h.broker.authenticate(&r.h.alpha).unwrap();
+    let req = parse_fill(FillOperation::Fill, body().as_bytes()).unwrap();
+    {
+        let fut = r.h.broker.fill(&agent, req, Instant::now());
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("a stalled fill cannot finish"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    let e = entries(&r);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!(e[1]["event"], "fill_aborted");
+    assert_eq!(e[1]["live_origin"], "https://login.example.com");
     assert_wiped(&r);
 }

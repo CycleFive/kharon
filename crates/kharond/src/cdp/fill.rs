@@ -188,6 +188,12 @@ impl FillEngine {
         Self { browser }
     }
 
+    /// Whether the engine's CDP connection has ended (see
+    /// [`super::CdpClient::is_closed`]).
+    pub fn is_closed(&self) -> bool {
+        self.browser.client().is_closed()
+    }
+
     pub async fn fill(
         &self,
         plan: &FillPlan,

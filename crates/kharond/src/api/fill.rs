@@ -13,11 +13,13 @@
 //! value (REQ-GOAL-001): secrets travel only broker → [`FillBackend`] in
 //! a [`FillPlan`] whose buffers are zeroized when the call returns.
 //!
-//! The browser side is a [`FillBackend`]: production is
-//! [`CdpFillBackend`] over the [`FillEngine`] (one CDP browser context
-//! per agent, REQ-ARCH-005); tests substitute a stub.
+//! The browser side is a [`FillBackend`] over the [`FillEngine`] (one
+//! CDP browser context per agent, REQ-ARCH-005): the daemon runs
+//! [`ConnectingCdpBackend`] (configured endpoints, connected on first
+//! fill); [`CdpFillBackend`] takes pre-built engines; tests substitute
+//! a stub.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -28,8 +30,10 @@ use url::Url;
 
 use super::error::{ApiError, Detail};
 use crate::cdp::fill::DEFAULT_FILL_DEADLINE;
-use crate::cdp::{AgentContext, FieldKind, FillEngine, FillOutcome, FillPlan};
-use crate::config::PolicyConfig;
+use crate::cdp::{
+    AgentContext, Browser, CdpClient, CdpEndpoint, FieldKind, FillEngine, FillOutcome, FillPlan,
+};
+use crate::config::{AgentConfig, PolicyConfig};
 
 /// Longest accepted `cdp_target_id` / `frame_id` (bytes). Chrome's are
 /// 32 hex digits.
@@ -426,6 +430,105 @@ impl FillBackend for CdpFillBackend {
             match self.agents.get(agent_id) {
                 Some((engine, ctx)) => engine.fill(plan, ctx, allow_default).await,
                 None => FillOutcome::TargetNotOwned,
+            }
+        })
+    }
+}
+
+/// The daemon's backend: one configured CDP endpoint per agent
+/// (`[agents.<id>] cdp`, REQ-ARCH-002), connected on demand.
+///
+/// Startup never touches the browser: the first fill for an agent (after
+/// its `fill_dispatch` entry, inside the fill deadline) connects, creates
+/// the agent's own browser context (REQ-ARCH-005) and keeps both. A
+/// connection that has ended (browser restart, tunnel drop) is replaced
+/// by the next fill, with a fresh context; the fill that saw it end
+/// reports `cdp_error`. A fill dropped by the deadline mid-connect leaves
+/// nothing cached, so the next fill starts over.
+///
+/// Fills for one agent are serialised on the connect step only; the
+/// fill itself runs on a clone of the engine.
+pub struct ConnectingCdpBackend {
+    agents: HashMap<String, AgentBrowser>,
+}
+
+struct AgentBrowser {
+    endpoint: CdpEndpoint,
+    live: tokio::sync::Mutex<Option<(FillEngine, AgentContext)>>,
+}
+
+impl ConnectingCdpBackend {
+    /// One lazily-connected browser per `(agent id, endpoint)`.
+    pub fn new<I, S>(agents: I) -> Self
+    where
+        I: IntoIterator<Item = (S, CdpEndpoint)>,
+        S: Into<String>,
+    {
+        Self {
+            agents: agents
+                .into_iter()
+                .map(|(id, endpoint)| {
+                    (
+                        id.into(),
+                        AgentBrowser {
+                            endpoint,
+                            live: tokio::sync::Mutex::new(None),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Every `[agents.<id>]` with its validated `cdp` endpoint.
+    pub fn from_agents(agents: &BTreeMap<String, AgentConfig>) -> Self {
+        Self::new(agents.iter().map(|(id, a)| (id.clone(), a.cdp.clone())))
+    }
+}
+
+impl AgentBrowser {
+    /// The live engine and context, connecting first if there is none
+    /// or the last connection ended.
+    async fn engine(&self, agent_id: &str) -> Result<(FillEngine, AgentContext), FillOutcome> {
+        let mut live = self.live.lock().await;
+        if let Some((engine, ctx)) = &*live
+            && !engine.is_closed()
+        {
+            return Ok((engine.clone(), ctx.clone()));
+        }
+        *live = None;
+        let client = CdpClient::connect(&self.endpoint)
+            .await
+            .map_err(|e| FillOutcome::Error(e.to_string()))?;
+        let browser = Browser::new(client);
+        let ctx = browser
+            .create_agent_context(agent_id)
+            .await
+            .map_err(|e| FillOutcome::Error(e.to_string()))?;
+        let engine = FillEngine::new(browser);
+        *live = Some((engine.clone(), ctx.clone()));
+        Ok((engine, ctx))
+    }
+}
+
+impl FillBackend for ConnectingCdpBackend {
+    fn has_agent(&self, agent_id: &str) -> bool {
+        self.agents.contains_key(agent_id)
+    }
+
+    fn fill<'a>(
+        &'a self,
+        agent_id: &'a str,
+        plan: &'a FillPlan,
+        allow_default: bool,
+    ) -> FillFuture<'a> {
+        Box::pin(async move {
+            let Some(agent) = self.agents.get(agent_id) else {
+                return FillOutcome::TargetNotOwned;
+            };
+            match agent.engine(agent_id).await {
+                Ok((engine, ctx)) => engine.fill(plan, &ctx, allow_default).await,
+                Err(outcome) => outcome,
             }
         })
     }

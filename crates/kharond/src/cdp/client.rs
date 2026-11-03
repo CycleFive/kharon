@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::stream::SplitSink;
@@ -146,9 +146,19 @@ pub struct CdpClient {
     write: Arc<Mutex<WsSplitSink>>,
     pending: Arc<Mutex<HashMap<u64, Reply>>>,
     next_id: Arc<AtomicU64>,
+    /// Set by the read task when the WebSocket ends (stream end or
+    /// protocol error). A closed client never recovers; callers that
+    /// keep one (the daemon's fill backend) reconnect.
+    closed: Arc<AtomicBool>,
 }
 
 impl CdpClient {
+    /// Whether the connection has ended. Every request on a closed
+    /// client fails; a fresh [`Self::connect`] is needed.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Connect per a validated endpoint. `ws://` connects plainly;
     /// `wss://` runs the pinned-TLS handshake first (REQ-ARCH-002).
     pub async fn connect(endpoint: &CdpEndpoint) -> Result<Self, CdpError> {
@@ -198,6 +208,8 @@ impl CdpClient {
         let (write, mut read) = ws.split();
         let pending: Arc<Mutex<HashMap<u64, Reply>>> = Arc::new(Mutex::new(HashMap::new()));
         let pending_read = Arc::clone(&pending);
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_read = Arc::clone(&closed);
         tokio::spawn(async move {
             loop {
                 let frame = match read.next().await {
@@ -238,6 +250,7 @@ impl CdpClient {
                 }
             }
             // Connection ended: fail every in-flight request.
+            closed_read.store(true, Ordering::Release);
             let mut pending = pending_read.lock().await;
             for (_, reply) in pending.drain() {
                 let _ = reply.send(Err(CdpError::ConnectionClosed));
@@ -248,6 +261,7 @@ impl CdpClient {
             write: Arc::new(Mutex::new(write)),
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
+            closed,
         }
     }
 

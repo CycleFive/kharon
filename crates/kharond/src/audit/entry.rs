@@ -157,6 +157,11 @@ pub struct Entry {
     /// Head seq recovered from a torn tail line (only on `LogTruncated`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovered_seq: Option<u64>,
+    /// Hex SHA-256 of the loaded export file (only on `ExportLoaded`,
+    /// REQ-EXP-004: replacing the file and restarting produces a new
+    /// `export_loaded` entry whose hash differs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_sha256: Option<String>,
 }
 
 impl Entry {
@@ -177,6 +182,7 @@ impl Entry {
             result: None,
             detail_code: None,
             recovered_seq: None,
+            file_sha256: None,
         }
     }
 
@@ -221,6 +227,13 @@ impl Entry {
     /// `Event::LogTruncated` entries, which the writer emits itself).
     pub fn recovered_seq(mut self, v: u64) -> Self {
         self.recovered_seq = Some(v);
+        self
+    }
+
+    /// Hex SHA-256 of the loaded export file (only set on
+    /// `Event::ExportLoaded` entries, REQ-EXP-004).
+    pub fn file_sha256(mut self, v: impl Into<String>) -> Self {
+        self.file_sha256 = Some(v.into());
         self
     }
 

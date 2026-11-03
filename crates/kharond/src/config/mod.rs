@@ -10,7 +10,9 @@
 //! 2. [`Config::check_startup`] checks the config against the host: the
 //!    mlock rule (`require_mlock = true`, the default, with mlock
 //!    unavailable is refused, REQ-MEM-002; the probe is injected via
-//!    [`MlockProbe`] so tests need no `CAP_IPC_LOCK`), and in sync mode
+//!    [`MlockProbe`] so tests need no `CAP_IPC_LOCK`); in export mode
+//!    that the export file classifies as a password-protected
+//!    encrypted export (REQ-EXP-002, refused at startup); and in sync mode
 //!    that the sync client can be built: `api_key_file` passes the
 //!    SPEC §8 permission check (REQ-DEP-008: a regular file, not group-
 //!    or world-writable; group/world-readable or foreign-owned only
@@ -287,6 +289,24 @@ pub enum ConfigError {
     /// `data_dir` is not an absolute path.
     #[error("`data_dir` must be an absolute path")]
     DataDirNotAbsolute,
+    /// The export file is not a password-protected encrypted export
+    /// (REQ-EXP-002: plaintext JSON, CSV, and account-restricted
+    /// exports are refused at startup).
+    #[error(
+        "export file is not a password-protected encrypted Bitwarden export (ExportNotPasswordEncrypted)"
+    )]
+    ExportNotPasswordEncrypted,
+    /// The export file's KDF parameters are unsupported or out of range.
+    #[error("export file KDF parameters are invalid")]
+    ExportKdfInvalid,
+    /// The export file could not be read.
+    #[error("cannot read export file {path}: {kind}")]
+    ExportRead {
+        /// Path that failed.
+        path: PathBuf,
+        /// `std::io::ErrorKind` rendering.
+        kind: String,
+    },
 }
 
 impl ConfigError {
@@ -329,6 +349,9 @@ impl ConfigError {
             Self::ApiWildcardBind => "api_wildcard_bind",
             Self::ApiListenNotUnicast => "api_listen_not_unicast",
             Self::DataDirNotAbsolute => "data_dir_not_absolute",
+            Self::ExportNotPasswordEncrypted => "export_not_password_encrypted",
+            Self::ExportKdfInvalid => "export_kdf_invalid",
+            Self::ExportRead { .. } => "export_read",
         }
     }
 }
@@ -682,6 +705,24 @@ impl Config {
             warnings = keyfile::check_api_key_file(&bw.api_key_file)
                 .map_err(|reason| ConfigError::ApiKeyFile { reason })?;
             bw.sync_client()?;
+        }
+        if let Source::Export(exp) = &self.source {
+            // REQ-EXP-002: the export file must classify as a
+            // password-protected encrypted export at startup, before
+            // any unlock exists. The parsed envelope is dropped here;
+            // the unlock path loads its own copy.
+            crate::export::ExportFile::load(&exp.file).map_err(|e| match e {
+                crate::export::ExportError::NotPasswordEncrypted => {
+                    ConfigError::ExportNotPasswordEncrypted
+                }
+                crate::export::ExportError::Kdf(_) => ConfigError::ExportKdfInvalid,
+                crate::export::ExportError::Read { path, kind } => {
+                    ConfigError::ExportRead { path, kind }
+                }
+                crate::export::ExportError::AuthFailed => {
+                    unreachable!("invariant: startup classification never authenticates")
+                }
+            })?;
         }
         Ok(warnings)
     }

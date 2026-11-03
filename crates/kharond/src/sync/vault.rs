@@ -27,7 +27,7 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 use super::SyncError;
 use super::wire::{CIPHER_TYPE_LOGIN, Cipher, SyncResponse};
 
-pub(super) fn norm_id(s: &str) -> String {
+pub(crate) fn norm_id(s: &str) -> String {
     s.trim().to_ascii_lowercase()
 }
 
@@ -103,6 +103,35 @@ impl std::fmt::Debug for Item {
 }
 
 impl Item {
+    /// Build an item from already-classified parts. The sync path
+    /// builds items in [`decrypt_metadata`]; this constructor is for
+    /// the export loader (issue #12), whose source is a decrypted
+    /// plaintext export: metadata arrives as plaintext (REQ-CRY-006
+    /// classes) and secrets arrive already re-wrapped as EncString
+    /// text under the export session's per-unlock key, so an `Item`
+    /// never holds a plaintext secret in either mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        id: String,
+        name: String,
+        username: Option<String>,
+        uris: Vec<ItemUri>,
+        revision: Option<String>,
+        protected_password: Option<String>,
+        protected_totp: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            username,
+            uris,
+            revision,
+            protected_cipher_key: None,
+            protected_password,
+            protected_totp,
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -120,6 +149,17 @@ impl Item {
     /// Server `revisionDate` (RFC 3339), for grant pinning (REQ-REV-004).
     pub fn revision(&self) -> Option<&str> {
         self.revision.as_deref()
+    }
+    /// The protected (EncString) password text, for the session that
+    /// owns the key for it (the export loader's wrap key). Ciphertext,
+    /// never plaintext.
+    pub fn protected_password(&self) -> Option<&str> {
+        self.protected_password.as_deref()
+    }
+    /// The protected (EncString) TOTP text; see
+    /// [`Item::protected_password`].
+    pub fn protected_totp(&self) -> Option<&str> {
+        self.protected_totp.as_deref()
     }
     pub fn has_password(&self) -> bool {
         self.protected_password.is_some()
@@ -166,6 +206,13 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// Build a vault from items constructed outside the sync path
+    /// (the export loader, issue #12), with the loader's own report.
+    pub fn with_report(items: Vec<Item>, report: SyncReport) -> Self {
+        let items = items.into_iter().map(|i| (i.id.clone(), i)).collect();
+        Self { items, report }
+    }
+
     /// Every in-scope item, ordered by id.
     pub fn items(&self) -> impl Iterator<Item = &Item> {
         self.items.values()

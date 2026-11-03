@@ -89,7 +89,10 @@ async fn serve(cfg: Config) -> ExitCode {
     };
     drop(cfg);
     match daemon.local_addr() {
-        Ok(addr) => eprintln!("kharond: agent API listening on {addr} (locked)"),
+        Ok(addr) => {
+            eprintln!("kharond: agent API listening on {addr} (locked)");
+            eprintln!("kharond: owner socket {}", daemon.owner_socket().display());
+        }
         Err(e) => {
             eprintln!("kharond: cannot read listen address: {}", e.kind());
             return ExitCode::from(EX_SOFTWARE);

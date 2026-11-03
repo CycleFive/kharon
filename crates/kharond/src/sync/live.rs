@@ -196,30 +196,75 @@ pub struct LiveSync {
 /// (REQ-CRY-006), which are not key material.
 impl ZeroizeOnDrop for LiveSync {}
 
+/// The network half of an unlock, done before the lock controller
+/// is engaged (issue #11, lock module composition note): prelogin
+/// and sync carry no key material, so they run *before*
+/// [`LockController::unlock`]; only [`PreparedUnlock::derive`] —
+/// the part that touches the master password — runs inside the
+/// controller's derivation closure.
+pub struct PreparedUnlock {
+    client: SyncClient,
+    kdf: kharon_bwcrypto::Kdf,
+    sync: SyncResponse,
+    email: String,
+    scope: Scope,
+    policy: SyncPolicy,
+    organization_id: String,
+}
+
+impl PreparedUnlock {
+    /// Derive the session from the master password and build the
+    /// vault. Synchronous (the KDF is CPU work): call it inside the
+    /// lock controller's derivation closure, from a blocking thread.
+    pub fn derive(self, password: &Zeroizing<String>) -> Result<LiveSync, SyncError> {
+        let mut session = Session::unlock(password, &self.email, &self.kdf, &self.sync, self.scope)?;
+        let vault = session.apply_sync(&self.sync)?;
+        Ok(LiveSync {
+            client: self.client,
+            session,
+            vault,
+            policy: self.policy,
+            organization_id: self.organization_id,
+            last_sync: Instant::now(),
+        })
+    }
+}
+
 impl LiveSync {
-    /// Unlock: prelogin, sync, REQ-CRY-008 check (before any key is
-    /// derived), unlock the session, filter.
-    pub async fn unlock(
+    /// The network half of [`LiveSync::unlock`]: prelogin, sync, and
+    /// the REQ-CRY-008 scope check (before any key is derived).
+    pub async fn prepare(
         mut client: SyncClient,
-        password: &Zeroizing<String>,
         scope: Scope,
         policy: SyncPolicy,
-    ) -> Result<Self, SyncError> {
+    ) -> Result<PreparedUnlock, SyncError> {
         let kdf = client.prelogin().await?;
         let sync = client.sync().await?;
         let organization_id = scope.organization_id().to_owned();
         check_dedicated_scope(&sync, &organization_id, policy.allow_extra_orgs)?;
         let email = client.email().to_owned();
-        let mut session = Session::unlock(password, &email, &kdf, &sync, scope)?;
-        let vault = session.apply_sync(&sync)?;
-        Ok(Self {
+        Ok(PreparedUnlock {
             client,
-            session,
-            vault,
+            kdf,
+            sync,
+            email,
+            scope,
             policy,
             organization_id,
-            last_sync: Instant::now(),
         })
+    }
+
+    /// Unlock: prelogin, sync, REQ-CRY-008 check (before any key is
+    /// derived), unlock the session, filter.
+    pub async fn unlock(
+        client: SyncClient,
+        password: &Zeroizing<String>,
+        scope: Scope,
+        policy: SyncPolicy,
+    ) -> Result<Self, SyncError> {
+        Self::prepare(client, scope, policy)
+            .await?
+            .derive(password)
     }
 
     pub fn vault(&self) -> &Vault {

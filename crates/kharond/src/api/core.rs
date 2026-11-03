@@ -51,7 +51,7 @@ use super::meta::{ItemMeta, matches_origin, matches_query};
 use super::token::TokenStore;
 use crate::audit::{AuditLog, Entry, Event};
 use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin};
-use crate::lock::{AuditError, Clock, LockController, SystemClock};
+use crate::lock::{AuditError, Clock, LockController, LockEvent, SystemClock};
 use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::{LiveSync, SecretField, SyncError, Vault};
 use crate::totp::skew::Observation;
@@ -272,7 +272,7 @@ fn validate_origin(origin: &str) -> Result<String, ApiError> {
 pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     tokens: TokenStore,
     lock: Mutex<LockController<S, C>>,
-    audit: Mutex<Box<dyn AuditSink>>,
+    audit: Arc<Mutex<Box<dyn AuditSink>>>,
     origin_cfg: OriginConfig,
     clock_skew: ClockSkewGate,
     fill_backend: Option<Box<dyn FillBackend>>,
@@ -300,7 +300,7 @@ fn new_request_id() -> String {
 struct DispatchGuard<'b> {
     plan: FillPlan,
     plan_wiped: Option<&'b PlanWipedHook>,
-    audit: &'b Mutex<Box<dyn AuditSink>>,
+    audit: &'b Arc<Mutex<Box<dyn AuditSink>>>,
     abort_entry: Option<Entry>,
 }
 
@@ -354,7 +354,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         Self {
             tokens,
             lock: Mutex::new(lock),
-            audit: Mutex::new(audit),
+            audit: Arc::new(Mutex::new(audit)),
             origin_cfg,
             clock_skew: ClockSkewGate::default(),
             fill_backend: None,
@@ -423,6 +423,38 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// `std::sync::Mutex`: never hold the guard across an `.await`.
     pub fn lock_controller(&self) -> &Mutex<LockController<S, C>> {
         &self.lock
+    }
+
+    /// Append an entry to the broker's audit log (owner actions:
+    /// the `export_loaded` entry of an export-mode unlock,
+    /// REQ-EXP-004). Fails as [`ApiError::AUDIT_FAILED`], like every
+    /// audited path (REQ-AUD-003).
+    pub fn append_audit(&self, entry: Entry) -> Result<(), ApiError> {
+        self.append(entry)
+    }
+
+    /// Route the lock controller's transitions into the audit log
+    /// (REQ-AUD-003): `Unlocked` → `unlock`, locks → `lock` /
+    /// `key_rotated` / `scope_widened` (via
+    /// [`LockEvent::audit_entry`]). The daemon calls this at
+    /// startup; until it is called, transitions are unaudited (the
+    /// state machine's unit tests wire their own sink instead).
+    /// Because the controller enforces REQ-AUD-003 fail-closed on
+    /// the `Unlocked` entry, an audit failure rolls the unlock
+    /// back — exactly as if the sink had been wired by hand.
+    pub fn wire_lock_audit(&self) {
+        let audit = Arc::clone(&self.audit);
+        let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        lock.set_event_sink(Box::new(move |event: LockEvent| {
+            let Some(entry) = event.audit_entry() else {
+                return Ok(());
+            };
+            audit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .append(entry)
+                .map_err(|_| AuditError)
+        }));
     }
 
     /// Verify a bearer token (REQ-API-003). One Argon2id evaluation:

@@ -716,15 +716,13 @@ impl Config {
         if let Source::Export(exp) = &self.source {
             // REQ-EXP-002: the export file must classify as a
             // password-protected encrypted export at startup, before
-            // any unlock exists. This call is classification only,
-            // and dropping the parsed envelope here is safe ONLY
-            // because no unlock path exists yet: under the
-            // REQ-EXP-004 load-once contract, when the unlock channel
-            // lands the daemon must keep the startup `ExportFile`
-            // and use it for every unlock — re-reading the file at
-            // unlock would let a replaced file take effect without a
-            // restart, and would reopen a classify/use gap
-            // (PR #59 review, non-blocking a).
+            // any unlock exists. This call is classification only;
+            // the daemon separately loads the `ExportFile` once in
+            // `daemon::start` and keeps that instance for every
+            // unlock, per the REQ-EXP-004 load-once contract —
+            // re-reading the file at unlock would let a replaced
+            // file take effect without a restart, and would reopen
+            // a classify/use gap (PR #59 review, non-blocking a).
             crate::export::ExportFile::load(&exp.file).map_err(|e| match e {
                 crate::export::ExportError::NotPasswordEncrypted => {
                     ConfigError::ExportNotPasswordEncrypted

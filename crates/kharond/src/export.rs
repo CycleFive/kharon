@@ -462,6 +462,14 @@ impl VaultView for ExportSession {
     fn vault(&self) -> &Vault {
         ExportSession::vault(self)
     }
+
+    fn decrypt_secret(
+        &self,
+        item_id: &str,
+        field: SecretField,
+    ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
+        ExportSession::decrypt_secret(self, item_id, field)
+    }
 }
 
 #[cfg(test)]

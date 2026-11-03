@@ -65,3 +65,5 @@ base64ct = { version = "1", features = ["alloc"] }
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.13", features = ["crypto", "ring"] }
+# Paused clock for the REQ-API-009 deadline tests.
+tokio = { version = "1", features = ["test-util"] }

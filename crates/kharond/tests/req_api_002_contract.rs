@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 
 use api_support::*;
 use kharond::api::core::{Operation, parse_request};
+use kharond::api::fill::{FillOperation, parse_fill};
 use kharond::api::http::OPENAPI_JSON;
 use kharond::api::{ApiError, Detail, ErrorCode};
 use serde_json::{Value, json};
@@ -568,7 +569,13 @@ async fn req_api_002_openapi_document_matches_the_routes() {
         .collect();
     assert_eq!(
         paths,
-        BTreeSet::from(["/v1/status", "/v1/items", "/v1/openapi.json"])
+        BTreeSet::from([
+            "/v1/status",
+            "/v1/items",
+            "/v1/fill",
+            "/v1/fill_totp",
+            "/v1/openapi.json"
+        ])
     );
     // Error codes in the doc are exactly the enum.
     let codes: BTreeSet<&str> =
@@ -596,7 +603,7 @@ async fn req_api_002_openapi_document_matches_the_routes() {
         "/",
         "/v1",
         "/v1/items/x",
-        "/v1/fill",
+        "/v1/fill_and_submit",
         "/v1/secret",
         "/v1/export",
     ] {
@@ -619,4 +626,428 @@ async fn req_api_002_openapi_document_matches_the_routes() {
     assert_eq!(r.status, 405);
     assert_eq!(r.header("allow"), Some("GET"));
     assert_eq!(r.header("cache-control"), Some("no-store"));
+    // The fill routes are POST-only.
+    for p in ["/v1/fill", "/v1/fill_totp"] {
+        let r = get(addr, p, Some(&h.alpha)).await;
+        assert_eq!(r.status, 405, "{p}");
+        assert_eq!(r.header("allow"), Some("POST"), "{p}");
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+    }
+}
+
+// ---- fill / fill_totp (#18, #19) --------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FillTool {
+    Fill,
+    FillTotp,
+}
+
+struct FillCase {
+    name: &'static str,
+    locked: bool,
+    /// `None`: no fill backend (the daemon today).
+    backend: Option<FakeAnswer>,
+    who: Who,
+    tool: FillTool,
+    body: Value,
+}
+
+fn fill_body(item: &str, fields: Value, submit: bool) -> Value {
+    json!({
+        "item_id": item,
+        "target": {"cdp_target_id": "T-1", "expected_origin": "https://login.example.com"},
+        "fields": fields,
+        "submit": submit,
+    })
+}
+
+fn fill_cases() -> Vec<FillCase> {
+    let pw = || json!([{"kind": "password"}]);
+    let c = |name, locked, backend, who, tool, body| FillCase {
+        name,
+        locked,
+        backend,
+        who,
+        tool,
+        body,
+    };
+    use FakeAnswer::*;
+    use FillTool::*;
+    vec![
+        c(
+            "fill password",
+            false,
+            Some(Filled),
+            Who::Alpha,
+            Fill,
+            fill_body(ITEM_A, pw(), false),
+        ),
+        c(
+            "fill username+password and submit",
+            false,
+            Some(Filled),
+            Who::Beta,
+            Fill,
+            fill_body(
+                ITEM_A,
+                json!([{"kind": "username", "selector": "#u"}, {"kind": "password"}]),
+                true,
+            ),
+        ),
+        c(
+            "fill origin mismatch",
+            false,
+            Some(OriginMismatch),
+            Who::Alpha,
+            Fill,
+            fill_body(ITEM_A, pw(), false),
+        ),
+        c(
+            "fill locked",
+            true,
+            Some(Filled),
+            Who::Alpha,
+            Fill,
+            fill_body(ITEM_A, pw(), false),
+        ),
+        c(
+            "fill no backend",
+            false,
+            None,
+            Who::Alpha,
+            Fill,
+            fill_body(ITEM_A, pw(), false),
+        ),
+        c(
+            "fill unknown item",
+            false,
+            Some(Filled),
+            Who::Alpha,
+            Fill,
+            fill_body("00000000-0000-4000-8000-000000000000", pw(), false),
+        ),
+        c(
+            "fill item has no totp",
+            false,
+            Some(Filled),
+            Who::Alpha,
+            Fill,
+            fill_body(ITEM_A, json!([{"kind": "totp"}]), false),
+        ),
+        c(
+            "fill no fields",
+            false,
+            Some(Filled),
+            Who::Alpha,
+            Fill,
+            fill_body(ITEM_A, json!([]), false),
+        ),
+        c(
+            "fill no token",
+            false,
+            Some(Filled),
+            Who::NoToken,
+            Fill,
+            fill_body(ITEM_A, pw(), false),
+        ),
+        c(
+            "fill swapped token",
+            false,
+            Some(Filled),
+            Who::Swapped,
+            Fill,
+            fill_body(ITEM_A, pw(), false),
+        ),
+        c(
+            "fill_totp item has no totp",
+            false,
+            Some(Filled),
+            Who::Alpha,
+            FillTotp,
+            json!({
+                "item_id": ITEM_A,
+                "target": {"cdp_target_id": "T-1", "expected_origin": "https://login.example.com"},
+            }),
+        ),
+        c(
+            "fill_totp password refused",
+            false,
+            Some(Filled),
+            Who::Alpha,
+            FillTotp,
+            json!({
+                "item_id": ITEM_A,
+                "target": {"cdp_target_id": "T-1", "expected_origin": "https://login.example.com"},
+                "fields": [{"kind": "password"}],
+            }),
+        ),
+    ]
+}
+
+async fn call_fill(t: Transport, h: &Harness, case: &FillCase) -> Outcome {
+    let tok = token(h, case.who);
+    let op = match case.tool {
+        FillTool::Fill => FillOperation::Fill,
+        FillTool::FillTotp => FillOperation::FillTotp,
+    };
+    let body = case.body.to_string();
+    match t {
+        Transport::Core => {
+            let Some(tok) = tok else {
+                return err(ApiError::MISSING_TOKEN);
+            };
+            let agent = match h.broker.authenticate(&tok) {
+                Ok(a) => a,
+                Err(e) => return err(e),
+            };
+            let received = tokio::time::Instant::now();
+            match parse_fill(op, body.as_bytes()) {
+                Ok(r) => match h.broker.fill(&agent, r, received).await {
+                    Ok(o) => ("ok".into(), o.body()),
+                    Err(e) => err(e),
+                },
+                Err(e) => err(e),
+            }
+        }
+        Transport::Http => {
+            let addr = serve_http(h.broker.clone()).await;
+            let path = match case.tool {
+                FillTool::Fill => "/v1/fill",
+                FillTool::FillTotp => "/v1/fill_totp",
+            };
+            let r = post_json(addr, path, tok.as_deref(), &body).await;
+            assert_eq!(r.header("cache-control"), Some("no-store"), "{}", case.name);
+            let v = r.json();
+            if r.status == 200 {
+                ("ok".into(), v)
+            } else {
+                let code = v["error"].as_str().unwrap().to_owned();
+                let ec = ErrorCode::ALL
+                    .into_iter()
+                    .find(|c| c.as_str() == code)
+                    .unwrap();
+                assert_eq!(r.status, ec.http_status(), "{}", case.name);
+                (code, v)
+            }
+        }
+        Transport::Mcp => {
+            let addr = serve_http(h.broker.clone()).await;
+            let tool = match case.tool {
+                FillTool::Fill => "kharon_fill",
+                FillTool::FillTotp => "kharon_fill_totp",
+            };
+            let r = mcp_call(addr, tok.as_deref(), tool, &body).await;
+            let v = r.json();
+            if r.status == 401 {
+                return (v["error"].as_str().unwrap().to_owned(), v);
+            }
+            assert_eq!(r.status, 200, "{}: {v}", case.name);
+            let result = &v["result"];
+            let inner: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            if result["isError"] == json!(true) {
+                (inner["error"].as_str().unwrap().to_owned(), inner)
+            } else {
+                ("ok".into(), inner)
+            }
+        }
+    }
+}
+
+fn check_fill(case: &FillCase, (code, body): &Outcome, seen: &[SeenPlan], audit: &[Value]) {
+    let result = |status: &str, filled: &[&str], detail: Option<&str>| {
+        let mut v = json!({"status": status, "fields_filled": filled});
+        if let Some(d) = detail {
+            v["detail"] = json!(d);
+        }
+        assert_eq!((code.as_str(), body), ("ok", &v), "{}", case.name);
+    };
+    let error = |e: ApiError| {
+        assert_eq!(
+            (code.as_str(), body),
+            (e.code.as_str(), &e.body()),
+            "{}",
+            case.name
+        )
+    };
+    let password = manifest()["items"][0]["password"].as_str().unwrap();
+    match case.name {
+        "fill password" => {
+            result("filled", &["password"], None);
+            assert_eq!(seen.len(), 1);
+            let p = &seen[0];
+            assert_eq!(p.agent, "alpha");
+            assert_eq!(p.target_id, "T-1");
+            assert_eq!(p.fields, [("password", None, password.to_owned())]);
+            assert!(!p.submit);
+            assert_eq!(
+                p.expected_origin.as_deref(),
+                Some("https://login.example.com")
+            );
+            assert!(p.matchers > 0, "the item's URIs are the matchers");
+            assert_eq!(audit, [json!(["fill", "alpha", null, "filled"])]);
+        }
+        "fill username+password and submit" => {
+            result("filled", &["username", "password"], None);
+            let p = &seen[0];
+            assert_eq!(p.agent, "beta");
+            assert_eq!(p.fields[0].0, "username");
+            assert_eq!(p.fields[0].1.as_deref(), Some("#u"));
+            assert_eq!(p.fields[1], ("password", None, password.to_owned()));
+            assert!(p.submit, "REQ-API-008: submit only when asked");
+        }
+        "fill origin mismatch" => {
+            result("origin_mismatch", &[], None);
+            assert_eq!(audit, [json!(["fill", "alpha", null, "origin_mismatch"])]);
+        }
+        "fill locked" => {
+            error(ApiError::LOCKED);
+            assert!(seen.is_empty());
+            assert_eq!(audit, [json!(["fill", "alpha", null, "locked"])]);
+        }
+        "fill no backend" => result("error", &[], Some("fill_unavailable")),
+        "fill unknown item" => {
+            result("not_found", &[], Some("unknown_item"));
+            assert!(seen.is_empty());
+        }
+        "fill item has no totp" | "fill_totp item has no totp" => {
+            result("error", &[], Some("item_field_missing"));
+            assert!(seen.is_empty(), "nothing typed");
+        }
+        "fill no fields" => {
+            error(ApiError::bad_request(Detail::NoFillFields));
+            assert!(audit.is_empty() && seen.is_empty());
+        }
+        "fill_totp password refused" => {
+            error(ApiError::bad_request(Detail::InvalidFillRequest));
+            assert!(audit.is_empty() && seen.is_empty());
+        }
+        "fill no token" => error(ApiError::MISSING_TOKEN),
+        "fill swapped token" => {
+            assert_eq!(code, "unauthorized", "{}", case.name);
+            assert!(seen.is_empty());
+        }
+        other => panic!("no expectation for case {other}"),
+    }
+}
+
+#[tokio::test]
+async fn req_api_002_fill_contract_identical_on_every_transport() {
+    for case in fill_cases() {
+        let mut results = Vec::new();
+        for t in TRANSPORTS {
+            let fake = case.backend.map(FakeFill::new);
+            let f = fake.clone();
+            let h = Harness::with(case.locked, move |b| match f {
+                Some(f) => b.with_fill_backend(Box::new(f)),
+                None => b,
+            });
+            let out = call_fill(t, &h, &case).await;
+            assert_no_canary(&out.1.to_string());
+            assert_no_canary(&serde_json::to_string(&*h.audit.entries.lock().unwrap()).unwrap());
+            let seen = fake.map(|f| f.seen()).unwrap_or_default();
+            results.push((t, out, h.audit.summary(), seen));
+        }
+        let (_, first, first_audit, first_seen) = &results[0];
+        check_fill(&case, first, first_seen, first_audit);
+        for (t, out, audit, seen) in &results[1..] {
+            assert_eq!(out, first, "{}: {t:?} disagrees with Core", case.name);
+            assert_eq!(
+                audit, first_audit,
+                "{}: {t:?} audit trail differs",
+                case.name
+            );
+            assert_eq!(
+                seen, first_seen,
+                "{}: {t:?} sent a different plan",
+                case.name
+            );
+        }
+    }
+}
+
+/// An MCP input schema as an OpenAPI component: no `$schema`, `$defs`
+/// hoisted to `components/schemas`.
+fn as_component(s: &Value) -> Value {
+    match s {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .filter(|(k, _)| *k != "$schema" && *k != "$defs")
+                .map(|(k, v)| {
+                    let v = match (k.as_str(), v) {
+                        ("$ref", Value::String(r)) => {
+                            json!(r.replace("#/$defs/", "#/components/schemas/"))
+                        }
+                        _ => as_component(v),
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(as_component).collect()),
+        v => v.clone(),
+    }
+}
+
+#[test]
+fn req_api_002_openapi_fill_bodies_are_the_mcp_schemas() {
+    // One body type serves both transports: the OpenAPI request bodies
+    // are the generated MCP input schemas, so the two cannot drift.
+    use kharond::api::mcp::Tool as McpTool;
+    let doc: Value = serde_json::from_str(OPENAPI_JSON).unwrap();
+    let schemas = &doc["components"]["schemas"];
+    for (tool, name, path) in [
+        (McpTool::Fill, "FillRequest", "/v1/fill"),
+        (McpTool::FillTotp, "FillTotpRequest", "/v1/fill_totp"),
+    ] {
+        let s = tool.input_schema();
+        assert_eq!(schemas[name], as_component(&s), "{name}");
+        for (k, v) in s["$defs"].as_object().unwrap() {
+            assert_eq!(&schemas[k.as_str()], &as_component(v), "{k}");
+        }
+        let body =
+            &doc["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(body["$ref"], format!("#/components/schemas/{name}"));
+    }
+    // FillResult's enums cover every status and detail the broker emits.
+    use kharond::api::FillStatus;
+    use kharond::cdp::fill::{FieldKind, FillOutcome};
+    let enum_of = |p: &str| -> BTreeSet<String> {
+        schemas["FillResult"]["properties"][p]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (statuses, details) = (enum_of("status"), enum_of("detail"));
+    let all = [
+        FillStatus::UnknownItem,
+        FillStatus::ItemFieldMissing,
+        FillStatus::DecryptFailed,
+        FillStatus::Unavailable,
+        FillStatus::Engine(FillOutcome::Filled {
+            kinds: vec![FieldKind::Password],
+        }),
+        FillStatus::Engine(FillOutcome::OriginMismatch),
+        FillStatus::Engine(FillOutcome::NonSecureContext),
+        FillStatus::Engine(FillOutcome::Navigated),
+        FillStatus::Engine(FillOutcome::FieldNotFound {
+            kinds: vec![FieldKind::Password],
+        }),
+        FillStatus::Engine(FillOutcome::TargetNotOwned),
+        FillStatus::Engine(FillOutcome::DefaultContextRefused),
+        FillStatus::Engine(FillOutcome::UnknownTarget),
+        FillStatus::Engine(FillOutcome::Timeout),
+        FillStatus::Engine(FillOutcome::ClockSkew),
+        FillStatus::Engine(FillOutcome::TotpUnsupported),
+        FillStatus::Engine(FillOutcome::Error("x".into())),
+    ];
+    for s in &all {
+        assert!(statuses.contains(s.status()), "{}", s.status());
+        if let Some(d) = s.detail() {
+            assert!(details.contains(d), "{d}");
+        }
+    }
 }

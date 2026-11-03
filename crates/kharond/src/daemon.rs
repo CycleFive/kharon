@@ -35,6 +35,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::api::core::Broker;
+use crate::api::fill::FillPolicy;
 use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
 use crate::audit::{AuditConfig as LogConfig, AuditLog, FileCheckpointSink, OpenError};
@@ -185,7 +186,12 @@ pub async fn start(
     );
     let broker = Arc::new(
         Broker::new(tokens, lock, Box::new(audit), cfg.policy.origin_config())
-            .with_clock_skew_policy(SkewPolicy::from(&cfg.policy)),
+            .with_clock_skew_policy(SkewPolicy::from(&cfg.policy))
+            // REQ-API-009 `fill_deadline` and the fill origin policy.
+            // No fill backend yet: the CDP connection and per-agent
+            // browser contexts are wired by a follow-up to #18, so
+            // until then every fill is `error`/`fill_unavailable`.
+            .with_fill_policy(FillPolicy::from(&cfg.policy)),
     );
     // REQ-API-007: the server whose `Date` the clock is checked
     // against. Building the client does no I/O; config validation has

@@ -11,11 +11,17 @@
 //! | `GET /v1/status` | bearer | `StatusBody` |
 //! | `GET /v1/items[?origin=]` | bearer | list, `[ItemMeta]` |
 //! | `GET /v1/items?q=[&origin=]` | bearer | search, `[ItemMeta]` |
+//! | `POST /v1/fill` | bearer | `FillRequest` → `FillResult` (`submit: true` is `fill_and_submit`) |
+//! | `POST /v1/fill_totp` | bearer | `FillTotpRequest` → `FillResult` |
 //! | `GET /v1/openapi.json` | none | the OpenAPI document |
 //! | `POST /mcp` | bearer | MCP over Streamable HTTP ([`super::mcp`]) |
 //!
 //! Order: route (404), method (405), bearer token (401), parameters
-//! (400), then [`Broker::dispatch`]. Token verification is one
+//! (400), then [`Broker::dispatch`]. The fill routes take a JSON body
+//! instead of a query: route (404), method (405, `Allow: POST`), a
+//! browser `Origin` (403, as on `/mcp`), bearer token (401), content
+//! type and size (400), [`parse_fill`] (400), then [`Broker::fill`],
+//! whose REQ-API-009 deadline runs from when the handler was entered. Token verification is one
 //! Argon2id evaluation (~19 MiB, tens of ms); it runs on the blocking
 //! pool behind a semaphore so concurrent bad tokens cannot exhaust
 //! memory or starve the runtime.
@@ -31,8 +37,13 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
+use axum::body::to_bytes;
+use tokio::time::Instant;
+
 use super::core::{AgentId, Broker, Operation, Request as ApiRequest, VaultView, parse_request};
 use super::error::{ApiError, Detail, ErrorCode};
+use super::fill::{FillOperation, parse_fill};
+use super::mcp::{MAX_BODY_BYTES, is_json};
 use crate::lock::Clock;
 
 /// The OpenAPI 3.1 document for this transport.
@@ -91,15 +102,25 @@ enum Route {
     OpenApi,
 }
 
+/// `POST /v1/fill`.
+pub const FILL_PATH: &str = "/v1/fill";
+/// `POST /v1/fill_totp`.
+pub const FILL_TOTP_PATH: &str = "/v1/fill_totp";
+
 async fn handle<S, C>(State(state): State<Arc<AppState<S, C>>>, req: Request) -> Response
 where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
+    let received = Instant::now();
     let route = match req.uri().path() {
         "/v1/status" => Route::Status,
         "/v1/items" => Route::Items,
         "/v1/openapi.json" => Route::OpenApi,
+        FILL_PATH => return handle_fill(state, req, FillOperation::Fill, received).await,
+        FILL_TOTP_PATH => {
+            return handle_fill(state, req, FillOperation::FillTotp, received).await;
+        }
         super::mcp::MCP_PATH => return super::mcp::handle(state, req).await,
         _ => return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute)),
     };
@@ -133,6 +154,60 @@ where
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
     }
+}
+
+async fn handle_fill<S, C>(
+    state: Arc<AppState<S, C>>,
+    req: Request,
+    op: FillOperation,
+    received: Instant,
+) -> Response
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    if req.method() != Method::POST {
+        return method_not_allowed("POST");
+    }
+    if req.headers().contains_key(header::ORIGIN) {
+        return error(ApiError::new(
+            ErrorCode::Forbidden,
+            Detail::BrowserOriginRefused,
+        ));
+    }
+    let token = bearer_token(&req);
+    let (parts, body) = req.into_parts();
+    let agent = match authenticate(&state, token).await {
+        Ok(a) => a,
+        Err(e) => return error(e),
+    };
+    if !is_json(&parts.headers) {
+        return error(ApiError::bad_request(Detail::UnsupportedContentType));
+    }
+    drop(parts);
+    let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+        return error(ApiError::bad_request(Detail::BodyTooLarge));
+    };
+    let fill_req = match parse_fill(op, &bytes) {
+        Ok(r) => r,
+        Err(e) => return error(e),
+    };
+    drop(bytes);
+    match state.broker.fill(&agent, fill_req, received).await {
+        Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
+        Err(e) => error(e),
+    }
+}
+
+/// 405 with `Allow: <allow>`.
+pub(super) fn method_not_allowed(allow: &'static str) -> Response {
+    let mut resp = error(ApiError::new(
+        ErrorCode::MethodNotAllowed,
+        Detail::MethodNotAllowed,
+    ));
+    resp.headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static(allow));
+    resp
 }
 
 fn parse_query(op: Operation, raw: &str) -> Result<ApiRequest, ApiError> {

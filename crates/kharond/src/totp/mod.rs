@@ -30,7 +30,7 @@ use hmac::{Hmac, Mac};
 use kharon_bwcrypto::Secret;
 use zeroize::{Zeroize, Zeroizing};
 
-pub use fill::{TotpFill, TotpTarget};
+pub use fill::{TotpFill, TotpTarget, totp_code};
 pub use skew::{ClockSample, ClockSkewGate, ClockSkewRefused, SkewPolicy, SkewVerdict};
 
 /// RFC 6238 default period (seconds).

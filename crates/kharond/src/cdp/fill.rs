@@ -74,6 +74,13 @@ pub struct FillPlan {
     /// `form.requestSubmit()` in the isolated world) after every field
     /// fills successfully. Never dispatched on any failure or timeout.
     pub submit: bool,
+    /// The agent's claimed origin (`FillRequest.target.expected_origin`).
+    /// Never evidence (REQ-ORG-002): the live origin decides. It can
+    /// only refuse: a claim that differs from the live origin of the
+    /// target is `origin_mismatch` before any page code runs
+    /// (REQ-APR-007's "claims A while the tab is on B"). `None` skips
+    /// the comparison (engine-level callers).
+    pub expected_origin: Option<String>,
 }
 
 /// The outcome of one fill attempt, one-to-one with `FillResult.status`
@@ -197,6 +204,13 @@ impl FillEngine {
             Ok(info) => info,
             Err(e) => return FillOutcome::from(e),
         };
+
+        // The agent's claim can only narrow: claim ≠ live → refuse.
+        if let Some(claimed) = &plan.expected_origin
+            && !claim_matches(claimed, &info.url)
+        {
+            return FillOutcome::OriginMismatch;
+        }
 
         if info.type_ == "iframe" {
             let host = match url_host(&info.url) {
@@ -487,6 +501,19 @@ fn url_host(href: &str) -> Option<String> {
         .and_then(|u| u.host_str().map(str::to_owned))
 }
 
+/// Whether the agent's claimed origin is the live page's origin
+/// (scheme, host, port; path and query ignored). An unparsable claim
+/// or page URL never matches.
+fn claim_matches(claimed: &str, live_href: &str) -> bool {
+    match (url::Url::parse(claimed), url::Url::parse(live_href)) {
+        (Ok(c), Ok(l)) => {
+            let c = c.origin();
+            c.is_tuple() && c == l.origin()
+        }
+        _ => false,
+    }
+}
+
 fn expected_origin(href: &str) -> String {
     match url::Url::parse(href) {
         Ok(u) => u.origin().ascii_serialization(),
@@ -611,6 +638,29 @@ mod tests {
             "https://a.b.example.com"
         );
         assert_eq!(expected_origin("not a url"), "");
+        // REQ-APR-007: the claim is compared by origin only.
+        assert!(claim_matches(
+            "https://accounts.example.com",
+            "https://accounts.example.com/login?x=1"
+        ));
+        assert!(claim_matches(
+            "https://accounts.example.com/other",
+            "https://accounts.example.com/login"
+        ));
+        assert!(!claim_matches(
+            "https://accounts.example.com",
+            "https://evil.test/login"
+        ));
+        assert!(!claim_matches(
+            "http://accounts.example.com",
+            "https://accounts.example.com/"
+        ));
+        assert!(!claim_matches(
+            "https://accounts.example.com:8443",
+            "https://accounts.example.com/"
+        ));
+        assert!(!claim_matches("not a url", "https://a.example/"));
+        assert!(!claim_matches("data:text/html,x", "data:text/html,x"));
     }
 
     /// Regression (review finding 1): the callFunctionOn reply carries
@@ -773,6 +823,7 @@ mod tests {
             origin_cfg: OriginConfig::default(),
             cross_origin_iframe_hosts: Vec::new(),
             submit: true, // even a requested submit must never be dispatched
+            expected_origin: None,
         };
         let secret = plan.fields[0].value.clone();
 

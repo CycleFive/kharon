@@ -29,6 +29,7 @@
 use std::time::{Duration, SystemTime};
 
 use kharon_bwcrypto::Secret;
+use zeroize::Zeroizing;
 
 use super::TotpKey;
 use super::skew::ClockSkewGate;
@@ -36,6 +37,34 @@ use crate::audit::{AuditLog, Entry, Event};
 use crate::cdp::fill::{DEFAULT_FILL_DEADLINE, DeadlineFiller};
 use crate::cdp::{AgentContext, FieldFill, FieldKind, FillEngine, FillOutcome, FillPlan};
 use crate::origin::{OriginConfig, OriginMatcher};
+
+/// Steps 1–3 without the fill: the clock gate, then parse `field` (the
+/// item's decrypted `login.totp`) and compute the code for `now`. The
+/// field is dropped (wiped) before this returns; the code lives only in
+/// the returned `Zeroizing` buffer. A refusal is
+/// [`FillOutcome::ClockSkew`] or [`FillOutcome::TotpUnsupported`]; the
+/// caller audits it. Shared by [`TotpFill`] and the API's `fill_totp`
+/// (`crate::api::fill`), which consults the gate itself before
+/// decrypting and then calls this.
+pub fn totp_code(
+    gate: &ClockSkewGate,
+    field: Secret<String>,
+    now: SystemTime,
+) -> Result<Zeroizing<String>, FillOutcome> {
+    if gate.check_totp().is_err() {
+        drop(field);
+        return Err(FillOutcome::ClockSkew);
+    }
+    let key = match TotpKey::parse(&field) {
+        Ok(k) => k,
+        Err(_) => {
+            drop(field);
+            return Err(FillOutcome::TotpUnsupported);
+        }
+    };
+    drop(field);
+    key.code_now(now).map_err(|_| FillOutcome::ClockSkew)
+}
 
 /// Where a TOTP code goes: [`FillPlan`] without the field values.
 #[derive(Debug, Clone)]
@@ -96,23 +125,11 @@ impl<'a> TotpFill<'a> {
         agent_ctx: &AgentContext,
         allow_default: bool,
     ) -> FillOutcome {
-        if self.gate.check_totp().is_err() {
-            drop(field);
-            return self.refuse(agent_ctx, FillOutcome::ClockSkew);
-        }
-        let key = match TotpKey::parse(&field) {
-            Ok(k) => k,
-            Err(_) => {
-                drop(field);
-                return self.refuse(agent_ctx, FillOutcome::TotpUnsupported);
-            }
-        };
-        drop(field);
-        let code = match key.code_now(self.now.unwrap_or_else(SystemTime::now)) {
+        let now = self.now.unwrap_or_else(SystemTime::now);
+        let code = match totp_code(self.gate, field, now) {
             Ok(c) => c,
-            Err(_) => return self.refuse(agent_ctx, FillOutcome::ClockSkew),
+            Err(refusal) => return self.refuse(agent_ctx, refusal),
         };
-        drop(key);
         let plan = FillPlan {
             target_id: target.target_id,
             fields: vec![FieldFill {
@@ -124,6 +141,7 @@ impl<'a> TotpFill<'a> {
             origin_cfg: target.origin_cfg,
             cross_origin_iframe_hosts: target.cross_origin_iframe_hosts,
             submit: target.submit,
+            expected_origin: None,
         };
         let (plan, outcome) = DeadlineFiller::new(self.engine, self.audit)
             .with_deadline(self.deadline)

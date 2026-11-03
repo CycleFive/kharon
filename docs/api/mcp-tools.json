@@ -81,5 +81,255 @@
     },
     "name": "kharon_search",
     "title": "Search items"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Type the item's username and/or password into the tab cdp_target_id in your own browser context; with submit: true, submit the form once every field filled. The secret never leaves the broker: the result is a status and the kinds filled. The live origin must match the item and expected_origin. Bounded by the fill deadline (10 s). Audited. Same body as POST /v1/fill.",
+    "inputSchema": {
+      "$defs": {
+        "FieldArgs": {
+          "additionalProperties": false,
+          "description": "One `fields[]` entry of `fill`.",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/FieldKindArg",
+              "description": "Which item field."
+            },
+            "selector": {
+              "default": null,
+              "description": "CSS selector of the input; omitted: the broker finds it.",
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "FieldKindArg": {
+          "description": "SPEC §4 field kinds.",
+          "enum": [
+            "username",
+            "password",
+            "totp"
+          ],
+          "type": "string"
+        },
+        "TargetArgs": {
+          "additionalProperties": false,
+          "description": "SPEC §4 `target`.",
+          "properties": {
+            "cdp_target_id": {
+              "description": "CDP target id of a tab in the agent's own browser context.",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "expected_origin": {
+              "description": "The origin the agent believes the tab is on. Never trusted: the\nlive origin decides, and a mismatch is `origin_mismatch`\n(REQ-ORG-002, REQ-APR-007).",
+              "format": "uri",
+              "maxLength": 2048,
+              "type": "string"
+            },
+            "frame_id": {
+              "default": null,
+              "description": "Not supported: must be omitted or null. Address an\nout-of-process frame by its own `cdp_target_id`.",
+              "maxLength": 128,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "cdp_target_id",
+            "expected_origin"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "SPEC §4 `FillRequest`: the `POST /v1/fill` body and the\n`kharon_fill` arguments.",
+      "properties": {
+        "fields": {
+          "description": "The fields to fill, at most one per kind. `selector` overrides\nthe broker's heuristic for that field.",
+          "items": {
+            "$ref": "#/$defs/FieldArgs"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "type": "array"
+        },
+        "grant_id": {
+          "default": null,
+          "description": "An approved grant to fill under (REQ-APR-*; issue #20).",
+          "maxLength": 128,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "item_id": {
+          "description": "The item to fill from (an `id` from `kharon_list` /\n`kharon_search`).",
+          "format": "uuid",
+          "maxLength": 36,
+          "minLength": 36,
+          "type": "string"
+        },
+        "submit": {
+          "default": false,
+          "description": "Submit the form after every field filled (`fill_and_submit`).\nNever dispatched on any failure or timeout.",
+          "type": "boolean"
+        },
+        "target": {
+          "$ref": "#/$defs/TargetArgs",
+          "description": "The tab (or out-of-process frame) to fill."
+        }
+      },
+      "required": [
+        "item_id",
+        "target",
+        "fields"
+      ],
+      "title": "FillArgs",
+      "type": "object"
+    },
+    "name": "kharon_fill",
+    "title": "Fill a login form"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Type the item's current TOTP code into the tab cdp_target_id in your own browser context; the code is never returned. Refused while the broker clock is skewed. Audited. Same body as POST /v1/fill_totp.",
+    "inputSchema": {
+      "$defs": {
+        "TargetArgs": {
+          "additionalProperties": false,
+          "description": "SPEC §4 `target`.",
+          "properties": {
+            "cdp_target_id": {
+              "description": "CDP target id of a tab in the agent's own browser context.",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "expected_origin": {
+              "description": "The origin the agent believes the tab is on. Never trusted: the\nlive origin decides, and a mismatch is `origin_mismatch`\n(REQ-ORG-002, REQ-APR-007).",
+              "format": "uri",
+              "maxLength": 2048,
+              "type": "string"
+            },
+            "frame_id": {
+              "default": null,
+              "description": "Not supported: must be omitted or null. Address an\nout-of-process frame by its own `cdp_target_id`.",
+              "maxLength": 128,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "cdp_target_id",
+            "expected_origin"
+          ],
+          "type": "object"
+        },
+        "TotpFieldArgs": {
+          "additionalProperties": false,
+          "description": "One `fields[]` entry of `fill_totp`.",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/TotpKindArg",
+              "description": "Always `totp`."
+            },
+            "selector": {
+              "default": null,
+              "description": "CSS selector of the input; omitted: the broker finds it.",
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "TotpKindArg": {
+          "description": "The one kind `fill_totp` takes.",
+          "enum": [
+            "totp"
+          ],
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "SPEC §4 `FillTotpRequest`: `FillRequest` with `fields =\n[{kind: \"totp\", selector?}]` (the default when omitted).",
+      "properties": {
+        "fields": {
+          "description": "Exactly one `totp` field. Omitted: `[{\"kind\": \"totp\"}]`.",
+          "items": {
+            "$ref": "#/$defs/TotpFieldArgs"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "grant_id": {
+          "default": null,
+          "description": "An approved grant to fill under (issue #20).",
+          "maxLength": 128,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "item_id": {
+          "description": "The item whose TOTP code to fill.",
+          "format": "uuid",
+          "maxLength": 36,
+          "minLength": 36,
+          "type": "string"
+        },
+        "submit": {
+          "default": false,
+          "description": "Submit the form after the code filled.",
+          "type": "boolean"
+        },
+        "target": {
+          "$ref": "#/$defs/TargetArgs",
+          "description": "The tab (or out-of-process frame) to fill."
+        }
+      },
+      "required": [
+        "item_id",
+        "target"
+      ],
+      "title": "FillTotpArgs",
+      "type": "object"
+    },
+    "name": "kharon_fill_totp",
+    "title": "Fill a TOTP code"
   }
 ]

@@ -4,7 +4,7 @@
 //! test. (Semantics are REQ-API-002's contract test, which runs every
 //! case over MCP too.)
 //!
-//! Today five of the six tools exist: `kharon_request_grant` arrives
+//! Today six of the seven tools exist: `kharon_request_grant` arrives
 //! with #20 and extends [`Tool::ALL`] and the snapshot.
 
 mod api_support;
@@ -57,7 +57,7 @@ fn req_api_001_schema_properties_are_exactly_what_the_core_accepts() {
     use kharond::api::core::parse_request;
     for t in Tool::ALL {
         let Some(op) = t.operation() else {
-            continue; // fill tools: next test
+            continue; // fill tools and kharon_context: next tests
         };
         let s = t.input_schema();
         assert_eq!(s["type"], "object");
@@ -90,6 +90,41 @@ fn req_api_001_schema_properties_are_exactly_what_the_core_accepts() {
             .unwrap_or_default();
         let expect: &[&str] = if t == Tool::Search { &["q"] } else { &[] };
         assert_eq!(required, expect, "{}", t.name());
+    }
+}
+
+#[test]
+fn req_api_001_context_schema_is_what_parse_context_body_accepts() {
+    // `kharon_context` takes no arguments: the schema is an empty
+    // closed object and the core accepts exactly an empty body or `{}`.
+    use kharond::api::core::parse_context_body;
+    let t = Tool::Context;
+    assert_eq!(t.name(), "kharon_context");
+    assert!(t.operation().is_none() && t.fill_operation().is_none());
+    let s = t.input_schema();
+    assert_eq!(s["type"], "object");
+    assert_eq!(s["additionalProperties"], json!(false));
+    assert_eq!(s["properties"], json!({}));
+    assert!(s.get("required").is_none());
+    let d = &t.definition()["annotations"];
+    assert_eq!(d["readOnlyHint"], json!(false));
+    assert_eq!(d["idempotentHint"], json!(true));
+    assert_eq!(d["destructiveHint"], json!(false));
+    assert_eq!(d["openWorldHint"], json!(true));
+    for ok in [&b""[..], b"{}", b" { } "] {
+        assert_eq!(parse_context_body(ok), Ok(()), "{ok:?}");
+    }
+    for (bad, detail) in [
+        (&br#"{"agent_id":"beta"}"#[..], Detail::UnknownParameter),
+        (b"[]", Detail::InvalidArguments),
+        (b"null", Detail::InvalidArguments),
+        (b"{", Detail::InvalidJsonBody),
+    ] {
+        assert_eq!(
+            parse_context_body(bad),
+            Err(ApiError::bad_request(detail)),
+            "{bad:?}"
+        );
     }
 }
 
@@ -171,7 +206,8 @@ async fn req_api_001_tools_list_serves_the_generated_tools() {
             "kharon_list",
             "kharon_search",
             "kharon_fill",
-            "kharon_fill_totp"
+            "kharon_fill_totp",
+            "kharon_context"
         ]
     );
     assert!(res["ttlMs"].is_u64());
@@ -243,7 +279,7 @@ async fn req_api_001_legacy_initialize_handshake() {
     assert!(!is_error);
     assert_eq!(
         body,
-        json!({"locked": false, "agent_id": "alpha", "grants": []})
+        json!({"locked": false, "agent_id": "alpha", "grants": [], "browser_context_id": null})
     );
     // Legacy unknown method: JSON-RPC error on HTTP 200 (a pre-2026
     // client reads 404 as an expired session).

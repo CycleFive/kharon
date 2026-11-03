@@ -150,6 +150,26 @@ pub struct StatusBody {
     pub agent_id: String,
     /// The agent's active grants.
     pub grants: Vec<GrantView>,
+    /// The agent's cached browser context (REQ-ARCH-005, #65), from the
+    /// cache only: reading status never connects. `null` before the
+    /// first `kharon_context` / fill, after a lock, and once the
+    /// connection that owned it has ended.
+    pub browser_context_id: Option<String>,
+}
+
+/// `POST /v1/context` / `kharon_context` body (REQ-ARCH-005, #65).
+/// `browser_context_id` is present only on `ok`; `detail` is a fixed
+/// code on `error` (`cdp_error`, `fill_unavailable`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContextResult {
+    /// `ok`, `timeout` or `error`.
+    pub status: &'static str,
+    /// The agent's `browserContextId`: open pages for the agent in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_context_id: Option<String>,
+    /// A fixed code on `error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<&'static str>,
 }
 
 /// A successful response.
@@ -161,6 +181,8 @@ pub enum Outcome {
     Items(Vec<ItemMeta>),
     /// `fill` / `fill_totp` result (any status, including refusals).
     Fill(FillResult),
+    /// `kharon_context` result (any status).
+    Context(ContextResult),
 }
 
 impl Outcome {
@@ -170,6 +192,7 @@ impl Outcome {
             Self::Status(s) => serde_json::to_value(s),
             Self::Items(items) => serde_json::to_value(items),
             Self::Fill(r) => serde_json::to_value(r),
+            Self::Context(r) => serde_json::to_value(r),
         };
         v.expect("invariant: API bodies serialize")
     }
@@ -211,6 +234,21 @@ pub fn parse_request<'a>(
             r @ Request::Search { .. } => Ok(r),
             _ => Err(ApiError::bad_request(Detail::MissingParameter)),
         },
+    }
+}
+
+/// Validate a context request (`POST /v1/context` body, `kharon_context`
+/// arguments; #65): there are no parameters, so the body is empty or
+/// `{}`. Anything else is refused rather than ignored.
+pub fn parse_context_body(bytes: &[u8]) -> Result<(), ApiError> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Err(_) => Err(ApiError::bad_request(Detail::InvalidJsonBody)),
+        Ok(serde_json::Value::Object(m)) if m.is_empty() => Ok(()),
+        Ok(serde_json::Value::Object(_)) => Err(ApiError::bad_request(Detail::UnknownParameter)),
+        Ok(_) => Err(ApiError::bad_request(Detail::InvalidArguments)),
     }
 }
 
@@ -314,6 +352,26 @@ impl Drop for DispatchGuard<'_> {
         }
         if let Some(mut entry) = self.abort_entry.take() {
             entry.live_origin = self.plan.live_origin.get();
+            let _ = self
+                .audit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .append(entry);
+        }
+    }
+}
+
+/// Appends a context request's `aborted` outcome if the handler is
+/// dropped between `context_open` and its outcome (best effort, like
+/// `fill_aborted`).
+struct ContextGuard<'b> {
+    audit: &'b Mutex<Box<dyn AuditSink>>,
+    abort_entry: Option<Entry>,
+}
+
+impl Drop for ContextGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.abort_entry.take() {
             let _ = self
                 .audit
                 .lock()
@@ -462,6 +520,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             locked: lock.is_locked(),
             agent_id: agent.0.clone(),
             grants: Vec::new(),
+            browser_context_id: self
+                .fill_backend
+                .as_ref()
+                .and_then(|b| b.cached_context_id(agent.as_str())),
         }
     }
 
@@ -625,6 +687,102 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         };
         self.append(entry)?;
         Ok(Outcome::Fill(status.result()))
+    }
+
+    /// Hand `agent` its browser context id (REQ-ARCH-005, #65): connect
+    /// if needed, create or return the agent's cached context.
+    /// Idempotent while the connection lives; a reconnect (browser
+    /// restart, lock then unlock) gives a new id.
+    ///
+    /// Same machinery as [`Self::fill`]: lock-gated (`423` while
+    /// locked, a `context` entry with result `locked`), bounded by the
+    /// fill deadline from `received`, and audited as two transitions:
+    /// `context_open` (request id) is appended before any CDP I/O (a
+    /// failed append is [`ApiError::AUDIT_FAILED`] with no connect), and
+    /// exactly one `context` outcome entry (same request id; result
+    /// `ok`, `timeout`/`deadline_expired` or `error`/`cdp_error`) before
+    /// the reply. A dropped handler appends `aborted`/`handler_dropped`
+    /// best effort. A refusal before the browser (no backend for the
+    /// agent, expired before dispatch) writes only the outcome entry.
+    /// Not fill activity: does not reset the idle timer.
+    pub async fn context(&self, agent: &AgentId, received: Instant) -> Result<Outcome, ApiError> {
+        let deadline = received + self.fill_policy.deadline;
+        let request_id = new_request_id();
+        let base = |e: Event| {
+            Entry::new(e)
+                .agent_id(agent.0.clone())
+                .request_id(request_id.clone())
+        };
+        let generation = {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            if lock.require_unlocked().is_err() {
+                drop(lock);
+                self.append(base(Event::Context).result("locked"))?;
+                return Err(ApiError::LOCKED);
+            }
+            // Read under the gate's mutex, as for a fill (#66).
+            match &self.fill_backend {
+                Some(b) if b.has_agent(agent.as_str()) => Some((Arc::clone(b), b.generation())),
+                _ => None,
+            }
+        };
+        let result: Result<String, FillStatus> = match generation {
+            None => Err(FillStatus::Unavailable),
+            Some(_) if Instant::now() >= deadline => Err(FillStatus::Engine(FillOutcome::Timeout)),
+            Some((backend, generation)) => {
+                self.append(base(Event::ContextOpen).result("dispatched"))?;
+                let mut guard = ContextGuard {
+                    audit: &self.audit,
+                    abort_entry: Some(
+                        base(Event::Context)
+                            .result("aborted")
+                            .detail_code("handler_dropped"),
+                    ),
+                };
+                let open = backend.context_in_generation(agent.as_str(), generation);
+                let r = match tokio::time::timeout_at(deadline, open).await {
+                    Ok(Ok(id)) => Ok(id),
+                    Ok(Err(outcome)) => Err(FillStatus::Engine(outcome)),
+                    Err(_) => Err(FillStatus::Engine(FillOutcome::Timeout)),
+                };
+                guard.abort_entry = None;
+                r
+            }
+        };
+        let (entry, body) = match result {
+            Ok(id) => (
+                base(Event::Context).result("ok"),
+                ContextResult {
+                    status: "ok",
+                    browser_context_id: Some(id),
+                    detail: None,
+                },
+            ),
+            Err(FillStatus::Engine(FillOutcome::Timeout)) => (
+                base(Event::Context)
+                    .result("timeout")
+                    .detail_code("deadline_expired"),
+                ContextResult {
+                    status: "timeout",
+                    browser_context_id: None,
+                    detail: None,
+                },
+            ),
+            Err(status) => {
+                // `cdp_error` or `fill_unavailable`.
+                let detail = status.detail().unwrap_or("cdp_error");
+                (
+                    base(Event::Context).result("error").detail_code(detail),
+                    ContextResult {
+                        status: "error",
+                        browser_context_id: None,
+                        detail: Some(detail),
+                    },
+                )
+            }
+        };
+        self.append(entry)?;
+        Ok(Outcome::Context(body))
     }
 
     async fn run_fill(

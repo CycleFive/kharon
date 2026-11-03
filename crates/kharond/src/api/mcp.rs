@@ -18,11 +18,14 @@
 //! | `kharon_search` | `GET /v1/items?q=[&origin=]` |
 //! | `kharon_fill` | `POST /v1/fill` |
 //! | `kharon_fill_totp` | `POST /v1/fill_totp` |
+//! | `kharon_context` | `POST /v1/context` (#65) |
 //!
 //! The read tools' arguments become `(name, value)` pairs for
 //! [`parse_request`]; the fill tools' arguments object is exactly the
 //! HTTP JSON body, handed to [`parse_fill`] and
-//! [`Broker::fill`](super::core::Broker::fill). A fill that ran but did
+//! [`Broker::fill`](super::core::Broker::fill); `kharon_context`'s
+//! (none) go to [`parse_context_body`] and
+//! [`Broker::context`](super::core::Broker::context). A fill that ran but did
 //! not fill (`origin_mismatch`, `timeout`, …) is a `FillResult`, as on
 //! HTTP, so `isError` is `false`; `isError: true` is reserved for the
 //! `ApiError` bodies (bad arguments, locked, audit failure).
@@ -64,7 +67,8 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 use super::core::{
-    AgentId, Broker, MAX_ORIGIN_LEN, MAX_QUERY_LEN, Operation, VaultView, parse_request,
+    AgentId, Broker, MAX_ORIGIN_LEN, MAX_QUERY_LEN, Operation, VaultView, parse_context_body,
+    parse_request,
 };
 use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillArgs, FillOperation, FillTotpArgs, parse_fill};
@@ -97,8 +101,9 @@ const CACHE_TTL_MS: u64 = 3_600_000;
 const INSTRUCTIONS: &str = "kharon credentials broker. No tool ever returns a secret: \
 kharon_list and kharon_search return item metadata, and kharon_fill / kharon_fill_totp type the \
 item's username, password or current TOTP code into a tab in your own browser context and \
-report only which fields were filled. The live page origin decides, never your claim. Every \
-call is audited.";
+report only which fields were filled. kharon_context returns your own browserContextId: open the \
+tabs you want filled in it. The live page origin decides, never your claim. Every call is \
+audited.";
 
 // ---------------------------------------------------------------- tools
 
@@ -106,6 +111,11 @@ call is audited.";
 #[derive(Debug, Clone, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct StatusArgs {}
+
+/// `kharon_context` arguments: none (#65).
+#[derive(Debug, Clone, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ContextArgs {}
 
 /// `kharon_list` arguments.
 #[derive(Debug, Clone, Default, JsonSchema)]
@@ -144,16 +154,19 @@ pub enum Tool {
     Fill,
     /// `kharon_fill_totp` (#19).
     FillTotp,
+    /// `kharon_context` (#65).
+    Context,
 }
 
 impl Tool {
     /// Every tool, in `tools/list` order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Status,
         Self::List,
         Self::Search,
         Self::Fill,
         Self::FillTotp,
+        Self::Context,
     ];
 
     /// Tool name.
@@ -164,6 +177,7 @@ impl Tool {
             Self::Search => "kharon_search",
             Self::Fill => "kharon_fill",
             Self::FillTotp => "kharon_fill_totp",
+            Self::Context => "kharon_context",
         }
     }
 
@@ -173,30 +187,30 @@ impl Tool {
     }
 
     /// The read operation the tool runs ([`parse_request`]); `None`
-    /// for the fill tools.
+    /// for the fill tools and `kharon_context`.
     pub const fn operation(self) -> Option<Operation> {
         match self {
             Self::Status => Some(Operation::Status),
             Self::List => Some(Operation::List),
             Self::Search => Some(Operation::Search),
-            Self::Fill | Self::FillTotp => None,
+            Self::Fill | Self::FillTotp | Self::Context => None,
         }
     }
 
     /// The fill operation the tool runs ([`parse_fill`]); `None` for
-    /// the read tools.
+    /// the read tools and `kharon_context`.
     pub const fn fill_operation(self) -> Option<FillOperation> {
         match self {
             Self::Fill => Some(FillOperation::Fill),
             Self::FillTotp => Some(FillOperation::FillTotp),
-            Self::Status | Self::List | Self::Search => None,
+            Self::Status | Self::List | Self::Search | Self::Context => None,
         }
     }
 
     /// Argument names the tool takes (its schema's `properties`).
     pub const fn parameters(self) -> &'static [&'static str] {
         match self {
-            Self::Status => &[],
+            Self::Status | Self::Context => &[],
             Self::List => &["origin"],
             Self::Search => &["q", "origin"],
             Self::Fill | Self::FillTotp => &["item_id", "target", "fields", "submit", "grant_id"],
@@ -210,13 +224,16 @@ impl Tool {
             Self::Search => "Search items",
             Self::Fill => "Fill a login form",
             Self::FillTotp => "Fill a TOTP code",
+            Self::Context => "Your browser context",
         }
     }
 
     const fn description(self) -> &'static str {
         match self {
             Self::Status => {
-                "Whether the broker is locked, the calling agent's id, and its active grants. \
+                "Whether the broker is locked, the calling agent's id, its active grants, and \
+                 its cached browser_context_id (null until kharon_context or a fill opened one, \
+                 and after a lock or browser restart; reading status never connects). \
                  Same body as GET /v1/status."
             }
             Self::List => {
@@ -239,6 +256,15 @@ impl Tool {
                  browser context; the code is never returned. Refused while the broker clock \
                  is skewed. Audited. Same body as POST /v1/fill_totp."
             }
+            Self::Context => {
+                "Your own browser context id (browser_context_id, the CDP browserContextId): \
+                 connects to your configured browser if needed and creates your context, or \
+                 returns the one already open. Open the tabs you want filled in it \
+                 (Target.createTarget with this browserContextId); tabs elsewhere are \
+                 target_not_owned. The same id until the connection ends: after a browser \
+                 restart or a broker lock you get a new one. Requires unlock. Bounded by the \
+                 fill deadline (10 s). Audited. Same body as POST /v1/context."
+            }
         }
     }
 
@@ -254,6 +280,7 @@ impl Tool {
             Self::Search => generator.into_root_schema_for::<SearchArgs>(),
             Self::Fill => generator.into_root_schema_for::<FillArgs>(),
             Self::FillTotp => generator.into_root_schema_for::<FillTotpArgs>(),
+            Self::Context => generator.into_root_schema_for::<ContextArgs>(),
         };
         let mut v = schema.to_value();
         if let Some(o) = v.as_object_mut() {
@@ -277,13 +304,15 @@ impl Tool {
 
     /// MCP tool annotations. The fill tools write into a page outside
     /// the broker (open world, not idempotent: a submit is an action)
-    /// but destroy nothing.
+    /// but destroy nothing. `kharon_context` may create a browser
+    /// context (open world, not read-only) but repeating it returns the
+    /// same one (idempotent).
     fn annotations(self) -> Value {
         let reads = self.operation().is_some();
         json!({
             "readOnlyHint": reads,
             "destructiveHint": false,
-            "idempotentHint": reads,
+            "idempotentHint": reads || matches!(self, Self::Context),
             "openWorldHint": !reads,
         })
     }
@@ -686,7 +715,13 @@ where
                         Err(e) => Err(e),
                     }
                 }
-                (None, None) => unreachable!("invariant: every tool is a read or a fill"),
+                (None, None) => {
+                    debug_assert_eq!(tool, Tool::Context);
+                    match fill_arguments(call.arguments).and_then(parse_context_body) {
+                        Ok(()) => broker.context(agent, received).await,
+                        Err(e) => Err(e),
+                    }
+                }
             };
             match outcome {
                 Ok(o) => tool_result(id, era, o.body(), false),

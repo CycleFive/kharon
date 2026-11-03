@@ -60,7 +60,8 @@ pub enum VerifyOutcome {
     /// `request_id`. The fill may have written to a page without its
     /// result being logged (crash, lost `fill_aborted`), or is still in
     /// flight if the log was read from a running daemon. `seq` is the
-    /// first such dispatch.
+    /// first such dispatch. A `context_open` without exactly one `context`
+    /// entry is reported the same way (#65).
     UnmatchedFillDispatch { seq: u64 },
     /// REQ-AUD-003†: a second outcome entry for a `request_id` whose
     /// `fill_dispatch` already has one ("exactly one entry per
@@ -89,12 +90,15 @@ impl fmt::Display for VerifyOutcome {
                 write!(f, "checkpoint at seq {seq} belongs to a different log")
             }
             VerifyOutcome::UnmatchedFillDispatch { seq } => {
-                write!(f, "fill_dispatch at seq {seq} has no outcome entry")
+                write!(
+                    f,
+                    "dispatch entry (fill_dispatch or context_open) at seq {seq} has no outcome entry"
+                )
             }
             VerifyOutcome::DuplicateFillOutcome { seq } => {
                 write!(
                     f,
-                    "entry seq {seq} is a second outcome for one fill_dispatch"
+                    "entry seq {seq} is a second outcome for one fill_dispatch or context_open"
                 )
             }
         }
@@ -127,8 +131,8 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
     let data = fs::read_to_string(path)?;
     let mut hashes: Vec<String> = Vec::new();
     let mut log_id: Option<String> = None;
-    // request_id → (dispatch seq, outcome seen).
-    let mut dispatches: HashMap<String, (u64, bool)> = HashMap::new();
+    // request_id → (dispatch seq, outcome seen, is context_open).
+    let mut dispatches: HashMap<String, (u64, bool, bool)> = HashMap::new();
     let mut duplicate: Option<u64> = None;
     for (i, line) in data.lines().enumerate() {
         if line.trim().is_empty() {
@@ -184,11 +188,21 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
 
         if let Some(rid) = &entry.request_id {
             match entry.event {
-                Event::FillDispatch => {
-                    dispatches.entry(rid.clone()).or_insert((entry.seq, false));
+                Event::FillDispatch | Event::ContextOpen => {
+                    let kind = entry.event == Event::ContextOpen;
+                    dispatches
+                        .entry(rid.clone())
+                        .or_insert((entry.seq, false, kind));
                 }
-                Event::Fill | Event::FillTotp | Event::FillTimeout | Event::FillAborted => {
-                    if let Some((_, seen)) = dispatches.get_mut(rid) {
+                Event::Fill
+                | Event::FillTotp
+                | Event::FillTimeout
+                | Event::FillAborted
+                | Event::Context => {
+                    let kind = entry.event == Event::Context;
+                    if let Some((_, seen, k)) = dispatches.get_mut(rid)
+                        && *k == kind
+                    {
                         if *seen {
                             duplicate.get_or_insert(entry.seq);
                         }
@@ -201,8 +215,8 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
     }
     let unmatched = dispatches
         .values()
-        .filter(|(_, seen)| !seen)
-        .map(|(seq, _)| *seq)
+        .filter(|(_, seen, _)| !seen)
+        .map(|(seq, _, _)| *seq)
         .min();
     let fill_finding = match (unmatched, duplicate) {
         (Some(u), Some(d)) if d < u => Some(VerifyOutcome::DuplicateFillOutcome { seq: d }),
@@ -658,6 +672,40 @@ mod tests {
         assert_eq!(
             verify_dir(dir.path(), &log),
             VerifyOutcome::DuplicateFillOutcome { seq: 3 }
+        );
+    }
+
+    /// #65: `context_open` pairs with exactly one `context` entry, and
+    /// only with that: a fill outcome carrying its request id does not
+    /// close it.
+    #[test]
+    fn req_aud_003_context_open_pairs_with_one_context_outcome() {
+        let dir = tempdir();
+        let mut log = open(dir.path());
+        let open_ctx = |rid: &str| {
+            Entry::new(Event::ContextOpen)
+                .agent_id("alpha")
+                .request_id(rid)
+                .result("dispatched")
+        };
+        log.append(open_ctx("a")).unwrap();
+        log.append(outcome(Event::Context, "a")).unwrap();
+        log.append(outcome(Event::Context, "locked")).unwrap(); // refusal
+        assert_eq!(
+            verify_dir(dir.path(), &log),
+            VerifyOutcome::Ok { head_seq: 3 }
+        );
+        log.append(open_ctx("b")).unwrap(); // seq 4
+        log.append(outcome(Event::Fill, "b")).unwrap();
+        assert_eq!(
+            verify_dir(dir.path(), &log),
+            VerifyOutcome::UnmatchedFillDispatch { seq: 4 }
+        );
+        log.append(outcome(Event::Context, "b")).unwrap();
+        log.append(outcome(Event::Context, "b")).unwrap(); // seq 7
+        assert_eq!(
+            verify_dir(dir.path(), &log),
+            VerifyOutcome::DuplicateFillOutcome { seq: 7 }
         );
     }
 

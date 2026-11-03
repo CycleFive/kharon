@@ -3,7 +3,7 @@
   "info": {
     "title": "kharon agent API",
     "version": "0.1.0",
-    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools served at POST /mcp on the same listener (REQ-API-001; tool schemas in docs/api/mcp-tools.json). The forbidden error code is only returned by /mcp and the fill routes (requests carrying an Origin header). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Grants (pending_approval, denied, grant_id enforcement) arrive with issue #20.",
+    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools served at POST /mcp on the same listener (REQ-API-001; tool schemas in docs/api/mcp-tools.json). The forbidden error code is only returned by /mcp, the fill routes and /v1/context (requests carrying an Origin header). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Grants (pending_approval, denied, grant_id enforcement) arrive with issue #20.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -17,7 +17,7 @@
     "/v1/status": {
       "get": {
         "operationId": "kharon_status",
-        "summary": "Lock state and the caller's grants. Does not require unlock.",
+        "summary": "Lock state, the caller's grants and its cached browser context id. Does not require unlock and never connects to the browser.",
         "responses": {
           "200": {
             "description": "Status",
@@ -187,6 +187,52 @@
         }
       }
     },
+    "/v1/context": {
+      "post": {
+        "operationId": "kharon_context",
+        "summary": "The agent's own browser context id (CDP browserContextId; REQ-ARCH-005, issue #65): connects to the agent's browser if needed and creates the agent's context, or returns the cached one. Idempotent while the connection lives; a reconnect or a lock gives a new id, and fills into tabs of the old context get target_not_owned. Takes no parameters (empty body or {}). Bounded by the fill deadline (REQ-API-009). Requires unlock. Audited: context_open before any CDP write, then one context outcome entry (REQ-AUD-003).",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The context call's result (including timeout and error outcomes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "423": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/openapi.json": {
       "get": {
         "operationId": "openapi",
@@ -247,7 +293,8 @@
         "required": [
           "locked",
           "agent_id",
-          "grants"
+          "grants",
+          "browser_context_id"
         ],
         "properties": {
           "locked": {
@@ -264,6 +311,13 @@
               "type": "object"
             },
             "maxItems": 0
+          },
+          "browser_context_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent's cached browser context id (REQ-ARCH-005): null until kharon_context or a fill opened one, and after a reconnect or lock invalidated it. Read from the cache only; status never connects."
           }
         }
       },
@@ -594,6 +648,42 @@
               "unknown_item",
               "item_field_missing",
               "decrypt_failed",
+              "fill_unavailable"
+            ]
+          }
+        }
+      },
+      "ContextRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "description": "No parameters; same as the kharon_context inputSchema. The body may also be empty."
+      },
+      "ContextResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status"
+        ],
+        "description": "Result of POST /v1/context (REQ-ARCH-005). browser_context_id is present exactly when status is ok.",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "timeout",
+              "error"
+            ]
+          },
+          "browser_context_id": {
+            "type": "string",
+            "description": "CDP browserContextId of the agent's own context; open the tabs to fill in it (Target.createTarget browserContextId)."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Fixed reason code when status is error (also the audit detail_code).",
+            "enum": [
+              "cdp_error",
               "fill_unavailable"
             ]
           }

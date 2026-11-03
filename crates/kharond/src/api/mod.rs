@@ -20,7 +20,9 @@ pub mod mcp;
 pub mod meta;
 pub mod token;
 
-pub use self::core::{AgentId, AuditSink, Broker, Outcome, Request, StatusBody, VaultView};
+pub use self::core::{
+    AgentId, AuditSink, Broker, ContextResult, Outcome, Request, StatusBody, VaultView,
+};
 pub use error::{ApiError, Detail, ErrorCode};
 pub use fill::{
     CdpFillBackend, ConnectingCdpBackend, FillBackend, FillOperation, FillPolicy, FillRequest,

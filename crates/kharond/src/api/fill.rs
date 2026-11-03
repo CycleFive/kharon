@@ -381,6 +381,13 @@ impl FillStatus {
 /// A boxed fill future.
 pub type FillFuture<'a> = Pin<Box<dyn Future<Output = FillOutcome> + Send + 'a>>;
 
+/// A boxed context future (#65): the agent's `browserContextId`, or why
+/// there is none (`Error` → `cdp_error`).
+pub type ContextFuture<'a> = Pin<Box<dyn Future<Output = Result<String, FillOutcome>> + Send + 'a>>;
+
+/// Why a backend without browser contexts refuses a context request.
+const NO_CONTEXTS: &str = "backend has no browser contexts";
+
 /// Where fills go: per agent, a browser context to fill in.
 pub trait FillBackend: Send + Sync {
     /// Whether `agent_id` has a browser context (checked before any
@@ -428,6 +435,29 @@ pub trait FillBackend: Send + Sync {
     /// and cannot fail. Teardown that needs the browser runs in the
     /// background, best effort.
     fn on_lock(&self) {}
+
+    /// The agent's browser context id for a request admitted in unlock
+    /// generation `generation` (REQ-ARCH-005, #65): connect and create
+    /// the context if needed, else return the cached one. Bounded and
+    /// dropped by the broker like a fill, so it must make no CDP write
+    /// once dropped, and cache nothing for a locked generation.
+    fn context_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        generation: u64,
+    ) -> ContextFuture<'a> {
+        let _ = (agent_id, generation);
+        Box::pin(async { Err(FillOutcome::Error(NO_CONTEXTS.into())) })
+    }
+
+    /// The agent's current browser context id from the cache only: no
+    /// connect, no CDP I/O, no waiting (`kharon_status`, #65). `None`
+    /// before the first context, after a lock, and once the connection
+    /// that owned it has ended.
+    fn cached_context_id(&self, agent_id: &str) -> Option<String> {
+        let _ = agent_id;
+        None
+    }
 }
 
 /// The production backend: the CDP [`FillEngine`], one [`AgentContext`]
@@ -467,13 +497,30 @@ impl FillBackend for CdpFillBackend {
             }
         })
     }
+
+    fn context_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        generation: u64,
+    ) -> ContextFuture<'a> {
+        let _ = generation;
+        let id = self.cached_context_id(agent_id);
+        Box::pin(async move { id.ok_or_else(|| FillOutcome::Error(NO_CONTEXTS.into())) })
+    }
+
+    fn cached_context_id(&self, agent_id: &str) -> Option<String> {
+        self.agents
+            .get(agent_id)
+            .map(|(_, ctx)| ctx.browser_context_id().to_owned())
+    }
 }
 
 /// The daemon's backend: one configured CDP endpoint per agent
 /// (`[agents.<id>] cdp`, REQ-ARCH-002), connected on demand.
 ///
-/// Startup never touches the browser: the first fill for an agent (after
-/// its `fill_dispatch` entry, inside the fill deadline) connects, creates
+/// Startup never touches the browser: the first fill or context call for
+/// an agent (after its `fill_dispatch`/`context_open` entry, inside the
+/// fill deadline) connects, creates
 /// the agent's own browser context (REQ-ARCH-005) and keeps both. A
 /// connection that has ended (browser restart, tunnel drop) is replaced
 /// by the next fill, with a fresh context; the fill that saw it end
@@ -540,6 +587,16 @@ type Live = Option<Cached>;
 struct AgentBrowser {
     endpoint: CdpEndpoint,
     live: Arc<tokio::sync::Mutex<Live>>,
+    /// A copy of `*live`, updated whenever it changes, for readers that
+    /// must not wait on a connect in flight (`kharon_status`, #65). A
+    /// `std` mutex, never held across an `.await`.
+    published: Arc<std::sync::Mutex<Live>>,
+}
+
+/// Store `value` in the agent's cache and its published copy.
+fn set_live(live: &mut Live, published: &std::sync::Mutex<Live>, value: Live) {
+    *published.lock().unwrap_or_else(|p| p.into_inner()) = value.clone();
+    *live = value;
 }
 
 /// Why the backend refused a fill admitted before a lock.
@@ -561,6 +618,7 @@ impl ConnectingCdpBackend {
                         AgentBrowser {
                             endpoint,
                             live: Arc::new(tokio::sync::Mutex::new(None)),
+                            published: Arc::new(std::sync::Mutex::new(None)),
                         },
                     )
                 })
@@ -618,7 +676,9 @@ impl AgentBrowser {
         {
             return Ok(c.clone());
         }
-        if let Some(stale) = live.take()
+        let stale = live.take();
+        set_live(&mut live, &self.published, None);
+        if let Some(stale) = stale
             && !stale.engine.is_closed()
         {
             // Normally the lock's own teardown got here first; this only
@@ -629,6 +689,7 @@ impl AgentBrowser {
         let endpoint = self.endpoint.clone();
         let agent_id = agent_id.to_owned();
         let current = Arc::clone(current);
+        let published = Arc::clone(&self.published);
         let connect = tokio::spawn(async move {
             let opened = open_agent_browser(&endpoint, &agent_id, budget, generation).await?;
             // Checked while holding the agent's lock: a lock that bumps
@@ -638,7 +699,7 @@ impl AgentBrowser {
                 teardown(opened, &agent_id, teardown_budget).await;
                 return Err(LOCKED_DURING_FILL.to_owned());
             }
-            *live = Some(opened.clone());
+            set_live(&mut live, &published, Some(opened.clone()));
             Ok::<_, String>(opened)
         });
         match connect.await {
@@ -657,6 +718,7 @@ impl AgentBrowser {
 /// task) is left alone.
 async fn close_cached(
     live: Arc<tokio::sync::Mutex<Live>>,
+    published: Arc<std::sync::Mutex<Live>>,
     agent_id: String,
     lock_generation: u64,
     budget: Duration,
@@ -664,7 +726,11 @@ async fn close_cached(
     let taken = {
         let mut live = live.lock().await;
         match &*live {
-            Some(c) if c.generation < lock_generation => live.take(),
+            Some(c) if c.generation < lock_generation => {
+                let taken = live.take();
+                set_live(&mut live, &published, None);
+                taken
+            }
             _ => None,
         }
     };
@@ -779,6 +845,49 @@ impl FillBackend for ConnectingCdpBackend {
         })
     }
 
+    /// Connect if needed, then the cached context's id (#65). Same
+    /// connect step as a fill: lazy, generation-checked, adopted on
+    /// expiry (#68). Sends no CDP command beyond the connect's own
+    /// `createBrowserContext`.
+    fn context_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        generation: u64,
+    ) -> ContextFuture<'a> {
+        Box::pin(async move {
+            let Some(agent) = self.agents.get(agent_id) else {
+                return Err(FillOutcome::Error(NO_CONTEXTS.into()));
+            };
+            let c = agent
+                .engine(
+                    agent_id,
+                    self.connect_timeout,
+                    self.teardown_timeout,
+                    generation,
+                    &self.generation,
+                )
+                .await?;
+            if self.generation() != generation {
+                return Err(FillOutcome::Error(LOCKED_DURING_FILL.into()));
+            }
+            Ok(c.ctx.browser_context_id().to_owned())
+        })
+    }
+
+    /// The published copy only: never waits on a connect in flight. A
+    /// context from a locked generation or on a connection that ended
+    /// is reported as none, even before its teardown has run.
+    fn cached_context_id(&self, agent_id: &str) -> Option<String> {
+        let agent = self.agents.get(agent_id)?;
+        let published = agent.published.lock().unwrap_or_else(|p| p.into_inner());
+        match &*published {
+            Some(c) if c.generation == self.generation() && !c.engine.is_closed() => {
+                Some(c.ctx.browser_context_id().to_owned())
+            }
+            _ => None,
+        }
+    }
+
     /// Advance the generation (so nothing opened before this lock is
     /// reused or cached) and tear every cached session down in the
     /// background. Without a tokio runtime (sync callers) only the
@@ -792,6 +901,7 @@ impl FillBackend for ConnectingCdpBackend {
         for (agent_id, agent) in &self.agents {
             rt.spawn(close_cached(
                 Arc::clone(&agent.live),
+                Arc::clone(&agent.published),
                 agent_id.clone(),
                 lock_generation,
                 self.teardown_timeout,

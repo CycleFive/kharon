@@ -4,14 +4,17 @@
 //! - [`meta`]: `ItemMeta` and the origin/search filters (REQ-API-004).
 //! - [`error`]: fixed-text errors (REQ-API-006).
 //! - [`core`]: transport-independent dispatch (REQ-API-002).
+//! - [`fill`]: `fill` / `fill_totp` requests, results and the browser
+//!   backend (REQ-API-008, REQ-API-009; #18, #19).
 //! - [`http`]: the `/v1/*` HTTP transport and its OpenAPI document.
 //! - [`mcp`]: the MCP transport (`POST /mcp`, REQ-API-001), a second
 //!   adapter over [`core`] on the same listener.
 //!
-//! Fill endpoints arrive with #18/#19, grants with #20.
+//! Grants (`kharon_request_grant`, `POST /v1/grants`) arrive with #20.
 
 pub mod core;
 pub mod error;
+pub mod fill;
 pub mod http;
 pub mod mcp;
 pub mod meta;
@@ -19,5 +22,9 @@ pub mod token;
 
 pub use self::core::{AgentId, AuditSink, Broker, Outcome, Request, StatusBody, VaultView};
 pub use error::{ApiError, Detail, ErrorCode};
+pub use fill::{
+    CdpFillBackend, FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus,
+    parse_fill,
+};
 pub use meta::ItemMeta;
 pub use token::{ParamFloor, TokenStore};

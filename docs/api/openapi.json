@@ -3,19 +3,38 @@
   "info": {
     "title": "kharon agent API",
     "version": "0.1.0",
-    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools served at POST /mcp on the same listener (REQ-API-001; tool schemas in docs/api/mcp-tools.json). The forbidden error code is only returned by /mcp (requests carrying an Origin header). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Fill routes arrive with issue #18.",
-    "license": { "name": "MIT OR Apache-2.0" }
+    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools served at POST /mcp on the same listener (REQ-API-001; tool schemas in docs/api/mcp-tools.json). The forbidden error code is only returned by /mcp and the fill routes (requests carrying an Origin header). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Grants (pending_approval, denied, grant_id enforcement) arrive with issue #20.",
+    "license": {
+      "name": "MIT OR Apache-2.0"
+    }
   },
-  "security": [{ "agentToken": [] }],
+  "security": [
+    {
+      "agentToken": []
+    }
+  ],
   "paths": {
     "/v1/status": {
       "get": {
         "operationId": "kharon_status",
         "summary": "Lock state and the caller's grants. Does not require unlock.",
         "responses": {
-          "200": { "description": "Status", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } } } },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "200": {
+            "description": "Status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
         }
       }
     },
@@ -24,15 +43,147 @@
         "operationId": "kharon_list_search",
         "summary": "List (no q) or search (q) in-scope items as ItemMeta, optionally filtered by origin. Requires unlock.",
         "parameters": [
-          { "name": "q", "in": "query", "required": false, "description": "Search text: case-insensitive substring of the item name or a URI host. Presence selects kharon_search. 1–256 bytes, not blank.", "schema": { "type": "string", "minLength": 1, "maxLength": 256 } },
-          { "name": "origin", "in": "query", "required": false, "description": "Absolute http(s) origin or page URL. Keeps items with a URI the SPEC §6 matcher would allow to fill there (REQ-API-004).", "schema": { "type": "string", "format": "uri", "maxLength": 2048 } }
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Search text: case-insensitive substring of the item name or a URI host. Presence selects kharon_search. 1–256 bytes, not blank.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "required": false,
+            "description": "Absolute http(s) origin or page URL. Keeps items with a URI the SPEC §6 matcher would allow to fill there (REQ-API-004).",
+            "schema": {
+              "type": "string",
+              "format": "uri",
+              "maxLength": 2048
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "Matching items", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ItemMeta" } } } } },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "423": { "$ref": "#/components/responses/Error" },
-          "500": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Matching items",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ItemMeta"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "423": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/fill": {
+      "post": {
+        "operationId": "kharon_fill",
+        "summary": "Fill username/password/TOTP into the agent's own tab via CDP (isolated world); submit: true is fill_and_submit (REQ-API-008). The live origin must match the item and expected_origin (REQ-ORG-002). Bounded end to end by the fill deadline, default 10 s (REQ-API-009). Requires unlock. Audited before the reply (REQ-AUD-003).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FillRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The fill attempt's result (including non-filled outcomes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FillResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "423": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/fill_totp": {
+      "post": {
+        "operationId": "kharon_fill_totp",
+        "summary": "Fill the item's current TOTP code (REQ-API-007); fields defaults to [{kind: totp}]. Refused (status error, detail clock_skew) when the clock is skewed. Otherwise as /v1/fill.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FillTotpRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The fill attempt's result (including non-filled outcomes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FillResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "423": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -41,63 +192,411 @@
         "operationId": "openapi",
         "summary": "This document.",
         "security": [],
-        "responses": { "200": { "description": "OpenAPI document", "content": { "application/json": {} } } }
+        "responses": {
+          "200": {
+            "description": "OpenAPI document",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
       }
     }
   },
   "components": {
     "securitySchemes": {
-      "agentToken": { "type": "http", "scheme": "bearer", "description": "kh_agent_<id>_<64 lowercase hex>. Only its Argon2id hash is stored (REQ-API-003)." }
+      "agentToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "kh_agent_<id>_<64 lowercase hex>. Only its Argon2id hash is stored (REQ-API-003)."
+      }
     },
     "responses": {
-      "Error": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Error": {
+        "description": "Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
       "Unauthorized": {
         "description": "Missing or invalid agent token",
-        "headers": { "WWW-Authenticate": { "schema": { "type": "string" } } },
-        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+        "headers": {
+          "WWW-Authenticate": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
       }
     },
     "schemas": {
       "Status": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["locked", "agent_id", "grants"],
+        "required": [
+          "locked",
+          "agent_id",
+          "grants"
+        ],
         "properties": {
-          "locked": { "type": "boolean" },
-          "agent_id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
-          "grants": { "type": "array", "description": "SPEC §4 Grant; always empty until the grant model lands (issue #20).", "items": { "type": "object" }, "maxItems": 0 }
+          "locked": {
+            "type": "boolean"
+          },
+          "agent_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{1,64}$"
+          },
+          "grants": {
+            "type": "array",
+            "description": "SPEC §4 Grant; always empty until the grant model lands (issue #20).",
+            "items": {
+              "type": "object"
+            },
+            "maxItems": 0
+          }
         }
       },
       "ItemMeta": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "name", "uris", "has_password", "has_totp"],
+        "required": [
+          "id",
+          "name",
+          "uris",
+          "has_password",
+          "has_totp"
+        ],
         "properties": {
-          "id": { "type": "string", "format": "uuid" },
-          "name": { "type": "string" },
-          "username_hint": { "type": "string", "description": "Masked (OQ-4): first character, ***, then @domain for email addresses." },
-          "uris": { "type": "array", "items": { "$ref": "#/components/schemas/UriMeta" } },
-          "has_password": { "type": "boolean" },
-          "has_totp": { "type": "boolean" },
-          "revision": { "type": "string", "format": "date-time" }
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "username_hint": {
+            "type": "string",
+            "description": "Masked (OQ-4): first character, ***, then @domain for email addresses."
+          },
+          "uris": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UriMeta"
+            }
+          },
+          "has_password": {
+            "type": "boolean"
+          },
+          "has_totp": {
+            "type": "boolean"
+          },
+          "revision": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "UriMeta": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["host", "match"],
+        "required": [
+          "host",
+          "match"
+        ],
         "properties": {
-          "host": { "type": "string" },
-          "match": { "type": "string", "enum": ["domain", "host", "exact", "starts_with"] }
+          "host": {
+            "type": "string"
+          },
+          "match": {
+            "type": "string",
+            "enum": [
+              "domain",
+              "host",
+              "exact",
+              "starts_with"
+            ]
+          }
         }
       },
       "Error": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["error", "detail"],
+        "required": [
+          "error",
+          "detail"
+        ],
         "properties": {
-          "error": { "type": "string", "enum": ["unauthorized", "forbidden", "locked", "bad_request", "not_found", "method_not_allowed", "audit_failed"] },
-          "detail": { "type": "string", "description": "Fixed text from a closed enum; never contains request or vault values (REQ-API-006)." }
+          "error": {
+            "type": "string",
+            "enum": [
+              "unauthorized",
+              "forbidden",
+              "locked",
+              "bad_request",
+              "not_found",
+              "method_not_allowed",
+              "audit_failed"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "description": "Fixed text from a closed enum; never contains request or vault values (REQ-API-006)."
+          }
+        }
+      },
+      "FieldArgs": {
+        "additionalProperties": false,
+        "description": "One `fields[]` entry of `fill`.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/FieldKindArg",
+            "description": "Which item field."
+          },
+          "selector": {
+            "default": null,
+            "description": "CSS selector of the input; omitted: the broker finds it.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "FieldKindArg": {
+        "description": "SPEC §4 field kinds.",
+        "enum": [
+          "username",
+          "password",
+          "totp"
+        ],
+        "type": "string"
+      },
+      "TargetArgs": {
+        "additionalProperties": false,
+        "description": "SPEC §4 `target`.",
+        "properties": {
+          "cdp_target_id": {
+            "description": "CDP target id of a tab in the agent's own browser context.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "expected_origin": {
+            "description": "The origin the agent believes the tab is on. Never trusted: the\nlive origin decides, and a mismatch is `origin_mismatch`\n(REQ-ORG-002, REQ-APR-007).",
+            "format": "uri",
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "frame_id": {
+            "default": null,
+            "description": "Not supported: must be omitted or null. Address an\nout-of-process frame by its own `cdp_target_id`.",
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cdp_target_id",
+          "expected_origin"
+        ],
+        "type": "object"
+      },
+      "FillRequest": {
+        "additionalProperties": false,
+        "description": "SPEC §4 `FillRequest`: the `POST /v1/fill` body and the\n`kharon_fill` arguments.",
+        "properties": {
+          "fields": {
+            "description": "The fields to fill, at most one per kind. `selector` overrides\nthe broker's heuristic for that field.",
+            "items": {
+              "$ref": "#/components/schemas/FieldArgs"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "type": "array"
+          },
+          "grant_id": {
+            "default": null,
+            "description": "An approved grant to fill under (REQ-APR-*; issue #20).",
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "item_id": {
+            "description": "The item to fill from (an `id` from `kharon_list` /\n`kharon_search`).",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "type": "string"
+          },
+          "submit": {
+            "default": false,
+            "description": "Submit the form after every field filled (`fill_and_submit`).\nNever dispatched on any failure or timeout.",
+            "type": "boolean"
+          },
+          "target": {
+            "$ref": "#/components/schemas/TargetArgs",
+            "description": "The tab (or out-of-process frame) to fill."
+          }
+        },
+        "required": [
+          "item_id",
+          "target",
+          "fields"
+        ],
+        "title": "FillArgs",
+        "type": "object"
+      },
+      "TotpFieldArgs": {
+        "additionalProperties": false,
+        "description": "One `fields[]` entry of `fill_totp`.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/TotpKindArg",
+            "description": "Always `totp`."
+          },
+          "selector": {
+            "default": null,
+            "description": "CSS selector of the input; omitted: the broker finds it.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "TotpKindArg": {
+        "description": "The one kind `fill_totp` takes.",
+        "enum": [
+          "totp"
+        ],
+        "type": "string"
+      },
+      "FillTotpRequest": {
+        "additionalProperties": false,
+        "description": "SPEC §4 `FillTotpRequest`: `FillRequest` with `fields =\n[{kind: \"totp\", selector?}]` (the default when omitted).",
+        "properties": {
+          "fields": {
+            "description": "Exactly one `totp` field. Omitted: `[{\"kind\": \"totp\"}]`.",
+            "items": {
+              "$ref": "#/components/schemas/TotpFieldArgs"
+            },
+            "maxItems": 1,
+            "minItems": 1,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "grant_id": {
+            "default": null,
+            "description": "An approved grant to fill under (issue #20).",
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "item_id": {
+            "description": "The item whose TOTP code to fill.",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "type": "string"
+          },
+          "submit": {
+            "default": false,
+            "description": "Submit the form after the code filled.",
+            "type": "boolean"
+          },
+          "target": {
+            "$ref": "#/components/schemas/TargetArgs",
+            "description": "The tab (or out-of-process frame) to fill."
+          }
+        },
+        "required": [
+          "item_id",
+          "target"
+        ],
+        "title": "FillTotpArgs",
+        "type": "object"
+      },
+      "FillResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "fields_filled"
+        ],
+        "description": "SPEC §4 FillResult. Never carries a secret value: only the kinds filled (REQ-GOAL-001). A fill that ran but did not fill is still 200 with a non-filled status. pending_approval and denied arrive with grants (issue #20).",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "filled",
+              "origin_mismatch",
+              "navigated",
+              "field_not_found",
+              "target_not_owned",
+              "not_found",
+              "timeout",
+              "error"
+            ]
+          },
+          "fields_filled": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "username",
+                "password",
+                "totp"
+              ]
+            },
+            "uniqueItems": true
+          },
+          "detail": {
+            "type": "string",
+            "description": "Fixed reason code for some non-filled statuses (also the audit detail_code).",
+            "enum": [
+              "insecure_context",
+              "default_context_refused",
+              "unknown_target",
+              "clock_skew",
+              "totp_unsupported",
+              "cdp_error",
+              "unknown_item",
+              "item_field_missing",
+              "decrypt_failed",
+              "fill_unavailable"
+            ]
+          }
         }
       }
     }

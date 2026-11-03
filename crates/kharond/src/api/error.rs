@@ -107,10 +107,25 @@ pub enum Detail {
     InvalidArguments,
     /// The MCP endpoint refuses requests carrying `Origin`.
     BrowserOriginRefused,
-    /// The MCP request body is not `application/json`.
+    /// The request body (MCP, `fill`) is not `application/json`.
     UnsupportedContentType,
-    /// The MCP request body exceeds its cap.
+    /// The request body (MCP, `fill`) exceeds its cap.
     BodyTooLarge,
+    /// The request body is not valid JSON (`fill`, `fill_totp`).
+    InvalidJsonBody,
+    /// The fill request does not match `FillRequest` / `FillTotpRequest`
+    /// (unknown, missing, duplicate or mistyped field).
+    InvalidFillRequest,
+    /// `item_id` is not a UUID.
+    InvalidItemId,
+    /// A fill request string exceeds its length cap.
+    FieldTooLong,
+    /// `fields` is empty.
+    NoFillFields,
+    /// `fields` names the same kind twice.
+    DuplicateFillField,
+    /// `target.frame_id` is set; address a frame by its own CDP target id.
+    FrameIdUnsupported,
 }
 
 impl Detail {
@@ -135,11 +150,18 @@ impl Detail {
             Self::BrowserOriginRefused => "browser origins are not accepted",
             Self::UnsupportedContentType => "content type must be application/json",
             Self::BodyTooLarge => "request body too large",
+            Self::InvalidJsonBody => "request body is not valid JSON",
+            Self::InvalidFillRequest => "fill request does not match the schema",
+            Self::InvalidItemId => "item_id must be a UUID",
+            Self::FieldTooLong => "request field too long",
+            Self::NoFillFields => "fields must name at least one field",
+            Self::DuplicateFillField => "fields names a kind twice",
+            Self::FrameIdUnsupported => "frame_id is not supported; use the frame's cdp_target_id",
         }
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 25] = [
         Self::MissingToken,
         Self::InvalidToken,
         Self::Locked,
@@ -158,6 +180,13 @@ impl Detail {
         Self::BrowserOriginRefused,
         Self::UnsupportedContentType,
         Self::BodyTooLarge,
+        Self::InvalidJsonBody,
+        Self::InvalidFillRequest,
+        Self::InvalidItemId,
+        Self::FieldTooLong,
+        Self::NoFillFields,
+        Self::DuplicateFillField,
+        Self::FrameIdUnsupported,
     ];
 }
 

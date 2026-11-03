@@ -19,22 +19,36 @@
 //! [`ApiError::AUDIT_FAILED`]; nothing is returned that was not
 //! logged. Status needs no unlock and is not audited (it is not a §7
 //! event).
+//!
+//! Fills (`fill`, `fill_totp`) take the async [`Broker::fill`] instead
+//! of [`Broker::dispatch`] (the browser round trip is async; the read
+//! operations stay sync): authenticate, then the lock gate, then (TODO
+//! #20) the grant check, then resolve the item and decrypt the values
+//! into a [`FillPlan`], then the [`FillBackend`], all under one
+//! wall-clock fill deadline (REQ-API-009); then zeroize the plan, then
+//! append exactly one audit entry (`fill`, `fill_totp` or
+//! `fill_timeout`), then reply.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
+use kharon_bwcrypto::Secret;
 use serde::Serialize;
+use tokio::time::Instant;
 use url::Url;
-use zeroize::ZeroizeOnDrop;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::error::{ApiError, Detail};
+use super::fill::{FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus};
 use super::meta::{ItemMeta, matches_origin, matches_query};
 use super::token::TokenStore;
 use crate::audit::{AuditLog, Entry, Event};
+use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan};
 use crate::lock::{AuditError, Clock, LockController, SystemClock};
-use crate::origin::OriginConfig;
-use crate::sync::{LiveSync, Vault};
+use crate::origin::{OriginConfig, OriginMatcher};
+use crate::sync::{LiveSync, SecretField, SyncError, Vault};
 use crate::totp::skew::Observation;
-use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy};
+use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy, totp_code};
 
 /// Longest accepted `origin` (bytes).
 pub const MAX_ORIGIN_LEN: usize = 2048;
@@ -42,15 +56,33 @@ pub const MAX_ORIGIN_LEN: usize = 2048;
 pub const MAX_QUERY_LEN: usize = 256;
 
 /// What the lock controller holds while unlocked, as the API sees it:
-/// something with a synced vault. The daemon's is [`LiveSync`].
+/// something with a synced vault and the key to its secrets. The
+/// daemon's is [`LiveSync`] (or the export loader's session).
 pub trait VaultView: ZeroizeOnDrop + Send {
     /// The in-scope items.
     fn vault(&self) -> &Vault;
+
+    /// Decrypt one secret field of one item, per fill only, into a
+    /// zeroizing buffer (REQ-CRY-006).
+    fn decrypt_secret(
+        &self,
+        item_id: &str,
+        field: SecretField,
+    ) -> Result<Zeroizing<Vec<u8>>, SyncError>;
 }
 
 impl VaultView for LiveSync {
     fn vault(&self) -> &Vault {
         LiveSync::vault(self)
+    }
+
+    fn decrypt_secret(
+        &self,
+        item_id: &str,
+        field: SecretField,
+    ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
+        self.session()
+            .decrypt_secret(LiveSync::vault(self), item_id, field)
     }
 }
 
@@ -120,6 +152,8 @@ pub enum Outcome {
     Status(StatusBody),
     /// List or search result.
     Items(Vec<ItemMeta>),
+    /// `fill` / `fill_totp` result (any status, including refusals).
+    Fill(FillResult),
 }
 
 impl Outcome {
@@ -128,6 +162,7 @@ impl Outcome {
         let v = match self {
             Self::Status(s) => serde_json::to_value(s),
             Self::Items(items) => serde_json::to_value(items),
+            Self::Fill(r) => serde_json::to_value(r),
         };
         v.expect("invariant: API bodies serialize")
     }
@@ -233,6 +268,33 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     audit: Mutex<Box<dyn AuditSink>>,
     origin_cfg: OriginConfig,
     clock_skew: ClockSkewGate,
+    fill_backend: Option<Box<dyn FillBackend>>,
+    fill_policy: FillPolicy,
+    plan_wiped: Option<PlanWipedHook>,
+}
+
+/// Called with every resolved [`FillPlan`] after its values were
+/// zeroized (tests prove the wipe; REQ-API-009).
+pub type PlanWipedHook = Arc<dyn Fn(&FillPlan) + Send + Sync>;
+
+/// Why a fill stopped before the browser.
+enum Unresolved {
+    /// The lock gate refused: `423 locked`, like list/search.
+    Locked,
+    /// A `FillResult` refusal.
+    Refused(FillStatus),
+}
+
+/// Move decrypted bytes into a zeroizing `String`; non-UTF-8 is wiped
+/// and refused.
+fn into_text(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, FillStatus> {
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(s) => Ok(Zeroizing::new(s)),
+        Err(e) => {
+            e.into_bytes().zeroize();
+            Err(FillStatus::DecryptFailed)
+        }
+    }
 }
 
 impl<S: VaultView, C: Clock> Broker<S, C> {
@@ -249,7 +311,35 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             audit: Mutex::new(audit),
             origin_cfg,
             clock_skew: ClockSkewGate::default(),
+            fill_backend: None,
+            fill_policy: FillPolicy::default(),
+            plan_wiped: None,
         }
+    }
+
+    /// Fill through `backend` (without one every fill is
+    /// `error`/`fill_unavailable`).
+    pub fn with_fill_backend(mut self, backend: Box<dyn FillBackend>) -> Self {
+        self.fill_backend = Some(backend);
+        self
+    }
+
+    /// Use `[policy] fill_deadline`, `allow_default_context` and
+    /// `allow_cross_origin_iframe_hosts` (default: 10 s, false, none).
+    pub fn with_fill_policy(mut self, policy: FillPolicy) -> Self {
+        self.fill_policy = policy;
+        self
+    }
+
+    /// Observe every fill plan after its values were wiped (tests).
+    pub fn with_plan_wiped_hook(mut self, hook: PlanWipedHook) -> Self {
+        self.plan_wiped = Some(hook);
+        self
+    }
+
+    /// The fill policy in force.
+    pub fn fill_policy(&self) -> &FillPolicy {
+        &self.fill_policy
     }
 
     /// Use `[policy] clock_skew_warn` / `clock_skew_refuse` instead of
@@ -360,5 +450,181 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .append(entry)
             .map_err(|_| ApiError::AUDIT_FAILED)?;
         result.map(Outcome::Items).map_err(|_| ApiError::LOCKED)
+    }
+    fn append(&self, entry: Entry) -> Result<(), ApiError> {
+        self.audit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .append(entry)
+            .map_err(|_| ApiError::AUDIT_FAILED)
+    }
+
+    /// Run a `fill` / `fill_totp` for `agent` (SPEC §4, REQ-API-008).
+    ///
+    /// `received` is when the transport received the request: the
+    /// REQ-API-009 deadline (`[policy] fill_deadline`, default 10 s)
+    /// runs from there over resolve and fill. On expiry the backend
+    /// future is dropped (no further CDP writes, submit never sent),
+    /// the plan is zeroized, a `fill_timeout` entry is appended, and
+    /// the result is `timeout`. Exactly one audit entry per call; an
+    /// audit failure is [`ApiError::AUDIT_FAILED`] (REQ-AUD-003),
+    /// including on the timeout path. A locked broker is
+    /// [`ApiError::LOCKED`], as for list/search.
+    pub async fn fill(
+        &self,
+        agent: &AgentId,
+        req: FillRequest,
+        received: Instant,
+    ) -> Result<Outcome, ApiError> {
+        let deadline = received + self.fill_policy.deadline;
+        let event = match req.operation {
+            FillOperation::Fill => Event::Fill,
+            FillOperation::FillTotp => Event::FillTotp,
+        };
+        let status = match self.resolve_fill(agent, &req) {
+            Err(Unresolved::Locked) => {
+                self.append(
+                    Entry::new(event)
+                        .agent_id(agent.0.clone())
+                        .item_id(req.item_id.clone())
+                        .result("locked"),
+                )?;
+                return Err(ApiError::LOCKED);
+            }
+            Err(Unresolved::Refused(status)) => status,
+            Ok(mut plan) => {
+                let status = self.run_fill(agent, &plan, deadline).await;
+                for f in &mut plan.fields {
+                    f.value.zeroize();
+                }
+                if let Some(hook) = &self.plan_wiped {
+                    hook(&plan);
+                }
+                drop(plan);
+                status
+            }
+        };
+        let entry = if status == FillStatus::Engine(FillOutcome::Timeout) {
+            Entry::new(Event::FillTimeout)
+                .agent_id(agent.0.clone())
+                .item_id(req.item_id.clone())
+                .result("timeout")
+                .detail_code("deadline_expired")
+        } else {
+            let mut e = Entry::new(event)
+                .agent_id(agent.0.clone())
+                .item_id(req.item_id.clone())
+                .result(status.status());
+            if let Some(d) = status.detail() {
+                e = e.detail_code(d);
+            }
+            e
+        };
+        self.append(entry)?;
+        Ok(Outcome::Fill(status.result()))
+    }
+
+    async fn run_fill(&self, agent: &AgentId, plan: &FillPlan, deadline: Instant) -> FillStatus {
+        let Some(backend) = &self.fill_backend else {
+            return FillStatus::Unavailable;
+        };
+        if Instant::now() >= deadline {
+            return FillStatus::Engine(FillOutcome::Timeout);
+        }
+        let fill = backend.fill(agent.as_str(), plan, self.fill_policy.allow_default_context);
+        match tokio::time::timeout_at(deadline, fill).await {
+            Ok(outcome) => FillStatus::Engine(outcome),
+            Err(_) => FillStatus::Engine(FillOutcome::Timeout),
+        }
+    }
+
+    /// The sync half: lock gate, grant seam, item, values. Holds the
+    /// lock mutex for the duration (no `.await` here).
+    fn resolve_fill(&self, agent: &AgentId, req: &FillRequest) -> Result<FillPlan, Unresolved> {
+        let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        // The fill gate first (REQ-MEM-007), then fill activity resets
+        // the idle timer (REQ-MEM-004; a no-op that locks if expired).
+        if lock.require_unlocked().is_err() {
+            return Err(Unresolved::Locked);
+        }
+        lock.touch_activity();
+        let session = lock.require_unlocked().map_err(|_| Unresolved::Locked)?;
+        let refuse = |s| Err(Unresolved::Refused(s));
+
+        let Ok(item) = session.vault().get(&req.item_id) else {
+            return refuse(FillStatus::UnknownItem);
+        };
+
+        // TODO(#20): grant enforcement goes here, before any secret is
+        // decrypted: `req.grant_id` (accepted, length-checked, not yet
+        // consulted) or a standing grant for (agent, item, live origin,
+        // operation) → proceed; else `pending_approval` / `denied`.
+        let _ = &req.grant_id;
+
+        match &self.fill_backend {
+            Some(b) if b.has_agent(agent.as_str()) => {}
+            _ => return refuse(FillStatus::Unavailable),
+        }
+
+        // Every requested kind must exist before anything is decrypted.
+        for (kind, _) in &req.fields {
+            let present = match kind {
+                FieldKind::Username => item.username().is_some(),
+                FieldKind::Password => item.has_password(),
+                FieldKind::Totp => item.has_totp(),
+            };
+            if !present {
+                return refuse(FillStatus::ItemFieldMissing);
+            }
+        }
+        // REQ-API-007: the clock gate before the TOTP seed is decrypted.
+        if req.fields.iter().any(|(k, _)| *k == FieldKind::Totp)
+            && self.clock_skew.check_totp().is_err()
+        {
+            return refuse(FillStatus::Engine(FillOutcome::ClockSkew));
+        }
+
+        let mut fields = Vec::with_capacity(req.fields.len());
+        for (kind, selector) in &req.fields {
+            let value = match kind {
+                FieldKind::Username => {
+                    Zeroizing::new(item.username().unwrap_or_default().to_owned())
+                }
+                FieldKind::Password => {
+                    match session.decrypt_secret(&req.item_id, SecretField::Password) {
+                        Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
+                        Err(_) => return refuse(FillStatus::DecryptFailed),
+                    }
+                }
+                FieldKind::Totp => {
+                    let mut seed = match session.decrypt_secret(&req.item_id, SecretField::Totp) {
+                        Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
+                        Err(_) => return refuse(FillStatus::DecryptFailed),
+                    };
+                    let seed = Secret::new(std::mem::take(&mut *seed));
+                    totp_code(&self.clock_skew, seed, SystemTime::now())
+                        .map_err(|o| Unresolved::Refused(FillStatus::Engine(o)))?
+                }
+            };
+            fields.push(FieldFill {
+                kind: *kind,
+                selector: selector.clone(),
+                value,
+            });
+        }
+
+        Ok(FillPlan {
+            target_id: req.target_id.clone(),
+            fields,
+            item_matchers: item
+                .uris()
+                .iter()
+                .filter_map(|u| OriginMatcher::new(&u.uri, u.match_type).ok())
+                .collect(),
+            origin_cfg: self.origin_cfg.clone(),
+            cross_origin_iframe_hosts: self.fill_policy.cross_origin_iframe_hosts.clone(),
+            submit: req.submit,
+            expected_origin: Some(req.expected_origin.clone()),
+        })
     }
 }

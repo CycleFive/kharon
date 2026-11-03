@@ -9,13 +9,23 @@
 //! carries exactly the body `/v1/*` would return (the contract test,
 //! `tests/req_api_002_contract.rs`, checks this case by case).
 //!
-//! Tools (SPEC §4; fill, fill-TOTP and grants arrive with #18/#19/#20):
+//! Tools (SPEC §4; `kharon_request_grant` arrives with #20):
 //!
 //! | Tool | HTTP equivalent |
 //! |---|---|
 //! | `kharon_status` | `GET /v1/status` |
 //! | `kharon_list` | `GET /v1/items[?origin=]` |
 //! | `kharon_search` | `GET /v1/items?q=[&origin=]` |
+//! | `kharon_fill` | `POST /v1/fill` |
+//! | `kharon_fill_totp` | `POST /v1/fill_totp` |
+//!
+//! The read tools' arguments become `(name, value)` pairs for
+//! [`parse_request`]; the fill tools' arguments object is exactly the
+//! HTTP JSON body, handed to [`parse_fill`] and
+//! [`Broker::fill`](super::core::Broker::fill). A fill that ran but did
+//! not fill (`origin_mismatch`, `timeout`, …) is a `FillResult`, as on
+//! HTTP, so `isError` is `false`; `isError: true` is reserved for the
+//! `ApiError` bodies (bad arguments, locked, audit failure).
 //!
 //! Input schemas are generated from the Rust argument types below with
 //! `schemars` (JSON Schema 2020-12); `docs/api/mcp-tools.json` is the
@@ -57,8 +67,10 @@ use super::core::{
     AgentId, Broker, MAX_ORIGIN_LEN, MAX_QUERY_LEN, Operation, VaultView, parse_request,
 };
 use super::error::{ApiError, Detail, ErrorCode};
+use super::fill::{FillArgs, FillOperation, FillTotpArgs, parse_fill};
 use super::http::{AppState, authenticate, bearer_token, error, json_response};
 use crate::lock::Clock;
+use tokio::time::Instant;
 
 /// The MCP endpoint path.
 pub const MCP_PATH: &str = "/mcp";
@@ -82,9 +94,11 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 /// How long a client may cache discovery and the tool list (ms). The
 /// tool set changes only with the daemon binary.
 const CACHE_TTL_MS: u64 = 3_600_000;
-const INSTRUCTIONS: &str = "kharon credentials broker. Tools return item metadata only, never \
-secrets; filling a credential into a page is a separate, granted operation. Every list and \
-search is audited.";
+const INSTRUCTIONS: &str = "kharon credentials broker. No tool ever returns a secret: \
+kharon_list and kharon_search return item metadata, and kharon_fill / kharon_fill_totp type the \
+item's username, password or current TOTP code into a tab in your own browser context and \
+report only which fields were filled. The live page origin decides, never your claim. Every \
+call is audited.";
 
 // ---------------------------------------------------------------- tools
 
@@ -126,11 +140,21 @@ pub enum Tool {
     List,
     /// `kharon_search`.
     Search,
+    /// `kharon_fill` (#18).
+    Fill,
+    /// `kharon_fill_totp` (#19).
+    FillTotp,
 }
 
 impl Tool {
     /// Every tool, in `tools/list` order.
-    pub const ALL: [Self; 3] = [Self::Status, Self::List, Self::Search];
+    pub const ALL: [Self; 5] = [
+        Self::Status,
+        Self::List,
+        Self::Search,
+        Self::Fill,
+        Self::FillTotp,
+    ];
 
     /// Tool name.
     pub const fn name(self) -> &'static str {
@@ -138,6 +162,8 @@ impl Tool {
             Self::Status => "kharon_status",
             Self::List => "kharon_list",
             Self::Search => "kharon_search",
+            Self::Fill => "kharon_fill",
+            Self::FillTotp => "kharon_fill_totp",
         }
     }
 
@@ -146,12 +172,24 @@ impl Tool {
         Self::ALL.into_iter().find(|t| t.name() == name)
     }
 
-    /// The core operation the tool runs.
-    pub const fn operation(self) -> Operation {
+    /// The read operation the tool runs ([`parse_request`]); `None`
+    /// for the fill tools.
+    pub const fn operation(self) -> Option<Operation> {
         match self {
-            Self::Status => Operation::Status,
-            Self::List => Operation::List,
-            Self::Search => Operation::Search,
+            Self::Status => Some(Operation::Status),
+            Self::List => Some(Operation::List),
+            Self::Search => Some(Operation::Search),
+            Self::Fill | Self::FillTotp => None,
+        }
+    }
+
+    /// The fill operation the tool runs ([`parse_fill`]); `None` for
+    /// the read tools.
+    pub const fn fill_operation(self) -> Option<FillOperation> {
+        match self {
+            Self::Fill => Some(FillOperation::Fill),
+            Self::FillTotp => Some(FillOperation::FillTotp),
+            Self::Status | Self::List | Self::Search => None,
         }
     }
 
@@ -161,6 +199,7 @@ impl Tool {
             Self::Status => &[],
             Self::List => &["origin"],
             Self::Search => &["q", "origin"],
+            Self::Fill | Self::FillTotp => &["item_id", "target", "fields", "submit", "grant_id"],
         }
     }
 
@@ -169,6 +208,8 @@ impl Tool {
             Self::Status => "Broker status",
             Self::List => "List items",
             Self::Search => "Search items",
+            Self::Fill => "Fill a login form",
+            Self::FillTotp => "Fill a TOTP code",
         }
     }
 
@@ -186,6 +227,18 @@ impl Tool {
                 "Item metadata (never secrets) whose name or URI host contains q, optionally \
                  filtered by origin. Audited. Same body as GET /v1/items?q=."
             }
+            Self::Fill => {
+                "Type the item's username and/or password into the tab cdp_target_id in your \
+                 own browser context; with submit: true, submit the form once every field \
+                 filled. The secret never leaves the broker: the result is a status and the \
+                 kinds filled. The live origin must match the item and expected_origin. \
+                 Bounded by the fill deadline (10 s). Audited. Same body as POST /v1/fill."
+            }
+            Self::FillTotp => {
+                "Type the item's current TOTP code into the tab cdp_target_id in your own \
+                 browser context; the code is never returned. Refused while the broker clock \
+                 is skewed. Audited. Same body as POST /v1/fill_totp."
+            }
         }
     }
 
@@ -199,6 +252,8 @@ impl Tool {
             Self::Status => generator.into_root_schema_for::<StatusArgs>(),
             Self::List => generator.into_root_schema_for::<ListArgs>(),
             Self::Search => generator.into_root_schema_for::<SearchArgs>(),
+            Self::Fill => generator.into_root_schema_for::<FillArgs>(),
+            Self::FillTotp => generator.into_root_schema_for::<FillTotpArgs>(),
         };
         let mut v = schema.to_value();
         if let Some(o) = v.as_object_mut() {
@@ -216,12 +271,20 @@ impl Tool {
             "title": self.title(),
             "description": self.description(),
             "inputSchema": self.input_schema(),
-            "annotations": {
-                "readOnlyHint": true,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false,
-            },
+            "annotations": self.annotations(),
+        })
+    }
+
+    /// MCP tool annotations. The fill tools write into a page outside
+    /// the broker (open world, not idempotent: a submit is an action)
+    /// but destroy nothing.
+    fn annotations(self) -> Value {
+        let reads = self.operation().is_some();
+        json!({
+            "readOnlyHint": reads,
+            "destructiveHint": false,
+            "idempotentHint": reads,
+            "openWorldHint": !reads,
         })
     }
 }
@@ -441,6 +504,18 @@ fn argument_pairs(tool: Tool, raw: Option<&RawValue>) -> Result<Vec<(String, Str
     Ok(pairs)
 }
 
+/// The fill tools' arguments as the JSON body [`parse_fill`] takes
+/// (the HTTP body). Absent or `null` is `{}` (then refused as missing
+/// fields); a non-object is [`Detail::InvalidArguments`], as for the
+/// read tools.
+fn fill_arguments(raw: Option<&RawValue>) -> Result<&[u8], ApiError> {
+    match raw.map(RawValue::get) {
+        None | Some("null") => Ok(b"{}"),
+        Some(r) if r.starts_with('{') => Ok(r.as_bytes()),
+        Some(_) => Err(ApiError::bad_request(Detail::InvalidArguments)),
+    }
+}
+
 fn tool_result(id: &Value, era: Era, body: Value, is_error: bool) -> Reply {
     rpc_result(
         id,
@@ -453,7 +528,14 @@ fn tool_result(id: &Value, era: Era, body: Value, is_error: bool) -> Reply {
 }
 
 /// Handle one JSON-RPC message from an authenticated agent.
-fn rpc<S, C>(broker: &Broker<S, C>, agent: &AgentId, headers: &HeaderMap, body: &[u8]) -> Reply
+/// `received` starts a fill's REQ-API-009 deadline.
+async fn rpc<S, C>(
+    broker: &Broker<S, C>,
+    agent: &AgentId,
+    headers: &HeaderMap,
+    body: &[u8],
+    received: Instant,
+) -> Reply
 where
     S: VaultView,
     C: Clock,
@@ -592,14 +674,20 @@ where
             let Some(tool) = Tool::from_name(&call.name) else {
                 return rpc_error(Some(id), RpcError::UnknownTool, StatusCode::OK);
             };
-            let outcome = argument_pairs(tool, call.arguments)
-                .and_then(|pairs| {
-                    parse_request(
-                        tool.operation(),
-                        pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                    )
-                })
-                .and_then(|r| broker.dispatch(agent, r));
+            let outcome = match (tool.operation(), tool.fill_operation()) {
+                (Some(op), _) => argument_pairs(tool, call.arguments)
+                    .and_then(|pairs| {
+                        parse_request(op, pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                    })
+                    .and_then(|r| broker.dispatch(agent, r)),
+                (None, Some(op)) => {
+                    match fill_arguments(call.arguments).and_then(|raw| parse_fill(op, raw)) {
+                        Ok(r) => broker.fill(agent, r, received).await,
+                        Err(e) => Err(e),
+                    }
+                }
+                (None, None) => unreachable!("invariant: every tool is a read or a fill"),
+            };
             match outcome {
                 Ok(o) => tool_result(id, era, o.body(), false),
                 Err(e) => tool_result(id, era, e.body(), true),
@@ -609,7 +697,7 @@ where
     }
 }
 
-fn is_json(headers: &HeaderMap) -> bool {
+pub(super) fn is_json(headers: &HeaderMap) -> bool {
     match header_str(headers, header::CONTENT_TYPE.as_str()) {
         Ok(Some(v)) => v
             .split(';')
@@ -625,6 +713,7 @@ where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
+    let received = Instant::now();
     if req.method() != Method::POST {
         // Stateless server: no GET stream, no DELETE session.
         let mut resp = error(ApiError::new(
@@ -653,7 +742,7 @@ where
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
         return error(ApiError::bad_request(Detail::BodyTooLarge));
     };
-    match rpc(&state.broker, &agent, &parts.headers, &bytes) {
+    match rpc(&state.broker, &agent, &parts.headers, &bytes, received).await {
         Reply::Accepted => Response::builder()
             .status(StatusCode::ACCEPTED)
             .body(axum::body::Body::empty())

@@ -4,9 +4,8 @@
 //! test. (Semantics are REQ-API-002's contract test, which runs every
 //! case over MCP too.)
 //!
-//! Today three of the six tools exist: `kharon_fill`,
-//! `kharon_fill_totp` and `kharon_request_grant` arrive with #18, #19
-//! and #20 and extend [`Tool::ALL`] and the snapshot.
+//! Today five of the six tools exist: `kharon_request_grant` arrives
+//! with #20 and extends [`Tool::ALL`] and the snapshot.
 
 mod api_support;
 
@@ -57,6 +56,9 @@ fn req_api_001_schema_properties_are_exactly_what_the_core_accepts() {
     // unknown parameter, and the required set is what the core needs.
     use kharond::api::core::parse_request;
     for t in Tool::ALL {
+        let Some(op) = t.operation() else {
+            continue; // fill tools: next test
+        };
         let s = t.input_schema();
         assert_eq!(s["type"], "object");
         assert_eq!(s["additionalProperties"], json!(false));
@@ -70,18 +72,14 @@ fn req_api_001_schema_properties_are_exactly_what_the_core_accepts() {
             if t == Tool::Search && *p != "q" {
                 pairs.push(("q", "x"));
             }
-            assert!(
-                parse_request(t.operation(), pairs).is_ok(),
-                "{} {p}",
-                t.name()
-            );
+            assert!(parse_request(op, pairs).is_ok(), "{} {p}", t.name());
         }
         let mut pairs = vec![("include_secret", "1")];
         if t == Tool::Search {
             pairs.push(("q", "x"));
         }
         assert_eq!(
-            parse_request(t.operation(), pairs),
+            parse_request(op, pairs),
             Err(ApiError::bad_request(Detail::UnknownParameter)),
             "{}",
             t.name()
@@ -92,6 +90,57 @@ fn req_api_001_schema_properties_are_exactly_what_the_core_accepts() {
             .unwrap_or_default();
         let expect: &[&str] = if t == Tool::Search { &["q"] } else { &[] };
         assert_eq!(required, expect, "{}", t.name());
+    }
+}
+
+#[test]
+fn req_api_001_fill_schemas_are_what_parse_fill_accepts() {
+    // The fill tools' arguments are the HTTP JSON body: the schema's
+    // properties are exactly the body's fields, a minimal body per the
+    // schema's `required` parses, and an extra property is refused.
+    use kharond::api::fill::parse_fill;
+    for (t, required) in [
+        (Tool::Fill, &["item_id", "target", "fields"][..]),
+        (Tool::FillTotp, &["item_id", "target"][..]),
+    ] {
+        let op = t.fill_operation().unwrap();
+        assert!(t.operation().is_none());
+        let s = t.input_schema();
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["additionalProperties"], json!(false));
+        let got: Vec<&str> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(got, required, "{}", t.name());
+        let mut body = json!({
+            "item_id": "5d38619a-0591-4d2d-ab79-3d34e7a88f66",
+            "target": {"cdp_target_id": "T1", "expected_origin": "https://login.example.com"},
+        });
+        if t == Tool::Fill {
+            body["fields"] = json!([{"kind": "password"}]);
+        }
+        assert!(
+            parse_fill(op, body.to_string().as_bytes()).is_ok(),
+            "{}",
+            t.name()
+        );
+        body["submit"] = json!(true);
+        body["grant_id"] = json!("g1");
+        assert!(
+            parse_fill(op, body.to_string().as_bytes()).is_ok(),
+            "{}",
+            t.name()
+        );
+        body["include_secret"] = json!(true);
+        assert_eq!(
+            parse_fill(op, body.to_string().as_bytes()).unwrap_err(),
+            ApiError::bad_request(Detail::InvalidFillRequest),
+            "{}",
+            t.name()
+        );
     }
 }
 
@@ -115,7 +164,16 @@ async fn req_api_001_tools_list_serves_the_generated_tools() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["kharon_status", "kharon_list", "kharon_search"]);
+    assert_eq!(
+        names,
+        [
+            "kharon_status",
+            "kharon_list",
+            "kharon_search",
+            "kharon_fill",
+            "kharon_fill_totp"
+        ]
+    );
     assert!(res["ttlMs"].is_u64());
     assert_eq!(res["cacheScope"], "public");
 }
@@ -341,8 +399,8 @@ async fn req_api_001_json_rpc_errors() {
     // Unknown tool: protocol error, not a tool result.
     let r = mcp_call(addr, Some(&h.alpha), "kharon_export", "{}").await;
     assert_eq!((r.status, rpc_error_code(&r)), (200, -32602));
-    let r = mcp_call(addr, Some(&h.alpha), "kharon_fill", "{}").await;
-    assert_eq!(rpc_error_code(&r), -32602, "fill is #18");
+    let r = mcp_call(addr, Some(&h.alpha), "kharon_request_grant", "{}").await;
+    assert_eq!(rpc_error_code(&r), -32602, "request_grant is #20");
     // Notifications are accepted with no body.
     let r = post_mcp_raw(
         addr,

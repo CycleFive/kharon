@@ -14,13 +14,15 @@ use std::time::Duration;
 
 use argon2::Argon2;
 use kharon_bwcrypto::Kdf;
+use kharond::api::fill::FillFuture;
 use kharond::api::token::{ParamFloor, TokenStore, generate_with};
-use kharond::api::{AuditSink, Broker, VaultView};
+use kharond::api::{AuditSink, Broker, FillBackend, VaultView};
 use kharond::audit::Entry;
+use kharond::cdp::fill::{FieldKind, FillOutcome, FillPlan};
 use kharond::lock::{AuditError, LockController, LockPolicy, ManualClock, StaticHardening};
 use kharond::origin::OriginConfig;
 use kharond::sync::wire::SyncResponse;
-use kharond::sync::{Scope, Session, Vault};
+use kharond::sync::{Scope, SecretField, Session, SyncError, Vault};
 use serde_json::{Value, json};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
@@ -77,7 +79,18 @@ pub fn assert_no_canary(text: &str) {
 
 /// The fixture vault, unlocked once (PBKDF2 600k) per test binary.
 pub fn fixture_vault() -> Arc<Vault> {
-    static V: OnceLock<Arc<Vault>> = OnceLock::new();
+    fixture().1.clone()
+}
+
+/// Fixture item A (`https://login.example.com/`, has a password).
+pub const ITEM_A: &str = "5d38619a-0591-4d2d-ab79-3d34e7a88f66";
+/// Fixture item B (`https://app.example.com/login`).
+pub const ITEM_B: &str = "e9f2522d-66e6-4c93-a440-8cfca46746fa";
+
+/// The fixture session (its org key decrypts item secrets per fill)
+/// and vault.
+pub fn fixture() -> &'static (Arc<Session>, Arc<Vault>) {
+    static V: OnceLock<(Arc<Session>, Arc<Vault>)> = OnceLock::new();
     V.get_or_init(|| {
         let mut s = load("sync_fixture.json");
         let base = s["ciphers"].as_array().unwrap().clone();
@@ -108,21 +121,35 @@ pub fn fixture_vault() -> Arc<Vault> {
         .unwrap();
         let vault = session.apply_sync(&sync).unwrap();
         assert_eq!(vault.len(), 6, "fixture items + clones in scope");
-        Arc::new(vault)
+        (Arc::new(session), Arc::new(vault))
     })
-    .clone()
 }
 
-/// The lock controller's session in tests: the shared fixture vault.
-/// (The real one is `LiveSync`.) No key material: the `Session` that
-/// decrypted the fixture is dropped inside `fixture_vault`.
-pub struct TestSession(pub Arc<Vault>);
+/// The lock controller's session in tests: the shared fixture vault
+/// and the fixture `Session` (for per-fill decrypts). The real one is
+/// `LiveSync`.
+pub struct TestSession(pub Arc<Vault>, pub Arc<Session>);
+
+impl TestSession {
+    pub fn fixture() -> Self {
+        let (s, v) = fixture();
+        Self(v.clone(), s.clone())
+    }
+}
 
 impl ZeroizeOnDrop for TestSession {}
 
 impl VaultView for TestSession {
     fn vault(&self) -> &Vault {
         &self.0
+    }
+
+    fn decrypt_secret(
+        &self,
+        item_id: &str,
+        field: SecretField,
+    ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
+        self.1.decrypt_secret(&self.0, item_id, field)
     }
 }
 
@@ -189,6 +216,12 @@ pub struct Harness {
 
 impl Harness {
     pub fn new(locked: bool) -> Self {
+        Self::with(locked, |b| b)
+    }
+
+    /// As [`Harness::new`], with `configure` applied to the broker
+    /// (fill backend, policies, hooks).
+    pub fn with(locked: bool, configure: impl FnOnce(TestBroker) -> TestBroker) -> Self {
         let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
         let (beta, hb) = generate_with(&cheap_argon(), "beta");
         let tokens = TokenStore::with_floor(
@@ -203,16 +236,15 @@ impl Harness {
             Box::new(StaticHardening::all_ok()),
         );
         if !locked {
-            let vault = fixture_vault();
-            lock.unlock(|| Ok::<_, ()>(TestSession(vault))).unwrap();
+            lock.unlock(|| Ok::<_, ()>(TestSession::fixture())).unwrap();
         }
         let audit = RecordingAudit::default();
-        let broker = Broker::new(
+        let broker = configure(Broker::new(
             tokens,
             lock,
             Box::new(audit.clone()),
             OriginConfig::default(),
-        );
+        ));
         Self {
             broker: Arc::new(broker),
             clock,
@@ -381,4 +413,100 @@ pub fn json_object(pairs: &[(&str, &str)]) -> String {
         .map(|(k, v)| format!("{}:{}", json!(k), json!(v)))
         .collect();
     format!("{{{}}}", fields.join(","))
+}
+
+/// One plan a [`FakeFill`] received (values copied for assertions;
+/// tests only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenPlan {
+    pub agent: String,
+    pub target_id: String,
+    pub fields: Vec<(&'static str, Option<String>, String)>,
+    pub submit: bool,
+    pub expected_origin: Option<String>,
+    pub matchers: usize,
+}
+
+/// What a [`FakeFill`] answers.
+#[derive(Clone, Copy, Debug)]
+pub enum FakeAnswer {
+    /// `filled` with the plan's kinds.
+    Filled,
+    /// `origin_mismatch`.
+    OriginMismatch,
+    /// Never completes (the broker's deadline must cut it off).
+    Stall,
+}
+
+/// A [`FillBackend`] without a browser: agents `alpha` and `beta`
+/// have a context; it records every plan and answers `answer`.
+#[derive(Clone)]
+pub struct FakeFill {
+    pub seen: Arc<Mutex<Vec<SeenPlan>>>,
+    pub answer: FakeAnswer,
+}
+
+impl FakeFill {
+    pub fn new(answer: FakeAnswer) -> Self {
+        Self {
+            seen: Arc::default(),
+            answer,
+        }
+    }
+
+    pub fn seen(&self) -> Vec<SeenPlan> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl FillBackend for FakeFill {
+    fn has_agent(&self, agent_id: &str) -> bool {
+        matches!(agent_id, "alpha" | "beta")
+    }
+
+    fn fill<'a>(
+        &'a self,
+        agent_id: &'a str,
+        plan: &'a FillPlan,
+        _allow_default: bool,
+    ) -> FillFuture<'a> {
+        self.seen.lock().unwrap().push(SeenPlan {
+            agent: agent_id.to_owned(),
+            target_id: plan.target_id.clone(),
+            fields: plan
+                .fields
+                .iter()
+                .map(|f| (f.kind.as_str(), f.selector.clone(), (*f.value).clone()))
+                .collect(),
+            submit: plan.submit,
+            expected_origin: plan.expected_origin.clone(),
+            matchers: plan.item_matchers.len(),
+        });
+        let answer = self.answer;
+        let kinds: Vec<FieldKind> = plan.fields.iter().map(|f| f.kind).collect();
+        Box::pin(async move {
+            match answer {
+                FakeAnswer::Filled => FillOutcome::Filled { kinds },
+                FakeAnswer::OriginMismatch => FillOutcome::OriginMismatch,
+                FakeAnswer::Stall => std::future::pending().await,
+            }
+        })
+    }
+}
+
+/// `POST <path>` with a JSON `body` and an optional bearer token.
+pub async fn post_json(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: Option<&str>,
+    body: &str,
+) -> RawResponse {
+    let auth = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    raw_request(addr, head.as_bytes()).await
 }

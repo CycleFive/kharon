@@ -21,13 +21,16 @@ const TOKEN_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2h
 
 /// A servable export-mode config: local-only checkpoints (no off-host
 /// sink yet), no mlock requirement, `data_dir` and `[api]` as given.
+/// The export file is the real password-protected fixture from #12:
+/// since REQ-EXP-002 the daemon classifies the export file at
+/// startup, so a dummy path no longer boots.
 fn config(hash: &str, data_dir: &Path, api: &str) -> String {
     format!(
         r#"mode = "export"
 data_dir = "{}"
 
 [export]
-file = "/data/export.json"
+file = "{}"
 
 [agents.assistant]
 token_hash = "{hash}"
@@ -40,7 +43,11 @@ checkpoint_local_only = true
 require_mlock = false
 
 {api}"#,
-        data_dir.display()
+        data_dir.display(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/export/password_protected.json"
+        )
     )
 }
 

@@ -58,13 +58,26 @@ pub enum EncError {
 }
 
 /// A 64-byte Bitwarden symmetric key: `enc_key || mac_key`, wiped on drop.
-pub struct SymmetricKey(Zeroizing<[u8; 64]>);
+///
+/// The bytes live in a single heap allocation (`Box`) behind the
+/// `Zeroizing` wrapper (issue #54, item 5; REQ-MEM-003): moving a
+/// `SymmetricKey` by value — e.g. a `HashMap` rehash moving cached
+/// org keys — copies only the pointer, never the 64 key bytes, so
+/// no un-wiped stale copy is left in a freed table or stack slot.
+/// The box is unsized (`Box<[u8]>`, length checked to exactly 64
+/// in [`SymmetricKey::from_slice`], the only constructor) because
+/// `zeroize` implements `Zeroize` for `Box<[u8]>` but not for
+/// `Box<[u8; 64]>`; the security property the issue asks for —
+/// one heap allocation, moves copy only the pointer — is the same.
+pub struct SymmetricKey(Zeroizing<Box<[u8]>>);
 
 impl SymmetricKey {
     /// Wrap exactly 64 bytes of key material.
     pub fn from_slice(bytes: &[u8]) -> Result<Self, EncError> {
-        let arr: [u8; 64] = bytes.try_into().map_err(|_| EncError::InvalidKeyLength)?;
-        Ok(Self(Zeroizing::new(arr)))
+        if bytes.len() != 64 {
+            return Err(EncError::InvalidKeyLength);
+        }
+        Ok(Self(Zeroizing::new(bytes.into())))
     }
 
     /// Test-only view of the raw key bytes, for byte-for-byte vector
@@ -439,6 +452,32 @@ mod tests {
             parsed.decrypt_rsa(&test_rsa_key()),
             Err(EncError::DecryptionFailed)
         ));
+    }
+
+    #[test]
+    fn issue_54_symmetric_key_is_one_heap_allocation_not_64_inline_bytes() {
+        // Item 5 (REQ-MEM-003): the key value itself must be
+        // pointer-sized, not 64 inline bytes — a by-value move
+        // (e.g. a HashMap rehash of cached org keys) then copies
+        // only the pointer and leaves no un-wiped copy behind.
+        assert!(
+            std::mem::size_of::<SymmetricKey>() < 64,
+            "SymmetricKey must not carry its 64 bytes inline: {}",
+            std::mem::size_of::<SymmetricKey>()
+        );
+        assert_eq!(
+            std::mem::size_of::<SymmetricKey>(),
+            std::mem::size_of::<Zeroizing<Box<[u8]>>>()
+        );
+        // Keys survive many map insertions (rehashes/moves) intact.
+        let mut map = std::collections::HashMap::new();
+        for i in 0..128u8 {
+            let bytes = [i; 64];
+            map.insert(i, SymmetricKey::from_slice(&bytes).unwrap());
+        }
+        for i in 0..128u8 {
+            assert_eq!(map[&i].as_bytes_for_test(), &[i; 64][..]);
+        }
     }
 
     #[test]

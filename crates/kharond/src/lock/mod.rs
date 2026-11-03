@@ -85,7 +85,9 @@ use std::time::Duration;
 
 use zeroize::ZeroizeOnDrop;
 
+use crate::audit::{Entry, Event};
 use crate::config::{MemoryConfig, PolicyConfig};
+use crate::sync::LockReason as SyncLockReason;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use hardening::{
@@ -136,10 +138,14 @@ impl From<(&PolicyConfig, &MemoryConfig)> for LockPolicy {
 #[error("audit write failed")]
 pub struct AuditError;
 
-/// Why the broker locked. The audit event name for a lock is
-/// `locked_<audit_name>`, except the two forced locks whose audit
-/// entries the ACs name directly: `key_rotated` (REQ-MEM-006) and
-/// `scope_widened` (REQ-CRY-008).
+/// Why the broker locked. Its audit entry is built by
+/// [`LockReason::audit_entry`]: ordinary locks are `Event::Lock`
+/// with a fixed `detail_code`, and the two forced locks whose audit
+/// entries the ACs name directly are their own events —
+/// `key_rotated` (REQ-MEM-006) and `scope_widened` (REQ-CRY-008).
+/// (Issue #54, item 2: the previous `audit_event() -> &str` returned
+/// `locked_*` strings that are not `audit::Event` names at all, and
+/// `Event` deserialization rejects unknown names.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockReason {
     /// Owner action (`kharon lock`, web UI, `kharon panic`).
@@ -159,17 +165,51 @@ pub enum LockReason {
 }
 
 impl LockReason {
-    /// The audit event name for this lock (REQ-AUD-003, REQ-MEM-006,
-    /// REQ-CRY-008).
-    pub fn audit_event(self) -> &'static str {
+    /// The audit entry for this lock (REQ-AUD-003, REQ-MEM-006,
+    /// REQ-CRY-008; issue #54, item 2). Ordinary locks are
+    /// `Event::Lock` plus a fixed `detail_code` (`manual`,
+    /// `idle_timeout`, `absolute_timeout`,
+    /// `unknown_crypto_version` — fixed strings only, never
+    /// interpolated values, per REQ-API-006). The forced locks are
+    /// their own events (`Event::KeyRotated` /
+    /// `Event::ScopeWidened`) with no `detail_code`: the lock side
+    /// does not know the finer sync-side cause, which
+    /// `sync::LockReason::audit_entry` carries in its own
+    /// `detail_code` (`org_key_changed` / `other_org_visible` /
+    /// `item_outside_org`) when the caller has it.
+    pub fn audit_entry(self) -> Entry {
         match self {
-            Self::Manual => "locked_manual",
-            Self::IdleTimeout => "locked_idle_timeout",
-            Self::AbsoluteTimeout => "locked_absolute_timeout",
-            Self::KeyRotated => "key_rotated",
-            Self::UnknownCryptoVersion => "locked_unknown_crypto_version",
-            Self::ScopeWidened => "scope_widened",
+            Self::Manual => Entry::new(Event::Lock).detail_code("manual"),
+            Self::IdleTimeout => Entry::new(Event::Lock).detail_code("idle_timeout"),
+            Self::AbsoluteTimeout => Entry::new(Event::Lock).detail_code("absolute_timeout"),
+            Self::KeyRotated => Entry::new(Event::KeyRotated),
+            Self::UnknownCryptoVersion => {
+                Entry::new(Event::Lock).detail_code("unknown_crypto_version")
+            }
+            Self::ScopeWidened => Entry::new(Event::ScopeWidened),
         }
+    }
+}
+
+impl From<&SyncLockReason> for LockReason {
+    /// The single conversion from the sync layer's lock reason to
+    /// the controller's (issue #54, item 3): a `SyncOutcome::Lock`
+    /// feeds the controller through this conversion (or through
+    /// [`LockController::on_sync_lock`], which uses it), never
+    /// through a second hand-mapped path. The sync side keeps its
+    /// own finer `detail_code`s in its `audit_entry()`; this
+    /// conversion carries only the controller-level reason.
+    fn from(reason: &SyncLockReason) -> Self {
+        match reason {
+            SyncLockReason::ScopeWidened(_) => Self::ScopeWidened,
+            SyncLockReason::KeyRotated => Self::KeyRotated,
+        }
+    }
+}
+
+impl From<SyncLockReason> for LockReason {
+    fn from(reason: SyncLockReason) -> Self {
+        Self::from(&reason)
     }
 }
 
@@ -189,6 +229,23 @@ pub enum LockEvent {
         /// Why.
         reason: LockReason,
     },
+}
+
+impl LockEvent {
+    /// The audit entry for this transition, where the audit
+    /// vocabulary has one (issue #54, item 2): `Unlocked` maps to
+    /// `Event::Unlock` the same way a lock maps through
+    /// [`LockReason::audit_entry`]. The mlock transitions have no
+    /// `audit::Event` variant and return `None` — they are operator
+    /// signals, not audited events, and no new event name may be
+    /// invented for them (`Event` rejects unknown names).
+    pub fn audit_entry(self) -> Option<Entry> {
+        match self {
+            Self::Unlocked => Some(Entry::new(Event::Unlock)),
+            Self::Locked { reason } => Some(reason.audit_entry()),
+            Self::UnlockRefusedMlock | Self::MlockBestEffortFailed => None,
+        }
+    }
 }
 
 /// Why an unlock attempt failed.
@@ -282,11 +339,14 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
         self.unlocked.is_none()
     }
 
-    /// The current session, if any is held. This is *not* the fill
-    /// gate: it does not run the expiry check. Fill code must use
-    /// [`Self::require_unlocked`].
-    pub fn session(&self) -> Option<&S> {
-        self.unlocked.as_ref().map(|u| &u.session)
+    /// Whether a session is currently held. This is the only
+    /// session query besides the fill gate (issue #54, item 1): the
+    /// previous `session() -> Option<&S>` handed out `&S` without
+    /// running the expiry check, and in-crate callers (#14/#55 live
+    /// in this crate) could misuse it as a gate.
+    /// [`Self::require_unlocked`] is the only way to get `&S`.
+    pub fn has_session(&self) -> bool {
+        self.unlocked.is_some()
     }
 
     /// When the current unlock began (on the controller's clock),
@@ -318,6 +378,13 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
         &mut self,
         derive: impl FnOnce() -> Result<S, E>,
     ) -> Result<(), UnlockError<E>> {
+        // Expiry first (issue #54, item 4): an expired-but-unpolled
+        // session is locked with its expiry reason and the re-unlock
+        // proceeds, instead of failing `AlreadyUnlocked` and leaving
+        // the owner stuck until something happens to poll.
+        if let Some(reason) = self.expiry_reason() {
+            self.lock(reason);
+        }
         if self.unlocked.is_some() {
             return Err(UnlockError::AlreadyUnlocked);
         }
@@ -411,6 +478,16 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
         self.lock(LockReason::ScopeWidened)
     }
 
+    /// The one path from a sync outcome into the controller
+    /// (issue #54, item 3): `SyncOutcome::Lock(reason)` is handled
+    /// by `controller.on_sync_lock(&reason)`, which converts via
+    /// `From<&SyncLockReason>` and locks. Callers that also
+    /// write the audit entry should use the sync reason's own
+    /// `audit_entry()`, which keeps its finer `detail_code`.
+    pub fn on_sync_lock(&mut self, reason: &SyncLockReason) -> bool {
+        self.lock(LockReason::from(reason))
+    }
+
     /// The fill gate: the session, or [`LockedError`] — checked
     /// before any grant (REQ-MEM-007). Runs the expiry check first
     /// and locks an expired session with the right reason, so at
@@ -421,7 +498,10 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
         if let Some(reason) = self.expiry_reason() {
             self.lock(reason);
         }
-        self.session().ok_or(LockedError)
+        self.unlocked
+            .as_ref()
+            .map(|u| &u.session)
+            .ok_or(LockedError)
     }
 }
 

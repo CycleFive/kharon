@@ -271,7 +271,7 @@ fn req_mem_005_restart_comes_up_locked_with_nothing_persisted() {
         Box::new(StaticHardening::all_ok()),
     );
     assert!(c.is_locked(), "restart boots locked");
-    assert!(c.session().is_none());
+    assert!(!c.has_session());
 }
 
 #[test]
@@ -301,7 +301,8 @@ fn req_mem_006_rotated_org_key_locks_and_audits_key_rotated() {
             }
         ]
     );
-    assert_eq!(LockReason::KeyRotated.audit_event(), "key_rotated");
+    let e = LockReason::KeyRotated.audit_entry();
+    assert_eq!(e.event, kharond::audit::Event::KeyRotated);
 }
 
 #[test]
@@ -322,5 +323,5 @@ fn req_cry_006_lock_leaves_no_secret_material_behind() {
     c.lock(LockReason::Manual);
     assert!(canary.all_zero());
     assert!(c.require_unlocked().is_err(), "fill gate closed after lock");
-    assert!(c.session().is_none());
+    assert!(!c.has_session());
 }

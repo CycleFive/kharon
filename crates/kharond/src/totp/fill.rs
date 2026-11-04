@@ -123,6 +123,14 @@ impl<'a> TotpFill<'a> {
     /// refusal's `fill_totp`, or the deadline's `fill_timeout`) could
     /// not be appended: REQ-AUD-003†, the reply is `audit_failed`, as in
     /// the daemon path (#46).
+    ///
+    /// # Audit
+    ///
+    /// Every other (non-timeout) outcome from the fill is returned
+    /// **unaudited**: this layer writes no `fill_dispatch` and no outcome
+    /// entry for it, so the caller must append the `fill_totp` outcome
+    /// entry itself, mirroring [`crate::cdp::fill::DeadlineFiller`]'s
+    /// Audit section (REQ-AUD-003†; retiring this path is #77).
     pub async fn run(
         self,
         target: TotpTarget,

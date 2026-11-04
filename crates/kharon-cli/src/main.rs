@@ -7,9 +7,15 @@
 //! §8): `kharon unlock` / `kharon lock` / `kharon status` talk to
 //! the daemon's unix owner socket. The unlock password is read
 //! from the terminal with echo disabled — never from argv, env,
-//! or a file (REQ-EXP-003) — and zeroized after use; when stdin is
-//! not a terminal it is read from stdin instead (one line), which
-//! is what automation and tests use.
+//! or a file (REQ-EXP-003) — and its dedicated buffers are
+//! zeroized after use; when stdin is not a terminal it is read
+//! from stdin instead (one line), which is what automation and
+//! tests use. (Narrowed, PR #81 review: the JSON request frame is
+//! built with serde_json into a zeroizing buffer that is wiped
+//! whole, but serde's internal growth copies and the tty/stdin
+//! read buffers are std internals this short-lived CLI cannot
+//! wipe — the daemon side, the long-lived process, is where
+//! REQ-MEM-003's zeroization is enforced and scanned for.)
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -74,12 +80,28 @@ enum AuditCommand {
 
 /// One owner-socket round trip: send `request` (which may hold a
 /// zeroizing password buffer), return the parsed response.
+///
+/// Before anything is written, the peer's uid is checked against
+/// our own effective uid (PR #81 review): the password must only
+/// ever go to a daemon running as us, never to whatever happens to
+/// be listening at `--socket`.
 fn owner_request(
     socket: &PathBuf,
     request: &Zeroizing<String>,
 ) -> Result<serde_json::Value, String> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|e| format!("cannot connect to owner socket {socket:?}: {e}"))?;
+    let peer_uid = {
+        use std::os::fd::AsFd;
+        rustix::net::sockopt::socket_peercred(stream.as_fd())
+            .map(|c| c.uid.as_raw())
+            .map_err(|e| format!("cannot read owner socket peer credentials: {e}"))?
+    };
+    if peer_uid != rustix::process::geteuid().as_raw() {
+        return Err(format!(
+            "owner socket peer uid {peer_uid} is not our euid; refusing to send to it"
+        ));
+    }
     stream
         .write_all(request.as_bytes())
         .and_then(|()| stream.write_all(b"\n"))

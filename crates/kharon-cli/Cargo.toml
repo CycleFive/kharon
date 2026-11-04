@@ -18,7 +18,7 @@ zeroize = "1"
 # Terminal echo control for the unlock password prompt (tty, no
 # echo; SPEC §8), and the owner socket's uid check. Safe wrappers
 # only, the same rustix kharond already uses.
-rustix = { version = "1", default-features = false, features = ["std", "termios", "process"] }
+rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net"] }
 kharond = { path = "../kharond", version = "0.0.0" }
 
 [dev-dependencies]

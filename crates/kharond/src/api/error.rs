@@ -225,3 +225,12 @@ impl ApiError {
         json!({ "error": self.code.as_str(), "detail": self.detail.as_str() })
     }
 }
+
+/// REQ-AUD-003†: an engine-level outcome append failure
+/// ([`crate::cdp::fill::DeadlineFiller`]'s `fill_timeout`) is the API's
+/// `audit_failed`, the same reply `Broker::fill` gives (#46).
+impl From<crate::cdp::AuditFailed> for ApiError {
+    fn from(_: crate::cdp::AuditFailed) -> Self {
+        Self::AUDIT_FAILED
+    }
+}

@@ -200,7 +200,8 @@ async fn req_api_007_fill_totp_fills_code_never_returns_it() {
     let outcome = TotpFill::new(&h.engine, &mut h.audit, &gate)
         .at(now)
         .run(target(), seed(), &h.ctx, false)
-        .await;
+        .await
+        .expect("audit append");
     assert_eq!(
         outcome,
         FillOutcome::Filled {
@@ -222,7 +223,8 @@ async fn req_api_007_fill_totp_fills_code_never_returns_it() {
     let outcome = TotpFill::new(&h.engine, &mut h.audit, &gate)
         .at(UNIX_EPOCH + Duration::from_secs(1_634_603_498))
         .run(target(), steam, &h.ctx, false)
-        .await;
+        .await
+        .expect("audit append");
     assert_eq!(outcome.status(), "filled");
     assert_eq!(filled_values(&h.received)[1].1, "2C5H2");
     assert_no_code(&outcome.result_body(), "2C5H2");
@@ -239,7 +241,8 @@ async fn req_api_007_unsupported_field_refused_without_cdp() {
             &h.ctx,
             false,
         )
-        .await;
+        .await
+        .expect("audit append");
     assert_eq!(outcome, FillOutcome::TotpUnsupported);
     assert_eq!(outcome.result_body()["detail"], "totp_unsupported");
     assert!(filled_values(&h.received).is_empty());
@@ -261,7 +264,8 @@ async fn req_api_007_skew_45s_warning_only() {
 
     let outcome = TotpFill::new(&h.engine, &mut h.audit, &gate)
         .run(target(), seed(), &h.ctx, false)
-        .await;
+        .await
+        .expect("audit append");
     assert_eq!(outcome.status(), "filled");
     let events = audit_events(h.dir.path());
     assert!(
@@ -281,7 +285,8 @@ async fn req_api_007_skew_120s_refuses_totp_not_passwords() {
 
     let outcome = TotpFill::new(&h.engine, &mut h.audit, &gate)
         .run(target(), seed(), &h.ctx, false)
-        .await;
+        .await
+        .expect("audit append");
     assert_eq!(outcome, FillOutcome::ClockSkew);
     let body = outcome.result_body();
     assert_eq!(body["status"], "error");
@@ -309,9 +314,9 @@ async fn req_api_007_skew_120s_refuses_totp_not_passwords() {
         .await;
     assert_eq!(
         outcome,
-        FillOutcome::Filled {
+        Ok(FillOutcome::Filled {
             kinds: vec![FieldKind::Password]
-        }
+        })
     );
 
     let events = audit_events(h.dir.path());
@@ -331,7 +336,8 @@ async fn req_api_007_skew_120s_refuses_totp_not_passwords() {
     h.audit.append(obs.audit.unwrap()).unwrap();
     let outcome = TotpFill::new(&h.engine, &mut h.audit, &gate)
         .run(target(), seed(), &h.ctx, false)
-        .await;
+        .await
+        .expect("audit append");
     assert_eq!(outcome.status(), "filled");
 }
 

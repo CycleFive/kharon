@@ -48,3 +48,8 @@ pub use log::{
     OpenError,
 };
 pub use verify::{VerifyError, VerifyOutcome, verify};
+
+/// Test doubles elsewhere in the crate (e.g. a failing writer for the
+/// fill deadline's REQ-AUD-003 tests) plug in here.
+#[cfg(test)]
+pub(crate) use log::AuditWriter;

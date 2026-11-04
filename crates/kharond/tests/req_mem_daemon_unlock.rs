@@ -6,10 +6,13 @@
 //! - REQ-EXP-004 (restart level): replacing the export file does
 //!   nothing until a restart; after restart + unlock the audit log
 //!   holds a new `export_loaded` hash.
-//! - REQ-MEM-003: debug-build canary scan of the real daemon's
-//!   `/proc/self/mem` — the export password occurs 0 times after
-//!   unlock, the item-secret canary 0 times after unlock and after
-//!   lock (REQ-CRY-006).
+//! - REQ-MEM-003: `canary-scan`-feature canary scan of the real
+//!   daemon's memory (read via `process_vm_readv`, since a hardened
+//!   daemon's `/proc/self/mem` is not openable by its own uid) —
+//!   the export password occurs 0 times after unlock, the
+//!   item-secret canary 0 times after unlock and after lock, and
+//!   the export-derived key (a non-UTF-8 needle, sent hex-encoded)
+//!   0 times after lock (REQ-CRY-006).
 //! - REQ-MEM-005: kill -9 → restart comes up `locked`; `strings`
 //!   over `data_dir` finds no password or canary.
 //! - REQ-EXP-001: export mode fully works inside a network
@@ -38,7 +41,11 @@ use serde_json::{Value, json};
 
 const FIXTURE_A: &[u8] = include_bytes!("fixtures/export/password_protected.json");
 const FIXTURE_B: &[u8] = include_bytes!("fixtures/export/password_protected_replaced.json");
+const FIXTURE_ESC: &[u8] = include_bytes!("fixtures/export/password_protected_escaped.json");
 const PASSWORD: &str = "kharon export fixture password 9";
+/// The escaped fixture's password: contains `"` and `\`, so its
+/// JSON wire form is full of escapes (see the generator).
+const ESCAPED_PASSWORD: &str = "kharon \"escape\" \\ fixture 9";
 const CANARY: &str = "CANARY-EXPORT-PASSWORD-7f3a";
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -108,8 +115,58 @@ fn owner_status(socket: &Path) -> Value {
 
 fn owner_scan(socket: &Path, needle: &str) -> usize {
     let reply = owner_op(socket, &json!({"op": "scan", "needle": needle}));
+    // A `scan_unavailable` reply fails here, loudly: a scanner that
+    // could not read must never be read as "0 hits" (item 2).
     assert_eq!(reply["ok"], json!(true), "scan reply: {reply}");
     reply["hits"].as_u64().unwrap() as usize
+}
+
+fn owner_scan_hex(socket: &Path, needle: &[u8]) -> usize {
+    let reply = owner_op(
+        socket,
+        &json!({"op": "scan", "needle_hex": hex::encode(needle)}),
+    );
+    assert_eq!(reply["ok"], json!(true), "hex scan reply: {reply}");
+    reply["hits"].as_u64().unwrap() as usize
+}
+
+/// Retry a positive-control scan briefly (mapping churn under
+/// parallel load), then return the best count seen.
+fn scan_until_hit(socket: &Path, needle: &str) -> usize {
+    let mut best = 0;
+    for _ in 0..10 {
+        best = owner_scan(socket, needle);
+        if best >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    best
+}
+
+/// The fixture's 64-byte export key, derived *independently* here
+/// (PBKDF2-HMAC-SHA256 over the file's verbatim salt string, then
+/// the HKDF `enc`/`mac` stretch — the REQ-EXP-001 derivation, same
+/// shape as the fixture generator) so the test can scan for raw
+/// key bytes without kharon-bwcrypto exposing them.
+fn derive_fixture_export_key(fixture: &[u8]) -> Vec<u8> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let v: Value = serde_json::from_slice(fixture).unwrap();
+    let salt = v["salt"].as_str().unwrap();
+    let iterations = v["kdfIterations"].as_u64().unwrap() as u32;
+    let mut master = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(
+        PASSWORD.as_bytes(),
+        salt.as_bytes(),
+        iterations,
+        &mut master,
+    );
+    let hk = Hkdf::<Sha256>::from_prk(&master).unwrap();
+    let mut key = vec![0u8; 64];
+    hk.expand(b"enc", &mut key[..32]).unwrap();
+    hk.expand(b"mac", &mut key[32..]).unwrap();
+    key
 }
 
 struct Running {
@@ -319,14 +376,13 @@ fn spawn_kharond(config_path: &Path, data_dir: &Path) -> DaemonChild {
 }
 
 fn write_binary_config(dir: &Path) -> (PathBuf, String) {
+    write_binary_config_for(dir, "password_protected.json")
+}
+
+fn write_binary_config_for(dir: &Path, fixture: &str) -> (PathBuf, String) {
     let (token, hash) = generate("alpha");
     let data_dir = dir.join("data");
-    let cfg = config_toml(
-        &hash,
-        &data_dir,
-        &fixture_path("password_protected.json"),
-        "127.0.0.1:0",
-    );
+    let cfg = config_toml(&hash, &data_dir, &fixture_path(fixture), "127.0.0.1:0");
     let path = dir.join("kharon.toml");
     std::fs::write(&path, cfg).unwrap();
     (path, token.expose_secret().clone())
@@ -345,32 +401,87 @@ fn req_mem_003_canary_scan_of_the_running_daemon_finds_zero_hits() {
     assert_eq!(owner_unlock(&d.socket, PASSWORD)["ok"], json!(true));
     assert_eq!(owner_status(&d.socket)["locked"], json!(false));
 
-    // Positive control: the scanner does find strings that are in
-    // the process (its own binary's name is in mapped .rodata).
-    // Retried briefly: under full-suite parallel load a scan can
-    // race the daemon's own mapping churn; a scanner that never
-    // finds it is broken and still fails here. (The zero-hit
-    // assertions below are single-shot — they are the AC.)
-    let mut control = 0;
-    for _ in 0..10 {
-        control = owner_scan(&d.socket, "kharond");
-        if control >= 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    assert!(control >= 1, "scanner control: hits={control}");
+    // Positive control (PR #81 review, item 3): the needle must be
+    // something that lives ONLY in the daemon's heap, so a scanner
+    // reading only file-backed mappings cannot pass it. The export
+    // file's SHA-256 hex is held as a `String` in the daemon's
+    // `ExportFile` (and in the session), computed here from the
+    // fixture. Retried briefly for mapping churn under parallel
+    // load; a scanner that never finds it is broken and still
+    // fails here. (The zero-hit assertions below are single-shot —
+    // they are the AC.)
+    let sha_hex = ExportFile::from_bytes(FIXTURE_A)
+        .unwrap()
+        .sha256_hex()
+        .to_owned();
+    let control = scan_until_hit(&d.socket, &sha_hex);
+    assert!(control >= 1, "heap scanner control: hits={control}");
     // The export password was zeroized after derivation.
     assert_eq!(owner_scan(&d.socket, PASSWORD), 0, "password after unlock");
     // No plaintext secret cache while unlocked (REQ-CRY-006).
     assert_eq!(owner_scan(&d.socket, CANARY), 0, "item canary after unlock");
+    // Key material (item 4): the export-derived key, scanned as
+    // raw bytes via the hex needle. It is dropped inside
+    // `ExportFile::unlock` before the session is installed, so 0
+    // is expected here too — the "≥1 while unlocked" heap-control
+    // role is served by the SHA-256 hex above (the session's
+    // per-unlock wrap key is random and known to no one, by
+    // design: a scan op that could reveal it would be the oracle
+    // item 5 forbids).
+    let export_key = derive_fixture_export_key(FIXTURE_A);
+    assert_eq!(
+        owner_scan_hex(&d.socket, &export_key),
+        0,
+        "export key after unlock"
+    );
 
     assert_eq!(
         owner_op(&d.socket, &json!({"op": "lock"}))["ok"],
         json!(true)
     );
+    // The control must STILL hit after lock (the `ExportFile` is
+    // daemon-lifetime), so the zeros below are measured by a
+    // scanner proven live in the locked state too.
+    let control = scan_until_hit(&d.socket, &sha_hex);
+    assert!(control >= 1, "heap control after lock: hits={control}");
     assert_eq!(owner_scan(&d.socket, CANARY), 0, "item canary after lock");
     assert_eq!(owner_scan(&d.socket, PASSWORD), 0, "password after lock");
+    // REQ-MEM-003's "after lock (keys)": the derived key is gone.
+    assert_eq!(
+        owner_scan_hex(&d.socket, &export_key),
+        0,
+        "export key after lock"
+    );
+
+    d.child.kill().unwrap();
+    let _ = d.child.wait();
+}
+
+/// Item 7's canary case: an unlock whose password contains `"` and
+/// `\` (so the wire JSON is escape-laden) must leave zero copies of
+/// the decoded password in daemon memory — a serde escape-decoding
+/// scratch copy would be caught here. The daemon hand-decodes the
+/// password field, so no such copy is ever made.
+#[test]
+fn req_mem_003_canary_scan_with_an_escaped_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, _token) = write_binary_config_for(dir.path(), "password_protected_escaped.json");
+    let mut d = spawn_kharond(&cfg, &dir.path().join("data"));
+
+    assert_eq!(owner_unlock(&d.socket, ESCAPED_PASSWORD)["ok"], json!(true));
+    assert_eq!(owner_status(&d.socket)["locked"], json!(false));
+    let sha_hex = ExportFile::from_bytes(FIXTURE_ESC)
+        .unwrap()
+        .sha256_hex()
+        .to_owned();
+    let control = scan_until_hit(&d.socket, &sha_hex);
+    assert!(control >= 1, "heap scanner control: hits={control}");
+    assert_eq!(
+        owner_scan(&d.socket, ESCAPED_PASSWORD),
+        0,
+        "escaped password after unlock"
+    );
+    assert_eq!(owner_scan(&d.socket, CANARY), 0, "item canary after unlock");
 
     d.child.kill().unwrap();
     let _ = d.child.wait();
@@ -480,16 +591,48 @@ fn req_exp_001_export_mode_works_with_no_network_egress() {
     }
     let exe = std::env::current_exe().unwrap();
     let script = format!(
-        "ip link set lo up 2>/dev/null; exec {} req_exp_001_export_mode_works_with_no_network_egress --exact --nocapture",
+        "ip link set lo up || {{ echo LO_UP_FAILED; exit 3; }}; exec {} req_exp_001_export_mode_works_with_no_network_egress --exact --nocapture",
         exe.display()
     );
-    let out = Command::new("unshare")
+    let out = match Command::new("unshare")
         .args(["-rn", "sh", "-c", &script])
         .env(NETNS_CHILD_ENV, "1")
         .output()
-        .expect("unshare must be available for the netns AC");
+    {
+        Ok(out) => out,
+        Err(e) => {
+            // Skip LOUDLY (PR #81 review, item 1): the environment
+            // cannot run the AC at all; that must be visible in the
+            // test output, never a quiet pass or a confusing fail.
+            eprintln!(
+                "SKIPPED req_exp_001: cannot spawn `unshare` ({e}); \
+                 the no-egress AC is NOT exercised in this environment"
+            );
+            return;
+        }
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success()
+        && (stderr.contains("Operation not permitted")
+            || stdout.contains("LO_UP_FAILED")
+            || stderr.contains("LO_UP_FAILED"))
+    {
+        // Hosted CI runners refuse unprivileged user namespaces
+        // (`unshare: write failed /proc/self/uid_map: Operation
+        // not permitted`), so `unshare -rn` cannot work there.
+        // Skip loudly with the reason; the AC still runs wherever
+        // userns is allowed (dev boxes), which is where it was
+        // verified for this PR.
+        eprintln!(
+            "SKIPPED req_exp_001: unprivileged user/net namespaces unavailable \
+             here (status={}, stderr={}); the no-egress AC is NOT exercised \
+             in this environment",
+            out.status,
+            stderr.trim()
+        );
+        return;
+    }
     assert!(
         out.status.success() && stdout.contains("NETNS_OK"),
         "netns child failed: status={} stdout={stdout} stderr={stderr}",

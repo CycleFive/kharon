@@ -126,10 +126,14 @@ impl<'a> TotpFill<'a> {
     ///
     /// # Audit
     ///
-    /// Every other (non-timeout) outcome from the fill is returned
-    /// **unaudited**: this layer writes no `fill_dispatch` and no outcome
-    /// entry for it, so the caller must append the `fill_totp` outcome
-    /// entry itself, mirroring [`crate::cdp::fill::DeadlineFiller`]'s
+    /// This layer audits the pre-fill refusals itself (`clock_skew`,
+    /// unsupported field: their `fill_totp` entry is written by
+    /// `refuse()`, see above) and the deadline's `fill_timeout`. Every
+    /// other outcome of the fill itself is returned **unaudited**: this
+    /// layer writes no `fill_dispatch` and no outcome entry for it, so
+    /// the caller must append the `fill_totp` outcome entry itself, and
+    /// must not append one for a refusal or a timeout (exactly one entry
+    /// per outcome), mirroring [`crate::cdp::fill::DeadlineFiller`]'s
     /// Audit section (REQ-AUD-003†; retiring this path is #77).
     pub async fn run(
         self,

@@ -49,7 +49,9 @@ use crate::api::core::{Broker, VaultView};
 use crate::api::fill::{ConnectingCdpBackend, FillPolicy};
 use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
-use crate::audit::{AuditConfig as LogConfig, AuditLog, Entry, Event, FileCheckpointSink, OpenError};
+use crate::audit::{
+    AuditConfig as LogConfig, AuditLog, Entry, Event, FileCheckpointSink, OpenError,
+};
 use crate::config::{BitwardenConfig, Config, Source};
 use crate::export::{ExportError, ExportFile, ExportSession};
 use crate::lock::{
@@ -76,8 +78,9 @@ pub type DaemonBroker = Broker<DaemonSession, SystemClock>;
 /// the API's [`VaultView`] seam both modes look identical; dropping
 /// either variant wipes its key material (REQ-MEM-003).
 pub enum DaemonSession {
-    /// `mode = "sync"`: a live-synced Vaultwarden session.
-    Sync(LiveSync),
+    /// `mode = "sync"`: a live-synced Vaultwarden session. Boxed:
+    /// `LiveSync` is over a kilobyte and the export variant is not.
+    Sync(Box<LiveSync>),
     /// `mode = "export"`: the startup export file's snapshot.
     Export(ExportSession),
 }
@@ -98,7 +101,7 @@ impl VaultView for DaemonSession {
         field: SecretField,
     ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
         match self {
-            Self::Sync(s) => VaultView::decrypt_secret(s, item_id, field),
+            Self::Sync(s) => VaultView::decrypt_secret(&**s, item_id, field),
             Self::Export(s) => VaultView::decrypt_secret(s, item_id, field),
         }
     }
@@ -107,8 +110,9 @@ impl VaultView for DaemonSession {
 /// Where an unlock gets its session (the daemon's half of the
 /// source config, with everything unlock needs kept from startup).
 enum UnlockSource {
-    /// Sync mode: build a fresh client per unlock.
-    Sync(BitwardenConfig),
+    /// Sync mode: build a fresh client per unlock. Boxed for the
+    /// same size reason as [`DaemonSession::Sync`].
+    Sync(Box<BitwardenConfig>),
     /// Export mode: the startup [`ExportFile`], loaded **once** in
     /// [`start`] and used for every unlock (REQ-EXP-004 load-once).
     Export(Arc<ExportFile>),
@@ -172,9 +176,7 @@ impl OwnerOps for DaemonOwner {
             UnlockSource::Sync(bw) => {
                 // Network first, with no password involved:
                 // prelogin + sync + the REQ-CRY-008 scope check.
-                let client = bw
-                    .sync_client()
-                    .map_err(|_| OwnerFailure::UnlockFailed)?;
+                let client = bw.sync_client().map_err(|_| OwnerFailure::UnlockFailed)?;
                 let prepared = LiveSync::prepare(client, bw.scope(), bw.sync_policy())
                     .await
                     .map_err(|_| OwnerFailure::UnlockFailed)?;
@@ -184,8 +186,12 @@ impl OwnerOps for DaemonOwner {
                         .lock_controller()
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    lock.unlock(|| prepared.derive(&password).map(DaemonSession::Sync))
-                        .map_err(Self::map_unlock_error)
+                    lock.unlock(|| {
+                        prepared
+                            .derive(&password)
+                            .map(|s| DaemonSession::Sync(Box::new(s)))
+                    })
+                    .map_err(Self::map_unlock_error)
                 })
                 .await
                 .map_err(|_| OwnerFailure::UnlockFailed)??;
@@ -360,7 +366,7 @@ pub async fn start(
     // loads the export file ONCE, here — every unlock uses this
     // instance, never a re-read (REQ-EXP-004 load-once).
     let source = match &cfg.source {
-        Source::Sync(bw) => UnlockSource::Sync(bw.clone()),
+        Source::Sync(bw) => UnlockSource::Sync(Box::new(bw.clone())),
         Source::Export(exp) => UnlockSource::Export(Arc::new(ExportFile::load(&exp.file)?)),
     };
 

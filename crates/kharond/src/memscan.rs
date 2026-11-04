@@ -54,10 +54,8 @@ fn readable_regions() -> Vec<Region> {
         let Some((lo, hi)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(lo), Ok(hi)) = (
-            usize::from_str_radix(lo, 16),
-            usize::from_str_radix(hi, 16),
-        ) else {
+        let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+        else {
             continue;
         };
         if hi > lo {
@@ -95,9 +93,8 @@ pub fn count_occurrences(needle: &[u8], exclude: &[Range<usize>]) -> usize {
         let p = tail.as_ptr() as usize;
         p..p + tail.capacity()
     };
-    let excluded = |at: usize, extra: &[Range<usize>]| {
-        exclude.iter().chain(extra).any(|r| r.contains(&at))
-    };
+    let excluded =
+        |at: usize, extra: &[Range<usize>]| exclude.iter().chain(extra).any(|r| r.contains(&at));
 
     let mut hits = 0usize;
     for region in readable_regions() {
@@ -134,7 +131,7 @@ pub fn count_occurrences(needle: &[u8], exclude: &[Range<usize>]) -> usize {
                                 continue;
                             }
                             if in_tail == &needle[..in_tail.len()]
-                                && &chunk[..from_chunk] == &needle[in_tail.len()..]
+                                && chunk[..from_chunk] == needle[in_tail.len()..]
                             {
                                 hits += 1;
                             }
@@ -182,11 +179,7 @@ fn count_in(
     while i + needle.len() <= window.len() {
         if window[i] == needle[0] && &window[i..i + needle.len()] == needle {
             let at = window_addr + i;
-            if !exclude
-                .iter()
-                .chain(extra_exclude)
-                .any(|r| r.contains(&at))
-            {
+            if !exclude.iter().chain(extra_exclude).any(|r| r.contains(&at)) {
                 hits += 1;
             }
             i += 1;
@@ -220,7 +213,7 @@ mod tests {
         // least that copy (the `canary` String and its clones in
         // this test are other copies, so only check it drops).
         let range = (leaked.as_ptr() as usize)..(leaked.as_ptr() as usize + leaked.len());
-        let excluded = count_occurrences(leaked, &[range.clone()]);
+        let excluded = count_occurrences(leaked, std::slice::from_ref(&range));
         assert!(excluded < hits, "exclusion must hide the named copy");
     }
 

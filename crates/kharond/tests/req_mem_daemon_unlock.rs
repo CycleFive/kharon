@@ -42,7 +42,11 @@ const PASSWORD: &str = "kharon export fixture password 9";
 const CANARY: &str = "CANARY-EXPORT-PASSWORD-7f3a";
 
 fn fixture_path(name: &str) -> PathBuf {
-    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/export")).join(name)
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/export"
+    ))
+    .join(name)
 }
 
 fn config_toml(hash: &str, data_dir: &Path, export_file: &Path, listen: &str) -> String {
@@ -87,9 +91,7 @@ fn owner_op(socket: &Path, request: &Value) -> Value {
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
-    stream
-        .write_all(request.to_string().as_bytes())
-        .unwrap();
+    stream.write_all(request.to_string().as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
     let mut reply = String::new();
     stream.read_to_string(&mut reply).unwrap();
@@ -163,7 +165,10 @@ async fn req_exp_003_unlock_only_via_owner_socket_and_restart_boots_locked() {
 
     let run = start_daemon(&cfg).await;
     // Boots locked: status says so on both surfaces, list is 423.
-    assert_eq!(get(run.addr, "/v1/status", Some(&token)).await.json()["locked"], json!(true));
+    assert_eq!(
+        get(run.addr, "/v1/status", Some(&token)).await.json()["locked"],
+        json!(true)
+    );
     assert_eq!(get(run.addr, "/v1/items", Some(&token)).await.status, 423);
     assert_eq!(owner_status(&run.socket)["locked"], json!(true));
 
@@ -185,11 +190,17 @@ async fn req_exp_003_unlock_only_via_owner_socket_and_restart_boots_locked() {
     let audit = audit_text(data.path());
     assert!(audit.contains("\"export_loaded\""), "{audit}");
     assert!(audit.contains("\"unlock\""), "{audit}");
-    let sha = ExportFile::from_bytes(FIXTURE_A).unwrap().sha256_hex().to_owned();
+    let sha = ExportFile::from_bytes(FIXTURE_A)
+        .unwrap()
+        .sha256_hex()
+        .to_owned();
     assert!(audit.contains(&sha), "export_loaded carries the file hash");
 
     // Lock via the owner socket: list is 423 again.
-    assert_eq!(owner_op(&run.socket, &json!({"op": "lock"}))["ok"], json!(true));
+    assert_eq!(
+        owner_op(&run.socket, &json!({"op": "lock"}))["ok"],
+        json!(true)
+    );
     assert_eq!(owner_status(&run.socket)["locked"], json!(true));
     assert_eq!(get(run.addr, "/v1/items", Some(&token)).await.status, 423);
     run.shutdown().await;
@@ -211,8 +222,13 @@ async fn req_exp_004_restart_level_replace_file_and_new_audit_hash() {
     let data = tempfile::tempdir().unwrap();
     let export_file = data.path().join("export.json");
     std::fs::write(&export_file, FIXTURE_A).unwrap();
-    let cfg = Config::from_toml_str(&config_toml(&hash, data.path(), &export_file, "127.0.0.1:0"))
-        .unwrap();
+    let cfg = Config::from_toml_str(&config_toml(
+        &hash,
+        data.path(),
+        &export_file,
+        "127.0.0.1:0",
+    ))
+    .unwrap();
 
     let run = start_daemon(&cfg).await;
     assert_eq!(owner_unlock(&run.socket, PASSWORD)["ok"], json!(true));
@@ -245,8 +261,14 @@ async fn req_exp_004_restart_level_replace_file_and_new_audit_hash() {
             v["file_sha256"].as_str().unwrap().to_owned()
         })
         .collect();
-    let sha_a = ExportFile::from_bytes(FIXTURE_A).unwrap().sha256_hex().to_owned();
-    let sha_b = ExportFile::from_bytes(FIXTURE_B).unwrap().sha256_hex().to_owned();
+    let sha_a = ExportFile::from_bytes(FIXTURE_A)
+        .unwrap()
+        .sha256_hex()
+        .to_owned();
+    let sha_b = ExportFile::from_bytes(FIXTURE_B)
+        .unwrap()
+        .sha256_hex()
+        .to_owned();
     assert_eq!(hashes, [sha_a, sha_b]);
 }
 
@@ -343,7 +365,10 @@ fn req_mem_003_canary_scan_of_the_running_daemon_finds_zero_hits() {
     // No plaintext secret cache while unlocked (REQ-CRY-006).
     assert_eq!(owner_scan(&d.socket, CANARY), 0, "item canary after unlock");
 
-    assert_eq!(owner_op(&d.socket, &json!({"op": "lock"}))["ok"], json!(true));
+    assert_eq!(
+        owner_op(&d.socket, &json!({"op": "lock"}))["ok"],
+        json!(true)
+    );
     assert_eq!(owner_scan(&d.socket, CANARY), 0, "item canary after lock");
     assert_eq!(owner_scan(&d.socket, PASSWORD), 0, "password after lock");
 

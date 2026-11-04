@@ -139,8 +139,8 @@ impl Drop for EchoOff {
 
 fn read_password_tty() -> Result<Zeroizing<String>, String> {
     use std::io::BufRead;
-    let mut tty = std::fs::File::open("/dev/tty")
-        .map_err(|e| format!("cannot open /dev/tty: {e}"))?;
+    let mut tty =
+        std::fs::File::open("/dev/tty").map_err(|e| format!("cannot open /dev/tty: {e}"))?;
     {
         use std::os::fd::AsFd;
         let _guard = EchoOff::new(tty.as_fd())?;

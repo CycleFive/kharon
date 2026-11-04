@@ -217,7 +217,8 @@ impl PreparedUnlock {
     /// vault. Synchronous (the KDF is CPU work): call it inside the
     /// lock controller's derivation closure, from a blocking thread.
     pub fn derive(self, password: &Zeroizing<String>) -> Result<LiveSync, SyncError> {
-        let mut session = Session::unlock(password, &self.email, &self.kdf, &self.sync, self.scope)?;
+        let mut session =
+            Session::unlock(password, &self.email, &self.kdf, &self.sync, self.scope)?;
         let vault = session.apply_sync(&self.sync)?;
         Ok(LiveSync {
             client: self.client,
@@ -262,9 +263,7 @@ impl LiveSync {
         scope: Scope,
         policy: SyncPolicy,
     ) -> Result<Self, SyncError> {
-        Self::prepare(client, scope, policy)
-            .await?
-            .derive(password)
+        Self::prepare(client, scope, policy).await?.derive(password)
     }
 
     pub fn vault(&self) -> &Vault {

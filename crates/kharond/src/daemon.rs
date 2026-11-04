@@ -139,6 +139,16 @@ impl DaemonOwner {
     }
 }
 
+/// Why an export-mode derivation closure failed: the export
+/// itself, or the `export_loaded` audit append that is part of the
+/// load (kept distinct so the append maps to `audit_failed`, not
+/// to the indistinguishable `unlock_failed`). Unit variants: the
+/// underlying error is deliberately not carried, per REQ-API-006.
+enum ExportUnlockError {
+    Export,
+    Audit,
+}
+
 impl OwnerOps for DaemonOwner {
     async fn unlock(&self, password: Zeroizing<String>) -> Result<(), OwnerFailure> {
         match &self.source {
@@ -151,27 +161,44 @@ impl OwnerOps for DaemonOwner {
                         .lock_controller()
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    lock.unlock(|| file.unlock(&password).map(DaemonSession::Export))
-                        .map_err(Self::map_unlock_error)
+                    // REQ-EXP-004 / REQ-AUD-003 (PR #81 review,
+                    // item 6): the `export_loaded` entry is
+                    // appended INSIDE the derivation closure —
+                    // after `file.unlock` succeeds, before the
+                    // session is returned and installed. The
+                    // controller mutex is held throughout and the
+                    // lock→audit mutex order is the existing one,
+                    // so there is no window where the agent API
+                    // can serve a load with no audit record, and
+                    // no re-acquire that could lock a *different*
+                    // (concurrent) session on failure. A failed
+                    // append is a derivation failure: no session
+                    // is ever installed.
+                    let audit_broker = Arc::clone(&broker);
+                    lock.unlock(|| {
+                        let session = file
+                            .unlock(&password)
+                            .map_err(|_| ExportUnlockError::Export)?;
+                        let entry = Entry::new(Event::ExportLoaded).file_sha256(sha256.clone());
+                        audit_broker
+                            .append_audit(entry)
+                            .map_err(|_| ExportUnlockError::Audit)?;
+                        Ok(DaemonSession::Export(session))
+                    })
+                    .map_err(|e| match e {
+                        UnlockError::AlreadyUnlocked => OwnerFailure::AlreadyUnlocked,
+                        UnlockError::MlockUnavailable => OwnerFailure::MlockUnavailable,
+                        UnlockError::Audit(_) => OwnerFailure::AuditFailed,
+                        UnlockError::DeriveFailed(ExportUnlockError::Audit) => {
+                            OwnerFailure::AuditFailed
+                        }
+                        UnlockError::DeriveFailed(ExportUnlockError::Export) => {
+                            OwnerFailure::UnlockFailed
+                        }
+                    })
                 })
                 .await
-                .map_err(|_| OwnerFailure::UnlockFailed)??;
-                // REQ-EXP-004: the load is incomplete until its
-                // `export_loaded` entry (with the file's SHA-256)
-                // is in the audit log. If the append fails, lock
-                // again and report the failure rather than run
-                // with an unaudited load (REQ-AUD-003).
-                let entry = Entry::new(Event::ExportLoaded).file_sha256(sha256);
-                if self.broker.append_audit(entry).is_err() {
-                    let mut lock = self
-                        .broker
-                        .lock_controller()
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    lock.lock(LockReason::Manual);
-                    return Err(OwnerFailure::AuditFailed);
-                }
-                Ok(())
+                .map_err(|_| OwnerFailure::UnlockFailed)?
             }
             UnlockSource::Sync(bw) => {
                 // Network first, with no password involved:
@@ -510,4 +537,103 @@ fn create_private_dir(path: &std::path::Path) -> io::Result<()> {
         b.mode(0o700);
     }
     b.create(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::core::AuditSink;
+    use crate::lock::{AuditError, StaticHardening};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// An audit sink that records event names and can be told to
+    /// refuse `export_loaded` appends (PR #81 review, item 6's
+    /// failing-sink test).
+    struct TestSink {
+        events: Arc<Mutex<Vec<String>>>,
+        fail_export_loaded: bool,
+    }
+
+    impl AuditSink for TestSink {
+        fn append(&mut self, entry: Entry) -> Result<(), AuditError> {
+            let name = serde_json::to_value(&entry.event)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if self.fail_export_loaded && name == "export_loaded" {
+                return Err(AuditError);
+            }
+            self.events.lock().unwrap().push(name);
+            Ok(())
+        }
+    }
+
+    fn export_owner(fail_export_loaded: bool) -> (DaemonOwner, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink {
+            events: Arc::clone(&events),
+            fail_export_loaded,
+        };
+        let tokens = TokenStore::from_agents(&BTreeMap::new()).unwrap();
+        let lock = LockController::new(
+            LockPolicy {
+                require_mlock: false,
+                ..LockPolicy::default()
+            },
+            SystemClock,
+            Box::new(StaticHardening::all_ok()),
+        );
+        let broker = Arc::new(Broker::new(
+            tokens,
+            lock,
+            Box::new(sink),
+            crate::origin::OriginConfig { allow_http: false },
+        ));
+        broker.wire_lock_audit();
+        let file = ExportFile::from_bytes(
+            include_bytes!("../tests/fixtures/export/password_protected.json").as_slice(),
+        )
+        .unwrap();
+        (
+            DaemonOwner {
+                broker,
+                source: UnlockSource::Export(Arc::new(file)),
+            },
+            events,
+        )
+    }
+
+    const EXPORT_PASSWORD: &str = "kharon export fixture password 9";
+
+    #[tokio::test]
+    async fn export_loaded_append_failure_means_no_session_is_installed() {
+        let (owner, events) = export_owner(true);
+        let err = owner
+            .unlock(Zeroizing::new(EXPORT_PASSWORD.to_owned()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnerFailure::AuditFailed);
+        assert!(owner.is_locked().await, "status stays locked");
+        assert!(
+            !events.lock().unwrap().iter().any(|e| e == "unlock"),
+            "no unlock entry may stand for an uninstalled session: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn export_loaded_is_recorded_before_the_unlock_entry() {
+        let (owner, events) = export_owner(false);
+        owner
+            .unlock(Zeroizing::new(EXPORT_PASSWORD.to_owned()))
+            .await
+            .unwrap();
+        assert!(!owner.is_locked().await);
+        let events = events.lock().unwrap();
+        let loaded = events.iter().position(|e| e == "export_loaded").unwrap();
+        let unlock = events.iter().position(|e| e == "unlock").unwrap();
+        assert!(loaded < unlock, "export_loaded precedes unlock: {events:?}");
+    }
 }

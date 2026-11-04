@@ -34,7 +34,7 @@ use zeroize::Zeroizing;
 use super::TotpKey;
 use super::skew::ClockSkewGate;
 use crate::audit::{AuditLog, Entry, Event};
-use crate::cdp::fill::{DEFAULT_FILL_DEADLINE, DeadlineFiller};
+use crate::cdp::fill::{AuditFailed, DEFAULT_FILL_DEADLINE, DeadlineFiller};
 use crate::cdp::{AgentContext, FieldFill, FieldKind, FillEngine, FillOutcome, FillPlan};
 use crate::origin::{OriginConfig, OriginMatcher};
 
@@ -118,13 +118,26 @@ impl<'a> TotpFill<'a> {
     }
 
     /// Run the fill. `field` is the item's decrypted `login.totp`.
+    ///
+    /// `Err(AuditFailed)` when an outcome entry this layer writes (the
+    /// refusal's `fill_totp`, or the deadline's `fill_timeout`) could
+    /// not be appended: REQ-AUD-003†, the reply is `audit_failed`, as in
+    /// the daemon path (#46).
+    ///
+    /// # Audit
+    ///
+    /// Every other (non-timeout) outcome from the fill is returned
+    /// **unaudited**: this layer writes no `fill_dispatch` and no outcome
+    /// entry for it, so the caller must append the `fill_totp` outcome
+    /// entry itself, mirroring [`crate::cdp::fill::DeadlineFiller`]'s
+    /// Audit section (REQ-AUD-003†; retiring this path is #77).
     pub async fn run(
         self,
         target: TotpTarget,
         field: Secret<String>,
         agent_ctx: &AgentContext,
         allow_default: bool,
-    ) -> FillOutcome {
+    ) -> Result<FillOutcome, AuditFailed> {
         let now = self.now.unwrap_or_else(SystemTime::now);
         let code = match totp_code(self.gate, field, now) {
             Ok(c) => c,
@@ -153,17 +166,93 @@ impl<'a> TotpFill<'a> {
         outcome
     }
 
-    /// Audit a refusal made before any CDP call and return it. The
-    /// refusal stands even if the append fails: no write was made and
-    /// none will be (cf. the `fill_timeout` path).
-    fn refuse(self, agent_ctx: &AgentContext, outcome: FillOutcome) -> FillOutcome {
+    /// Audit a refusal made before any CDP call and return it. No CDP
+    /// write was made and none will be, but the refusal is still an
+    /// outcome the log must have before it is reported: a failed append
+    /// is `Err(AuditFailed)` (REQ-AUD-003†; same as the `fill_timeout`
+    /// path, #46).
+    fn refuse(
+        self,
+        agent_ctx: &AgentContext,
+        outcome: FillOutcome,
+    ) -> Result<FillOutcome, AuditFailed> {
         let mut entry = Entry::new(Event::FillTotp)
             .agent_id(agent_ctx.agent_id())
             .result(outcome.status());
         if let Some(d) = outcome.detail() {
             entry = entry.detail_code(d);
         }
-        let _ = self.audit.append(entry);
-        outcome
+        self.audit.append(entry).map_err(|_| AuditFailed)?;
+        Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cdp::fill::test_support::{failing_audit, stalling_engine};
+
+    fn target() -> TotpTarget {
+        TotpTarget {
+            target_id: "t1".to_string(),
+            selector: None,
+            item_matchers: vec![
+                OriginMatcher::new("https://accounts.example.com/login", None).unwrap(),
+            ],
+            origin_cfg: OriginConfig::default(),
+            cross_origin_iframe_hosts: Vec::new(),
+            submit: false,
+        }
+    }
+
+    /// REQ-AUD-003†: a refusal made before any CDP call (here an
+    /// unsupported TOTP field, REQ-API-007) is still an outcome; when
+    /// its `fill_totp` entry cannot be appended the call is
+    /// `Err(AuditFailed)`, not the refusal (#46), and no fill call is
+    /// made.
+    #[tokio::test]
+    async fn req_aud_003_totp_refusal_append_failure_is_audit_failed() {
+        let (engine, ctx, received, _peer) = stalling_engine().await;
+        let (_dir, mut audit) = failing_audit();
+        let gate = ClockSkewGate::default();
+        let out = TotpFill::new(&engine, &mut audit, &gate)
+            .run(
+                target(),
+                Secret::new("otpauth://hotp/x?secret=GEZDGNBV".to_string()),
+                &ctx,
+                false,
+            )
+            .await;
+        assert_eq!(out, Err(AuditFailed));
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|m| m["method"] != "Runtime.callFunctionOn"),
+            "no fill call on a refusal"
+        );
+    }
+
+    /// REQ-API-009 + REQ-AUD-003†: `fill_totp` through the deadline
+    /// with a failing log is `Err(AuditFailed)` at the deadline, not
+    /// `Timeout`.
+    #[tokio::test]
+    async fn req_api_009_totp_timeout_append_failure_is_audit_failed() {
+        let (engine, ctx, _received, _peer) = stalling_engine().await;
+        let (_dir, mut audit) = failing_audit();
+        let gate = ClockSkewGate::default();
+        let start = std::time::Instant::now();
+        let out = TotpFill::new(&engine, &mut audit, &gate)
+            .with_deadline(Duration::from_millis(500))
+            .run(
+                target(),
+                Secret::new("JBSWY3DPEHPK3PXP".to_string()),
+                &ctx,
+                false,
+            )
+            .await;
+        assert_eq!(out, Err(AuditFailed));
+        assert!(start.elapsed() < Duration::from_millis(1100));
     }
 }

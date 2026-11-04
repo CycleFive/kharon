@@ -13,6 +13,7 @@
 //! | `GET /v1/items?q=[&origin=]` | bearer | search, `[ItemMeta]` |
 //! | `POST /v1/fill` | bearer | `FillRequest` → `FillResult` (`submit: true` is `fill_and_submit`) |
 //! | `POST /v1/fill_totp` | bearer | `FillTotpRequest` → `FillResult` |
+//! | `POST /v1/context` | bearer | empty or `{}` → `ContextResult` (the agent's `browserContextId`, #65) |
 //! | `GET /v1/openapi.json` | none | the OpenAPI document |
 //! | `POST /mcp` | bearer | MCP over Streamable HTTP ([`super::mcp`]) |
 //!
@@ -21,7 +22,10 @@
 //! instead of a query: route (404), method (405, `Allow: POST`), a
 //! browser `Origin` (403, as on `/mcp`), bearer token (401), content
 //! type and size (400), [`parse_fill`] (400), then [`Broker::fill`],
-//! whose REQ-API-009 deadline runs from when the handler was entered. Token verification is one
+//! whose REQ-API-009 deadline runs from when the handler was entered.
+//! `POST /v1/context` has the same order, with an optional body (empty or
+//! `{}`; JSON content type required only when non-empty), then
+//! [`Broker::context`] under the same deadline. Token verification is one
 //! Argon2id evaluation (~19 MiB, tens of ms); it runs on the blocking
 //! pool behind a semaphore so concurrent bad tokens cannot exhaust
 //! memory or starve the runtime.
@@ -40,7 +44,9 @@ use zeroize::Zeroizing;
 use axum::body::to_bytes;
 use tokio::time::Instant;
 
-use super::core::{AgentId, Broker, Operation, Request as ApiRequest, VaultView, parse_request};
+use super::core::{
+    AgentId, Broker, Operation, Request as ApiRequest, VaultView, parse_context_body, parse_request,
+};
 use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillOperation, parse_fill};
 use super::mcp::{MAX_BODY_BYTES, is_json};
@@ -106,6 +112,8 @@ enum Route {
 pub const FILL_PATH: &str = "/v1/fill";
 /// `POST /v1/fill_totp`.
 pub const FILL_TOTP_PATH: &str = "/v1/fill_totp";
+/// `POST /v1/context` (#65).
+pub const CONTEXT_PATH: &str = "/v1/context";
 
 async fn handle<S, C>(State(state): State<Arc<AppState<S, C>>>, req: Request) -> Response
 where
@@ -121,6 +129,7 @@ where
         FILL_TOTP_PATH => {
             return handle_fill(state, req, FillOperation::FillTotp, received).await;
         }
+        CONTEXT_PATH => return handle_context(state, req, received).await,
         super::mcp::MCP_PATH => return super::mcp::handle(state, req).await,
         _ => return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute)),
     };
@@ -194,6 +203,47 @@ where
     };
     drop(bytes);
     match state.broker.fill(&agent, fill_req, received).await {
+        Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
+        Err(e) => error(e),
+    }
+}
+
+async fn handle_context<S, C>(
+    state: Arc<AppState<S, C>>,
+    req: Request,
+    received: Instant,
+) -> Response
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    if req.method() != Method::POST {
+        return method_not_allowed("POST");
+    }
+    if req.headers().contains_key(header::ORIGIN) {
+        return error(ApiError::new(
+            ErrorCode::Forbidden,
+            Detail::BrowserOriginRefused,
+        ));
+    }
+    let token = bearer_token(&req);
+    let (parts, body) = req.into_parts();
+    let agent = match authenticate(&state, token).await {
+        Ok(a) => a,
+        Err(e) => return error(e),
+    };
+    let json = is_json(&parts.headers);
+    drop(parts);
+    let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+        return error(ApiError::bad_request(Detail::BodyTooLarge));
+    };
+    if !bytes.is_empty() && !json {
+        return error(ApiError::bad_request(Detail::UnsupportedContentType));
+    }
+    if let Err(e) = parse_context_body(&bytes) {
+        return error(e);
+    }
+    match state.broker.context(&agent, received).await {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
     }

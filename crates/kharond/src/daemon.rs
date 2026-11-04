@@ -376,8 +376,9 @@ pub async fn start(
             .with_fill_policy(FillPolicy::from(&cfg.policy))
             // REQ-API-008: each agent's configured CDP endpoint,
             // connected (and its browser context created, REQ-ARCH-005)
-            // on its first fill, after the `fill_dispatch` entry and
-            // inside the deadline. Startup does not need the browser.
+            // on its first fill or `kharon_context` call, after that
+            // call's `fill_dispatch`/`context_open` entry and inside the
+            // deadline. Startup does not need the browser.
             .with_fill_backend(Box::new(ConnectingCdpBackend::from_agents(&cfg.agents))),
     );
     // Lock/unlock transitions belong in the audit log (REQ-AUD-003).

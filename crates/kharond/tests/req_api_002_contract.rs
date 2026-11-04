@@ -395,11 +395,11 @@ fn check_expected(case: &Case, (code, body): &Outcome) {
     match case.name {
         "status unlocked" => assert_eq!(
             body,
-            &json!({"locked": false, "agent_id": "alpha", "grants": []})
+            &json!({"locked": false, "agent_id": "alpha", "grants": [], "browser_context_id": null})
         ),
         "status locked" => assert_eq!(
             body,
-            &json!({"locked": true, "agent_id": "beta", "grants": []})
+            &json!({"locked": true, "agent_id": "beta", "grants": [], "browser_context_id": null})
         ),
         "status after idle timeout" => assert_eq!(body["locked"], json!(true)),
         "status with params" | "list unknown param" => {
@@ -574,6 +574,7 @@ async fn req_api_002_openapi_document_matches_the_routes() {
             "/v1/items",
             "/v1/fill",
             "/v1/fill_totp",
+            "/v1/context",
             "/v1/openapi.json"
         ])
     );
@@ -626,8 +627,8 @@ async fn req_api_002_openapi_document_matches_the_routes() {
     assert_eq!(r.status, 405);
     assert_eq!(r.header("allow"), Some("GET"));
     assert_eq!(r.header("cache-control"), Some("no-store"));
-    // The fill routes are POST-only.
-    for p in ["/v1/fill", "/v1/fill_totp"] {
+    // The fill routes and /v1/context are POST-only.
+    for p in ["/v1/fill", "/v1/fill_totp", "/v1/context"] {
         let r = get(addr, p, Some(&h.alpha)).await;
         assert_eq!(r.status, 405, "{p}");
         assert_eq!(r.header("allow"), Some("POST"), "{p}");

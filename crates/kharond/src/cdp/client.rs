@@ -102,11 +102,14 @@ fn lock_pending(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<u64, Rep
     pending.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Fail every in-flight request with [`CdpError::ConnectionClosed`].
-fn fail_pending(pending: &Pending) {
+/// Fail every in-flight request with `error()`: [`CdpError::Poisoned`]
+/// when the connection was poisoned, so a waiter already awaiting its
+/// reply and the next request fail with the same error, otherwise
+/// [`CdpError::ConnectionClosed`].
+fn fail_pending(pending: &Pending, error: impl Fn() -> CdpError) {
     let drained: Vec<Reply> = lock_pending(pending).drain().map(|(_, r)| r).collect();
     for reply in drained {
-        let _ = reply.send(Err(CdpError::ConnectionClosed));
+        let _ = reply.send(Err(error()));
     }
 }
 
@@ -207,6 +210,13 @@ pub struct CdpClient {
     /// for as long as it runs — dropping every clone of the client does
     /// not end the connection; [`Self::close`] does.
     reader: Arc<tokio::task::AbortHandle>,
+    /// Test hook: bumped each time a frame write returns `Pending`,
+    /// i.e. a send is armed (a drop or `close` now poisons) and parked
+    /// mid-send. Lets tests synchronize on "blocked mid-send" instead
+    /// of sleeping; subscribe before starting the request so an
+    /// earlier request's park cannot satisfy the wait.
+    #[cfg(test)]
+    send_blocked: Arc<watch::Sender<u64>>,
 }
 
 /// How long [`CdpClient::close`] waits to hand the browser a WebSocket
@@ -245,7 +255,7 @@ impl CdpClient {
         self.closed.store(true, Ordering::Release);
         self.reader.abort();
         drop(sink.take());
-        fail_pending(&self.pending);
+        fail_pending(&self.pending, || CdpError::Poisoned);
     }
 
     #[cfg(test)]
@@ -345,7 +355,7 @@ impl CdpClient {
             }
             // Connection ended: fail every in-flight request.
             closed_read.store(true, Ordering::Release);
-            fail_pending(&pending_read);
+            fail_pending(&pending_read, || CdpError::ConnectionClosed);
         });
 
         Self {
@@ -356,6 +366,8 @@ impl CdpClient {
             poisoned: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(watch::channel(false).0),
             reader: Arc::new(reader.abort_handle()),
+            #[cfg(test)]
+            send_blocked: Arc::new(watch::channel(0).0),
         }
     }
 
@@ -386,7 +398,9 @@ impl CdpClient {
         self.reader.abort();
         // Senders give up on `shutdown`, so the lock is free promptly.
         drop(self.write.lock().await.take());
-        fail_pending(&self.pending);
+        // A send cancelled by this close poisoned the connection first;
+        // keep its error for anything still in flight.
+        fail_pending(&self.pending, || self.closed_error());
     }
 
     /// Send a browser-level request and await its reply.
@@ -461,8 +475,17 @@ impl CdpClient {
             // tungstenite's internal send buffer is the one remaining
             // plaintext copy — a documented limitation (it is freed by
             // the library, not zeroized).
+            let mut send = std::pin::pin!(sink.send(Message::Text((*text).clone())));
+            let send = std::future::poll_fn(|cx| {
+                let poll = send.as_mut().poll(cx);
+                #[cfg(test)]
+                if poll.is_pending() {
+                    self.send_blocked.send_modify(|parks| *parks += 1);
+                }
+                poll
+            });
             let sent = tokio::select! {
-                sent = sink.send(Message::Text((*text).clone())) => sent,
+                sent = send => sent,
                 // `close` was called while we were blocked mid-send:
                 // abandon the frame rather than finish it after the
                 // close (the guard poisons).
@@ -771,6 +794,19 @@ mod tests {
         json!({ "blob": "x".repeat(STALL_BYTES) })
     }
 
+    /// Run a stall-sized request until its frame write is armed and
+    /// parked mid-send (the `send_blocked` hook), then drop it there — the fill deadline firing mid-send. No timing: building
+    /// and serializing 32 MiB can take arbitrarily long on a loaded box.
+    async fn drop_request_blocked_mid_send(client: &CdpClient) {
+        let mut blocked = client.send_blocked.subscribe();
+        tokio::select! {
+            res = client.request("Runtime.callFunctionOn", huge_params()) => {
+                panic!("stall send must block mid-write, got {res:?}");
+            }
+            changed = blocked.changed() => changed.unwrap(),
+        }
+    }
+
     /// Issue #76: a request dropped mid-send (the fill deadline firing
     /// while the frame is being written) poisons the connection. Later
     /// requests fail fast, `close` sends nothing, and the buffered frame
@@ -781,12 +817,7 @@ mod tests {
         let (addr, go, peer) = stalled_reader_peer().await;
         let client = CdpClient::connect(&endpoint(addr)).await.unwrap();
 
-        let stalled = tokio::time::timeout(
-            Duration::from_millis(300),
-            client.request("Runtime.callFunctionOn", huge_params()),
-        )
-        .await;
-        assert!(stalled.is_err(), "send must still be blocked mid-write");
+        drop_request_blocked_mid_send(&client).await;
 
         assert!(client.is_poisoned());
         assert!(client.is_closed());
@@ -822,15 +853,19 @@ mod tests {
         let (addr, go, peer) = stalled_reader_peer().await;
         let client = CdpClient::connect(&endpoint(addr)).await.unwrap();
 
+        let mut blocked = client.send_blocked.subscribe();
         let sender = client.clone();
         let in_flight = tokio::spawn(async move {
             sender
                 .request("Runtime.callFunctionOn", huge_params())
                 .await
         });
-        // Let the send get stuck mid-write (serializing 32 MiB in a
-        // debug build takes a while; the send then blocks for good).
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Wait until the send is armed and parked mid-send. A
+        // fixed sleep here was racy: under load, building and
+        // serializing 32 MiB outlasted it, `close` landed before the
+        // request took the write lock, and the request failed fast
+        // without ever arming the send — closed, never poisoned.
+        blocked.changed().await.unwrap();
         assert!(!in_flight.is_finished());
 
         tokio::time::timeout(Duration::from_secs(5), client.close())
@@ -853,6 +888,47 @@ mod tests {
             .expect("socket released after close")
             .unwrap();
         assert!(seen.is_empty(), "frames reached the peer: {seen:?}");
+    }
+
+    /// A request already awaiting its reply when the connection is
+    /// poisoned fails with `Poisoned`, the same error as the requests
+    /// after it — not `ConnectionClosed` (#83 review nit).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poison_fails_reply_phase_waiters_with_poisoned() {
+        let (addr, _go, _peer) = stalled_reader_peer().await;
+        let client = CdpClient::connect(&endpoint(addr)).await.unwrap();
+
+        // A small frame fits the socket buffer, so the send completes
+        // and the request then awaits its (never sent) reply. Drive it
+        // until it has released the write lock: its send may park a
+        // few polls on the sink/stream split lock the read task shares.
+        let mut waiter = std::pin::pin!(client.request("Browser.getVersion", json!({})));
+        loop {
+            tokio::select! {
+                biased;
+                res = &mut waiter => panic!("no reply is ever sent, got {res:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+            // Polled at least once, so it holds the write lock until
+            // its send has returned.
+            if client.write.try_lock().is_ok() {
+                break;
+            }
+        }
+        assert!(!client.is_closed(), "waiter's send succeeded");
+        assert_eq!(client.pending_len(), 1);
+
+        drop_request_blocked_mid_send(&client).await;
+        assert!(client.is_poisoned());
+
+        let err = waiter.await.unwrap_err();
+        assert!(matches!(err, CdpError::Poisoned), "{err:?}");
+        let err = client
+            .request("Browser.getVersion", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CdpError::Poisoned), "{err:?}");
+        assert_eq!(client.pending_len(), 0);
     }
 
     /// Issue #76: requests that time out or are dropped while awaiting

@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use kharon_bwcrypto::Secret;
+use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::time::Instant;
 use url::Url;
@@ -138,11 +139,11 @@ pub enum Request {
 /// SPEC §4 `Grant` as status reports it. Grants arrive with issue #20's
 /// grant model; until then no grant can exist, so the type is empty
 /// and `grants` is always `[]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub enum GrantView {}
 
 /// `GET /v1/status` body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct StatusBody {
     /// Whether the broker is locked.
     pub locked: bool,
@@ -160,7 +161,7 @@ pub struct StatusBody {
 /// `POST /v1/context` / `kharon_context` body (REQ-ARCH-005, #65).
 /// `browser_context_id` is present only on `ok`; `detail` is a fixed
 /// code on `error` (`cdp_error`, `fill_unavailable`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ContextResult {
     /// `ok`, `timeout` or `error`.
     pub status: &'static str,

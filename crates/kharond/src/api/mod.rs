@@ -9,6 +9,8 @@
 //! - [`http`]: the `/v1/*` HTTP transport and its OpenAPI document.
 //! - [`mcp`]: the MCP transport (`POST /mcp`, REQ-API-001), a second
 //!   adapter over [`core`] on the same listener.
+//! - [`surface`]: every tool/route and its response schema
+//!   (REQ-GOAL-001).
 //!
 //! Grants (`kharon_request_grant`, `POST /v1/grants`) arrive with #20.
 
@@ -18,12 +20,13 @@ pub mod fill;
 pub mod http;
 pub mod mcp;
 pub mod meta;
+pub mod surface;
 pub mod token;
 
 pub use self::core::{
     AgentId, AuditSink, Broker, ContextResult, Outcome, Request, StatusBody, VaultView,
 };
-pub use error::{ApiError, Detail, ErrorCode};
+pub use error::{ApiError, Detail, ErrorBody, ErrorCode};
 pub use fill::{
     CdpFillBackend, ConnectingCdpBackend, FillBackend, FillOperation, FillPolicy, FillRequest,
     FillResult, FillStatus, parse_fill,

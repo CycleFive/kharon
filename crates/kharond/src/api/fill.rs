@@ -314,7 +314,7 @@ fn validate_expected_origin(origin: &str) -> Result<String, ApiError> {
 /// vault or the page can reach a response (REQ-GOAL-001, REQ-API-006).
 /// `grant_request_id` arrives with #20; `audit_seq` is not reported
 /// (see the PR's spec questions).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FillResult {
     /// `filled`, `origin_mismatch`, `target_not_owned`, `navigated`,
     /// `field_not_found`, `timeout`, `not_found` or `error`.
@@ -746,9 +746,12 @@ async fn teardown(c: Cached, agent_id: &str, budget: Duration) {
     if !c.engine.is_closed() {
         match tokio::time::timeout(budget, c.browser.close_agent_context(&c.ctx)).await {
             Ok(Ok(())) => {}
+            // The error's code, not its text: the text is the browser's
+            // (REQ-GOAL-001: nothing page-controlled reaches broker logs).
             Ok(Err(e)) => eprintln!(
                 "kharond: warning: lock: disposing agent {agent_id}'s browser context failed \
-                 ({e}); closing the connection"
+                 ({}); closing the connection",
+                e.code()
             ),
             Err(_) => eprintln!(
                 "kharond: warning: lock: disposing agent {agent_id}'s browser context timed out \

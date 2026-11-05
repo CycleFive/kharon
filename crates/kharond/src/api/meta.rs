@@ -15,6 +15,7 @@
 //! live frame origin regardless (REQ-ORG-002); the filter is a
 //! convenience, not a grant.
 
+use schemars::JsonSchema;
 use serde::Serialize;
 use url::Url;
 
@@ -23,7 +24,7 @@ use crate::sync::Item;
 
 /// SPEC §4 `ItemMeta`. Field set is pinned by the OpenAPI document
 /// (`docs/api/openapi.json`) and the REQ-API-004 golden test.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ItemMeta {
     /// Item id (lowercase UUID).
     pub id: String,
@@ -46,7 +47,7 @@ pub struct ItemMeta {
 }
 
 /// One `ItemMeta.uris[]` entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UriMeta {
     /// Host (no scheme, path, or credentials).
     pub host: String,
@@ -56,7 +57,7 @@ pub struct UriMeta {
 }
 
 /// `ItemMeta.uris[].match`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchKind {
     /// eTLD+1 (Bitwarden `Domain`, also the default).

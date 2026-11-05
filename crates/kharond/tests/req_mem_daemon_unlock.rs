@@ -610,8 +610,16 @@ fn req_exp_001_export_mode_works_with_no_network_egress() {
         "ip link set lo up || {{ echo LO_UP_FAILED; exit 3; }}; exec {} req_exp_001_export_mode_works_with_no_network_egress --exact --nocapture",
         exe.display()
     );
+    // Already root (the privileged CI step, #85): a plain netns is
+    // enough, and a child userns would lose DAC override on files
+    // owned by unmapped uids (e.g. the runner's 0750 $HOME).
+    let flags = if rustix::process::geteuid().is_root() {
+        "-n"
+    } else {
+        "-rn"
+    };
     let out = match Command::new("unshare")
-        .args(["-rn", "sh", "-c", &script])
+        .args([flags, "sh", "-c", &script])
         .env(NETNS_CHILD_ENV, "1")
         .output()
     {

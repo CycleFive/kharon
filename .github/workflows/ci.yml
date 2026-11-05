@@ -19,6 +19,7 @@ jobs:
       # (prebuilt binary; no root cargo) with KHARON_REQUIRE_NETNS=1, which
       # turns any skip into a failure.
       - name: req_exp_001 no-egress netns (privileged)
+        shell: bash # -eo pipefail: the test's exit status survives `tee`
         run: |
           bin=$(cargo test -p kharond --test req_mem_daemon_unlock --no-run --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact" and .target.name == "req_mem_daemon_unlock" and .executable != null) | .executable')

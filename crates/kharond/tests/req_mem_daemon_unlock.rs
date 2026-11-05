@@ -645,8 +645,13 @@ fn req_exp_001_export_mode_works_with_no_network_egress() {
         // Skip loudly with the reason; the AC still runs wherever
         // userns is allowed (dev boxes), which is where it was
         // verified for this PR.
+        let stage = if stdout.contains("LO_UP_FAILED") || stderr.contains("LO_UP_FAILED") {
+            "`ip link set lo up` inside the netns"
+        } else {
+            "namespace creation"
+        };
         netns_skip(&format!(
-            "unprivileged user/net namespaces unavailable here (status={}, stderr={})",
+            "`unshare {flags}` failed at {stage} (status={}, stderr={})",
             out.status,
             stderr.trim()
         ));

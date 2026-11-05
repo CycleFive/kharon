@@ -22,6 +22,10 @@ on:
       - "crates/kharond/src/cdp/**"
       - "crates/kharond/src/api/fill.rs"
       - "crates/kharond/src/daemon.rs"
+      # REQ-EXP-001 bw-export half (issue #84).
+      - "crates/kharond/tests/req_exp_loader.rs"
+      - "crates/kharond/tests/fixtures/export/**"
+      - "crates/kharond/src/export.rs"
 permissions: { contents: read }
 jobs:
   vaultwarden-fixture:
@@ -36,7 +40,7 @@ jobs:
         with: { components: "rustfmt, clippy" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install "cryptography==43.0.3"
+      - run: pip install "cryptography==43.0.3" "argon2-cffi==23.1.0"
       - name: Generate the throwaway loopback TLS cert
         # bw refuses plain-HTTP servers (InsecureUrlNotAllowedError),
         # so the fixture serves HTTPS on 127.0.0.1 with a per-run cert
@@ -152,6 +156,56 @@ jobs:
         run: >-
           cargo test -p kharond --test req_cry_009_notifications_hub
           req_cry_008_live_second_org_while_unlocked_locks -- --ignored --exact
+      - name: Rotate the fixture account KDF to Argon2id (issue #84; keep after all other live steps)
+        # Password-protected bw exports derive with the account's
+        # configured KDF, and the fixture account is seeded PBKDF2 —
+        # rotate_kdf.py performs the web vault's KDF change so the
+        # export below lands as Argon2id. Irreversible for the
+        # fixture: every PBKDF2-deriving helper (seed/mutate, the
+        # live tests above) stops working afterwards, so this and
+        # the export step run after the second-org step, which is
+        # no longer literally last but remains the last step that
+        # depends on the fixture as seeded.
+        run: >-
+          python3 rotate_kdf.py --base-url https://127.0.0.1:8222
+          --ca-cert "$PWD/tls/ca.pem"
+      - name: Real bw password-protected export loads + unlocks (REQ-EXP-001, issue #84)
+        working-directory: ${{ github.workspace }}
+        env:
+          KHARON_BW_EXPORT_JSON: ${{ runner.temp }}/bw-export.json
+        run: |
+          export NODE_EXTRA_CA_CERTS="${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem"
+          cd crates/kharon-bwcrypto/tests/fixtures/vaultwarden
+          # bw was installed by the oracle step (same pin, 2026.1.0).
+          # Fresh login after the KDF rotation: this also proves bw
+          # can log in with the Argon2id parameters. Password via
+          # env, session captured separately so a login failure
+          # fails here, as in the oracle step.
+          bw logout || true
+          bw config server https://127.0.0.1:8222
+          read -r BW_EMAIL BW_PASSWORD <<< "$(python3 -c '
+          import json
+          a = json.load(open("fixture.json"))["account"]
+          print(a["email"], a["password"])')"
+          export BW_PASSWORD
+          BW_SESSION="$(bw login "$BW_EMAIL" --passwordenv BW_PASSWORD --raw)"
+          export BW_SESSION
+          unset BW_PASSWORD
+          bw sync
+          # The seeded items are org-owned; a personal export would
+          # be empty. The org id comes from the seed-time sync
+          # capture (its only organization).
+          ORG_ID="$(python3 -c '
+          import json
+          s = json.load(open("${{ runner.temp }}/sync.live.json"))
+          print(s["profile"]["organizations"][0]["id"])')"
+          # Export password is fixture-only and recorded in
+          # crates/kharond/tests/req_exp_loader.rs (issue #84).
+          bw export --organizationid "$ORG_ID" --format encrypted_json \
+            --password "kharon bw export fixture password 4" \
+            --output "$KHARON_BW_EXPORT_JSON"
+          cd "${{ github.workspace }}"
+          cargo test -p kharond --test req_exp_loader req_exp_001_bw_produced_argon2id_export_loads_and_unlocks -- --ignored --exact
       - name: Tear down fixture (including its data volume)
         if: always()
         run: docker compose down -v

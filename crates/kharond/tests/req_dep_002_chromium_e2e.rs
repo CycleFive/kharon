@@ -21,7 +21,9 @@
 //!    through `POST /v1/fill` (the second with `submit: true`).
 //! 4. REQ-API-008's negative half (#18): a `fill_and_submit`
 //!    (`submit: true`) of username + password against a variant of
-//!    the page whose form has no password field.
+//!    the page whose form has no password field. The username is
+//!    written before the password is found missing, so this is also
+//!    SPEC §2's clear-on-failure case (#101).
 //!
 //! Asserted: the page's fields hold the seeded username and password
 //! (read back from the page's main world over a second CDP client);
@@ -29,7 +31,9 @@
 //! (REQ-API-008); the fill with a missing field answers
 //! `field_not_found` with nothing reported filled, and its form
 //! records 0 submits (REQ-API-008: submit only when all fields
-//! filled); no API reply carries a secret (REQ-GOAL-001); and the
+//! filled) and its username field is empty again, with the clear
+//! delivered as a second `input` event (SPEC §2 clear-on-failure:
+//! a partial fill leaves no value behind); no API reply carries a secret (REQ-GOAL-001); and the
 //! on-disk audit log has one `fill_dispatch` → `fill` pair per fill
 //! with the live origin and no secret in it (REQ-AUD-003†).
 //!
@@ -632,12 +636,13 @@ listen = "127.0.0.1:0"
         assert_eq!(res["fields_filled"], json!([]), "{res}");
 
         // Give a stray submit (none should exist) time to land, then
-        // read the counter from the page's main world.
+        // read the counter and the fields from the page's main world.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let got = cdp
             .eval(
                 &session,
-                "JSON.stringify([!!document.querySelector('input[type=password]'), window.__submits])",
+                "JSON.stringify([!!document.querySelector('input[type=password]'), window.__submits, \
+                 document.getElementById('username').value, window.__inputs])",
             )
             .await;
         let got: Value = serde_json::from_str(got.as_str().unwrap()).unwrap();
@@ -650,6 +655,15 @@ listen = "127.0.0.1:0"
             got[1],
             json!(0),
             "submit dispatched despite a missing field"
+        );
+        // SPEC §2 clear-on-failure (#101): the username was written
+        // (one `input`) and then cleared before the refusal returned
+        // (a second `input`), so no value is left behind.
+        assert_eq!(got[2], json!(""), "partial fill left a value in #username");
+        assert_eq!(
+            got[3],
+            json!(["username", "username"]),
+            "expected the write and the clear on #username"
         );
 
         // Audited like any fill: dispatch, then a `fill` outcome with

@@ -34,6 +34,12 @@
 ///    last element's form, else Enter key events). Never reached on
 ///    any refusal: failures throw before this point.
 ///
+/// Clear-on-failure (SPEC §2, #101): when a field fails after earlier
+/// fields were written, every element this call wrote is blanked
+/// (native setter, `input` + `change`, as for the write) before the
+/// error is rethrown, so a partial fill leaves no value behind and,
+/// since the throw precedes step 4, never submits.
+///
 /// Returns `{ results: [{ kind, filled: true }] }` by value.
 pub const FILL_IN_PAGE: &str = r#"
 function fillInPage(specs, fields, expectedTopOrigin, submitRequested) {
@@ -124,14 +130,39 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested) {
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  // SPEC §2 clear-on-failure (#101): if any field fails after earlier
+  // ones were written, blank every element this call wrote before the
+  // error leaves the function, so a partial fill leaves no secret in
+  // the page. Same task as the writes: no other page task can run in
+  // between (input/change listeners still see the value, per N1).
+  // Each element is recorded before its write, so a set that throws
+  // midway is cleared too; one failed clear does not stop the rest,
+  // and the original refusal is what propagates.
+  function clearWritten(elements) {
+    for (const el of elements) {
+      try {
+        setNativeValue(el, "");
+      } catch (_) {
+        /* best effort: keep clearing the others */
+      }
+    }
+  }
+
   const results = [];
+  const written = [];
   let lastFilledElement = null;
-  for (const f of fields) {
-    const el = resolveField(f.kind, f.selector);
-    if (!el) fail("field_not_found:" + f.kind);
-    setNativeValue(el, f.value);
-    results.push({ kind: f.kind, filled: true });
-    lastFilledElement = el;
+  try {
+    for (const f of fields) {
+      const el = resolveField(f.kind, f.selector);
+      if (!el) fail("field_not_found:" + f.kind);
+      written.push(el);
+      setNativeValue(el, f.value);
+      results.push({ kind: f.kind, filled: true });
+      lastFilledElement = el;
+    }
+  } catch (e) {
+    clearWritten(written);
+    throw e;
   }
 
   // REQ-API-008: reachable only after every field filled — any
@@ -307,7 +338,9 @@ console.log("ok");
     /// verbatim against a stubbed DOM, covering three cases:
     ///   A. all fields present + submit=true → one requestSubmit,
     ///      after both values are written (event order checked);
-    ///   B. a field missing + submit=true → no submit at all;
+    ///   B. a field missing + submit=true → no submit at all, and the
+    ///      field written before the miss is cleared again (SPEC §2
+    ///      clear-on-failure, #101);
     ///   C. no form on the last element → Enter fallback delivers
     ///      keydown/keypress/keyup on that element.
     #[test]
@@ -398,6 +431,11 @@ const originEnv = () => {
   } catch (e) { code = (e && e.kharonCode) || e.message; }
   if (code !== "field_not_found:password") throw new Error(`expected field_not_found, got ${code}`);
   if (submits !== 0) throw new Error("submit dispatched despite missing field");
+  // SPEC §2 clear-on-failure (#101): the username written before the
+  // missing password must be blanked, with events so page state sees it.
+  if (userEl._v !== "") throw new Error(`partial fill left a value: ${userEl._v}`);
+  const seq = userEl.events.map((e) => e.type).join(",");
+  if (seq !== "input,change,input,change") throw new Error(`unexpected clear events: ${seq}`);
   console.log("case B ok");
 }
 

@@ -48,7 +48,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
-use crate::api::core::{Broker, VaultView};
+use crate::api::core::{Broker, FillSync, SyncFetch, VaultView};
 use crate::api::fill::{ConnectingCdpBackend, FillPolicy};
 use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
@@ -62,6 +62,7 @@ use crate::lock::{
     UnlockError,
 };
 use crate::owner::{OwnerFailure, OwnerOps};
+use crate::sync::wire::SyncResponse;
 use crate::sync::{
     HubStatus, LiveSync, SecretField, SyncClient, SyncError, SyncOutcome, Vault, run_push,
 };
@@ -109,6 +110,44 @@ impl VaultView for DaemonSession {
             Self::Sync(s) => VaultView::decrypt_secret(&**s, item_id, field),
             Self::Export(s) => VaultView::decrypt_secret(s, item_id, field),
         }
+    }
+
+    fn is_stale(&self, now: tokio::time::Instant) -> bool {
+        match self {
+            Self::Sync(s) => s.is_stale(now),
+            Self::Export(_) => false,
+        }
+    }
+
+    fn apply_sync(&mut self, sync: &SyncResponse) -> Result<SyncOutcome, SyncError> {
+        match self {
+            Self::Sync(s) => s.apply(sync),
+            // Never stale, so never asked.
+            Self::Export(_) => Ok(SyncOutcome::Synced),
+        }
+    }
+}
+
+/// SPEC §8 fill-time re-sync source (issue #100), sync mode only: a
+/// fresh client per fetch, built as an unlock builds one, and
+/// dropped with its access token once the payload is in. Only used
+/// when the vault is already past the 5-minute bound, i.e. the
+/// background poll has been failing, so the extra login is rare.
+struct DaemonFillSync(Box<BitwardenConfig>);
+
+impl FillSync for DaemonFillSync {
+    fn fetch(&self) -> SyncFetch<'_> {
+        Box::pin(async move {
+            let result = match self.0.sync_client() {
+                Ok(mut client) => client.sync().await,
+                Err(_) => Err(SyncError::ApiKey("fill-time sync client")),
+            };
+            if let Err(e) = &result {
+                // Fixed-text errors only (no secrets in `SyncError`).
+                eprintln!("kharond: warning: fill-time re-sync failed ({e}); fill refused");
+            }
+            result
+        })
     }
 }
 
@@ -481,18 +520,21 @@ pub async fn start(
         SystemClock,
         hardening,
     );
-    let broker = Arc::new(
-        Broker::new(tokens, lock, Box::new(audit), cfg.policy.origin_config())
-            .with_clock_skew_policy(SkewPolicy::from(&cfg.policy))
-            // REQ-API-009 `fill_deadline` and the fill origin policy.
-            .with_fill_policy(FillPolicy::from(&cfg.policy))
-            // REQ-API-008: each agent's configured CDP endpoint,
-            // connected (and its browser context created, REQ-ARCH-005)
-            // on its first fill or `kharon_context` call, after that
-            // call's `fill_dispatch`/`context_open` entry and inside the
-            // deadline. Startup does not need the browser.
-            .with_fill_backend(Box::new(ConnectingCdpBackend::from_agents(&cfg.agents))),
-    );
+    let broker = Broker::new(tokens, lock, Box::new(audit), cfg.policy.origin_config())
+        .with_clock_skew_policy(SkewPolicy::from(&cfg.policy))
+        // REQ-API-009 `fill_deadline` and the fill origin policy.
+        .with_fill_policy(FillPolicy::from(&cfg.policy))
+        // REQ-API-008: each agent's configured CDP endpoint,
+        // connected (and its browser context created, REQ-ARCH-005)
+        // on its first fill or `kharon_context` call, after that
+        // call's `fill_dispatch`/`context_open` entry and inside the
+        // deadline. Startup does not need the browser.
+        .with_fill_backend(Box::new(ConnectingCdpBackend::from_agents(&cfg.agents)));
+    // SPEC §8: a fill against a vault older than 5 min re-syncs first.
+    let broker = Arc::new(match &cfg.source {
+        Source::Sync(bw) => broker.with_fill_sync(Arc::new(DaemonFillSync(Box::new(bw.clone())))),
+        Source::Export(_) => broker,
+    });
     // Lock/unlock transitions belong in the audit log (REQ-AUD-003).
     broker.wire_lock_audit();
     // REQ-API-007: the server whose `Date` the clock is checked

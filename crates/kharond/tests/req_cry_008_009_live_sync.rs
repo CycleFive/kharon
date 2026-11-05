@@ -5,10 +5,18 @@
 //! `/api/sync` payload is mutable so tests can widen the scope, rotate
 //! the org key, or add/edit/delete items while unlocked.
 
+mod api_support;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use api_support::{CHEAP_FLOOR, FakeAnswer, FakeFill, RecordingAudit, cheap_argon};
+use kharond::api::fill::{FillOperation, parse_fill};
+use kharond::api::token::{TokenStore, generate_with};
+use kharond::api::{ApiError, Broker, FillSync, Outcome, SyncFetch};
 use kharond::audit::Event;
+use kharond::lock::{LockController, LockPolicy, ManualClock, StaticHardening};
+use kharond::origin::OriginConfig;
 use kharond::sync::{
     ApiKey, LiveSync, LockReason, MAX_SYNC_INTERVAL, Scope, SyncClient, SyncError, SyncOutcome,
     SyncPolicy, TlsTrust, check_dedicated_scope, preflight, run, scope_violation,
@@ -190,6 +198,12 @@ async fn read_req(sock: &mut tokio::net::TcpStream) -> Option<Req> {
 }
 
 async fn mock(sync: Value) -> (Shared, SyncClient) {
+    let (state, client, _) = mock_at(sync).await;
+    (state, client)
+}
+
+/// As [`mock`], also returning the server URL (for a second client).
+async fn mock_at(sync: Value) -> (Shared, SyncClient, Url) {
     let state = Arc::new(Mutex::new(Mock {
         sync,
         syncs: 0,
@@ -197,13 +211,16 @@ async fn mock(sync: Value) -> (Shared, SyncClient) {
         after: None,
     }));
     let server = serve(state.clone()).await;
+    (state, client_for(&server), server)
+}
+
+fn client_for(server: &Url) -> SyncClient {
     let email = load("fixture.json")["account"]["email"]
         .as_str()
         .unwrap()
         .to_owned();
     let key = ApiKey::new(CLIENT_ID, Zeroizing::new(CLIENT_SECRET.to_owned())).unwrap();
-    let client = SyncClient::new(&server, &email, key, &TlsTrust::default()).unwrap();
-    (state, client)
+    SyncClient::new(server, &email, key, &TlsTrust::default()).unwrap()
 }
 
 fn password() -> Zeroizing<String> {
@@ -457,6 +474,184 @@ async fn req_cry_009_interval_capped_and_fill_staleness_rule() {
         live.sync_if_stale().await.unwrap(),
         SyncOutcome::Synced
     ));
+}
+
+// ---- REQ-CRY-009, SPEC §8 fill-time re-sync (issue #100) ----
+
+/// The fill path's `/api/sync` source: a second client on the mock
+/// (the daemon builds a fresh one per fetch from its config).
+struct MockFillSync(tokio::sync::Mutex<SyncClient>);
+
+impl FillSync for MockFillSync {
+    fn fetch(&self) -> SyncFetch<'_> {
+        Box::pin(async move { self.0.lock().await.sync().await })
+    }
+}
+
+struct FillRig {
+    state: Shared,
+    broker: Broker<LiveSync, Arc<ManualClock>>,
+    audit: RecordingAudit,
+    fake: FakeFill,
+    alpha: String,
+}
+
+/// A broker holding an unlocked [`LiveSync`] of the mock, with the
+/// fill-time re-sync wired to the same server and a fake browser.
+async fn fill_rig(sync: Value) -> FillRig {
+    let (_, org, coll) = fixture();
+    let (state, client, server) = mock_at(sync).await;
+    let live = LiveSync::unlock(
+        client,
+        &password(),
+        Scope::new(&org, [&coll]).unwrap(),
+        SyncPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let (alpha, hash) = generate_with(&cheap_argon(), "alpha");
+    let tokens = TokenStore::with_floor([("alpha", hash.as_str())], &CHEAP_FLOOR).unwrap();
+    let mut lock = LockController::new(
+        LockPolicy::default(),
+        Arc::new(ManualClock::new()),
+        Box::new(StaticHardening::all_ok()),
+    );
+    lock.unlock(|| Ok::<_, ()>(live)).unwrap();
+    let audit = RecordingAudit::default();
+    let fake = FakeFill::new(FakeAnswer::Filled);
+    let broker = Broker::new(
+        tokens,
+        lock,
+        Box::new(audit.clone()),
+        OriginConfig::default(),
+    )
+    .with_fill_backend(Box::new(fake.clone()))
+    .with_fill_sync(Arc::new(MockFillSync(tokio::sync::Mutex::new(client_for(
+        &server,
+    )))));
+    broker.wire_lock_audit();
+    FillRig {
+        state,
+        broker,
+        audit,
+        fake,
+        alpha: alpha.expose_secret().clone(),
+    }
+}
+
+impl FillRig {
+    async fn fill(&self, item_id: &str) -> Result<Value, ApiError> {
+        let agent = self.broker.authenticate(&self.alpha).unwrap();
+        let body = json!({
+            "item_id": item_id,
+            "target": {"cdp_target_id": "T-1", "expected_origin": "https://login.example.com"},
+            "fields": [{"kind": "password"}],
+        });
+        let req = parse_fill(FillOperation::Fill, body.to_string().as_bytes()).unwrap();
+        self.broker
+            .fill(&agent, req, tokio::time::Instant::now())
+            .await
+            .map(|o| match o {
+                Outcome::Fill(f) => serde_json::to_value(f).unwrap(),
+                other => panic!("not a fill result: {:?}", other.body()),
+            })
+    }
+
+    fn syncs(&self) -> usize {
+        self.state.lock().unwrap().syncs
+    }
+
+    fn events(&self) -> Vec<Value> {
+        self.audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let v = serde_json::to_value(e).unwrap();
+                json!([v["event"], v["result"], v["detail_code"]])
+            })
+            .collect()
+    }
+}
+
+/// Age the vault past the 5-minute bound on tokio's clock (the
+/// `LiveSync` last-sync instant), leaving real time running for I/O.
+async fn age_past_max_interval() {
+    tokio::time::pause();
+    tokio::time::advance(MAX_SYNC_INTERVAL + Duration::from_secs(1)).await;
+    tokio::time::resume();
+}
+
+fn with_new_item(mut s: Value) -> Value {
+    let mut c = s["ciphers"][0].clone();
+    c["id"] = json!(NEW_ITEM);
+    s["ciphers"].as_array_mut().unwrap().push(c);
+    s
+}
+
+#[tokio::test]
+async fn req_cry_009_fill_resyncs_stale_vault_before_resolving() {
+    let (s, _, _) = fixture();
+    let r = fill_rig(s.clone()).await;
+    let base = r.syncs();
+    set(&r.state, with_new_item(s));
+
+    // Fresh vault: no server hit, so the item added server-side is
+    // not visible yet.
+    let out = r.fill(NEW_ITEM).await.unwrap();
+    assert_eq!(out["status"], "not_found", "{out}");
+    assert_eq!(r.syncs(), base);
+
+    // Stale vault: the fill re-syncs first and finds the new item.
+    age_past_max_interval().await;
+    let out = r.fill(NEW_ITEM).await.unwrap();
+    assert_eq!(out["status"], "filled", "{out}");
+    assert_eq!(r.syncs(), base + 1);
+    assert_eq!(r.fake.seen().len(), 1);
+
+    // The re-sync reset the staleness clock: the next fill does not.
+    r.fill(NEW_ITEM).await.unwrap();
+    assert_eq!(r.syncs(), base + 1);
+}
+
+#[tokio::test]
+async fn req_cry_009_fill_refuses_stale_vault_when_resync_fails() {
+    let (s, _, _) = fixture();
+    let r = fill_rig(s.clone()).await;
+    let item = s["ciphers"][0]["id"].as_str().unwrap().to_owned();
+    r.state.lock().unwrap().fail_next = 1;
+    age_past_max_interval().await;
+
+    // Fails closed: the stale vault is not filled from.
+    let out = r.fill(&item).await.unwrap();
+    assert_eq!(
+        out,
+        json!({"status": "error", "fields_filled": [], "detail": "sync_failed"})
+    );
+    assert!(r.fake.seen().is_empty(), "no plan may reach the browser");
+    assert_eq!(r.events(), vec![json!(["fill", "error", "sync_failed"])]);
+    assert!(!r.broker.lock_controller().lock().unwrap().is_locked());
+
+    // The server recovers: the next fill re-syncs and proceeds.
+    let out = r.fill(&item).await.unwrap();
+    assert_eq!(out["status"], "filled", "{out}");
+}
+
+#[tokio::test]
+async fn req_cry_009_fill_resync_widening_scope_locks() {
+    let (s, _, _) = fixture();
+    let r = fill_rig(s.clone()).await;
+    let item = s["ciphers"][0]["id"].as_str().unwrap().to_owned();
+    set(&r.state, with_second_org(s));
+    age_past_max_interval().await;
+
+    assert!(matches!(r.fill(&item).await, Err(ApiError::LOCKED)));
+    assert!(r.fake.seen().is_empty());
+    assert!(r.broker.lock_controller().lock().unwrap().is_locked());
+    let events = r.events();
+    assert_eq!(events.last().unwrap(), &json!(["fill", "locked", null]));
+    assert!(events.iter().any(|e| e[0] == "scope_widened"), "{events:?}");
 }
 
 #[tokio::test]

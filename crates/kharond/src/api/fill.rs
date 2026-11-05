@@ -340,6 +340,9 @@ pub enum FillStatus {
     DecryptFailed,
     /// No browser is wired for this agent.
     Unavailable,
+    /// SPEC §8: the vault was stale and the fill-time re-sync failed,
+    /// so the fill was refused rather than served from it (issue #100).
+    SyncFailed,
 }
 
 impl FillStatus {
@@ -348,7 +351,9 @@ impl FillStatus {
         match self {
             Self::Engine(o) => o.status(),
             Self::UnknownItem => "not_found",
-            Self::ItemFieldMissing | Self::DecryptFailed | Self::Unavailable => "error",
+            Self::ItemFieldMissing | Self::DecryptFailed | Self::Unavailable | Self::SyncFailed => {
+                "error"
+            }
         }
     }
 
@@ -360,6 +365,7 @@ impl FillStatus {
             Self::ItemFieldMissing => Some("item_field_missing"),
             Self::DecryptFailed => Some("decrypt_failed"),
             Self::Unavailable => Some("fill_unavailable"),
+            Self::SyncFailed => Some("sync_failed"),
         }
     }
 
@@ -1057,6 +1063,11 @@ mod tests {
         assert_eq!(
             FillStatus::Unavailable.result().detail,
             Some("fill_unavailable")
+        );
+        let sync_failed = FillStatus::SyncFailed.result();
+        assert_eq!(
+            (sync_failed.status, sync_failed.detail),
+            ("error", Some("sync_failed"))
         );
         let filled = FillStatus::Engine(FillOutcome::Filled {
             kinds: vec![FieldKind::Password],

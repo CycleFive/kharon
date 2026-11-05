@@ -30,6 +30,21 @@ pub enum OwnershipError {
     Cdp(String),
 }
 
+impl OwnershipError {
+    /// A fixed name for the variant, for logs. [`Self::Cdp`]'s text comes
+    /// from the browser (a protocol `message`, a transport error), which a
+    /// hostile or buggy page can make echo anything it was sent, so broker
+    /// logs use this instead of `Display` (REQ-GOAL-001).
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownTarget => "unknown_target",
+            Self::TargetNotOwned => "target_not_owned",
+            Self::DefaultContextRefused => "default_context_refused",
+            Self::Cdp(_) => "cdp_error",
+        }
+    }
+}
+
 impl From<CdpError> for OwnershipError {
     fn from(e: CdpError) -> Self {
         match e {

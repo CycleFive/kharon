@@ -9,7 +9,9 @@
 //! keeps it that way: this file may not contain `format!`, `Secret`,
 //! or a `String`-carrying variant.
 
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Serialize;
+use serde_json::Value;
 
 /// Machine-readable error class (`error` in the body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +224,20 @@ impl ApiError {
 
     /// The JSON body: `{"error": code, "detail": detail}`.
     pub fn body(&self) -> Value {
-        json!({ "error": self.code.as_str(), "detail": self.detail.as_str() })
+        serde_json::to_value(ErrorBody {
+            error: self.code.as_str(),
+            detail: self.detail.as_str(),
+        })
+        .expect("invariant: error bodies serialize")
     }
+}
+
+/// The error body every transport sends: two fixed literals. Its schema
+/// is part of the REQ-GOAL-001 response surface ([`super::surface`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ErrorBody {
+    /// [`ErrorCode`] wire string.
+    pub error: &'static str,
+    /// [`Detail`] wire string.
+    pub detail: &'static str,
 }

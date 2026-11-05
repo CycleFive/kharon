@@ -7,8 +7,9 @@
 //!   period; Steam's 5-character alphabet).
 //! - [`skew`]: the startup clock check against the Vaultwarden `Date`
 //!   header (`clock_skew_warn` / `clock_skew_refuse`).
-//! - [`fill`]: `fill_totp` over the existing fill engine
-//!   ([`crate::cdp::FillEngine`] under the REQ-API-009 deadline).
+//! - [`fill`]: the code step of `fill_totp` ([`totp_code`]); the fill
+//!   itself, its deadline and its audit pair are
+//!   [`crate::api::Broker::fill`]'s, as for a password.
 //!
 //! Secret handling (REQ-CRY-006, REQ-API-005, G1): the decrypted field
 //! arrives as a [`Secret`]; the key bytes live in a [`Zeroizing`]
@@ -30,7 +31,7 @@ use hmac::{Hmac, Mac};
 use kharon_bwcrypto::Secret;
 use zeroize::{Zeroize, Zeroizing};
 
-pub use fill::{TotpFill, TotpTarget, totp_code};
+pub use fill::totp_code;
 pub use skew::{ClockSample, ClockSkewGate, ClockSkewRefused, SkewPolicy, SkewVerdict};
 
 /// RFC 6238 default period (seconds).

@@ -12,9 +12,11 @@
 //!    (REQ-ORG-003).
 //! 3. A destroyed execution context surfaces as a CDP error naming the
 //!    missing context — reported as `navigated` per the spec's mapping.
-//! 4. Re-read the loader via `Page.getFrameTree`; if it changed, run
-//!    [`CLEAR_IN_PAGE`] in the old world (best effort) and report
-//!    `navigated`.
+//! 4. Re-read the loader via `Page.getFrameTree`; if it changed and the
+//!    in-page call did not itself dispatch submit, run [`CLEAR_IN_PAGE`]
+//!    in the old world (best effort) and report `navigated`. A loader
+//!    change after a successful `submit: true` call is that submit's own
+//!    navigation: report `filled` with `fields_filled` (REQ-API-008, #102).
 //!
 //! Ownership (REQ-ARCH-005) gates step 1: the target must live in the
 //! requesting agent's browser context, or the default context when
@@ -503,6 +505,16 @@ impl FillEngine {
         // tree we are reading is not the tree we filled.
         match (&loader_before, &loader_after) {
             (Some(before), Some(after)) if before != after => {
+                // REQ-API-008 / #102: with `submit: true` the in-page call
+                // itself dispatches the form submit, so a loader change
+                // after a successful call (exceptions return earlier) is
+                // that submit's own navigation — report `filled` with
+                // `fields_filled`, do not scrub as navigated-away. A
+                // change after `submit: false`, or any failure path, is
+                // still `Navigated` / the failure.
+                if submit {
+                    return parse_fill_results(&result);
+                }
                 // Best-effort scrub in the old world (SPEC step 4).
                 let _ = session
                     .request_with_timeout(

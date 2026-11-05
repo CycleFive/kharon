@@ -162,8 +162,9 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested) {
 "#;
 
 /// Best-effort scrub of the fields a fill wrote (SPEC §6 step 4: when
-/// the loader changed after the write, clear before reporting
-/// `navigated`). Runs in the same isolated world when it still exists;
+/// the loader changed after a non-submit write, clear before reporting
+/// `navigated`). Not used when `submit: true` caused the loader change
+/// (#102). Runs in the same isolated world when it still exists;
 /// failures are ignored by the caller.
 pub const CLEAR_IN_PAGE: &str = r#"
 function clearInPage(fields) {

@@ -685,10 +685,9 @@ listen = "{AGENT_API}"
             "item_id": item_id,
             "target": {"cdp_target_id": target, "expected_origin": origin},
             "fields": [{"kind": "username"}, {"kind": "password"}],
-            // `fill`, then the agent clicks Sign in itself: with
-            // `submit: true` the broker's post-fill loader re-check sees
-            // the submit's own navigation and reports `navigated`.
-            "submit": false,
+            // REQ-API-008 / #102: submit:true on a navigating form must
+            // report `filled` with fields_filled, not `navigated`.
+            "submit": true,
         });
         let r = post_json(api, "/v1/fill", Some(&token), &body.to_string()).await;
         assert_eq!(r.status, 200, "fill {n}: {}", r.body);
@@ -697,14 +696,7 @@ listen = "{AGENT_API}"
         let res = r.json();
         assert_eq!(res["status"], json!("filled"), "fill {n}: {res}");
         assert_eq!(res["fields_filled"], json!(["username", "password"]));
-        let clicked = cdp
-            .eval(
-                &session,
-                "document.querySelector('#login button[type=submit]').click(); true",
-            )
-            .await;
-        assert_eq!(clicked, json!(true));
-        // The submit posted the canary to the page (a real navigation).
+        // The in-page submit posted the canary (a real navigation).
         let deadline = Instant::now() + Duration::from_secs(30);
         while submits.lock().unwrap().len() < n + 1 {
             assert!(Instant::now() < deadline, "fill {n}: the form never posted");

@@ -301,13 +301,24 @@ impl LiveSync {
     /// or server errors are returned and keep the current vault.
     pub async fn sync_now(&mut self) -> Result<SyncOutcome, SyncError> {
         let sync = self.client.sync().await?;
+        self.apply(&sync)
+    }
+
+    /// The offline half of [`Self::sync_now`]: apply a `/api/sync`
+    /// payload fetched elsewhere (the daemon fetches with its own
+    /// client so the network round trip never runs under the lock
+    /// controller's mutex). Same checks, same order: the REQ-CRY-008
+    /// scope check on the raw payload before anything is decrypted,
+    /// then the org-key comparison (REQ-MEM-006). Synchronous and
+    /// CPU-only.
+    pub fn apply(&mut self, sync: &SyncResponse) -> Result<SyncOutcome, SyncError> {
         if !self.policy.allow_extra_orgs {
-            let v = scope_violation(&sync, &self.organization_id);
+            let v = scope_violation(sync, &self.organization_id);
             if !v.is_empty() {
                 return Ok(SyncOutcome::Lock(LockReason::ScopeWidened(v)));
             }
         }
-        let vault = self.session.apply_sync(&sync)?;
+        let vault = self.session.apply_sync(sync)?;
         if vault.report().org_key_changed {
             return Ok(SyncOutcome::Lock(LockReason::KeyRotated));
         }

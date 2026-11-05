@@ -5,15 +5,31 @@
 //! binary frame, varint-framed `ReceiveMessage` invocations) next to
 //! the mock Bitwarden HTTP API serving the recorded fixture.
 //!
+//! The daemon-level tests (`req_cry_009_daemon_*`) run the assembled
+//! kharond (`daemon::start`, as the binary does) against the same mock
+//! and observe it only from outside: the agent API's `list`
+//! (`GET /v1/items`), the owner socket and the on-disk audit log.
+//!
 //! The live tests at the bottom run against the real Vaultwarden
 //! fixture in `fixture.yml`, mutating it through `mutate.py`.
 
+mod api_support;
+
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use api_support::get;
 use futures_util::{SinkExt, StreamExt};
+use kharond::api::token::generate;
 use kharond::audit::Event;
+use kharond::config::Config;
+use kharond::daemon;
+use kharond::lock::StaticHardening;
 use kharond::sync::{
     ApiKey, HubError, HubStatus, HubTiming, LiveSync, LockReason, MAX_SYNC_INTERVAL,
     NotificationsHub, Scope, SyncClient, SyncOutcome, SyncPolicy, TlsTrust, UpdateType, run,
@@ -783,6 +799,294 @@ fn req_cry_009_poll_floor_unchanged() {
     // Push is an accelerator; the poll floor stays the spec's 5 min.
     assert_eq!(MAX_SYNC_INTERVAL, Duration::from_secs(300));
     assert_eq!(HubTiming::default().unsupported_retry, MAX_SYNC_INTERVAL);
+}
+
+// ---- daemon level: the assembled kharond against the mock ----
+
+/// One owner-socket round trip (blocking).
+fn owner_op(socket: &Path, request: &Value) -> Value {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    stream.write_all(request.to_string().as_bytes()).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    serde_json::from_str(reply.trim()).unwrap_or_else(|_| panic!("bad owner reply: {reply}"))
+}
+
+async fn owner(socket: &Path, request: Value) -> Value {
+    let socket = socket.to_path_buf();
+    tokio::task::spawn_blocking(move || owner_op(&socket, &request))
+        .await
+        .unwrap()
+}
+
+struct MockDaemon {
+    addr: std::net::SocketAddr,
+    socket: std::path::PathBuf,
+    data: tempfile::TempDir,
+    token: String,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl MockDaemon {
+    /// `mode = "sync"` kharond on `server`, unlocked through the
+    /// owner socket with the fixture master password.
+    async fn unlocked(server: &Server) -> Self {
+        let (_, org, coll) = fixture();
+        let data = tempfile::tempdir().unwrap();
+        let api_key = data.path().join("api-key.json");
+        std::fs::write(
+            &api_key,
+            json!({"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&api_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let daemon_data = data.path().join("kharond");
+        std::fs::create_dir(&daemon_data).unwrap();
+        let email = load("fixture.json")["account"]["email"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (token, hash) = generate("alpha");
+        let toml = format!(
+            r#"mode = "sync"
+data_dir = "{data_dir}"
+
+[bitwarden]
+server = "{base}"
+email = "{email}"
+api_key_file = "{api_key}"
+organization_id = "{org}"
+collection_ids = ["{coll}"]
+
+[agents.alpha]
+token_hash = "{hash}"
+cdp = {{ endpoint = "ws://127.0.0.1:9/devtools/browser" }}
+
+[audit]
+checkpoint_local_only = true
+
+[memory]
+require_mlock = false
+
+[api]
+listen = "127.0.0.1:0"
+"#,
+            data_dir = daemon_data.display(),
+            base = server.url,
+            api_key = api_key.display(),
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        let d = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+            .await
+            .unwrap();
+        let addr = d.local_addr().unwrap();
+        let socket = d.owner_socket().to_path_buf();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(d.run(async {
+            let _ = stopped.await;
+        }));
+        let reply = owner(
+            &socket,
+            json!({"op": "unlock", "password": password().as_str()}),
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "unlock: {reply}");
+        Self {
+            addr,
+            socket,
+            data,
+            token: token.expose_secret().clone(),
+            stop: Some(stop),
+            server: server_task,
+        }
+    }
+
+    /// Agent `list`: item id → name.
+    async fn list(&self) -> std::collections::BTreeMap<String, String> {
+        let r = get(self.addr, "/v1/items", Some(&self.token)).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i["id"].as_str().unwrap().to_owned(),
+                    i["name"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Poll `list` until `want` holds; the elapsed time.
+    async fn until_listed(
+        &self,
+        what: &str,
+        want: impl Fn(&std::collections::BTreeMap<String, String>) -> bool,
+    ) -> Duration {
+        let t0 = tokio::time::Instant::now();
+        loop {
+            let l = self.list().await;
+            if want(&l) {
+                return t0.elapsed();
+            }
+            assert!(
+                t0.elapsed() < PUSH_DEADLINE,
+                "{what}: list did not reflect the change within 10 s: {l:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn audit_events(&self) -> Vec<String> {
+        let path = self.data.path().join("kharond/audit/audit.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["event"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    async fn shutdown(mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        timeout(PUSH_DEADLINE, &mut self.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// Wait until the daemon's push connection is up (its catch-up sync
+/// counted), so the changes below can only land by push.
+async fn hub_connected(server: &Server) {
+    timeout(PUSH_DEADLINE, async {
+        while server.hub_requests() == 0 || server.syncs() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the daemon never connected to the hub");
+}
+
+/// REQ-CRY-009 AC at the daemon level: add, edit and delete on the
+/// server reach the running daemon's agent `list` by push within
+/// 10 s — no restart, no owner action, the 5-minute poll never due.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_cry_009_daemon_list_reflects_add_edit_delete_by_push() {
+    let (s, _, _) = fixture();
+    let server = serve(s.clone()).await;
+    let d = MockDaemon::unlocked(&server).await;
+    hub_connected(&server).await;
+    let first = s["ciphers"][0]["id"].as_str().unwrap().to_owned();
+    let second = s["ciphers"][1]["id"].as_str().unwrap().to_owned();
+    let before = d.list().await;
+    assert_eq!(before.len(), 2, "{before:?}");
+    let first_name = before[&first].clone();
+    assert!(before.contains_key(&second));
+    // The first cipher has no per-cipher key: its fields are all under
+    // the org key, so they can be moved between its own fields.
+    assert!(s["ciphers"][0]["key"].is_null());
+    let username = load("fixture.json")["items"][0]["username"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Add: a copy of the first cipher under a new id.
+    let mut added = s.clone();
+    let mut c = s["ciphers"][0].clone();
+    c["id"] = json!(NEW_ITEM);
+    added["ciphers"].as_array_mut().unwrap().push(c);
+    server.set(added.clone());
+    server.push(1); // SyncCipherCreate
+    d.until_listed("add", |l| l.get(NEW_ITEM) == Some(&first_name))
+        .await;
+
+    // Edit: rename the new item (its name EncString replaced by its
+    // username's, under the same org key).
+    let mut edited = added.clone();
+    let last = edited["ciphers"].as_array().unwrap().len() - 1;
+    edited["ciphers"][last]["name"] = s["ciphers"][0]["login"]["username"].clone();
+    edited["ciphers"][last]["revisionDate"] = json!("2026-11-05T12:00:00Z");
+    server.set(edited.clone());
+    server.push(0); // SyncCipherUpdate
+    d.until_listed("edit", |l| l.get(NEW_ITEM) == Some(&username))
+        .await;
+
+    // Delete (Vaultwarden pushes SyncLoginDelete for a hard delete).
+    let mut deleted = edited;
+    deleted["ciphers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c["id"] != json!(NEW_ITEM));
+    server.set(deleted);
+    server.push(2);
+    d.until_listed("delete", |l| *l == before).await;
+
+    // Still the same unlock: no relock, no restart in between.
+    assert_eq!(
+        owner(&d.socket, json!({"op": "status"})).await["locked"],
+        json!(false)
+    );
+    let events = d.audit_events();
+    assert_eq!(
+        events.iter().filter(|e| *e == "unlock").count(),
+        1,
+        "{events:?}"
+    );
+    assert!(!events.iter().any(|e| e == "lock"), "{events:?}");
+    d.shutdown().await;
+}
+
+/// REQ-CRY-008 at the daemon level: the account gains a second org
+/// while the daemon is unlocked; the next sync (here: on the push)
+/// locks it with audit `scope_widened`, and `list` answers `locked`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_cry_008_daemon_second_org_while_unlocked_locks_scope_widened() {
+    let (s, _, _) = fixture();
+    let server = serve(s.clone()).await;
+    let d = MockDaemon::unlocked(&server).await;
+    hub_connected(&server).await;
+    assert_eq!(d.list().await.len(), 2);
+
+    server.set(with_second_org(s));
+    server.push(6); // SyncOrgKeys
+    timeout(PUSH_DEADLINE, async {
+        while owner(&d.socket, json!({"op": "status"})).await["locked"] != json!(true) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a second org must lock the daemon on the next sync");
+    let r = get(d.addr, "/v1/items", Some(&d.token)).await;
+    assert_eq!(r.status, 423, "{}", r.body);
+    assert!(r.body.contains("locked"), "{}", r.body);
+    let events = d.audit_events();
+    assert_eq!(
+        events.iter().filter(|e| *e == "scope_widened").count(),
+        1,
+        "{events:?}"
+    );
+
+    // The session's sync task ended with it: no more syncs, and the
+    // hub connection is gone.
+    tokio::time::sleep(daemon::LIVE_SYNC_LOCK_CHECK + Duration::from_secs(1)).await;
+    let syncs = server.syncs();
+    // No hub connection is left to receive it.
+    assert!(server.pushes.send(update_frame(1)).is_err());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(server.syncs(), syncs, "a locked daemon must not sync");
+    d.shutdown().await;
 }
 
 // ---- live: real Vaultwarden 1.33 (fixture.yml) ----

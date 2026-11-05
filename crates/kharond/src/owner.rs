@@ -19,6 +19,20 @@
 //!   the future web UI) is the only way in.
 //! - `{"op":"lock"}` — lock now, destroying the session.
 //! - `{"op":"status"}` — `{"ok":true,"locked":<bool>}`.
+//! - `{"op":"grants"}` — `{"ok":true,"pending":[…]}`: the pending
+//!   grant requests (SPEC §5, #20), each as the approval prompt an
+//!   owner decides on — the request id, agent, item, action, and the
+//!   **observed** origin (REQ-APR-007), never the claimed one.
+//! - `{"op":"approve","request_id":"gr_…","kind":"once",
+//!   "ttl_s":120,"max_uses":1,"scope_collection":"<uuid>"}` — approve
+//!   a pending request under owner-chosen terms (kind defaults to
+//!   `once`, scope to the request's item); replies
+//!   `{"ok":true,"grant_id":"g_…"}`. Term bounds are SPEC §5's,
+//!   enforced by the broker.
+//! - `{"op":"deny","request_id":"gr_…"}` — deny a pending request.
+//!
+//!   The CLI/ntfy presentation of these ops is #16; this socket is
+//!   the broker-side seam it drives.
 //! - `{"op":"scan","needle":"…"}` or
 //!   `{"op":"scan","needle_hex":"…"}` — only in builds with the
 //!   non-default cargo feature `canary-scan` (enabled by the test
@@ -36,7 +50,9 @@
 //! `unknown_op`, `forbidden`, `already_unlocked`,
 //! `mlock_unavailable` (REQ-MEM-002), `audit_failed` (REQ-AUD-003),
 //! `scan_unavailable`, `unlock_failed` (wrong password,
-//! unreachable server, bad export — deliberately indistinguishable).
+//! unreachable server, bad export — deliberately indistinguishable),
+//! and for the grant ops `not_found`, `not_pending`,
+//! `standing_disabled`, `invalid_terms`.
 //!
 //! The codes are indistinguishable; the *timing* is not, in sync
 //! mode: an unreachable server fails during `prepare`, before any
@@ -115,6 +131,47 @@ pub trait OwnerOps: Send + Sync + 'static {
         let _ = detail;
         async {}
     }
+
+    /// Approve a pending grant request (SPEC §5, #20) under the
+    /// owner's terms; returns the issued grant's id. Default: the
+    /// op is not supported (`unknown_op`) — test doubles predate
+    /// grants.
+    fn approve(
+        &self,
+        args: ApproveArgs,
+    ) -> impl Future<Output = Result<String, OwnerFailure>> + Send {
+        let _ = args;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Deny a pending grant request. Default: unsupported.
+    fn deny(&self, request_id: String) -> impl Future<Output = Result<(), OwnerFailure>> + Send {
+        let _ = request_id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// The pending grant requests, as approval prompts (observed
+    /// origin only, REQ-APR-007). Default: none.
+    fn pending_grants(&self) -> impl Future<Output = Vec<crate::api::ApprovalPrompt>> + Send {
+        async { Vec::new() }
+    }
+}
+
+/// Owner-chosen approval terms from an `approve` request line.
+/// `kind: None` is the SPEC §5 default (`once`); scope defaults to
+/// the request's item unless `scope_collection` names a collection.
+#[derive(Debug, Clone, Default)]
+pub struct ApproveArgs {
+    /// The `gr_…` request to approve.
+    pub request_id: String,
+    /// Grant kind override.
+    pub kind: Option<crate::config::GrantKind>,
+    /// Collection scope override.
+    pub scope_collection: Option<String>,
+    /// TTL override, seconds.
+    pub ttl_s: Option<u64>,
+    /// Use-cap override.
+    pub max_uses: Option<u64>,
 }
 
 /// Why an owner operation failed. Fixed codes only.
@@ -130,6 +187,16 @@ pub enum OwnerFailure {
     /// Derivation failed (wrong password, sync error, export auth
     /// failure — not distinguished, REQ-API-006).
     UnlockFailed,
+    /// The op is not implemented by this owner (test doubles).
+    Unsupported,
+    /// No grant request with that id (grant ops, #20).
+    NotFound,
+    /// The grant request is no longer pending (grant ops, #20).
+    NotPending,
+    /// Standing terms while standing grants are disabled (#20).
+    StandingDisabled,
+    /// Grant terms outside SPEC §5's bounds (grant ops, #20).
+    InvalidTerms,
 }
 
 impl OwnerFailure {
@@ -140,6 +207,11 @@ impl OwnerFailure {
             Self::MlockUnavailable => "mlock_unavailable",
             Self::AuditFailed => "audit_failed",
             Self::UnlockFailed => "unlock_failed",
+            Self::Unsupported => "unknown_op",
+            Self::NotFound => "not_found",
+            Self::NotPending => "not_pending",
+            Self::StandingDisabled => "standing_disabled",
+            Self::InvalidTerms => "invalid_terms",
         }
     }
 }
@@ -158,6 +230,21 @@ struct Request {
     #[cfg_attr(not(feature = "canary-scan"), allow(dead_code))]
     #[serde(default)]
     needle_hex: Option<Zeroizing<String>>,
+    /// Grant ops (#20): the `gr_…` request to decide.
+    #[serde(default)]
+    request_id: Option<String>,
+    /// Grant ops: `once` | `per-origin` | `standing`.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Grant ops: approve with collection scope instead of item.
+    #[serde(default)]
+    scope_collection: Option<String>,
+    /// Grant ops: TTL override, seconds.
+    #[serde(default)]
+    ttl_s: Option<u64>,
+    /// Grant ops: use-cap override.
+    #[serde(default)]
+    max_uses: Option<u64>,
 }
 
 /// The socket path for a daemon with this `data_dir`.
@@ -460,6 +547,62 @@ async fn dispatch<O: OwnerOps>(
             ok_response(Some(true))
         }
         "status" => ok_response(Some(ops.is_locked().await)),
+        "grants" => {
+            let pending: Vec<serde_json::Value> = ops
+                .pending_grants()
+                .await
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "request_id": p.request_id,
+                        "agent_id": p.agent_id,
+                        "item_id": p.item_id,
+                        "action": p.action,
+                        "origin": p.origin,
+                    })
+                })
+                .collect();
+            let mut out = serde_json::json!({ "ok": true, "pending": pending }).to_string();
+            out.push('\n');
+            out
+        }
+        "approve" => {
+            let Some(request_id) = req.request_id.clone() else {
+                return error_response("bad_request");
+            };
+            let kind = match req.kind.as_deref() {
+                None => None,
+                Some("once") => Some(crate::config::GrantKind::Once),
+                Some("per-origin") => Some(crate::config::GrantKind::PerOrigin),
+                Some("standing") => Some(crate::config::GrantKind::Standing),
+                Some(_) => return error_response("bad_request"),
+            };
+            let args = ApproveArgs {
+                request_id,
+                kind,
+                scope_collection: req.scope_collection.clone(),
+                ttl_s: req.ttl_s,
+                max_uses: req.max_uses,
+            };
+            match ops.approve(args).await {
+                Ok(grant_id) => {
+                    let mut out =
+                        serde_json::json!({ "ok": true, "grant_id": grant_id }).to_string();
+                    out.push('\n');
+                    out
+                }
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "deny" => {
+            let Some(request_id) = req.request_id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.deny(request_id).await {
+                Ok(()) => ok_response(None),
+                Err(e) => error_response(e.code()),
+            }
+        }
         "scan" => scan_response(req),
         _ => error_response("unknown_op"),
     }

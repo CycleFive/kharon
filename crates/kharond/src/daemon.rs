@@ -52,6 +52,7 @@ use crate::api::core::{Broker, FillSync, SyncFetch, VaultView};
 use crate::api::fill::{ConnectingCdpBackend, FillPolicy};
 use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
+use crate::api::{Channel, GrantError, GrantScope, GrantTerms};
 use crate::audit::{
     AuditConfig as LogConfig, AuditLog, Entry, Event, FileCheckpointSink, OpenError,
 };
@@ -61,7 +62,7 @@ use crate::lock::{
     HardeningError, LockController, LockPolicy, LockReason, MemoryHardening, SystemClock,
     UnlockError,
 };
-use crate::owner::{OwnerFailure, OwnerOps};
+use crate::owner::{ApproveArgs, OwnerFailure, OwnerOps};
 use crate::sync::wire::SyncResponse;
 use crate::sync::{
     HubStatus, LiveSync, SecretField, SyncClient, SyncError, SyncOutcome, Vault, run_push,
@@ -364,6 +365,72 @@ impl OwnerOps for DaemonOwner {
             .detail_code(detail);
         let _ = self.broker.append_audit(entry);
     }
+
+    async fn approve(&self, args: ApproveArgs) -> Result<String, OwnerFailure> {
+        // Broker grant ops are sync and append audit (file IO):
+        // spawn_blocking, like lock/status (PR #81 carry-over).
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || {
+            let Some(req) = broker.grant_request(&args.request_id) else {
+                return Err(OwnerFailure::NotFound);
+            };
+            let scope = match &args.scope_collection {
+                Some(c) => GrantScope::Collection(c.clone()),
+                None => GrantScope::Item(req.item_id.clone()),
+            };
+            let terms = GrantTerms {
+                scope,
+                kind: args.kind.unwrap_or(crate::config::GrantKind::Once),
+                ttl: args.ttl_s.map(std::time::Duration::from_secs),
+                max_uses: args.max_uses,
+            };
+            broker
+                .approve_grant_request(&args.request_id, &terms, Channel::Cli)
+                .map(|view| view.id)
+                .map_err(map_grant_error)
+        })
+        .await
+        // A panicked blocking task is an internal failure; the
+        // audit-failed code is the closest fixed code (the grant
+        // state is unknown, so approval must not be reported).
+        .map_err(|_| OwnerFailure::AuditFailed)?
+    }
+
+    async fn deny(&self, request_id: String) -> Result<(), OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || {
+            broker
+                .deny_grant_request(&request_id)
+                .map(|_| ())
+                .map_err(map_grant_error)
+        })
+        .await
+        .map_err(|_| OwnerFailure::AuditFailed)?
+    }
+
+    async fn pending_grants(&self) -> Vec<crate::api::ApprovalPrompt> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || {
+            broker
+                .pending_grant_requests()
+                .iter()
+                .filter_map(|r| r.prompt())
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
+/// Map a broker grant refusal onto the owner channel's fixed codes.
+fn map_grant_error(e: GrantError) -> OwnerFailure {
+    match e {
+        GrantError::NotFound => OwnerFailure::NotFound,
+        GrantError::NotPending => OwnerFailure::NotPending,
+        GrantError::StandingDisabled => OwnerFailure::StandingDisabled,
+        GrantError::InvalidTerms(_) => OwnerFailure::InvalidTerms,
+        GrantError::AuditFailed => OwnerFailure::AuditFailed,
+    }
 }
 
 /// Why the daemon refused to start after the config was accepted.
@@ -522,6 +589,9 @@ pub async fn start(
     );
     let broker = Broker::new(tokens, lock, Box::new(audit), cfg.policy.origin_config())
         .with_clock_skew_policy(SkewPolicy::from(&cfg.policy))
+        // SPEC §5 (#20): standing grants only when `[policy]
+        // allow_standing` says so.
+        .with_grant_policy(crate::api::GrantPolicy::from(&cfg.policy))
         // REQ-API-009 `fill_deadline` and the fill origin policy.
         .with_fill_policy(FillPolicy::from(&cfg.policy))
         // REQ-API-008: each agent's configured CDP endpoint,

@@ -529,6 +529,36 @@ async fn fill_rig(sync: Value) -> FillRig {
     .with_fill_sync(Arc::new(MockFillSync(tokio::sync::Mutex::new(client_for(
         &server,
     )))));
+    // #20: fills need a grant; seed a collection-wide one over the
+    // fixture domain (the grant covers `login.example.com` by
+    // registrable domain).
+    {
+        let now = kharond::lock::Clock::now(&kharond::lock::SystemClock);
+        let terms = kharond::api::GrantTerms {
+            scope: kharond::api::GrantScope::Collection(coll.clone()),
+            kind: kharond::config::GrantKind::PerOrigin,
+            ttl: Some(std::time::Duration::from_secs(24 * 3600)),
+            max_uses: None,
+        };
+        let mut store = broker.grant_store().lock().unwrap();
+        for action in [
+            kharond::api::GrantAction::Fill,
+            kharond::api::GrantAction::Totp,
+        ] {
+            store
+                .issue(
+                    "alpha",
+                    "00000000-0000-4000-8000-000000000000",
+                    action,
+                    "https://example.com",
+                    &terms,
+                    kharond::api::Channel::Cli,
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+    }
     broker.wire_lock_audit();
     FillRig {
         state,

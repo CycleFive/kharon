@@ -220,6 +220,35 @@ async fn e2e_with((url, received): (String, Received)) -> E2e {
         OriginConfig::default(),
     )
     .with_fill_backend(Box::new(backend));
+    // #20: fills need a grant; the export item has no collections, so
+    // seed item-scope grants for both actions.
+    {
+        let now = kharond::lock::Clock::now(&kharond::lock::SystemClock);
+        let terms = kharond::api::GrantTerms {
+            scope: kharond::api::GrantScope::Item(item_id.clone()),
+            kind: kharond::config::GrantKind::PerOrigin,
+            ttl: Some(std::time::Duration::from_secs(24 * 3600)),
+            max_uses: None,
+        };
+        let mut store = broker.grant_store().lock().unwrap();
+        for action in [
+            kharond::api::GrantAction::Fill,
+            kharond::api::GrantAction::Totp,
+        ] {
+            store
+                .issue(
+                    "alpha",
+                    &item_id,
+                    action,
+                    "https://example.com",
+                    &terms,
+                    kharond::api::Channel::Cli,
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(kharond::api::http::serve(listener, Arc::new(broker)));
@@ -430,24 +459,33 @@ async fn req_org_002_claimed_origin_differs_from_live_origin_is_refused() {
         )
         .await;
     assert_eq!(r.status, 200);
+    // #20: the refusal creates an origin_mismatch grant request and
+    // the FillResult carries its id (SPEC §4/§5, REQ-APR-007).
+    let body = r.json();
+    let grid = body["grant_request_id"].as_str().unwrap().to_owned();
+    assert!(grid.starts_with("gr_"), "{body}");
     assert_eq!(
-        r.json(),
-        json!({"status": "origin_mismatch", "fields_filled": []})
+        body,
+        json!({"status": "origin_mismatch", "fields_filled": [], "grant_request_id": grid})
     );
     assert!(e.fill_calls().is_empty(), "no page code ran");
+    // #20 ordering: the grant check runs before any CDP dispatch, so
+    // the audit shows the grant_request creation (observed origin,
+    // origin_mismatch) and the fill outcome — no fill_dispatch, since
+    // no page write was ever dispatched.
     assert_eq!(
         e.audit.summary(),
         [
             json!([
-                "fill_dispatch",
+                "grant_request",
                 "alpha",
-                "https://other.example",
-                "dispatched"
+                "https://example.com",
+                "origin_mismatch"
             ]),
             json!(["fill", "alpha", null, "origin_mismatch"])
         ]
     );
-    // #67: claim on the dispatch, live origin on the outcome.
+    // #67: live origin on the outcome.
     assert_eq!(
         e.audit.live_origins()[1],
         json!(["fill", "https://example.com"])

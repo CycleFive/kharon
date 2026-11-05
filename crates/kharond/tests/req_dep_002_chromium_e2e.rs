@@ -18,7 +18,10 @@
 //!    account's master password.
 //! 3. The agent asks for its browser context (`POST /v1/context`,
 //!    REQ-ARCH-005), opens a tab in it, and fills each seeded item
-//!    through `POST /v1/fill` (the second with `submit: true`).
+//!    through `POST /v1/fill` (the second with `submit: true`). The
+//!    first fill of each item is `pending_approval` (#20,
+//!    REQ-APR-001); the owner approves it over the owner socket
+//!    (per-origin) and the fill is retried.
 //! 4. REQ-API-008's negative half (#18): a `fill_and_submit`
 //!    (`submit: true`) of username + password against a variant of
 //!    the page whose form has no password field. The username is
@@ -552,6 +555,36 @@ listen = "127.0.0.1:0"
             "fields": [{"kind": "username"}, {"kind": "password"}],
             "submit": submit,
         });
+        let r = post_json(run.addr, "/v1/fill", Some(&token), &body.to_string()).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_no_canary(&r.body);
+        let res = r.json();
+        // REQ-APR-001 (#20): with no grant yet, the first fill of an
+        // item is `pending_approval` and nothing is decrypted. The
+        // owner approves the request over the owner socket
+        // (per-origin: this item, at this origin, for the rest of
+        // the test — the negative-half fill below reuses it), and
+        // the same fill is retried.
+        assert_eq!(
+            res["status"],
+            json!("pending_approval"),
+            "{}: {res}",
+            item["name"]
+        );
+        let grid = res["grant_request_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pending_approval without a grant_request_id: {res}"))
+            .to_owned();
+        let socket = run.socket.clone();
+        let approved = tokio::task::spawn_blocking(move || {
+            owner_op(
+                &socket,
+                &json!({"op": "approve", "request_id": grid, "kind": "per-origin"}),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(approved["ok"], json!(true), "approve: {approved}");
         let r = post_json(run.addr, "/v1/fill", Some(&token), &body.to_string()).await;
         assert_eq!(r.status, 200, "{}", r.body);
         assert_no_canary(&r.body);

@@ -14,6 +14,7 @@
 //! | `POST /v1/fill` | bearer | `FillRequest` → `FillResult` (`submit: true` is `fill_and_submit`) |
 //! | `POST /v1/fill_totp` | bearer | `FillTotpRequest` → `FillResult` |
 //! | `POST /v1/context` | bearer | empty or `{}` → `ContextResult` (the agent's `browserContextId`, #65) |
+//! | `POST /v1/grants` | bearer | `GrantRequest` → `GrantRequestBody` (`{grant_request_id, state}`, #20) |
 //! | `GET /v1/openapi.json` | none | the OpenAPI document |
 //! | `POST /mcp` | bearer | MCP over Streamable HTTP ([`super::mcp`]) |
 //!
@@ -49,6 +50,7 @@ use super::core::{
 };
 use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillOperation, parse_fill};
+use super::grant::parse_grant;
 use super::mcp::{MAX_BODY_BYTES, is_json};
 use crate::lock::Clock;
 
@@ -114,6 +116,8 @@ pub const FILL_PATH: &str = "/v1/fill";
 pub const FILL_TOTP_PATH: &str = "/v1/fill_totp";
 /// `POST /v1/context` (#65).
 pub const CONTEXT_PATH: &str = "/v1/context";
+/// `POST /v1/grants` (#20).
+pub const GRANTS_PATH: &str = "/v1/grants";
 
 async fn handle<S, C>(State(state): State<Arc<AppState<S, C>>>, req: Request) -> Response
 where
@@ -130,6 +134,7 @@ where
             return handle_fill(state, req, FillOperation::FillTotp, received).await;
         }
         CONTEXT_PATH => return handle_context(state, req, received).await,
+        GRANTS_PATH => return handle_grants(state, req, received).await,
         super::mcp::MCP_PATH => return super::mcp::handle(state, req).await,
         _ => return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute)),
     };
@@ -244,6 +249,56 @@ where
         return error(e);
     }
     match state.broker.context(&agent, received).await {
+        Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
+        Err(e) => error(e),
+    }
+}
+
+/// `POST /v1/grants` (#20): same order as the fill routes — method,
+/// browser `Origin`, bearer token, content type and size,
+/// [`parse_grant`], then [`Broker::request_grant`] under the fill
+/// deadline from when the handler was entered.
+async fn handle_grants<S, C>(
+    state: Arc<AppState<S, C>>,
+    req: Request,
+    received: Instant,
+) -> Response
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    if req.method() != Method::POST {
+        return method_not_allowed("POST");
+    }
+    if req.headers().contains_key(header::ORIGIN) {
+        return error(ApiError::new(
+            ErrorCode::Forbidden,
+            Detail::BrowserOriginRefused,
+        ));
+    }
+    let token = bearer_token(&req);
+    let (parts, body) = req.into_parts();
+    let agent = match authenticate(&state, token).await {
+        Ok(a) => a,
+        Err(e) => return error(e),
+    };
+    if !is_json(&parts.headers) {
+        return error(ApiError::bad_request(Detail::UnsupportedContentType));
+    }
+    drop(parts);
+    let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+        return error(ApiError::bad_request(Detail::BodyTooLarge));
+    };
+    let grant_req = match parse_grant(&bytes) {
+        Ok(r) => r,
+        Err(e) => return error(e),
+    };
+    drop(bytes);
+    match state
+        .broker
+        .request_grant(&agent, grant_req, received)
+        .await
+    {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
     }

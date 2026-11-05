@@ -61,6 +61,8 @@ fn harness_with(fake: FakeFill) -> Run {
                     .extend(plan.fields.iter().map(|f| (*f.value).clone()));
             }))
     });
+    // #20: fills need a grant; seed the fixture collection's.
+    h.grant_fixture_items();
     Run { h, fake, wiped }
 }
 

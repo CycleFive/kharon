@@ -11,12 +11,14 @@
 //!   adapter over [`core`] on the same listener.
 //! - [`surface`]: every tool/route and its response schema
 //!   (REQ-GOAL-001).
-//!
-//! Grants (`kharon_request_grant`, `POST /v1/grants`) arrive with #20.
+//! - [`grant`]: the grant model and request lifecycle (SPEC §5,
+//!   REQ-APR-001/002/003/007; #20), behind `kharon_request_grant`,
+//!   `POST /v1/grants`, the fill grant gate and status's grants.
 
 pub mod core;
 pub mod error;
 pub mod fill;
+pub mod grant;
 pub mod http;
 pub mod mcp;
 pub mod meta;
@@ -31,6 +33,11 @@ pub use error::{ApiError, Detail, ErrorBody, ErrorCode};
 pub use fill::{
     CdpFillBackend, ConnectingCdpBackend, FillBackend, FillOperation, FillPolicy, FillRequest,
     FillResult, FillStatus, parse_fill,
+};
+pub use grant::{
+    ApprovalPrompt, Channel, Grant, GrantAction, GrantError, GrantPolicy, GrantRequest,
+    GrantRequestArgs, GrantRequestBody, GrantScope, GrantStore, GrantTerms, GrantView,
+    RequestState, parse_grant,
 };
 pub use meta::ItemMeta;
 pub use token::{ParamFloor, TokenStore};

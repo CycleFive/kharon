@@ -14,12 +14,14 @@ use std::time::Duration;
 
 use argon2::Argon2;
 use kharon_bwcrypto::Kdf;
-use kharond::api::fill::{ContextFuture, FillFuture};
+use kharond::api::fill::{ContextFuture, FillFuture, ObserveFuture};
+use kharond::api::grant::{Channel, GrantAction, GrantScope, GrantTerms};
 use kharond::api::token::{ParamFloor, TokenStore, generate_with};
 use kharond::api::{AuditSink, Broker, FillBackend, VaultView};
 use kharond::audit::Entry;
 use kharond::cdp::fill::{FieldKind, FillOutcome, FillPlan};
-use kharond::lock::{AuditError, LockController, LockPolicy, ManualClock, StaticHardening};
+use kharond::config::GrantKind;
+use kharond::lock::{AuditError, Clock, LockController, LockPolicy, ManualClock, StaticHardening};
 use kharond::origin::OriginConfig;
 use kharond::sync::wire::SyncResponse;
 use kharond::sync::{Scope, SecretField, Session, SyncError, Vault};
@@ -80,6 +82,16 @@ pub fn assert_no_canary(text: &str) {
 /// The fixture vault, unlocked once (PBKDF2 600k) per test binary.
 pub fn fixture_vault() -> Arc<Vault> {
     fixture().1.clone()
+}
+
+/// The fixture's collection id (the scope every fixture item is in).
+pub fn fixture_collection_id() -> String {
+    static C: OnceLock<String> = OnceLock::new();
+    C.get_or_init(|| {
+        let s = load("sync_fixture.json");
+        s["collections"][0]["id"].as_str().unwrap().to_owned()
+    })
+    .clone()
 }
 
 /// Fixture item A (`https://login.example.com/`, has a password).
@@ -287,6 +299,39 @@ impl Harness {
     /// Advance past the idle timer (30 min default).
     pub fn idle_out(&self) {
         self.clock.advance(Duration::from_secs(31 * 60));
+    }
+
+    /// Issue `alpha` and `beta` collection-wide grants over the
+    /// fixture items' registrable domain (`example.com`), both
+    /// actions, 24 h — the precondition a pre-#20 fill test stated
+    /// implicitly. Since issue #20 a fill without a matching live
+    /// grant is `pending_approval`, so fill tests seed explicitly.
+    /// The broker's grant clock is the system clock in this harness,
+    /// so the TTL runs from now, not from the manual lock clock.
+    pub fn grant_fixture_items(&self) {
+        let mut store = self.broker.grant_store().lock().unwrap();
+        let now = kharond::lock::SystemClock.now();
+        for agent in ["alpha", "beta"] {
+            for action in [GrantAction::Fill, GrantAction::Totp] {
+                store
+                    .issue(
+                        agent,
+                        ITEM_A,
+                        action,
+                        "example.com",
+                        &GrantTerms {
+                            scope: GrantScope::Collection(fixture_collection_id()),
+                            kind: GrantKind::PerOrigin,
+                            ttl: Some(Duration::from_secs(24 * 60 * 60)),
+                            max_uses: None,
+                        },
+                        Channel::Cli,
+                        None,
+                        now,
+                    )
+                    .unwrap();
+            }
+        }
     }
 }
 
@@ -539,6 +584,21 @@ impl FillBackend for FakeFill {
                 FakeAnswer::Stall => std::future::pending().await,
             }
         })
+    }
+
+    /// The `live_url`'s serialized origin, as the engine would
+    /// observe it (#20); `None` when no live URL is set.
+    fn observe_origin<'a>(
+        &'a self,
+        _agent_id: &'a str,
+        _target_id: &'a str,
+        _allow_default: bool,
+    ) -> ObserveFuture<'a> {
+        let observed = self
+            .live_url
+            .and_then(|u| url::Url::parse(u).ok())
+            .map(|u| u.origin().ascii_serialization());
+        Box::pin(async move { observed })
     }
 
     /// `ctx-<agent>`, cached once handed out (no generations here).

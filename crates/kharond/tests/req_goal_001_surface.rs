@@ -73,6 +73,27 @@ const REVIEWED_STRINGS: &[(&str, &str)] = &[
     ("FillResult.status", "fixed FillStatus literal"),
     ("FillResult.fields_filled[]", "fixed field-kind literal"),
     ("FillResult.detail", "fixed detail-code literal"),
+    (
+        "FillResult.grant_request_id",
+        "broker-assigned grant request id (#20)",
+    ),
+    ("GrantView.id", "broker-assigned grant id (#20)"),
+    ("GrantView.agent_id", "the config's agent id"),
+    ("GrantView.item_id", "item UUID"),
+    ("GrantView.collection_id", "collection UUID"),
+    (
+        "GrantView.origin",
+        "granted origin: a host or registrable domain, from item metadata",
+    ),
+    (
+        "GrantView.expires_at",
+        "RFC 3339 rendering of the grant's remaining TTL",
+    ),
+    (
+        "GrantRequestBody.grant_request_id",
+        "broker-assigned grant request id (#20)",
+    ),
+    ("GrantRequestBody.state", "fixed request-state literal"),
     ("ContextResult.status", "fixed literal"),
     (
         "ContextResult.browser_context_id",

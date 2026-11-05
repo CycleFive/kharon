@@ -26,6 +26,14 @@ services:
       INVITATIONS_ALLOWED: "false"
       # Admin panel off: nothing to harden, nothing to leak.
       DISABLE_ADMIN_TOKEN: "true"
+      # Fixture-only: the workflow performs many /identity/connect/token
+      # logins (seed, oracle, per-mutation steps, KDF rotation, export);
+      # Vaultwarden's default login rate limit (LOGIN_RATELIMIT_SECONDS=60,
+      # LOGIN_RATELIMIT_MAX_BURST=10 in the pinned server's .env.template)
+      # intermittently answers 429 to the later steps (#95). Lift the burst
+      # at the source for this throwaway, loopback-only fixture so every
+      # login step is deterministic; never do this on a real vault.
+      LOGIN_RATELIMIT_MAX_BURST: "1000"
       # Served over HTTPS on loopback; must match the seed/bw base URL.
       DOMAIN: "https://127.0.0.1:8222"
       # Rocket serves TLS itself on 443 inside the container with the

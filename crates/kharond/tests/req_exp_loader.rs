@@ -17,6 +17,21 @@
 //!
 //! Fixture B ("replaced") holds one different login and backs the
 //! REQ-EXP-004 replace-file test.
+//!
+//! The `bw`-produced fixture (issue #84) is separate: an export made
+//! by the real Bitwarden CLI (`bw export --format encrypted_json
+//! --password …`, CLI 2026.1.0) from the seeded Vaultwarden fixture
+//! organization, after `rotate_kdf.py` moved the fixture account to
+//! Argon2id — so its envelope is `kdfType: 1` with the Bitwarden
+//! defaults (3 iterations, 64 MiB, parallelism 4), the Argon2id
+//! export path the PBKDF2 generator fixtures above do not cover.
+//! The export password is `kharon bw export fixture password 4`
+//! (fixture-only, like every other fixture value here). A specimen
+//! produced locally against the pinned fixture stack is committed
+//! as `fixtures/export/bw_produced_argon2id.json`; the test itself
+//! is ignored in the hermetic job and runs in the
+//! vaultwarden-fixture workflow, where the CLI produces a fresh
+//! export each run and points `KHARON_BW_EXPORT_JSON` at it.
 
 use std::path::{Path, PathBuf};
 
@@ -115,6 +130,89 @@ fn req_exp_001_loads_from_file_bytes_with_no_server_anywhere() {
     let file = ExportFile::from_bytes(FIXTURE_A.as_bytes()).unwrap();
     let session = file.unlock(&password()).unwrap();
     assert_eq!(session.vault().len(), 2);
+}
+
+/// Issue #84: the open half of REQ-EXP-001's AC — a fixture produced
+/// by `bw export --format encrypted_json --password …` itself (the
+/// real Bitwarden CLI), not by the Python generator. Ignored in the
+/// hermetic job: the vaultwarden-fixture workflow produces a fresh
+/// export from the seeded fixture organization on every run (after
+/// `rotate_kdf.py` moves the fixture account to Argon2id, so the
+/// envelope also covers the Argon2id export path end to end) and
+/// points `KHARON_BW_EXPORT_JSON` at it. Without the env var the
+/// test loads the committed specimen, produced the same way against
+/// the pinned fixture stack, so it can be reproduced locally.
+#[test]
+#[ignore = "fixture workflow only (issue #84): needs an export produced by the real bw CLI"]
+fn req_exp_001_bw_produced_argon2id_export_loads_and_unlocks() {
+    const BW_EXPORT_PASSWORD: &str = "kharon bw export fixture password 4";
+    let path = std::env::var_os("KHARON_BW_EXPORT_JSON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/export/bw_produced_argon2id.json")
+        });
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read bw export {}: {e}", path.display()));
+
+    // The envelope is a real `bw` password-protected export under
+    // the account's Argon2id KDF (Bitwarden defaults).
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["encrypted"], serde_json::json!(true));
+    assert_eq!(envelope["passwordProtected"], serde_json::json!(true));
+    assert_eq!(envelope["kdfType"], serde_json::json!(1));
+    assert_eq!(envelope["kdfIterations"], serde_json::json!(3));
+    assert_eq!(envelope["kdfMemory"], serde_json::json!(64));
+    assert_eq!(envelope["kdfParallelism"], serde_json::json!(4));
+
+    let file = ExportFile::load(&path).unwrap();
+    assert!(
+        matches!(
+            file.kdf(),
+            kharon_bwcrypto::Kdf::Argon2id {
+                iterations: 3,
+                memory_mib: 64,
+                parallelism: 4
+            }
+        ),
+        "loader KDF: {:?}",
+        file.kdf()
+    );
+
+    // Loads + unlocks end to end, and the vault is exactly the two
+    // seeded fixture logins (plaintexts per the vaultwarden
+    // fixture.json manifest — fixture-only values).
+    let session = file
+        .unlock(&Zeroizing::new(BW_EXPORT_PASSWORD.to_string()))
+        .unwrap();
+    let vault = session.vault();
+    assert_eq!(vault.len(), 2);
+    let mut names: Vec<&str> = vault.items().map(|i| i.name()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["fixture-no-cipher-key", "fixture-with-cipher-key"]);
+    for (name, username, password, uri) in [
+        (
+            "fixture-no-cipher-key",
+            "fixture-user-a@example.com",
+            "fixture-password-no-key-123",
+            "https://login.example.com/",
+        ),
+        (
+            "fixture-with-cipher-key",
+            "fixture-user-b@example.com",
+            "fixture-password-with-key-456",
+            "https://app.example.com/login",
+        ),
+    ] {
+        let item = vault.items().find(|i| i.name() == name).unwrap();
+        assert_eq!(item.username(), Some(username));
+        let pw = session
+            .decrypt_secret(item.id(), SecretField::Password)
+            .unwrap();
+        assert_eq!(&pw[..], password.as_bytes());
+        let uris: Vec<&str> = item.uris().iter().map(|u| u.uri.as_str()).collect();
+        assert_eq!(uris, [uri]);
+    }
 }
 
 #[test]

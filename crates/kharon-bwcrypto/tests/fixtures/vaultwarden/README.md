@@ -15,7 +15,8 @@ fresh randomness and UUIDs. Covers REQ-DEP-002 **(part)** per SPEC
 | `docker-compose.yml` | Pinned Vaultwarden (`vaultwarden/server:1.33.0`), loopback-only port 8222 serving HTTPS with a per-run self-signed cert from `./tls/` (the `bw` CLI refuses plain-HTTP servers), signups on for the fixture account, admin panel disabled, throwaway named volume. |
 | `fixture.json` | The manifest: fixture account (email / password / KDF params), org + collection names, and the two seeded items with their expected plaintexts. Fixture-only values — never reuse them. |
 | `seed.py` | Builds all account/org/cipher crypto client-side (independent `cryptography`/OpenSSL implementation). `--offline` writes a `/api/sync`-shaped payload; `--live` registers + seeds a running server via the official API endpoints and captures its real `/api/sync`. |
-| `mutate.py` | Live only: logs in as the fixture account like a web-vault device and adds / edits / deletes an item, or adds a second org, through the official API, so Vaultwarden emits real notifications-hub pushes. Drives the `req_cry_009_live_*` push E2E and `req_cry_008_live_second_org_while_unlocked_locks` (which widens the fixture, so the workflow runs it last). |
+| `mutate.py` | Live only: logs in as the fixture account like a web-vault device and adds / edits / deletes an item, or adds a second org, through the official API, so Vaultwarden emits real notifications-hub pushes. Drives the `req_cry_009_live_*` push E2E and `req_cry_008_live_second_org_while_unlocked_locks` (which widens the fixture, so the workflow runs it last among the as-seeded steps). |
+| `rotate_kdf.py` | Live only (issue #84): rotates the fixture account's KDF from the seeded PBKDF2 to Argon2id (Bitwarden defaults t = 3, m = 64 MiB, p = 4) through the official `/api/accounts/kdf` flow — the web vault's KDF change, performed client-side. Needed because password-protected `bw` exports derive with the account's configured KDF, and #84's export must cover the Argon2id path. Irreversible for the fixture, so the workflow runs it after every other live step, immediately before the `bw export` + loader test. Needs `argon2-cffi` in addition to `cryptography`. |
 | `sync_fixture.json` | Checked-in output of `seed.py --offline`; decrypted end-to-end by the Rust fixture tests on every `cargo test` run. Regenerate with the pinned env below. |
 | `../../req_dep_002_fixture.rs` | The Rust tests: harness-contract checks (`req_dep_002_*`), the offline chain decrypt (`req_cry_004_fixture_*`), and the ignored live decrypt (`req_cry_004_live_*`). |
 
@@ -85,6 +86,15 @@ KHARON_FIXTURE_CHROMIUM=/path/to/headless-shell \
   cargo test -p kharond --test req_dep_002_chromium_e2e -- --ignored
 docker compose -f docker-compose.yml down -v
 ```
+
+The #84 export check runs last in the workflow, after every
+as-seeded step: `rotate_kdf.py` moves the account to Argon2id, a
+fresh `bw login` + `bw export --organizationid <seeded org>
+--format encrypted_json --password …` produces the export, and
+`req_exp_001_bw_produced_argon2id_export_loads_and_unlocks` in
+`crates/kharond/tests/req_exp_loader.rs` loads and unlocks it via
+`KHARON_BW_EXPORT_JSON`. A specimen export produced this way is
+committed at `crates/kharond/tests/fixtures/export/bw_produced_argon2id.json`.
 
 ## Scope / honest limits
 

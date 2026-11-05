@@ -19,6 +19,12 @@
 //! Ownership (REQ-ARCH-005) gates step 1: the target must live in the
 //! requesting agent's browser context, or the default context when
 //! `allow_default` is set.
+//!
+//! This module is the engine only: it has no deadline and writes no
+//! audit entry. The daemon's one fill path, `fill` and `fill_totp`
+//! alike, is [`crate::api::Broker::fill`], which owns the REQ-API-009
+//! deadline and the REQ-AUD-003† dispatch / outcome audit pair around
+//! [`FillEngine::fill`] (#73, #77, #88).
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -26,7 +32,6 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::audit::{AuditLog, Entry, Event};
 use crate::origin::{MismatchReason, OriginConfig, OriginMatcher};
 
 use super::browser::{AgentContext, Browser, OwnershipError};
@@ -75,7 +80,7 @@ pub struct FillPlan {
     /// `form.requestSubmit()` in the isolated world) after every field
     /// fills successfully. Never dispatched on a fill failure; on a
     /// timeout the broker sends nothing further, but an in-page call
-    /// already dispatched still submits (see [`DeadlineFiller`], #46).
+    /// already dispatched still submits (see [`FillEngine::fill`], #46).
     pub submit: bool,
     /// The agent's claimed origin (`FillRequest.target.expected_origin`).
     /// Never evidence (REQ-ORG-002): the live origin decides. It can
@@ -140,12 +145,13 @@ pub enum FillOutcome {
     TargetNotOwned,
     DefaultContextRefused,
     UnknownTarget,
-    /// REQ-API-009: the end-to-end fill deadline expired. Fails closed:
-    /// the broker sent no further CDP writes after expiry and the
-    /// caller's secret buffers are zeroized by [`DeadlineFiller`] before
-    /// this is returned. Not a guarantee that nothing happened in the
-    /// page: an in-page fill call dispatched before expiry may still
-    /// fill (and submit) afterwards (see [`DeadlineFiller`], #46).
+    /// REQ-API-009: the end-to-end fill deadline expired. Never returned
+    /// by [`FillEngine::fill`] itself: [`crate::api::Broker::fill`] owns
+    /// the deadline and reports this after dropping the engine future
+    /// (no further broker-side CDP writes) and zeroizing the plan. Not a
+    /// guarantee that nothing happened in the page: an in-page fill call
+    /// dispatched before expiry may still fill (and submit) afterwards
+    /// (see [`FillEngine::fill`], #46).
     Timeout,
     /// REQ-API-007: `fill_totp` refused because the last clock sample
     /// exceeded `clock_skew_refuse`. No CDP call was made.
@@ -237,6 +243,49 @@ impl FillEngine {
         self.browser.client().is_closed()
     }
 
+    /// Run one fill attempt (SPEC §6 steps 1–4) and classify it.
+    ///
+    /// The engine has no deadline and writes no audit entry. The
+    /// daemon's only fill path, `fill` and `fill_totp` alike, is
+    /// [`crate::api::Broker::fill`] (through its
+    /// [`crate::api::FillBackend`]), which owns the REQ-API-009 deadline
+    /// and the REQ-AUD-003† `fill_dispatch` / outcome pair; on expiry it
+    /// drops this future, zeroizes the plan and appends `fill_timeout`.
+    ///
+    /// # Cancellation: what "fails closed" does *not* cover (#46)
+    ///
+    /// REQ-API-009 reads "no further CDP writes, submit not dispatched".
+    /// Dropping this future enforces only the first half, and only
+    /// broker-side: the broker stops *sending*, but it cannot recall a
+    /// frame the browser already has. A `Runtime.callFunctionOn` of
+    /// `FILL_IN_PAGE` dispatched before the deadline runs the in-page
+    /// function to completion: it fills every field **and, when
+    /// `plan.submit` is set, submits the form**, possibly *after* the
+    /// broker has replied `timeout`. "Submit not dispatched" holds in the
+    /// strong sense only when the deadline expires before the fill call
+    /// is sent (ownership check, attach, frame tree, isolated world);
+    /// after that it means "no *separate* submit write is sent", which is
+    /// vacuous here because submit rides inside the one in-page call
+    /// (REQ-ORG-003's atomic check-and-set). The `timeout` reply is thus
+    /// "the broker could not confirm the fill in time", not "nothing
+    /// happened in the page". Likewise the post-fill loader re-check and
+    /// the `CLEAR_IN_PAGE` scrub (step 4) never run after a drop.
+    ///
+    /// "Dispatched" has a crisp boundary (#76): a frame is on the wire
+    /// once its `send` returned. If the future is dropped while the fill
+    /// frame is still mid-`send` on the shared websocket sink, the
+    /// connection is poisoned ([`super::CdpError::Poisoned`]): the sink is
+    /// dropped with whatever it buffered unflushed, so no later write on
+    /// that connection (another request's, or the close frame) can carry
+    /// the frame out after expiry. Bytes the kernel already accepted may
+    /// still reach the browser, but a truncated frame is not a command.
+    /// The engine then reports [`FillEngine::is_closed`] and the daemon
+    /// reconnects on the next fill.
+    ///
+    /// Secrets live canonically in `plan.fields[*].value`
+    /// (`Zeroizing<String>`). Copies inside a dropped fill future are
+    /// freed by the allocator unzeroed — the same documented class as
+    /// tungstenite's internal send buffer (see [`crate::cdp::client`]).
     pub async fn fill(
         &self,
         plan: &FillPlan,
@@ -574,303 +623,12 @@ fn expected_origin(href: &str) -> String {
 }
 
 /// REQ-API-009: the default end-to-end fill deadline, from request receipt
-/// to the final CDP result. Configurable (`fill_deadline`); the config
-/// loader wires this in when it lands (#5).
+/// to the final CDP result. Configurable (`[policy] fill_deadline`);
+/// enforced by [`crate::api::Broker::fill`], not by the engine.
 pub const DEFAULT_FILL_DEADLINE: Duration = Duration::from_secs(10);
-
-/// REQ-API-009: wraps one `fill` / `fill_totp` / `fill_and_submit` in an
-/// end-to-end deadline. On expiry the fill fails closed:
-///
-/// - the in-flight fill future is dropped, so **no further CDP writes**
-///   are sent by the broker for this fill after expiry,
-/// - the caller-owned secret buffers in the returned [`FillPlan`] are
-///   zeroized **before** the outcome is returned,
-/// - one `fill_timeout` audit entry is appended before the response; if
-///   that append fails, the result is [`AuditFailed`] instead of
-///   [`FillOutcome::Timeout`] (REQ-AUD-003†, see below).
-///
-/// # What "fails closed" does *not* cover (#46)
-///
-/// REQ-API-009 reads "no further CDP writes, submit not dispatched".
-/// At this layer only the first half is enforceable, and only
-/// broker-side: dropping the future stops the broker from *sending*
-/// anything more, but it cannot recall a frame the browser already has.
-/// A `Runtime.callFunctionOn` of `FILL_IN_PAGE` that was dispatched
-/// before the deadline runs the in-page function to completion in the
-/// page: it fills every field **and, when `plan.submit` is set, submits
-/// the form**, possibly *after* the broker has replied `timeout`. A
-/// stall after dispatch (slow page, slow transport, a browser that
-/// executes but answers late) therefore can still fill and submit
-/// post-timeout. "Submit not dispatched" holds in the strong sense only
-/// when the deadline expires before the fill call is sent (ownership
-/// check, attach, frame tree, isolated world); after that it means "no
-/// *separate* submit write is sent by the broker", which is vacuous
-/// here because submit rides inside the one in-page call
-/// (REQ-ORG-003's atomic check-and-set). The `timeout` reply is thus
-/// "the broker could not confirm the fill in time", not "nothing
-/// happened in the page". Likewise the post-fill loader re-check and
-/// the `CLEAR_IN_PAGE` scrub (step 4) never run after expiry.
-///
-/// "Dispatched" has a crisp boundary (#76): a frame is on the wire once
-/// its `send` returned. If the deadline fires while the fill frame is
-/// still mid-`send` on the shared websocket sink, dropping the future
-/// poisons the connection ([`super::CdpError::Poisoned`]): the sink is
-/// dropped with whatever it buffered unflushed, so no later write on
-/// that connection (another request's, or the close frame) can carry
-/// the frame out after expiry. Bytes the kernel already accepted may
-/// still reach the browser, but a truncated frame is not a command.
-/// The engine then reports [`FillEngine::is_closed`] and the daemon
-/// reconnects on the next fill.
-///
-/// # Audit
-///
-/// This is an engine-level wrapper with no production caller (engine
-/// tests use it; the `TotpFill` wrapper that did was retired in #77).
-/// The daemon's only fill path, `fill` and `fill_totp` alike, is
-/// [`crate::api::Broker::fill`], which owns the REQ-AUD-003† dispatch /
-/// outcome pair: a `fill_dispatch` entry before any CDP write (append
-/// failure → `audit_failed`, no write) and one outcome entry after.
-/// This wrapper writes only the `fill_timeout` outcome entry, and
-/// treats its append exactly as the daemon does: a failed append is
-/// surfaced to the caller as `Err(AuditFailed)` (the API's
-/// `audit_failed`), never swallowed. The non-timeout outcomes are
-/// returned unaudited for the caller to record.
-///
-/// Ownership note: secrets live canonically in `plan.fields[*].value`
-/// (`Zeroizing<String>`). Copies inside the cancelled fill future are freed
-/// by the allocator unzeroed — the same documented class as tungstenite's
-/// internal send buffer (see [`crate::cdp::client`]).
-pub struct DeadlineFiller<'a> {
-    engine: &'a FillEngine,
-    audit: &'a mut AuditLog,
-    deadline: Duration,
-}
-
-impl<'a> DeadlineFiller<'a> {
-    pub fn new(engine: &'a FillEngine, audit: &'a mut AuditLog) -> Self {
-        Self {
-            engine,
-            audit,
-            deadline: DEFAULT_FILL_DEADLINE,
-        }
-    }
-
-    pub fn with_deadline(mut self, deadline: Duration) -> Self {
-        self.deadline = deadline;
-        self
-    }
-
-    /// Run the fill under the deadline. Returns the plan (secrets zeroized
-    /// on the timeout path, whatever the audit result) alongside the
-    /// outcome.
-    ///
-    /// `Err(AuditFailed)` only on the timeout path, when the
-    /// `fill_timeout` entry could not be appended (REQ-AUD-003†: "a
-    /// failed outcome append turns the reply into `audit_failed`"). The
-    /// deadline is unaffected: the append runs after expiry and the
-    /// zeroize, and a failing log fails immediately (a poisoned handle
-    /// refuses without I/O).
-    pub async fn run(
-        self,
-        mut plan: FillPlan,
-        agent_ctx: &AgentContext,
-        allow_default: bool,
-    ) -> (FillPlan, Result<FillOutcome, AuditFailed>) {
-        let fill = self.engine.fill(&plan, agent_ctx, allow_default);
-        match tokio::time::timeout(self.deadline, fill).await {
-            Ok(outcome) => (plan, Ok(outcome)),
-            Err(_elapsed) => {
-                // REQ-API-009: zeroize first, so an audit failure below
-                // cannot leave plaintext behind.
-                for f in &mut plan.fields {
-                    f.value.zeroize();
-                }
-                let mut entry = Entry::new(Event::FillTimeout)
-                    .agent_id(agent_ctx.agent_id())
-                    .result("timeout")
-                    .detail_code("deadline_expired");
-                entry.live_origin = plan.live_origin.get();
-                // REQ-AUD-003†: no reply the audit log does not have.
-                // Same rule as `Broker::fill` (#46 item 2): the reply
-                // becomes `audit_failed`. The append error itself is
-                // dropped (an I/O error or `Poisoned`; it carries no
-                // secret, but nothing above needs it).
-                match self.audit.append(entry) {
-                    Ok(()) => (plan, Ok(FillOutcome::Timeout)),
-                    Err(_) => (plan, Err(AuditFailed)),
-                }
-            }
-        }
-    }
-}
-
-/// REQ-AUD-003†: an outcome audit entry could not be appended, so the
-/// fill's result must not be reported (the API maps this to
-/// `audit_failed`, [`crate::api::ApiError::AUDIT_FAILED`]). Carries no
-/// detail: the underlying [`crate::audit::AppendError`] is an I/O error
-/// or `Poisoned`, and the reply is the fixed code either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("audit append failed (fail closed)")]
-pub struct AuditFailed;
-
-/// Shared fixtures for the REQ-API-009 / REQ-AUD-003 deadline tests.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-
-    /// A CDP peer on a fresh port plus an engine and agent context
-    /// connected to it. The peer answers the session-setup protocol and
-    /// records every frame; `Runtime.callFunctionOn` is recorded but
-    /// never answered (REQ-API-009's stall).
-    pub(crate) async fn stalling_engine() -> (
-        FillEngine,
-        AgentContext,
-        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use crate::cdp::client::CdpClient;
-        use crate::cdp::endpoint::{CdpEndpoint, Tunnel};
-        use futures_util::{SinkExt, StreamExt};
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::accept_async;
-
-        // A CDP peer that answers the session-setup protocol and then
-        // records every `Runtime.callFunctionOn` without replying. The
-        // join handle is kept alive for the test's lifetime.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_task = Arc::clone(&received);
-        let task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_async(stream).await.unwrap();
-            let mut script: HashMap<String, Value> = HashMap::new();
-            script.insert(
-                "Target.createBrowserContext".to_string(),
-                json!({ "browserContextId": "ctx-A" }),
-            );
-            script.insert(
-                "Target.getTargetInfo".to_string(),
-                json!({ "targetInfo": {
-                    "targetId": "t1",
-                    "browserContextId": "ctx-A",
-                    "url": "https://accounts.example.com/login",
-                    "title": "",
-                    "type": "page",
-                } }),
-            );
-            script.insert(
-                "Target.attachToTarget".to_string(),
-                json!({ "sessionId": "sess-1" }),
-            );
-            script.insert(
-                "Page.getFrameTree".to_string(),
-                json!({ "frameTree": { "frame": {
-                    "id": "f1",
-                    "loaderId": "l1",
-                    "url": "https://accounts.example.com/login",
-                }, "childFrames": [] } }),
-            );
-            script.insert(
-                "Page.createIsolatedWorld".to_string(),
-                json!({ "executionContextId": 7 }),
-            );
-            while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
-                ws.next().await
-            {
-                let msg: Value = serde_json::from_str(&text).unwrap();
-                received_task.lock().unwrap().push(msg.clone());
-                let method = msg["method"].as_str().unwrap();
-                // REQ-API-009's stall: the in-page fill call never gets a
-                // reply, so the deadline is the only thing that can end it.
-                if method == "Runtime.callFunctionOn" {
-                    continue;
-                }
-                let result = script.get(method).cloned().unwrap_or_else(|| json!({}));
-                let mut reply = json!({ "id": msg["id"], "result": result });
-                if let Some(session_id) = msg.get("sessionId") {
-                    reply["sessionId"] = session_id.clone();
-                }
-                ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                    reply.to_string(),
-                ))
-                .await
-                .unwrap();
-            }
-        });
-
-        let endpoint = CdpEndpoint::validate(
-            &format!("ws://{}/devtools/browser", addr),
-            Tunnel::Direct,
-            None,
-        )
-        .unwrap();
-        let client = CdpClient::connect(&endpoint).await.unwrap();
-        let browser = crate::cdp::browser::Browser::new(client);
-        let ctx = browser.create_agent_context("agent-A").await.unwrap();
-        let engine = FillEngine::new(browser);
-        (engine, ctx, received, task)
-    }
-
-    /// One password field carrying a canary, `submit: true` (even a
-    /// requested submit must never get a broker-side write after expiry).
-    pub(crate) fn canary_plan() -> FillPlan {
-        FillPlan {
-            target_id: "t1".to_string(),
-            fields: vec![FieldFill {
-                kind: FieldKind::Password,
-                selector: None,
-                value: Zeroizing::new("CANARY-fill-secret-9f3d".to_string()),
-            }],
-            item_matchers: vec![
-                OriginMatcher::new("https://accounts.example.com/login", None).unwrap(),
-            ],
-            origin_cfg: OriginConfig::default(),
-            cross_origin_iframe_hosts: Vec::new(),
-            submit: true,
-            expected_origin: None,
-            live_origin: LiveOrigin::new(),
-        }
-    }
-
-    /// A writer whose durability barrier always fails: the first append
-    /// errors (and poisons the handle), every later one is refused.
-    pub(crate) struct SyncFails;
-
-    impl std::io::Write for SyncFails {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl crate::audit::AuditWriter for SyncFails {
-        fn sync(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::other("simulated fdatasync failure"))
-        }
-    }
-
-    pub(crate) fn failing_audit() -> (tempfile::TempDir, AuditLog) {
-        use crate::audit::{AuditConfig, AuditKeys, NullCheckpointSink};
-        let dir = tempfile::tempdir().unwrap();
-        let keys = AuditKeys::load_or_generate(&dir.path().join("keys")).unwrap();
-        let log = AuditLog::open_for_test(
-            SyncFails,
-            keys,
-            AuditConfig::default(),
-            Box::new(NullCheckpointSink),
-        );
-        (dir, log)
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{canary_plan, failing_audit, stalling_engine};
     use super::*;
 
     #[test]
@@ -982,167 +740,6 @@ mod tests {
             ),
             FillOutcome::NonSecureContext
         ));
-    }
-
-    /// REQ-API-009 (configurable deadline row): a CDP stub that stalls
-    /// `Runtime.callFunctionOn` makes the whole fill fail closed at the
-    /// configured deadline: outcome `timeout`, caller-owned secret
-    /// buffers zeroized, exactly one `fill_timeout` audit entry written
-    /// before the response, and no CDP frame reaches the stub after the
-    /// deadline. Uses `fill_deadline=2s` (the AC's configurable row); the
-    /// 10 s default is pinned by `req_api_009_default_deadline`.
-    #[tokio::test]
-    async fn req_api_009_timeout_fails_closed() {
-        use crate::audit::NullCheckpointSink;
-        use crate::audit::{AuditConfig, AuditLog};
-        use std::time::Instant;
-
-        let (engine, ctx, received, _peer_task) = stalling_engine().await;
-
-        let dir = std::env::temp_dir().join(format!("kharon_audit_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut audit =
-            AuditLog::open(&dir, AuditConfig::default(), Box::new(NullCheckpointSink)).unwrap();
-
-        let mut plan = canary_plan();
-        let secret = plan.fields[0].value.clone();
-
-        let start = Instant::now();
-        let (returned_plan, outcome) = DeadlineFiller::new(&engine, &mut audit)
-            .with_deadline(Duration::from_secs(2))
-            .run(plan, &ctx, false)
-            .await;
-        let elapsed = start.elapsed();
-        plan = returned_plan;
-
-        assert_eq!(outcome, Ok(FillOutcome::Timeout));
-        // AC: timeout at the configured deadline (±0.5 s; tokio fires at
-        // the deadline, the window guards against clock slop).
-        assert!(
-            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_millis(2600),
-            "elapsed {elapsed:?}"
-        );
-        // Zeroize hook observed on the caller-owned secret buffer.
-        assert!(plan.fields.iter().all(|f| f.value.is_empty()));
-        // The original clone still holds the canary — the engine's copy is
-        // what got wiped; compare to prove zeroization really happened.
-        assert_eq!(&*secret, "CANARY-fill-secret-9f3d");
-
-        // Exactly one fill_timeout entry, written before the response.
-        let audit_text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
-        assert_eq!(
-            audit_text.matches("\"event\":\"fill_timeout\"").count(),
-            1,
-            "audit tail: {audit_text}"
-        );
-        // REQ-GOAL-001 (partial, for this path): no canary bytes in the
-        // audit log or anywhere in the response-reachable state.
-        assert!(!audit_text.contains("CANARY"));
-        // #67: the live origin read before the stall is on the timeout
-        // entry, as an origin (the page path is not recorded).
-        assert_eq!(
-            plan.live_origin.get().as_deref(),
-            Some("https://accounts.example.com")
-        );
-        assert!(
-            audit_text.contains("\"live_origin\":\"https://accounts.example.com\""),
-            "audit tail: {audit_text}"
-        );
-        assert!(!audit_text.contains("/login"), "no path in the log");
-
-        // No later write reaches the stub after the deadline: the fill
-        // future is dropped, so nothing further is sent. Give the peer a
-        // moment to deliver anything in flight, then freeze the count.
-        let count_at_return = received.lock().unwrap().len();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let count_after = received.lock().unwrap().len();
-        assert_eq!(
-            count_at_return, count_after,
-            "frames kept arriving after the deadline: {count_at_return} -> {count_after}"
-        );
-        // Exactly one in-page call was ever attempted (the stalled fill);
-        // the clear-scrub never ran.
-        let calls = received.lock().unwrap();
-        let call_count = calls
-            .iter()
-            .filter(|m| m["method"] == "Runtime.callFunctionOn")
-            .count();
-        assert_eq!(call_count, 1, "unexpected extra CDP writes: {calls:?}");
-        drop(calls);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// REQ-AUD-003† ("a failed outcome append turns the reply into
-    /// `audit_failed`") on REQ-API-009's timeout path (#46 item 2): a
-    /// `fill_timeout` append that fails is surfaced as
-    /// `Err(AuditFailed)`, not swallowed into `Timeout`. The REQ-API-009
-    /// guarantees still hold: the reply comes at the deadline, the
-    /// caller's secret buffer is zeroized, and no further CDP write
-    /// reaches the stub.
-    #[tokio::test]
-    async fn req_aud_003_timeout_append_failure_is_audit_failed() {
-        use std::time::Instant;
-
-        let (engine, ctx, received, _peer_task) = stalling_engine().await;
-        let (_dir, mut audit) = failing_audit();
-
-        let start = Instant::now();
-        let (plan, outcome) = DeadlineFiller::new(&engine, &mut audit)
-            .with_deadline(Duration::from_secs(1))
-            .run(canary_plan(), &ctx, false)
-            .await;
-        let elapsed = start.elapsed();
-
-        assert_eq!(outcome, Err(AuditFailed));
-        // REQ-API-009 timing: the failed append adds nothing measurable.
-        assert!(
-            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_millis(1600),
-            "elapsed {elapsed:?}"
-        );
-        // Zeroized before the append, so an audit failure leaves no
-        // plaintext in the returned plan.
-        assert!(plan.fields.iter().all(|f| f.value.is_empty()));
-        // The error carries no detail a secret could ride in.
-        assert_eq!(AuditFailed.to_string(), "audit append failed (fail closed)");
-        // And maps to the API's fixed `audit_failed` reply.
-        assert_eq!(
-            crate::api::ApiError::from(AuditFailed),
-            crate::api::ApiError::AUDIT_FAILED
-        );
-
-        let count_at_return = received.lock().unwrap().len();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(count_at_return, received.lock().unwrap().len());
-        let calls = received.lock().unwrap();
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|m| m["method"] == "Runtime.callFunctionOn")
-                .count(),
-            1,
-            "unexpected extra CDP writes: {calls:?}"
-        );
-    }
-
-    /// REQ-AUD-003† with a handle already poisoned by an earlier failed
-    /// append (the audit module refuses every later append without I/O):
-    /// the timeout path still reports `Err(AuditFailed)` at the deadline.
-    #[tokio::test]
-    async fn req_api_009_timeout_on_poisoned_log_is_audit_failed() {
-        let (engine, ctx, _received, _peer_task) = stalling_engine().await;
-        let (_dir, mut audit) = failing_audit();
-        audit
-            .append(Entry::new(Event::Fill))
-            .expect_err("first append fails and poisons");
-
-        let (plan, outcome) = DeadlineFiller::new(&engine, &mut audit)
-            .with_deadline(Duration::from_millis(500))
-            .run(canary_plan(), &ctx, false)
-            .await;
-        assert_eq!(outcome, Err(AuditFailed));
-        assert!(plan.fields.iter().all(|f| f.value.is_empty()));
     }
 
     /// #67: the live origin is recorded as a serialized origin only

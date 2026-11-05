@@ -24,9 +24,11 @@ Repo secrets (set 2026-11-05):
 | `BW_COMPAT_EMAIL` | Cloud test account email |
 | `BW_COMPAT_PASSWORD` | Master password |
 
-Optional (workflow comments show the wiring): `BW_COMPAT_ORG_ID`,
+Recommended (workflow comments show the wiring): `BW_COMPAT_ORG_ID`,
 `BW_COMPAT_COLLECTION_ID` to pin scope instead of “first org + first
-collection of that org”.
+collection of that org”. They were used on the 2026-11-05 run to
+avoid the empty Default collection, targeting the dedicated org’s
+`compat` collection.
 
 The cloud account must have **one dedicated organization** with at
 least one **collection** containing a **login** item (REQ-CRY-007
@@ -41,7 +43,7 @@ access from a trusted client and re-run.
 
 | Date (UTC) | Server | Job | REQ-CRY-005 | Notes |
 |---|---|---|---|---|
-| _pending first green `compat.yml` run_ | `vault.bitwarden.com` | — | — | PR for #25 lands the harness; update this row after the first successful `workflow_dispatch`. |
+| 2026-11-05 | `vault.bitwarden.com` | `bitwarden-cloud` | pass | [42113103215](https://github.com/CycleFive/kharon/actions/runs/42113103215) (`workflow_dispatch` on master, 2026-11-05T21:29:28Z, head `393b95d`, PR #108). REQ-DEP-004 / REQ-CRY-005: minted a personal API key, synced, and decrypted a login in the scoped `compat` collection. |
 
 Vaultwarden 1.3x half of REQ-CRY-005 is covered by
 `fixture.yml` → `req_cry_005_live_vaultwarden_api_key_sync` (issue #8 / #10).

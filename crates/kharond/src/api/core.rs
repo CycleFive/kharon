@@ -1044,8 +1044,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// REQ-APR-003: deny every grant request that has been pending
     /// for at least [`REQUEST_TIMEOUT`](super::grant::REQUEST_TIMEOUT),
     /// auditing each denial (`grant_request`, result `denied`, detail
-    /// `request_timeout`) *before* its transition takes effect
-    /// (REQ-AUD-003). Runs at the head of every fill and grant
+    /// `request_timeout`). Each denial transitions under the store
+    /// lock *before* its audit append: an owner approval that lands
+    /// after the expiry snapshot wins, and no timeout denial is ever
+    /// audited for a request that was in fact approved (PR #109
+    /// review). If the append fails the transition is rolled back —
+    /// the request is pending again (REQ-AUD-003 fail-closed, as for
+    /// owner denials). Runs at the head of every fill and grant
     /// request; the daemon may also call it on its own cadence.
     /// Returns how many requests transitioned.
     pub fn expire_grant_requests(&self) -> Result<usize, GrantError> {
@@ -1057,6 +1062,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .expired_pending(now);
         let mut count = 0;
         for req in expired {
+            let Some(req) = self
+                .grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .deny_expired(&req.id)
+            else {
+                // Approved (or otherwise resolved) since the
+                // snapshot: not a timeout denial, nothing to audit.
+                continue;
+            };
             let entry = Entry::new(Event::GrantRequest)
                 .agent_id(req.agent_id.clone())
                 .item_id(req.item_id.clone())
@@ -1064,16 +1079,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 .request_id(req.id.clone())
                 .result("denied")
                 .detail_code("request_timeout");
-            self.append(entry).map_err(|_| GrantError::AuditFailed)?;
-            if self
-                .grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .deny_expired(&req.id)
-                .is_some()
-            {
-                count += 1;
+            if self.append(entry).is_err() {
+                self.grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .restore_pending(&req.id);
+                return Err(GrantError::AuditFailed);
             }
+            count += 1;
         }
         Ok(count)
     }

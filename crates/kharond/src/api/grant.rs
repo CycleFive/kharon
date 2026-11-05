@@ -728,9 +728,10 @@ impl GrantStore {
     }
 
     /// Requests an expiry pass at `now` would deny, without
-    /// transitioning them: the broker audits each denial *before*
-    /// the transition takes effect (REQ-AUD-003), then calls
-    /// [`Self::deny_expired`].
+    /// transitioning them: the broker transitions each through
+    /// [`Self::deny_expired`] (so an approval that lands after this
+    /// snapshot wins) and audits the denial, rolling the transition
+    /// back if the audit append fails (REQ-AUD-003).
     pub fn expired_pending(&self, now: Duration) -> Vec<GrantRequest> {
         self.requests
             .iter()

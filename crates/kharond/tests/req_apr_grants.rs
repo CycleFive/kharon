@@ -16,6 +16,11 @@
 //!   observed; a claim that disagrees makes the fill
 //!   `origin_mismatch` and the request is refused before any prompt
 //!   exists.
+//! - **REQ-MEM-007**: a standing grant is inert while the broker is
+//!   locked (the fill returns `locked`, with no CDP write and no
+//!   grant use spent) and survives the lock — the same grant admits
+//!   again after unlock. (The AC's home issue is #23; the test
+//!   lands here per the PR #109 review.)
 //!
 //! The transports carry the same bodies: the last test runs
 //! `kharon_request_grant` over HTTP and MCP against one broker and
@@ -36,7 +41,7 @@ use kharond::api::grant::{Channel, GrantAction, GrantError, GrantTerms, RequestS
 use kharond::api::token::{TokenStore, generate_with};
 use kharond::api::{Broker, Outcome, VaultView, parse_fill, parse_grant};
 use kharond::audit::Entry;
-use kharond::lock::{Clock, LockController, LockPolicy, ManualClock, StaticHardening};
+use kharond::lock::{Clock, LockController, LockPolicy, LockReason, ManualClock, StaticHardening};
 use kharond::origin::OriginConfig;
 use kharond::sync::{SecretField, SyncError, Vault};
 use serde_json::{Value, json};
@@ -399,6 +404,89 @@ async fn req_apr_001_status_lists_the_agents_live_grants() {
         .unwrap();
     assert_eq!(store.grants_for("beta", rig.clock.now()).len(), 1);
     assert_eq!(store.grants_for("alpha", rig.clock.now()).len(), 1);
+}
+
+#[tokio::test]
+async fn req_mem_007_standing_grant_is_inert_while_locked_and_survives_lock() {
+    let rig = Rig::new("https://login.example.com/signin");
+    // A standing grant for alpha (the store is told standing is
+    // on, as `[policy] allow_standing` would arrange).
+    {
+        let mut store = rig.broker.grant_store().lock().unwrap();
+        store.set_allow_standing(true);
+        store
+            .issue(
+                "alpha",
+                ITEM_A,
+                GrantAction::Fill,
+                "https://login.example.com",
+                &GrantTerms {
+                    scope: kharond::api::GrantScope::Item(ITEM_A.to_owned()),
+                    kind: kharond::config::GrantKind::Standing,
+                    ttl: None,
+                    max_uses: None,
+                },
+                Channel::Cli,
+                None,
+                rig.clock.now(),
+            )
+            .unwrap();
+    }
+    let uses = |rig: &Rig| {
+        rig.broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .grants_for("alpha", rig.clock.now())[0]
+            .uses
+    };
+    // Unlocked: the standing grant admits, spending one use.
+    let r = rig.fill_password().await;
+    assert_eq!(r["status"], "filled", "{r}");
+    assert_eq!(rig.fake.seen().len(), 1);
+    assert_eq!(uses(&rig), 1);
+
+    // Locked: the grant does not admit — the fill is `locked`,
+    // the backend sees no plan (no CDP write), and no use is spent.
+    rig.broker
+        .lock_controller()
+        .lock()
+        .unwrap()
+        .lock(LockReason::Manual);
+    let req = parse_fill(
+        kharond::api::FillOperation::Fill,
+        json!({
+            "item_id": ITEM_A,
+            "target": {"cdp_target_id": "tab-1", "expected_origin": "https://login.example.com"},
+            "fields": [{"kind": "password"}],
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let out = rig.broker.fill(&rig.agent(), req, Instant::now()).await;
+    assert!(
+        matches!(out, Err(e) if e == kharond::api::ApiError::LOCKED),
+        "{out:?}"
+    );
+    assert_eq!(rig.fake.seen().len(), 1, "a locked fill wrote to CDP");
+    assert_eq!(uses(&rig), 1, "a locked fill spent a grant use");
+
+    // Unlocked again: the same grant survived the lock and admits.
+    rig.broker
+        .lock_controller()
+        .lock()
+        .unwrap()
+        .unlock(|| {
+            Ok::<_, ()>(CountingSession {
+                inner: TestSession::fixture(),
+                secret_decrypts: rig.decrypts.clone(),
+            })
+        })
+        .unwrap();
+    let r = rig.fill_password().await;
+    assert_eq!(r["status"], "filled", "{r}");
+    assert_eq!(uses(&rig), 2);
 }
 
 #[tokio::test]

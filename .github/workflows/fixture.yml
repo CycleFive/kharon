@@ -188,7 +188,20 @@ jobs:
           a = json.load(open("fixture.json"))["account"]
           print(a["email"], a["password"])')"
           export BW_PASSWORD
-          BW_SESSION="$(bw login "$BW_EMAIL" --passwordenv BW_PASSWORD --raw)"
+          # Vaultwarden rate-limits /identity/connect/token, and by
+          # this point the job has logged in a lot (seed, oracle,
+          # mutate.py per mutation, rotate_kdf.py a minute ago): the
+          # first run of this step died here with "Rate limit
+          # exceeded. Try again later." Retry with backoff.
+          BW_SESSION=""
+          for attempt in 1 2 3 4 5 6; do
+            if BW_SESSION="$(bw login "$BW_EMAIL" --passwordenv BW_PASSWORD --raw)"; then
+              break
+            fi
+            echo "bw login attempt $attempt failed; retrying in 20 s"
+            sleep 20
+          done
+          [ -n "$BW_SESSION" ] || { echo "bw login never succeeded"; exit 1; }
           export BW_SESSION
           unset BW_PASSWORD
           bw sync

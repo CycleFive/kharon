@@ -4,8 +4,8 @@
 //! test. (Semantics are REQ-API-002's contract test, which runs every
 //! case over MCP too.)
 //!
-//! Today six of the seven tools exist: `kharon_request_grant` arrives
-//! with #20 and extends [`Tool::ALL`] and the snapshot.
+//! All seven tools exist: `kharon_request_grant` landed with #20
+//! and is in [`Tool::ALL`] and the snapshot.
 
 mod api_support;
 
@@ -207,7 +207,8 @@ async fn req_api_001_tools_list_serves_the_generated_tools() {
             "kharon_search",
             "kharon_fill",
             "kharon_fill_totp",
-            "kharon_context"
+            "kharon_context",
+            "kharon_request_grant"
         ]
     );
     assert!(res["ttlMs"].is_u64());
@@ -435,8 +436,16 @@ async fn req_api_001_json_rpc_errors() {
     // Unknown tool: protocol error, not a tool result.
     let r = mcp_call(addr, Some(&h.alpha), "kharon_export", "{}").await;
     assert_eq!((r.status, rpc_error_code(&r)), (200, -32602));
+    // kharon_request_grant exists (#20): bad arguments are a tool
+    // result, not a protocol error.
     let r = mcp_call(addr, Some(&h.alpha), "kharon_request_grant", "{}").await;
-    assert_eq!(rpc_error_code(&r), -32602, "request_grant is #20");
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (body, is_error) = tool_body(&r);
+    assert!(is_error);
+    assert_eq!(
+        body,
+        ApiError::bad_request(Detail::InvalidGrantRequest).body()
+    );
     // Notifications are accepted with no body.
     let r = post_mcp_raw(
         addr,

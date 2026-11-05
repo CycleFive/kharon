@@ -539,7 +539,31 @@ async fn req_goal_001_fuzzed_fill_run_leaks_no_canary() {
     ] {
         let r = post_json(daemon.addr, path, Some(&token), &body.to_string()).await;
         assert_eq!(r.status, 200, "{path}: {}", r.body);
-        responses.push(r.body);
+        responses.push(r.body.clone());
+        // #20: a grantless fill is `pending_approval`. Approve the
+        // request over the owner socket (per-origin, test-lived) and
+        // retry the same fill so the warm-up actually fills.
+        if r.json()["status"] == json!("pending_approval") {
+            let grid = r.json()["grant_request_id"]
+                .as_str()
+                .expect("pending_approval carries a grant_request_id")
+                .to_owned();
+            let socket = daemon.socket.clone();
+            let approved = tokio::task::spawn_blocking(move || {
+                owner_op(
+                    &socket,
+                    &json!({ "op": "approve", "request_id": grid,
+                             "kind": "per-origin", "ttl_s": 86400 }),
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(approved["ok"], json!(true), "{approved}");
+            let r = post_json(daemon.addr, path, Some(&token), &body.to_string()).await;
+            assert_eq!(r.status, 200, "{path}: {}", r.body);
+            assert_eq!(r.json()["status"], json!("filled"), "{path}: {}", r.body);
+            responses.push(r.body);
+        }
     }
 
     let mut rng = Rng(seed | 1);

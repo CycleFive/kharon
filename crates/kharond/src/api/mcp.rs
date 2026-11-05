@@ -9,7 +9,7 @@
 //! carries exactly the body `/v1/*` would return (the contract test,
 //! `tests/req_api_002_contract.rs`, checks this case by case).
 //!
-//! Tools (SPEC §4; `kharon_request_grant` arrives with #20):
+//! Tools (SPEC §4):
 //!
 //! | Tool | HTTP equivalent |
 //! |---|---|
@@ -19,6 +19,7 @@
 //! | `kharon_fill` | `POST /v1/fill` |
 //! | `kharon_fill_totp` | `POST /v1/fill_totp` |
 //! | `kharon_context` | `POST /v1/context` (#65) |
+//! | `kharon_request_grant` | `POST /v1/grants` (#20) |
 //!
 //! The read tools' arguments become `(name, value)` pairs for
 //! [`parse_request`]; the fill tools' arguments object is exactly the
@@ -72,6 +73,7 @@ use super::core::{
 };
 use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillArgs, FillOperation, FillTotpArgs, parse_fill};
+use super::grant::{GrantArgs, parse_grant};
 use super::http::{AppState, authenticate, bearer_token, error, json_response};
 use crate::lock::Clock;
 use tokio::time::Instant;
@@ -156,17 +158,20 @@ pub enum Tool {
     FillTotp,
     /// `kharon_context` (#65).
     Context,
+    /// `kharon_request_grant` (#20).
+    RequestGrant,
 }
 
 impl Tool {
     /// Every tool, in `tools/list` order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Status,
         Self::List,
         Self::Search,
         Self::Fill,
         Self::FillTotp,
         Self::Context,
+        Self::RequestGrant,
     ];
 
     /// Tool name.
@@ -178,6 +183,7 @@ impl Tool {
             Self::Fill => "kharon_fill",
             Self::FillTotp => "kharon_fill_totp",
             Self::Context => "kharon_context",
+            Self::RequestGrant => "kharon_request_grant",
         }
     }
 
@@ -187,23 +193,24 @@ impl Tool {
     }
 
     /// The read operation the tool runs ([`parse_request`]); `None`
-    /// for the fill tools and `kharon_context`.
+    /// for the fill tools, `kharon_context` and
+    /// `kharon_request_grant`.
     pub const fn operation(self) -> Option<Operation> {
         match self {
             Self::Status => Some(Operation::Status),
             Self::List => Some(Operation::List),
             Self::Search => Some(Operation::Search),
-            Self::Fill | Self::FillTotp | Self::Context => None,
+            Self::Fill | Self::FillTotp | Self::Context | Self::RequestGrant => None,
         }
     }
 
     /// The fill operation the tool runs ([`parse_fill`]); `None` for
-    /// the read tools and `kharon_context`.
+    /// the read tools, `kharon_context` and `kharon_request_grant`.
     pub const fn fill_operation(self) -> Option<FillOperation> {
         match self {
             Self::Fill => Some(FillOperation::Fill),
             Self::FillTotp => Some(FillOperation::FillTotp),
-            Self::Status | Self::List | Self::Search | Self::Context => None,
+            Self::Status | Self::List | Self::Search | Self::Context | Self::RequestGrant => None,
         }
     }
 
@@ -214,6 +221,7 @@ impl Tool {
             Self::List => &["origin"],
             Self::Search => &["q", "origin"],
             Self::Fill | Self::FillTotp => &["item_id", "target", "fields", "submit", "grant_id"],
+            Self::RequestGrant => &["item_id", "target", "action"],
         }
     }
 
@@ -225,6 +233,7 @@ impl Tool {
             Self::Fill => "Fill a login form",
             Self::FillTotp => "Fill a TOTP code",
             Self::Context => "Your browser context",
+            Self::RequestGrant => "Request a grant",
         }
     }
 
@@ -265,6 +274,16 @@ impl Tool {
                  restart or a broker lock you get a new one. Requires unlock. Bounded by the \
                  fill deadline (10 s). Audited. Same body as POST /v1/context."
             }
+            Self::RequestGrant => {
+                "Ask the owner for a grant to fill one item (action fill, or totp) in the \
+                 tab cdp_target_id in your own browser context. The broker reads the tab's \
+                 live origin itself: if it differs from expected_origin the request is \
+                 origin_mismatch and no prompt is shown. Otherwise the request is pending \
+                 until the owner approves or it times out after 120 s (denied). Calling \
+                 again while one is pending returns the same request. A fill without a \
+                 matching grant creates the same request implicitly. Requires unlock. \
+                 Audited. Same body as POST /v1/grants."
+            }
         }
     }
 
@@ -281,6 +300,7 @@ impl Tool {
             Self::Fill => generator.into_root_schema_for::<FillArgs>(),
             Self::FillTotp => generator.into_root_schema_for::<FillTotpArgs>(),
             Self::Context => generator.into_root_schema_for::<ContextArgs>(),
+            Self::RequestGrant => generator.into_root_schema_for::<GrantArgs>(),
         };
         let mut v = schema.to_value();
         if let Some(o) = v.as_object_mut() {
@@ -312,7 +332,9 @@ impl Tool {
         json!({
             "readOnlyHint": reads,
             "destructiveHint": false,
-            "idempotentHint": reads || matches!(self, Self::Context),
+            // `kharon_request_grant` is idempotent too: the broker
+            // dedupes a pending request per (agent, item, action).
+            "idempotentHint": reads || matches!(self, Self::Context | Self::RequestGrant),
             "openWorldHint": !reads,
         })
     }
@@ -715,13 +737,21 @@ where
                         Err(e) => Err(e),
                     }
                 }
-                (None, None) => {
-                    debug_assert_eq!(tool, Tool::Context);
-                    match fill_arguments(call.arguments).and_then(parse_context_body) {
-                        Ok(()) => broker.context(agent, received).await,
-                        Err(e) => Err(e),
+                (None, None) => match tool {
+                    Tool::Context => {
+                        match fill_arguments(call.arguments).and_then(parse_context_body) {
+                            Ok(()) => broker.context(agent, received).await,
+                            Err(e) => Err(e),
+                        }
                     }
-                }
+                    Tool::RequestGrant => {
+                        match fill_arguments(call.arguments).and_then(parse_grant) {
+                            Ok(r) => broker.request_grant(agent, r, received).await,
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => unreachable!("only context and request_grant have no operation"),
+                },
             };
             match outcome {
                 Ok(o) => tool_result(id, era, o.body(), false),

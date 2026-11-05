@@ -23,6 +23,7 @@ use serde::Serialize;
 use super::core::{ContextResult, StatusBody};
 use super::error::ErrorBody;
 use super::fill::FillResult;
+use super::grant::GrantRequestBody;
 use super::mcp::Tool;
 use super::meta::ItemMeta;
 
@@ -34,6 +35,7 @@ pub const fn http_route(tool: Tool) -> (&'static str, &'static str) {
         Tool::Fill => ("POST", super::http::FILL_PATH),
         Tool::FillTotp => ("POST", super::http::FILL_TOTP_PATH),
         Tool::Context => ("POST", super::http::CONTEXT_PATH),
+        Tool::RequestGrant => ("POST", super::http::GRANTS_PATH),
     }
 }
 
@@ -45,6 +47,7 @@ pub fn response_schema(tool: Tool) -> Schema {
         Tool::List | Tool::Search => schema_of::<Vec<ItemMeta>>(),
         Tool::Fill | Tool::FillTotp => schema_of::<FillResult>(),
         Tool::Context => schema_of::<ContextResult>(),
+        Tool::RequestGrant => schema_of::<GrantRequestBody>(),
     }
 }
 

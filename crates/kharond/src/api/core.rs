@@ -24,8 +24,15 @@
 //! of [`Broker::dispatch`] (the browser round trip is async; the read
 //! operations stay sync): authenticate, then the lock gate, then the
 //! SPEC §8 fill-time re-sync of a stale vault ([`FillSync`]), then
-//! (TODO #20) the grant check, then resolve the item and decrypt the values
-//! into a [`FillPlan`], then the [`FillBackend`], all under one
+//! resolve the item and — before any secret is decrypted — the grant
+//! check (SPEC §5, REQ-APR-001/002; [`super::grant`]): a matching live
+//! grant is consumed and the fill proceeds; an explicitly named grant
+//! that fails its terms is `denied`; no grant at all makes a
+//! [`GrantRequest`](super::grant::GrantRequest) from the live origin
+//! the backend observes (REQ-APR-007) and reports `pending_approval`
+//! (or `origin_mismatch`, when the tab is not where the agent
+//! claimed). An admitted fill decrypts the values into a
+//! [`FillPlan`], then the [`FillBackend`], all under one
 //! wall-clock fill deadline (REQ-API-009); then zeroize the plan, then
 //! append exactly one outcome entry (`fill`, `fill_totp` or
 //! `fill_timeout`), then reply. A fill that reaches the browser is two
@@ -51,6 +58,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::error::{ApiError, Detail};
 use super::fill::{FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus};
+use super::grant::{
+    Channel, Grant, GrantAction, GrantError, GrantPolicy, GrantRequest, GrantRequestArgs,
+    GrantRequestBody, GrantScope, GrantStore, GrantTerms, GrantView, RequestState,
+};
 use super::meta::{ItemMeta, matches_origin, matches_query};
 use super::token::TokenStore;
 use crate::audit::{AuditLog, Entry, Event};
@@ -174,12 +185,6 @@ pub enum Request {
     },
 }
 
-/// SPEC §4 `Grant` as status reports it. Grants arrive with issue #20's
-/// grant model; until then no grant can exist, so the type is empty
-/// and `grants` is always `[]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub enum GrantView {}
-
 /// `GET /v1/status` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct StatusBody {
@@ -222,6 +227,8 @@ pub enum Outcome {
     Fill(FillResult),
     /// `kharon_context` result (any status).
     Context(ContextResult),
+    /// `kharon_request_grant` result (any state, including refusals).
+    GrantRequest(GrantRequestBody),
 }
 
 impl Outcome {
@@ -232,6 +239,7 @@ impl Outcome {
             Self::Items(items) => serde_json::to_value(items),
             Self::Fill(r) => serde_json::to_value(r),
             Self::Context(r) => serde_json::to_value(r),
+            Self::GrantRequest(r) => serde_json::to_value(r),
         };
         v.expect("invariant: API bodies serialize")
     }
@@ -332,7 +340,7 @@ pub fn parse_items_query<'a>(
     }
 }
 
-fn validate_origin(origin: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_origin(origin: &str) -> Result<String, ApiError> {
     if origin.len() > MAX_ORIGIN_LEN {
         return Err(ApiError::bad_request(Detail::ParameterTooLong));
     }
@@ -356,6 +364,14 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     fill_policy: FillPolicy,
     plan_wiped: Option<PlanWipedHook>,
     fill_sync: Option<Arc<dyn FillSync>>,
+    /// The grant model (SPEC §5, #20): grants and requests, guarded
+    /// separately from the session so owner operations never hold
+    /// the lock controller.
+    grants: Mutex<GrantStore>,
+    /// Time source for grant TTLs and the request timeout: the
+    /// broker's injected clock in tests, [`SystemClock`] in the
+    /// daemon (whose lock controller runs on the same clock).
+    grant_clock: Arc<dyn Clock>,
 }
 
 /// Called with every resolved [`FillPlan`] after its values were
@@ -366,6 +382,23 @@ pub type PlanWipedHook = Arc<dyn Fn(&FillPlan) + Send + Sync>;
 /// `fill_dispatch` to its outcome entry (REQ-AUD-003†).
 fn new_request_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
+}
+
+/// The grant action of a fill operation (SPEC §5's `actions`).
+fn grant_action(op: FillOperation) -> GrantAction {
+    match op {
+        FillOperation::Fill => GrantAction::Fill,
+        FillOperation::FillTotp => GrantAction::Totp,
+    }
+}
+
+/// The item an audit entry names for a grant: the item of an
+/// item-scoped grant. A collection grant names no single item.
+fn grant_item_id(grant: &Grant) -> Option<String> {
+    match &grant.scope {
+        GrantScope::Item(id) => Some(id.clone()),
+        GrantScope::Collection(_) => None,
+    }
 }
 
 /// Owns a resolved [`FillPlan`] for the rest of [`Broker::fill`]. On
@@ -427,6 +460,11 @@ enum Unresolved {
     Locked,
     /// A `FillResult` refusal.
     Refused(FillStatus),
+    /// REQ-APR-001: the item exists and a browser is wired, but no
+    /// live grant matches. The async half of [`Broker::fill`] makes
+    /// the grant request (it needs the backend's live-origin
+    /// observation, which is a browser round trip).
+    NeedsApproval,
 }
 
 /// Move decrypted bytes into a zeroizing `String`; non-UTF-8 is wiped
@@ -459,7 +497,37 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             fill_policy: FillPolicy::default(),
             plan_wiped: None,
             fill_sync: None,
+            grants: Mutex::new(GrantStore::new(false)),
+            grant_clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Use `clock` for grant TTLs and the request timeout instead of
+    /// the system clock (tests drive both lock and grant timers with
+    /// one `ManualClock`).
+    pub fn with_grant_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.grant_clock = clock;
+        self
+    }
+
+    /// Apply `[policy]` to the grant store (standing grants on/off).
+    pub fn with_grant_policy(mut self, policy: GrantPolicy) -> Self {
+        self.grants
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_allow_standing(policy.allow_standing);
+        self
+    }
+
+    /// The grant store (owner operations below; tests seed and
+    /// inspect through it).
+    pub fn grant_store(&self) -> &Mutex<GrantStore> {
+        &self.grants
+    }
+
+    /// The grant clock's current reading.
+    fn grant_now(&self) -> std::time::Duration {
+        self.grant_clock.now()
     }
 
     /// Re-sync a stale vault through `source` before a fill resolves
@@ -597,10 +665,22 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         // Run the expiry check so an expired session reports locked.
         lock.poll();
+        let now = self.grant_now();
         StatusBody {
             locked: lock.is_locked(),
             agent_id: agent.0.clone(),
-            grants: Vec::new(),
+            // The agent's live grants (SPEC §4). Status is unaudited
+            // and never transitions anything: grants past their TTL
+            // simply stop being live, and timed-out requests deny on
+            // the next expiry pass, not here.
+            grants: self
+                .grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .grants_for(agent.as_str(), now)
+                .iter()
+                .map(|g| g.view(now))
+                .collect(),
             browser_context_id: self
                 .fill_backend
                 .as_ref()
@@ -708,6 +788,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // The live origin the engine read, if the fill got that far
         // (REQ-AUD-003†, #67); copied into the outcome entry.
         let mut live_origin = None;
+        // The grant request a `pending_approval` outcome created
+        // (#20), and the grant an admitted fill spent.
+        let mut grant_request_id: Option<String> = None;
+        let mut admitted_grant: Option<String> = None;
+        // REQ-APR-003: requests past their timeout deny themselves
+        // before this fill's own grant check runs.
+        self.expire_grant_requests()
+            .map_err(|_| ApiError::AUDIT_FAILED)?;
         let resolved = match self.resync_if_stale(deadline).await {
             Ok(()) => self.resolve_fill(agent, &req),
             Err(u) => Err(u),
@@ -718,7 +806,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 return Err(ApiError::LOCKED);
             }
             Err(Unresolved::Refused(status)) => status,
-            Ok((plan, generation)) => {
+            Err(Unresolved::NeedsApproval) => {
+                let (status, id, observed) = self.pending_for_fill(agent, &req, deadline).await?;
+                grant_request_id = id;
+                // #67: the observed origin is the outcome entry's
+                // live_origin, as when the engine reads it.
+                live_origin = observed;
+                status
+            }
+            Ok((plan, generation, grant_id)) => {
+                admitted_grant = Some(grant_id.clone());
                 let field_count = plan.fields.len() as u64;
                 // Owns the plan from here: every way out of this arm,
                 // including this future being dropped, wipes it.
@@ -737,6 +834,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     self.append(
                         base(Event::FillDispatch)
                             .origin(req.expected_origin.clone())
+                            .grant_id(grant_id.clone())
                             .field_count(field_count)
                             .result("dispatched"),
                     )?;
@@ -770,8 +868,330 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             Some(o) => entry.live_origin(o),
             None => entry,
         };
+        let entry = match &admitted_grant {
+            Some(g) => entry.grant_id(g.clone()),
+            None => entry,
+        };
         self.append(entry)?;
-        Ok(Outcome::Fill(status.result()))
+        let mut result = status.result();
+        result.grant_request_id = grant_request_id;
+        Ok(Outcome::Fill(result))
+    }
+
+    /// The `grant_request` audit entry for a request's creation:
+    /// result `pending`, or `origin_mismatch` for a request born
+    /// refused (REQ-APR-007). The entry's `origin` is the observed
+    /// live origin — the evidence, as on fill outcome entries (#67) —
+    /// and its `request_id` is the grant request's id.
+    fn grant_creation_entry(req: &GrantRequest) -> Entry {
+        let entry = Entry::new(Event::GrantRequest)
+            .agent_id(req.agent_id.clone())
+            .item_id(req.item_id.clone())
+            .origin(req.observed_origin.clone())
+            .request_id(req.id.clone());
+        match req.state {
+            RequestState::OriginMismatch => entry.result("origin_mismatch"),
+            _ => entry.result("pending"),
+        }
+    }
+
+    /// A grantless fill's second half (REQ-APR-001/007): observe the
+    /// target's live origin through the backend (bounded by the fill
+    /// deadline), make the grant request, audit its creation, and
+    /// report `pending_approval` — or `origin_mismatch` when the tab
+    /// is not where the agent claimed, or `target_not_owned` when
+    /// there is nothing to observe. Nothing has been decrypted.
+    /// Also returns the observed origin (when one was read) so the
+    /// caller's outcome entry carries it as `live_origin` (#67).
+    async fn pending_for_fill(
+        &self,
+        agent: &AgentId,
+        req: &FillRequest,
+        deadline: Instant,
+    ) -> Result<(FillStatus, Option<String>, Option<String>), ApiError> {
+        let observed = match &self.fill_backend {
+            Some(b) => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    b.observe_origin(
+                        agent.as_str(),
+                        &req.target_id,
+                        self.fill_policy.allow_default_context,
+                    ),
+                )
+                .await
+                {
+                    Ok(o) => o,
+                    Err(_) => {
+                        return Ok((FillStatus::Engine(FillOutcome::Timeout), None, None));
+                    }
+                }
+            }
+            None => None,
+        };
+        let Some(observed) = observed else {
+            return Ok((FillStatus::Engine(FillOutcome::TargetNotOwned), None, None));
+        };
+        let (greq, created) = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .create_request(
+                agent.as_str(),
+                &req.item_id,
+                grant_action(req.operation),
+                &req.expected_origin,
+                &observed,
+                self.grant_now(),
+            );
+        if created {
+            self.append(Self::grant_creation_entry(&greq))?;
+        }
+        let status = match greq.state {
+            RequestState::OriginMismatch => FillStatus::Engine(FillOutcome::OriginMismatch),
+            _ => FillStatus::PendingApproval,
+        };
+        Ok((status, Some(greq.id), Some(observed)))
+    }
+
+    /// Run a `kharon_request_grant` / `POST /v1/grants` for `agent`
+    /// (SPEC §4, #20): the explicit form of the request a grantless
+    /// fill makes implicitly. Lock-gated like a fill (`423` while
+    /// locked, audited as a `grant_request` entry with result
+    /// `locked`); an unknown item is `not_found` and a target the
+    /// broker cannot observe is `target_not_owned` — both as
+    /// [`GrantRequestBody`] states with no request created, mirroring
+    /// how fills report refusals in-band. A created request is
+    /// audited before the reply (REQ-AUD-003). Bounded by the fill
+    /// deadline from `received`, like fills and context calls.
+    pub async fn request_grant(
+        &self,
+        agent: &AgentId,
+        args: GrantRequestArgs,
+        received: Instant,
+    ) -> Result<Outcome, ApiError> {
+        let deadline = received + self.fill_policy.deadline;
+        self.expire_grant_requests()
+            .map_err(|_| ApiError::AUDIT_FAILED)?;
+        let base = |result: &'static str| {
+            Entry::new(Event::GrantRequest)
+                .agent_id(agent.0.clone())
+                .item_id(args.item_id.clone())
+                .result(result)
+        };
+        let known = {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            match lock.require_unlocked() {
+                Ok(session) => session.vault().get(&args.item_id).is_ok(),
+                Err(_) => {
+                    drop(lock);
+                    self.append(base("locked"))?;
+                    return Err(ApiError::LOCKED);
+                }
+            }
+        };
+        if !known {
+            self.append(base("not_found"))?;
+            return Ok(Outcome::GrantRequest(GrantRequestBody::refused(
+                "not_found",
+            )));
+        }
+        let observed = match &self.fill_backend {
+            Some(b) => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    b.observe_origin(
+                        agent.as_str(),
+                        &args.target_id,
+                        self.fill_policy.allow_default_context,
+                    ),
+                )
+                .await
+                {
+                    Ok(o) => o,
+                    Err(_) => {
+                        self.append(base("timeout"))?;
+                        return Ok(Outcome::GrantRequest(GrantRequestBody::refused("timeout")));
+                    }
+                }
+            }
+            None => None,
+        };
+        let Some(observed) = observed else {
+            self.append(base("target_not_owned"))?;
+            return Ok(Outcome::GrantRequest(GrantRequestBody::refused(
+                "target_not_owned",
+            )));
+        };
+        let (greq, created) = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .create_request(
+                agent.as_str(),
+                &args.item_id,
+                args.action,
+                &args.expected_origin,
+                &observed,
+                self.grant_now(),
+            );
+        if created {
+            self.append(Self::grant_creation_entry(&greq))?;
+        }
+        Ok(Outcome::GrantRequest(GrantRequestBody::of(&greq)))
+    }
+
+    /// REQ-APR-003: deny every grant request that has been pending
+    /// for at least [`REQUEST_TIMEOUT`](super::grant::REQUEST_TIMEOUT),
+    /// auditing each denial (`grant_request`, result `denied`, detail
+    /// `request_timeout`) *before* its transition takes effect
+    /// (REQ-AUD-003). Runs at the head of every fill and grant
+    /// request; the daemon may also call it on its own cadence.
+    /// Returns how many requests transitioned.
+    pub fn expire_grant_requests(&self) -> Result<usize, GrantError> {
+        let now = self.grant_now();
+        let expired = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expired_pending(now);
+        let mut count = 0;
+        for req in expired {
+            let entry = Entry::new(Event::GrantRequest)
+                .agent_id(req.agent_id.clone())
+                .item_id(req.item_id.clone())
+                .origin(req.observed_origin.clone())
+                .request_id(req.id.clone())
+                .result("denied")
+                .detail_code("request_timeout");
+            self.append(entry).map_err(|_| GrantError::AuditFailed)?;
+            if self
+                .grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .deny_expired(&req.id)
+                .is_some()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Approve a pending grant request on `channel`, issuing its
+    /// grant under `terms` (the owner surface for #16/#17 to call).
+    /// The `grant_issue` entry is appended before the approval is
+    /// reported; if the append fails the approval is rolled back —
+    /// the request is pending again and no grant exists
+    /// (REQ-AUD-003 fail-closed, as for unlock).
+    pub fn approve_grant_request(
+        &self,
+        request_id: &str,
+        terms: &GrantTerms,
+        channel: Channel,
+    ) -> Result<GrantView, GrantError> {
+        let now = self.grant_now();
+        let grant = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .approve(request_id, terms, channel, now)?;
+        let entry = Entry::new(Event::GrantIssue)
+            .agent_id(grant.agent_id.clone())
+            .grant_id(grant.id.clone())
+            .channel(channel.as_str())
+            .request_id(request_id)
+            .result("issued");
+        let entry = match grant_item_id(&grant) {
+            Some(id) => entry.item_id(id),
+            None => entry,
+        };
+        if self.append(entry).is_err() {
+            self.grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .rollback_approval(request_id, &grant.id);
+            return Err(GrantError::AuditFailed);
+        }
+        Ok(grant.view(now))
+    }
+
+    /// Deny a pending grant request (owner action). Audited
+    /// (`grant_request`, result `denied`, detail `owner_denied`);
+    /// an audit failure restores the request to pending.
+    pub fn deny_grant_request(&self, request_id: &str) -> Result<GrantRequest, GrantError> {
+        let req = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .deny(request_id)?;
+        let entry = Entry::new(Event::GrantRequest)
+            .agent_id(req.agent_id.clone())
+            .item_id(req.item_id.clone())
+            .origin(req.observed_origin.clone())
+            .request_id(req.id.clone())
+            .result("denied")
+            .detail_code("owner_denied");
+        if self.append(entry).is_err() {
+            self.grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .restore_pending(request_id);
+            return Err(GrantError::AuditFailed);
+        }
+        Ok(req)
+    }
+
+    /// Revoke a grant (REQ-REV-001's broker primitive; effective for
+    /// the next fill). Audited (`grant_revoke`); an audit failure
+    /// restores the grant. `false` when no such grant exists.
+    pub fn revoke_grant(&self, grant_id: &str) -> Result<bool, GrantError> {
+        let Some(grant) = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .grant(grant_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        self.grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revoke(grant_id);
+        let entry = Entry::new(Event::GrantRevoke)
+            .agent_id(grant.agent_id.clone())
+            .grant_id(grant.id.clone())
+            .result("revoked");
+        let entry = match grant_item_id(&grant) {
+            Some(id) => entry.item_id(id),
+            None => entry,
+        };
+        if self.append(entry).is_err() {
+            self.grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .restore_grant(grant);
+            return Err(GrantError::AuditFailed);
+        }
+        Ok(true)
+    }
+
+    /// A grant request by id (owner surfaces, tests).
+    pub fn grant_request(&self, request_id: &str) -> Option<GrantRequest> {
+        self.grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .request(request_id)
+            .cloned()
+    }
+
+    /// Every pending grant request (the approval channels' queue).
+    pub fn pending_grant_requests(&self) -> Vec<GrantRequest> {
+        self.grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending_requests()
     }
 
     /// Hand `agent` its browser context id (REQ-ARCH-005, #65): connect
@@ -946,7 +1366,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         &self,
         agent: &AgentId,
         req: &FillRequest,
-    ) -> Result<(FillPlan, u64), Unresolved> {
+    ) -> Result<(FillPlan, u64, String), Unresolved> {
         let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         // The fill gate first (REQ-MEM-007), then fill activity resets
         // the idle timer (REQ-MEM-004; a no-op that locks if expired).
@@ -960,12 +1380,6 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let Ok(item) = session.vault().get(&req.item_id) else {
             return refuse(FillStatus::UnknownItem);
         };
-
-        // TODO(#20): grant enforcement goes here, before any secret is
-        // decrypted: `req.grant_id` (accepted, length-checked, not yet
-        // consulted) or a standing grant for (agent, item, live origin,
-        // operation) → proceed; else `pending_approval` / `denied`.
-        let _ = &req.grant_id;
 
         let generation = match &self.fill_backend {
             Some(b) if b.has_agent(agent.as_str()) => b.generation(),
@@ -989,6 +1403,65 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         {
             return refuse(FillStatus::Engine(FillOutcome::ClockSkew));
         }
+
+        // REQ-APR-001/002 (SPEC §5, #20): the grant gate — after the
+        // item, the browser and every other pre-decrypt refusal, and
+        // before anything is decrypted. A matching live grant is
+        // consumed (one use, spent at admission). An explicitly named
+        // grant that fails any dimension (agent, item/collection,
+        // origin, action, TTL, uses) is `denied`: naming a grant and
+        // missing its terms is a refusal, not a fresh request. No
+        // grant at all is `NeedsApproval`: [`Broker::fill`] makes the
+        // request from the observed live origin, still decrypting
+        // nothing.
+        let action = match req.operation {
+            FillOperation::Fill => GrantAction::Fill,
+            FillOperation::FillTotp => GrantAction::Totp,
+        };
+        let now = self.grant_now();
+        let admitted = {
+            let mut store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+            match &req.grant_id {
+                Some(gid) => {
+                    let ok = store.grant(gid).is_some_and(|g| {
+                        g.matches(
+                            agent.as_str(),
+                            &req.item_id,
+                            item.collection_ids(),
+                            &req.expected_origin,
+                            action,
+                            now,
+                        )
+                    }) && store.consume(gid, now);
+                    if !ok {
+                        return refuse(FillStatus::GrantDenied);
+                    }
+                    gid.clone()
+                }
+                None => {
+                    let found = store
+                        .matching_grant(
+                            agent.as_str(),
+                            &req.item_id,
+                            item.collection_ids(),
+                            &req.expected_origin,
+                            action,
+                            now,
+                        )
+                        .map(|g| g.id.clone());
+                    match found {
+                        Some(gid) => {
+                            // Live under this same lock hold, by
+                            // `matching_grant`'s check.
+                            let consumed = store.consume(&gid, now);
+                            debug_assert!(consumed);
+                            gid
+                        }
+                        None => return Err(Unresolved::NeedsApproval),
+                    }
+                }
+            }
+        };
 
         let mut fields = Vec::with_capacity(req.fields.len());
         for (kind, selector) in &req.fields {
@@ -1033,6 +1506,6 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             expected_origin: Some(req.expected_origin.clone()),
             live_origin: LiveOrigin::new(),
         };
-        Ok((plan, generation))
+        Ok((plan, generation, admitted))
     }
 }

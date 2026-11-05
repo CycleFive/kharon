@@ -575,6 +575,7 @@ async fn req_api_002_openapi_document_matches_the_routes() {
             "/v1/fill",
             "/v1/fill_totp",
             "/v1/context",
+            "/v1/grants",
             "/v1/openapi.json"
         ])
     );
@@ -966,6 +967,9 @@ async fn req_api_002_fill_contract_identical_on_every_transport() {
                 Some(f) => b.with_fill_backend(Box::new(f)),
                 None => b,
             });
+            // #20: a fill that should reach the browser needs a
+            // matching live grant, or it stops at pending_approval.
+            h.grant_fixture_items();
             let out = call_fill(t, &h, &case).await;
             assert_no_canary(&out.1.to_string());
             assert_no_canary(&serde_json::to_string(&*h.audit.entries.lock().unwrap()).unwrap());
@@ -1023,6 +1027,7 @@ fn req_api_002_openapi_fill_bodies_are_the_mcp_schemas() {
     for (tool, name, path) in [
         (McpTool::Fill, "FillRequest", "/v1/fill"),
         (McpTool::FillTotp, "FillTotpRequest", "/v1/fill_totp"),
+        (McpTool::RequestGrant, "GrantRequest", "/v1/grants"),
     ] {
         let s = tool.input_schema();
         assert_eq!(schemas[name], as_component(&s), "{name}");
@@ -1050,6 +1055,9 @@ fn req_api_002_openapi_fill_bodies_are_the_mcp_schemas() {
         FillStatus::ItemFieldMissing,
         FillStatus::DecryptFailed,
         FillStatus::Unavailable,
+        FillStatus::SyncFailed,
+        FillStatus::PendingApproval,
+        FillStatus::GrantDenied,
         FillStatus::Engine(FillOutcome::Filled {
             kinds: vec![FieldKind::Password],
         }),

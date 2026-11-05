@@ -203,6 +203,36 @@ fn broker_with(seed: &'static str, backend: Box<dyn FillBackend>, policy: FillPo
             .unwrap()
             .extend(plan.fields.iter().map(|f| (*f.value).clone()));
     }));
+    // #20: fills need a grant. The export item has no collections, so
+    // seed item-scope grants for both actions (long TTL: this broker's
+    // grant clock is the wall clock).
+    {
+        let now = kharond::lock::Clock::now(&kharond::lock::SystemClock);
+        let terms = kharond::api::GrantTerms {
+            scope: kharond::api::GrantScope::Item(item_id.clone()),
+            kind: kharond::config::GrantKind::PerOrigin,
+            ttl: Some(std::time::Duration::from_secs(24 * 3600)),
+            max_uses: None,
+        };
+        let mut store = broker.grant_store().lock().unwrap();
+        for action in [
+            kharond::api::GrantAction::Fill,
+            kharond::api::GrantAction::Totp,
+        ] {
+            store
+                .issue(
+                    "alpha",
+                    &item_id,
+                    action,
+                    "https://example.com",
+                    &terms,
+                    kharond::api::Channel::Cli,
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+    }
     let agent = broker.authenticate(token.expose_secret()).unwrap();
     Harness {
         broker,

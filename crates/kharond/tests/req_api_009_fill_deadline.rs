@@ -53,6 +53,9 @@ fn harness(answer: FakeAnswer, deadline: Option<Duration>) -> Run {
                     .extend(plan.fields.iter().map(|f| (*f.value).clone()));
             }))
     });
+    // #20: fills need a grant; the fixture items' tests predate the
+    // grant model, so the harness seeds collection-wide ones.
+    h.grant_fixture_items();
     Run { h, fake, wiped }
 }
 

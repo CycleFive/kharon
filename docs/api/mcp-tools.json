@@ -349,5 +349,100 @@
     },
     "name": "kharon_context",
     "title": "Your browser context"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Ask the owner for a grant to fill one item (action fill, or totp) in the tab cdp_target_id in your own browser context. The broker reads the tab's live origin itself: if it differs from expected_origin the request is origin_mismatch and no prompt is shown. Otherwise the request is pending until the owner approves or it times out after 120 s (denied). Calling again while one is pending returns the same request. A fill without a matching grant creates the same request implicitly. Requires unlock. Audited. Same body as POST /v1/grants.",
+    "inputSchema": {
+      "$defs": {
+        "GrantAction": {
+          "description": "The action a grant covers: one element of SPEC §5's\n`actions ⊆ {fill, totp}`.",
+          "oneOf": [
+            {
+              "const": "fill",
+              "description": "`kharon_fill` / `POST /v1/fill`.",
+              "type": "string"
+            },
+            {
+              "const": "totp",
+              "description": "`kharon_fill_totp` / `POST /v1/fill_totp`.",
+              "type": "string"
+            }
+          ]
+        },
+        "TargetArgs": {
+          "additionalProperties": false,
+          "description": "SPEC §4 `target`.",
+          "properties": {
+            "cdp_target_id": {
+              "description": "CDP target id of a tab in the agent's own browser context.",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "expected_origin": {
+              "description": "The origin the agent believes the tab is on. Never trusted: the\nlive origin decides, and a mismatch is `origin_mismatch`\n(REQ-ORG-002, REQ-APR-007).",
+              "format": "uri",
+              "maxLength": 2048,
+              "type": "string"
+            },
+            "frame_id": {
+              "default": null,
+              "description": "Not supported: must be omitted or null. Address an\nout-of-process frame by its own `cdp_target_id`.",
+              "maxLength": 128,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "cdp_target_id",
+            "expected_origin"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "SPEC §4 `kharon_request_grant` arguments / `POST /v1/grants`\nbody: the same JSON on both transports, like the fill tools'.",
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The action to grant (`fill` default, or `totp`)."
+        },
+        "item_id": {
+          "description": "The item to fill from.",
+          "format": "uuid",
+          "maxLength": 36,
+          "minLength": 36,
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/TargetArgs",
+          "description": "The tab the fill would target: the broker reads the live\norigin from it for the prompt (REQ-APR-007)."
+        }
+      },
+      "required": [
+        "item_id",
+        "target"
+      ],
+      "title": "GrantArgs",
+      "type": "object"
+    },
+    "name": "kharon_request_grant",
+    "title": "Request a grant"
   }
 ]

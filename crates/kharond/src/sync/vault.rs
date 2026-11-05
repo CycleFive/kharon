@@ -89,6 +89,11 @@ pub struct Item {
     username: Option<String>,
     uris: Vec<ItemUri>,
     revision: Option<String>,
+    /// Collections the cipher sits in (sync path; empty for export
+    /// items, whose format has folders, not collections). Metadata
+    /// (REQ-CRY-006 classes): the grant model matches
+    /// collection-scoped grants against it (REQ-APR-002).
+    collection_ids: Vec<String>,
     protected_cipher_key: Option<String>,
     protected_password: Option<String>,
     protected_totp: Option<String>,
@@ -126,6 +131,7 @@ impl Item {
             username,
             uris,
             revision,
+            collection_ids: Vec::new(),
             protected_cipher_key: None,
             protected_password,
             protected_totp,
@@ -145,6 +151,10 @@ impl Item {
     }
     pub fn uris(&self) -> &[ItemUri] {
         &self.uris
+    }
+    /// Collections the item sits in (empty for export items).
+    pub fn collection_ids(&self) -> &[String] {
+        &self.collection_ids
     }
     /// Server `revisionDate` (RFC 3339), for grant pinning (REQ-REV-004).
     pub fn revision(&self) -> Option<&str> {
@@ -450,6 +460,12 @@ fn decrypt_metadata(c: &Cipher, org_key: &SymmetricKey) -> Result<Item, EncError
         username,
         uris,
         revision: c.revision_date.clone(),
+        collection_ids: c
+            .collection_ids
+            .iter()
+            .flatten()
+            .map(|id| norm_id(id))
+            .collect(),
         protected_cipher_key: nonempty(c.key.as_ref()),
         protected_password: nonempty(login.and_then(|l| l.password.as_ref())),
         protected_totp: nonempty(login.and_then(|l| l.totp.as_ref())),

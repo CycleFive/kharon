@@ -389,6 +389,16 @@ fn effective_port(u: &Url) -> u16 {
     u.port_or_known_default().unwrap_or(0)
 }
 
+/// eTLD+1 (registrable domain) of `host` per the vendored PSL,
+/// including the private section. The grant model's origin matching
+/// (REQ-APR-002) reduces fill hosts with this, so a grant naming a
+/// registrable domain covers its subdomains — and nothing wider:
+/// a public suffix itself reduces to `None` or to a registrable
+/// domain under it, never to the suffix.
+pub fn registrable_domain(host: &str) -> Option<String> {
+    registrable(host)
+}
+
 /// eTLD+1 (registrable domain) per the vendored PSL, including the private
 /// section, so `github.io` yields `user.github.io`.
 fn registrable(host: &str) -> Option<String> {

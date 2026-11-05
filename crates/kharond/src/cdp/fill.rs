@@ -245,6 +245,27 @@ impl FillEngine {
         self.browser.client().is_closed()
     }
 
+    /// The live serialized origin of `target_id` (REQ-APR-007, #20):
+    /// the ownership check a fill runs in its step 1, and nothing
+    /// else — no attach, no page code. Grant requests observe through
+    /// this so a prompt can show where the tab actually is, never
+    /// the agent's claim (REQ-ORG-002). An opaque origin (e.g.
+    /// `about:blank`) reports as `null`, like [`LiveOrigin`].
+    pub async fn observe_origin(
+        &self,
+        target_id: &str,
+        agent_ctx: &AgentContext,
+        allow_default: bool,
+    ) -> Result<String, OwnershipError> {
+        let info = self
+            .browser
+            .check_ownership(target_id, agent_ctx, allow_default)
+            .await?;
+        Ok(url::Url::parse(&info.url)
+            .map(|u| u.origin().ascii_serialization())
+            .unwrap_or_else(|_| "null".to_owned()))
+    }
+
     /// Run one fill attempt (SPEC §6 steps 1–4) and classify it.
     ///
     /// The engine has no deadline and writes no audit entry. The

@@ -3,7 +3,7 @@
   "info": {
     "title": "kharon agent API",
     "version": "0.1.0",
-    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools served at POST /mcp on the same listener (REQ-API-001; tool schemas in docs/api/mcp-tools.json). The forbidden error code is only returned by /mcp, the fill routes and /v1/context (requests carrying an Origin header). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Grants (pending_approval, denied, grant_id enforcement) arrive with issue #20.",
+    "description": "SPEC §4 agent-facing HTTP API (REQ-API-002). Same semantics as the MCP tools served at POST /mcp on the same listener (REQ-API-001; tool schemas in docs/api/mcp-tools.json). The forbidden error code is only returned by /mcp, the fill routes, /v1/context and /v1/grants (requests carrying an Origin header). There is no route that returns a secret value (REQ-GOAL-001, REQ-API-005). Grants are enforced (issue #20): a fill without a matching live grant returns pending_approval with a grant_request_id, a fill naming a grant that fails its terms returns denied, and POST /v1/grants creates the same request explicitly.",
     "license": {
       "name": "MIT OR Apache-2.0"
     }
@@ -233,6 +233,52 @@
         }
       }
     },
+    "/v1/grants": {
+      "post": {
+        "operationId": "kharon_request_grant",
+        "summary": "Request a grant for one item and action (SPEC §5; REQ-APR-001/002/003/007, issue #20): the broker reads the target tab's live origin itself, and a claim that disagrees is origin_mismatch with no prompt shown. Otherwise the request is pending until the owner approves or it times out after 120 s (denied). Calling again while one is pending returns the same request. A fill without a matching grant creates the same request implicitly. Requires unlock. Audited before the reply (REQ-AUD-003).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The grant request's id and state (including not_found and target_not_owned refusals, which create no request)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GrantRequestResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "423": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/openapi.json": {
       "get": {
         "operationId": "openapi",
@@ -306,11 +352,10 @@
           },
           "grants": {
             "type": "array",
-            "description": "SPEC §4 Grant; always empty until the grant model lands (issue #20).",
+            "description": "SPEC §4 Grant: the calling agent's live grants (issue #20).",
             "items": {
-              "type": "object"
-            },
-            "maxItems": 0
+              "$ref": "#/components/schemas/Grant"
+            }
           },
           "browser_context_id": {
             "type": [
@@ -608,12 +653,14 @@
           "status",
           "fields_filled"
         ],
-        "description": "SPEC §4 FillResult. Never carries a secret value: only the kinds filled (REQ-GOAL-001). A fill that ran but did not fill is still 200 with a non-filled status. pending_approval and denied arrive with grants (issue #20).",
+        "description": "SPEC §4 FillResult. Never carries a secret value: only the kinds filled (REQ-GOAL-001). A fill that ran but did not fill is still 200 with a non-filled status. A fill without a matching live grant is pending_approval and names its grant_request_id (issue #20).",
         "properties": {
           "status": {
             "type": "string",
             "enum": [
               "filled",
+              "pending_approval",
+              "denied",
               "origin_mismatch",
               "navigated",
               "field_not_found",
@@ -635,6 +682,10 @@
             },
             "uniqueItems": true
           },
+          "grant_request_id": {
+            "type": "string",
+            "description": "The grant request a pending_approval (or born origin_mismatch) fill created (gr_…)."
+          },
           "detail": {
             "type": "string",
             "description": "Fixed reason code for some non-filled statuses (also the audit detail_code).",
@@ -649,7 +700,152 @@
               "item_field_missing",
               "decrypt_failed",
               "fill_unavailable",
-              "sync_failed"
+              "sync_failed",
+              "grant_denied"
+            ]
+          }
+        }
+      },
+      "Grant": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "agent_id",
+          "origin",
+          "actions",
+          "expires_at",
+          "uses",
+          "created_by_channel"
+        ],
+        "description": "SPEC §4/§5 Grant as kharon_status reports it: one live grant of the calling agent (issue #20). Exactly one of item_id and collection_id is present (the grant's scope).",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Broker-assigned grant id (g_…)."
+          },
+          "agent_id": {
+            "type": "string"
+          },
+          "item_id": {
+            "type": "string",
+            "description": "Item scope: the one item this grant covers."
+          },
+          "collection_id": {
+            "type": "string",
+            "description": "Collection scope: every item in this collection."
+          },
+          "origin": {
+            "type": "string",
+            "description": "The granted origin: a host, or a registrable domain covering its subdomains."
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "fill",
+                "totp"
+              ]
+            },
+            "uniqueItems": true
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 expiry (the remaining TTL when the status was read)."
+          },
+          "max_uses": {
+            "type": "integer",
+            "description": "Use cap; absent is unlimited within the TTL."
+          },
+          "uses": {
+            "type": "integer"
+          },
+          "created_by_channel": {
+            "type": "string",
+            "enum": [
+              "cli",
+              "web_ui",
+              "ntfy"
+            ]
+          }
+        }
+      },
+      "GrantRequest": {
+        "additionalProperties": false,
+        "description": "SPEC §4 `kharon_request_grant` arguments / `POST /v1/grants`\nbody: the same JSON on both transports, like the fill tools'.",
+        "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GrantAction"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The action to grant (`fill` default, or `totp`)."
+          },
+          "item_id": {
+            "description": "The item to fill from.",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/TargetArgs",
+            "description": "The tab the fill would target: the broker reads the live\norigin from it for the prompt (REQ-APR-007)."
+          }
+        },
+        "required": [
+          "item_id",
+          "target"
+        ],
+        "title": "GrantArgs",
+        "type": "object"
+      },
+      "GrantAction": {
+        "description": "The action a grant covers: one element of SPEC §5's\n`actions ⊆ {fill, totp}`.",
+        "oneOf": [
+          {
+            "const": "fill",
+            "description": "`kharon_fill` / `POST /v1/fill`.",
+            "type": "string"
+          },
+          {
+            "const": "totp",
+            "description": "`kharon_fill_totp` / `POST /v1/fill_totp`.",
+            "type": "string"
+          }
+        ]
+      },
+      "GrantRequestResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grant_request_id",
+          "state"
+        ],
+        "description": "SPEC §4 {grant_request_id, state}. grant_request_id is null when no request was created (not_found, target_not_owned, timeout).",
+        "properties": {
+          "grant_request_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Broker-assigned grant request id (gr_…)."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "origin_mismatch",
+              "not_found",
+              "target_not_owned",
+              "timeout"
             ]
           }
         }

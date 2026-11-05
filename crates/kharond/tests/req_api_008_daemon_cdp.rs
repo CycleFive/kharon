@@ -278,6 +278,35 @@ async fn run_with_backend(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let broker = Arc::new(broker);
+    // #20: fills need a grant; the export item has no collections, so
+    // seed item-scope grants for both actions.
+    {
+        let now = kharond::lock::Clock::now(&kharond::lock::SystemClock);
+        let terms = kharond::api::GrantTerms {
+            scope: kharond::api::GrantScope::Item(item_id.clone()),
+            kind: kharond::config::GrantKind::PerOrigin,
+            ttl: Some(std::time::Duration::from_secs(24 * 3600)),
+            max_uses: None,
+        };
+        let mut store = broker.grant_store().lock().unwrap();
+        for action in [
+            kharond::api::GrantAction::Fill,
+            kharond::api::GrantAction::Totp,
+        ] {
+            store
+                .issue(
+                    "alpha",
+                    &item_id,
+                    action,
+                    "https://example.com",
+                    &terms,
+                    kharond::api::Channel::Cli,
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+    }
     tokio::spawn(kharond::api::http::serve(listener, Arc::clone(&broker)));
     Run {
         addr,

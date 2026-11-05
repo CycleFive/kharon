@@ -128,6 +128,9 @@ pub enum Detail {
     DuplicateFillField,
     /// `target.frame_id` is set; address a frame by its own CDP target id.
     FrameIdUnsupported,
+    /// The grant request does not match `GrantRequest` (unknown,
+    /// missing, duplicate or mistyped field; issue #20).
+    InvalidGrantRequest,
 }
 
 impl Detail {
@@ -159,11 +162,12 @@ impl Detail {
             Self::NoFillFields => "fields must name at least one field",
             Self::DuplicateFillField => "fields names a kind twice",
             Self::FrameIdUnsupported => "frame_id is not supported; use the frame's cdp_target_id",
+            Self::InvalidGrantRequest => "grant request does not match the schema",
         }
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::MissingToken,
         Self::InvalidToken,
         Self::Locked,
@@ -189,6 +193,7 @@ impl Detail {
         Self::NoFillFields,
         Self::DuplicateFillField,
         Self::FrameIdUnsupported,
+        Self::InvalidGrantRequest,
     ];
 }
 

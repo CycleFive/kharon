@@ -196,7 +196,8 @@ pub struct FillRequest {
     pub fields: Vec<(FieldKind, Option<String>)>,
     /// `fill_and_submit`.
     pub submit: bool,
-    /// Accepted and length-checked; not yet enforced (issue #20).
+    /// An approved grant to fill under (issue #20): enforced by the
+    /// broker's grant gate before anything is decrypted.
     pub grant_id: Option<String>,
 }
 
@@ -312,15 +313,20 @@ fn validate_expected_origin(origin: &str) -> Result<String, ApiError> {
 
 /// SPEC §4 `FillResult`. Every field is a fixed string: nothing from the
 /// vault or the page can reach a response (REQ-GOAL-001, REQ-API-006).
-/// `grant_request_id` arrives with #20; `audit_seq` is not reported
-/// (see the PR's spec questions).
+/// `audit_seq` is not reported (see the PR's spec questions).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FillResult {
-    /// `filled`, `origin_mismatch`, `target_not_owned`, `navigated`,
-    /// `field_not_found`, `timeout`, `not_found` or `error`.
+    /// `filled`, `pending_approval`, `denied`, `origin_mismatch`,
+    /// `target_not_owned`, `navigated`, `field_not_found`, `timeout`,
+    /// `not_found` or `error`.
     pub status: &'static str,
     /// Kinds filled (only on `filled`).
     pub fields_filled: Vec<&'static str>,
+    /// The grant request a `pending_approval` (or a born
+    /// `origin_mismatch`) fill created, for the agent to poll in
+    /// `kharon_status` / re-fill after approval (REQ-APR-001, #20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_request_id: Option<String>,
     /// A fixed code, e.g. `unknown_item`, `clock_skew`, `cdp_error`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<&'static str>,
@@ -343,6 +349,16 @@ pub enum FillStatus {
     /// SPEC §8: the vault was stale and the fill-time re-sync failed,
     /// so the fill was refused rather than served from it (issue #100).
     SyncFailed,
+    /// REQ-APR-001: no live grant matches this fill and a grant
+    /// request is now pending the owner's decision. Nothing was
+    /// decrypted. The broker attaches the request id to the
+    /// [`FillResult`] (it is not part of the status).
+    PendingApproval,
+    /// REQ-APR-002: the fill named a `grant_id` that is unknown,
+    /// another agent's, expired, exhausted, or does not match this
+    /// fill's item / origin / action. Naming a grant and failing its
+    /// terms is a refusal, not a new request.
+    GrantDenied,
 }
 
 impl FillStatus {
@@ -351,6 +367,8 @@ impl FillStatus {
         match self {
             Self::Engine(o) => o.status(),
             Self::UnknownItem => "not_found",
+            Self::PendingApproval => "pending_approval",
+            Self::GrantDenied => "denied",
             Self::ItemFieldMissing | Self::DecryptFailed | Self::Unavailable | Self::SyncFailed => {
                 "error"
             }
@@ -366,6 +384,8 @@ impl FillStatus {
             Self::DecryptFailed => Some("decrypt_failed"),
             Self::Unavailable => Some("fill_unavailable"),
             Self::SyncFailed => Some("sync_failed"),
+            Self::PendingApproval => None,
+            Self::GrantDenied => Some("grant_denied"),
         }
     }
 
@@ -377,6 +397,7 @@ impl FillStatus {
                 Self::Engine(o) => o.fields_filled(),
                 _ => Vec::new(),
             },
+            grant_request_id: None,
             detail: self.detail(),
         }
     }
@@ -390,6 +411,12 @@ pub type FillFuture<'a> = Pin<Box<dyn Future<Output = FillOutcome> + Send + 'a>>
 /// A boxed context future (#65): the agent's `browserContextId`, or why
 /// there is none (`Error` → `cdp_error`).
 pub type ContextFuture<'a> = Pin<Box<dyn Future<Output = Result<String, FillOutcome>> + Send + 'a>>;
+
+/// A boxed origin-observation future (#20): the target's live
+/// serialized origin, or `None` when it cannot be observed (no such
+/// target in the agent's context, connection trouble, a backend that
+/// cannot observe).
+pub type ObserveFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 
 /// Why a backend without browser contexts refuses a context request.
 const NO_CONTEXTS: &str = "backend has no browser contexts";
@@ -464,6 +491,24 @@ pub trait FillBackend: Send + Sync {
         let _ = agent_id;
         None
     }
+
+    /// Observe the live serialized origin of `target_id` in the
+    /// agent's own context (REQ-APR-007, #20): a `Target.getTargetInfo`
+    /// read behind the same ownership check a fill runs, never agent
+    /// input (REQ-ORG-002). Used to build grant requests and their
+    /// prompts before any fill is attempted. `None` when the target
+    /// is not the agent's, is unknown, or cannot be read. The default
+    /// backend cannot observe; the broker then refuses to create a
+    /// promptable request (fail closed).
+    fn observe_origin<'a>(
+        &'a self,
+        agent_id: &'a str,
+        target_id: &'a str,
+        allow_default: bool,
+    ) -> ObserveFuture<'a> {
+        let _ = (agent_id, target_id, allow_default);
+        Box::pin(async { None })
+    }
 }
 
 /// The production backend: the CDP [`FillEngine`], one [`AgentContext`]
@@ -518,6 +563,21 @@ impl FillBackend for CdpFillBackend {
         self.agents
             .get(agent_id)
             .map(|(_, ctx)| ctx.browser_context_id().to_owned())
+    }
+
+    fn observe_origin<'a>(
+        &'a self,
+        agent_id: &'a str,
+        target_id: &'a str,
+        allow_default: bool,
+    ) -> ObserveFuture<'a> {
+        Box::pin(async move {
+            let (engine, ctx) = self.agents.get(agent_id)?;
+            engine
+                .observe_origin(target_id, ctx, allow_default)
+                .await
+                .ok()
+        })
     }
 }
 
@@ -880,6 +940,39 @@ impl FillBackend for ConnectingCdpBackend {
                 return Err(FillOutcome::Error(LOCKED_DURING_FILL.into()));
             }
             Ok(c.ctx.browser_context_id().to_owned())
+        })
+    }
+
+    /// Observe a target's live origin (#20): the same lazy connect as
+    /// a fill or context call, in the current unlock generation, then
+    /// one `Target.getTargetInfo` behind the ownership check. A lock
+    /// that lands first (or during) makes the observation `None`.
+    fn observe_origin<'a>(
+        &'a self,
+        agent_id: &'a str,
+        target_id: &'a str,
+        allow_default: bool,
+    ) -> ObserveFuture<'a> {
+        Box::pin(async move {
+            let agent = self.agents.get(agent_id)?;
+            let generation = self.generation();
+            let c = agent
+                .engine(
+                    agent_id,
+                    self.connect_timeout,
+                    self.teardown_timeout,
+                    generation,
+                    &self.generation,
+                )
+                .await
+                .ok()?;
+            if self.generation() != generation {
+                return None;
+            }
+            c.engine
+                .observe_origin(target_id, &c.ctx, allow_default)
+                .await
+                .ok()
         })
     }
 

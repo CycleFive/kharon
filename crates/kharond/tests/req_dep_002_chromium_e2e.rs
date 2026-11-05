@@ -19,13 +19,19 @@
 //! 3. The agent asks for its browser context (`POST /v1/context`,
 //!    REQ-ARCH-005), opens a tab in it, and fills each seeded item
 //!    through `POST /v1/fill` (the second with `submit: true`).
+//! 4. REQ-API-008's negative half (#18): a `fill_and_submit`
+//!    (`submit: true`) of username + password against a variant of
+//!    the page whose form has no password field.
 //!
 //! Asserted: the page's fields hold the seeded username and password
 //! (read back from the page's main world over a second CDP client);
 //! the submit fired exactly once and only for the `submit: true` fill
-//! (REQ-API-008); no API reply carries a secret (REQ-GOAL-001); and
-//! the on-disk audit log has one `fill_dispatch` → `fill` pair per
-//! fill with the live origin and no secret in it (REQ-AUD-003†).
+//! (REQ-API-008); the fill with a missing field answers
+//! `field_not_found` with nothing reported filled, and its form
+//! records 0 submits (REQ-API-008: submit only when all fields
+//! filled); no API reply carries a secret (REQ-GOAL-001); and the
+//! on-disk audit log has one `fill_dispatch` → `fill` pair per fill
+//! with the live origin and no secret in it (REQ-AUD-003†).
 //!
 //! Ignored by default: it needs the live fixture plus a Chromium
 //! binary. `fixture.yml` runs it with
@@ -91,6 +97,33 @@ const PAGE: &str = r#"<!doctype html>
 </body></html>
 "#;
 
+/// [`PAGE`] with the password field removed but the form and its
+/// submit counter kept, so a submit dispatched despite the missing
+/// field would be recorded (REQ-API-008). Served for any path whose
+/// query carries [`NO_PASSWORD_QUERY`].
+const PAGE_NO_PASSWORD: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>kharon REQ-API-008 test login, no password field</title></head>
+<body>
+<form id="login" action="/submitted" method="post">
+  <input id="username" name="username" type="email" autocomplete="username">
+  <button type="submit">Next</button>
+</form>
+<script>
+  window.__inputs = [];
+  window.__submits = 0;
+  document.addEventListener("input", (e) => window.__inputs.push(e.target.id));
+  document.getElementById("login").addEventListener("submit", (e) => {
+    e.preventDefault();
+    window.__submits += 1;
+  });
+</script>
+</body></html>
+"#;
+
+/// Query selecting [`PAGE_NO_PASSWORD`]. A query keeps the seeded
+/// item's host and path, so the origin and URI match are unchanged.
+const NO_PASSWORD_QUERY: &str = "form=no-password";
+
 fn manifest() -> Value {
     serde_json::from_str(&std::fs::read_to_string(format!("{FIXTURE_DIR}/fixture.json")).unwrap())
         .unwrap()
@@ -148,6 +181,8 @@ async fn serve_page(hosts: &[&str]) -> (u16, String) {
                     .to_owned();
                 let (status, body) = if path == "/favicon.ico" {
                     ("404 Not Found", "")
+                } else if path.contains(NO_PASSWORD_QUERY) {
+                    ("200 OK", PAGE_NO_PASSWORD)
                 } else {
                     ("200 OK", PAGE)
                 };
@@ -571,6 +606,79 @@ listen = "127.0.0.1:0"
             "dispatch is written before the outcome"
         );
         request_ids.push(rid);
+    }
+
+    // REQ-API-008, negative half: `submit: true` with a requested
+    // field the page does not have. The in-page fill throws before the
+    // submit step, so the form must record no submit at all.
+    {
+        let item = &items[0];
+        let mut page = urls[0].clone();
+        page.set_port(Some(port)).unwrap();
+        page.set_query(Some(NO_PASSWORD_QUERY));
+        let origin = page.origin().ascii_serialization();
+        let (target, session) = cdp.open(&context, page.as_str()).await;
+        let body = json!({
+            "item_id": id_of(item["name"].as_str().unwrap()),
+            "target": {"cdp_target_id": target, "expected_origin": origin},
+            "fields": [{"kind": "username"}, {"kind": "password"}],
+            "submit": true,
+        });
+        let r = post_json(run.addr, "/v1/fill", Some(&token), &body.to_string()).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_no_canary(&r.body);
+        let res = r.json();
+        assert_eq!(res["status"], json!("field_not_found"), "{res}");
+        assert_eq!(res["fields_filled"], json!([]), "{res}");
+
+        // Give a stray submit (none should exist) time to land, then
+        // read the counter from the page's main world.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let got = cdp
+            .eval(
+                &session,
+                "JSON.stringify([!!document.querySelector('input[type=password]'), window.__submits])",
+            )
+            .await;
+        let got: Value = serde_json::from_str(got.as_str().unwrap()).unwrap();
+        assert_eq!(
+            got[0],
+            json!(false),
+            "the variant page has no password field"
+        );
+        assert_eq!(
+            got[1],
+            json!(0),
+            "submit dispatched despite a missing field"
+        );
+
+        // Audited like any fill: dispatch, then a `fill` outcome with
+        // the refusal code, no secret.
+        let audit = std::fs::read_to_string(daemon_data.join("audit").join("audit.jsonl")).unwrap();
+        assert_no_canary(&audit);
+        let entries: Vec<Value> = audit
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let dispatch: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["event"] == json!("fill_dispatch"))
+            .filter(|e| !request_ids.contains(&e["request_id"]))
+            .collect();
+        assert_eq!(dispatch.len(), 1, "one new fill_dispatch: {audit}");
+        let rid = dispatch[0]["request_id"].clone();
+        let outcome: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["request_id"] == rid && e["event"] != json!("fill_dispatch"))
+            .collect();
+        assert_eq!(outcome.len(), 1, "exactly one outcome: {audit}");
+        assert_eq!(outcome[0]["event"], json!("fill"), "{}", outcome[0]);
+        assert_eq!(
+            outcome[0]["result"],
+            json!("field_not_found"),
+            "{}",
+            outcome[0]
+        );
     }
 
     // Lock, then stop the daemon and the browser.

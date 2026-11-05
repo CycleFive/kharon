@@ -548,6 +548,22 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 const NETNS_CHILD_ENV: &str = "KHARON_REQ_EXP_001_CHILD";
 const NETNS_ADDR: &str = "127.0.0.1:18741";
+/// Set (to anything) to turn the "namespaces unavailable" skip into a
+/// failure. CI sets it on the privileged step (#85) so a runner change
+/// can never silently re-mask REQ-EXP-001 as a pass.
+const REQUIRE_NETNS_ENV: &str = "KHARON_REQUIRE_NETNS";
+
+/// Skip loudly, or fail if `KHARON_REQUIRE_NETNS` is set.
+fn netns_skip(reason: &str) {
+    let msg = format!(
+        "SKIPPED req_exp_001: {reason}; the no-egress AC is NOT exercised in this environment"
+    );
+    assert!(
+        std::env::var_os(REQUIRE_NETNS_ENV).is_none(),
+        "{REQUIRE_NETNS_ENV} is set but {msg}"
+    );
+    eprintln!("{msg}");
+}
 
 /// Inside `unshare -rn`: loopback only, no egress, no Bitwarden
 /// server anywhere in the config — export mode must still unlock
@@ -604,10 +620,7 @@ fn req_exp_001_export_mode_works_with_no_network_egress() {
             // Skip LOUDLY (PR #81 review, item 1): the environment
             // cannot run the AC at all; that must be visible in the
             // test output, never a quiet pass or a confusing fail.
-            eprintln!(
-                "SKIPPED req_exp_001: cannot spawn `unshare` ({e}); \
-                 the no-egress AC is NOT exercised in this environment"
-            );
+            netns_skip(&format!("cannot spawn `unshare` ({e})"));
             return;
         }
     };
@@ -624,13 +637,11 @@ fn req_exp_001_export_mode_works_with_no_network_egress() {
         // Skip loudly with the reason; the AC still runs wherever
         // userns is allowed (dev boxes), which is where it was
         // verified for this PR.
-        eprintln!(
-            "SKIPPED req_exp_001: unprivileged user/net namespaces unavailable \
-             here (status={}, stderr={}); the no-egress AC is NOT exercised \
-             in this environment",
+        netns_skip(&format!(
+            "unprivileged user/net namespaces unavailable here (status={}, stderr={})",
             out.status,
             stderr.trim()
-        );
+        ));
         return;
     }
     assert!(
@@ -638,4 +649,5 @@ fn req_exp_001_export_mode_works_with_no_network_egress() {
         "netns child failed: status={} stdout={stdout} stderr={stderr}",
         out.status
     );
+    eprintln!("EXERCISED req_exp_001: export mode served `list` inside a no-egress netns");
 }

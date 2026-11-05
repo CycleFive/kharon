@@ -144,13 +144,21 @@ fn scan_until_hit(socket: &Path, needle: &str) -> usize {
     best
 }
 
-/// The fixture's 64-byte export key, derived *independently* here
-/// (PBKDF2-HMAC-SHA256 over the file's verbatim salt string, then
-/// the HKDF `enc`/`mac` stretch — the REQ-EXP-001 derivation, same
-/// shape as the fixture generator) so the test can scan for raw
-/// key bytes without kharon-bwcrypto exposing them.
-fn derive_fixture_export_key(fixture: &[u8]) -> Vec<u8> {
+/// The fixture's master key (PBKDF2 output) and 64-byte export
+/// key, derived *independently* here (PBKDF2-HMAC-SHA256 over the
+/// file's verbatim salt string, then the HKDF `enc`/`mac` stretch
+/// — the REQ-EXP-001 derivation, same shape as the fixture
+/// generator) so the test can scan for raw key bytes without
+/// kharon-bwcrypto exposing them.
+///
+/// Guard against a vacuous needle (PR #81 re-review, nit 2): the
+/// derived export key must actually decrypt the fixture's
+/// `encKeyValidation_DO_NOT_EDIT`, asserted here on every call —
+/// fixture or KDF drift must not be able to turn "key after
+/// lock = 0 hits" into a scan for bytes that were never the key.
+fn derive_fixture_keys(fixture: &[u8]) -> ([u8; 32], Vec<u8>) {
     use hkdf::Hkdf;
+    use kharon_bwcrypto::{EncString, SymmetricKey};
     use sha2::Sha256;
     let v: Value = serde_json::from_slice(fixture).unwrap();
     let salt = v["salt"].as_str().unwrap();
@@ -166,7 +174,17 @@ fn derive_fixture_export_key(fixture: &[u8]) -> Vec<u8> {
     let mut key = vec![0u8; 64];
     hk.expand(b"enc", &mut key[..32]).unwrap();
     hk.expand(b"mac", &mut key[32..]).unwrap();
-    key
+    let validation = EncString::parse(v["encKeyValidation_DO_NOT_EDIT"].as_str().unwrap())
+        .expect("fixture validation field is an EncString");
+    let symmetric = SymmetricKey::from_slice(&key).expect("64-byte export key");
+    let plain = validation
+        .decrypt_symmetric(&symmetric)
+        .expect("derived export key must decrypt the fixture validation field");
+    assert!(
+        std::str::from_utf8(&plain).is_ok(),
+        "validation field decrypts to the GUID string"
+    );
+    (master, key)
 }
 
 struct Running {
@@ -247,6 +265,11 @@ async fn req_exp_003_unlock_only_via_owner_socket_and_restart_boots_locked() {
     let audit = audit_text(data.path());
     assert!(audit.contains("\"export_loaded\""), "{audit}");
     assert!(audit.contains("\"unlock\""), "{audit}");
+    // The wrong-password attempt above is an `owner_auth_fail`
+    // (REQ-AUD-003, #86): failed owner authentication is audited,
+    // not silently refused.
+    assert!(audit.contains("\"owner_auth_fail\""), "{audit}");
+    assert!(audit.contains("\"unlock_failed\""), "{audit}");
     let sha = ExportFile::from_bytes(FIXTURE_A)
         .unwrap()
         .sha256_hex()
@@ -428,11 +451,18 @@ fn req_mem_003_canary_scan_of_the_running_daemon_finds_zero_hits() {
     // per-unlock wrap key is random and known to no one, by
     // design: a scan op that could reveal it would be the oracle
     // item 5 forbids).
-    let export_key = derive_fixture_export_key(FIXTURE_A);
+    let (master_key, export_key) = derive_fixture_keys(FIXTURE_A);
     assert_eq!(
         owner_scan_hex(&d.socket, &export_key),
         0,
         "export key after unlock"
+    );
+    // REQ-MEM-003 names the master key too (nit 3): the PBKDF2
+    // output the export key was stretched from is likewise gone.
+    assert_eq!(
+        owner_scan_hex(&d.socket, &master_key),
+        0,
+        "master key after unlock"
     );
 
     assert_eq!(
@@ -451,6 +481,11 @@ fn req_mem_003_canary_scan_of_the_running_daemon_finds_zero_hits() {
         owner_scan_hex(&d.socket, &export_key),
         0,
         "export key after lock"
+    );
+    assert_eq!(
+        owner_scan_hex(&d.socket, &master_key),
+        0,
+        "master key after lock"
     );
 
     d.child.kill().unwrap();

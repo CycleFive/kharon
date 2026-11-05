@@ -1,8 +1,10 @@
 name: fixture
-# Live Vaultwarden fixture job (issue #10, REQ-DEP-002 part /
-# REQ-CRY-004 live half). Manual + fixture-path changes only: the
-# normal `ci` job already covers the offline fixture tests, and this
-# job needs Docker service startup + the official `bw` CLI oracle.
+# Live Vaultwarden fixture job (issue #10, REQ-DEP-002 /
+# REQ-CRY-004 live half): compose up, seed, then the live tests,
+# including the headless-Chromium fill E2E (REQ-DEP-002's browser
+# half). Manual + fixture-path changes only: the normal `ci` job
+# already covers the offline fixture tests, and this job needs Docker
+# service startup + the official `bw` CLI oracle.
 on:
   workflow_dispatch:
   pull_request:
@@ -15,6 +17,11 @@ on:
       - "crates/kharond/tests/req_cry_005_sync.rs"
       - "crates/kharond/tests/req_cry_008_009_live_sync.rs"
       - "crates/kharond/tests/req_cry_009_notifications_hub.rs"
+      # REQ-DEP-002 browser half: the fill path it drives end to end.
+      - "crates/kharond/tests/req_dep_002_chromium_e2e.rs"
+      - "crates/kharond/src/cdp/**"
+      - "crates/kharond/src/api/fill.rs"
+      - "crates/kharond/src/daemon.rs"
 permissions: { contents: read }
 jobs:
   vaultwarden-fixture:
@@ -101,6 +108,27 @@ jobs:
           KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
           KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
         run: cargo test -p kharond --test req_cry_005_sync req_cry_005_live -- --ignored
+      - name: Install headless Chromium (pinned)
+        # chrome-headless-shell from the chromedp image, pinned by
+        # digest (Chromium 157.0.8103.27): copied out of the image,
+        # never run as a container. The runner image already has
+        # Chrome's shared libraries.
+        working-directory: ${{ runner.temp }}
+        run: |
+          cid="$(docker create chromedp/headless-shell@sha256:7bee201478b2f6266aae01243740ee85c16281e32f42d3aed9fdf04f4eace7a1)"
+          docker cp "$cid:/headless-shell" headless-shell
+          docker rm "$cid"
+          ./headless-shell/headless-shell --version
+      - name: Live REQ-DEP-002 seeded fixture fills a test page through headless Chromium (kharond)
+        # Runs while the seeded items are still as seed.py left them
+        # (the steps below re-sync and mutate the fixture).
+        working-directory: ${{ github.workspace }}
+        env:
+          KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222
+          KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
+          KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
+          KHARON_FIXTURE_CHROMIUM: ${{ runner.temp }}/headless-shell/headless-shell
+        run: cargo test -p kharond --test req_dep_002_chromium_e2e -- --ignored
       - name: Live REQ-CRY-008/009 dedicated-org preflight + live re-sync (kharond)
         working-directory: ${{ github.workspace }}
         env:

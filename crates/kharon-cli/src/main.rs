@@ -7,15 +7,20 @@
 //! §8): `kharon unlock` / `kharon lock` / `kharon status` talk to
 //! the daemon's unix owner socket. The unlock password is read
 //! from the terminal with echo disabled — never from argv, env,
-//! or a file (REQ-EXP-003) — and its dedicated buffers are
-//! zeroized after use; when stdin is not a terminal it is read
-//! from stdin instead (one line), which is what automation and
-//! tests use. (Narrowed, PR #81 review: the JSON request frame is
-//! built with serde_json into a zeroizing buffer that is wiped
-//! whole, but serde's internal growth copies and the tty/stdin
-//! read buffers are std internals this short-lived CLI cannot
-//! wipe — the daemon side, the long-lived process, is where
-//! REQ-MEM-003's zeroization is enforced and scanned for.)
+//! or a file (REQ-EXP-003); when stdin is not a terminal it is
+//! read from stdin instead (one line), which is what automation
+//! and tests use.
+//!
+//! Password hygiene in this short-lived CLI (#86, closing the
+//! PR #81 carry-overs): the password is read with `rustix::io::read`
+//! into a fixed zeroizing buffer (no `BufReader` / `read_line`
+//! std-internal copies), the JSON request frame is built by hand
+//! into a pre-sized zeroizing buffer (no `serde_json::Value` copy
+//! of the password, no growth reallocations), and a SIGINT during
+//! the tty prompt restores the terminal's echo before exiting
+//! (130) — `Drop` alone never runs on a signal. The daemon side
+//! remains where REQ-MEM-003 is enforced and scanned for; these
+//! measures keep the CLI from being the weakest copy.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -23,7 +28,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// The owner socket of a daemon with the SPEC §9 default
 /// `data_dir` (`/data`). Override with `--socket`.
@@ -113,6 +118,11 @@ fn owner_request(
     serde_json::from_str(&response).map_err(|_| "malformed reply from daemon".to_owned())
 }
 
+/// Longest password accepted, in bytes. The daemon's whole
+/// request line is capped at 8192 bytes; a password near this cap
+/// plus framing still fits comfortably.
+const MAX_PASSWORD_BYTES: usize = 1024;
+
 /// Read the unlock password: from the terminal with echo off when
 /// stdin is a terminal, else one line from stdin.
 fn read_password() -> Result<Zeroizing<String>, String> {
@@ -120,15 +130,88 @@ fn read_password() -> Result<Zeroizing<String>, String> {
     if std::io::stdin().is_terminal() {
         read_password_tty()
     } else {
-        let mut line = Zeroizing::new(String::new());
-        std::io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("cannot read password from stdin: {e}"))?;
-        while line.ends_with(['\n', '\r']) {
-            line.pop();
-        }
-        Ok(line)
+        use std::os::fd::AsFd;
+        let stdin = std::io::stdin();
+        read_password_line(stdin.as_fd(), "stdin")
     }
+}
+
+/// Read one password line from `fd` into a **fixed** zeroizing
+/// buffer with `rustix::io::read` (#86): no `BufReader` (whose
+/// 8 KiB heap buffer would hold an unwiped copy) and no
+/// `read_line` (whose growth reallocations would free unwiped
+/// prefixes). Stops at the first `\n` or EOF; a trailing `\r` is
+/// stripped. Overlong input is an error, never a truncation.
+fn read_password_line(
+    fd: std::os::fd::BorrowedFd<'_>,
+    source: &str,
+) -> Result<Zeroizing<String>, String> {
+    let mut buf = Zeroizing::new([0u8; MAX_PASSWORD_BYTES]);
+    let mut n = 0usize;
+    loop {
+        if n == buf.len() {
+            return Err(format!(
+                "password from {source} is too long (over {MAX_PASSWORD_BYTES} bytes)"
+            ));
+        }
+        match rustix::io::read(fd, &mut buf[n..]) {
+            Ok(0) => break,
+            Ok(m) => {
+                n += m;
+                if buf[n - 1] == b'\n' {
+                    n -= 1;
+                    break;
+                }
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(format!("cannot read password from {source}: {e}")),
+        }
+    }
+    if n > 0 && buf[n - 1] == b'\r' {
+        n -= 1;
+    }
+    // Take the bytes over into the String without a copy; on
+    // invalid UTF-8 the error owns the buffer, so wipe it first
+    // (same nit as kharond's owner decoder).
+    let mut bytes = Zeroizing::new(buf[..n].to_vec());
+    let bytes = std::mem::take(&mut *bytes);
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(Zeroizing::new(s)),
+        Err(e) => {
+            e.into_bytes().zeroize();
+            Err(format!("password from {source} is not valid UTF-8"))
+        }
+    }
+}
+
+/// Restore the terminal on SIGINT (#86). `EchoOff`'s `Drop`
+/// cannot run when the process dies on a signal, so a watcher
+/// thread waits on tokio's `ctrl_c` (handled in a normal thread,
+/// not a signal handler) and, if it fires, restores the saved
+/// termios itself and exits with the conventional 128+SIGINT.
+/// Best effort: if the watcher cannot be installed the prompt
+/// still works; only the interrupt path degrades.
+fn watch_for_sigint(original: rustix::termios::Termios) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let interrupted = rt.block_on(async { tokio::signal::ctrl_c().await.is_ok() });
+        if interrupted {
+            if let Ok(tty) = std::fs::File::open("/dev/tty") {
+                use std::os::fd::AsFd;
+                let _ = rustix::termios::tcsetattr(
+                    tty.as_fd(),
+                    rustix::termios::OptionalActions::Now,
+                    &original,
+                );
+            }
+            std::process::exit(130);
+        }
+    });
 }
 
 /// Disable echo on `/dev/tty` for the duration of the guard.
@@ -160,24 +243,46 @@ impl Drop for EchoOff {
 }
 
 fn read_password_tty() -> Result<Zeroizing<String>, String> {
-    use std::io::BufRead;
-    let mut tty =
-        std::fs::File::open("/dev/tty").map_err(|e| format!("cannot open /dev/tty: {e}"))?;
+    let tty = std::fs::File::open("/dev/tty").map_err(|e| format!("cannot open /dev/tty: {e}"))?;
     {
         use std::os::fd::AsFd;
-        let _guard = EchoOff::new(tty.as_fd())?;
+        let guard = EchoOff::new(tty.as_fd())?;
+        watch_for_sigint(guard.0.clone());
         eprint!("kharon master password: ");
-        let mut line = Zeroizing::new(String::new());
-        let mut reader = std::io::BufReader::new(&mut tty);
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("cannot read password: {e}"))?;
+        let password = read_password_line(tty.as_fd(), "the terminal");
         eprintln!();
-        while line.ends_with(['\n', '\r']) {
-            line.pop();
-        }
-        Ok(line)
+        password
     }
+}
+
+/// The unlock request frame, built by hand into a pre-sized
+/// zeroizing buffer (#86): `serde_json::json!` would first copy
+/// the password into a `Value::String`, and serializing that into
+/// a growing `String` would free unwiped prefixes on reallocation.
+/// The capacity covers the worst case (every password byte a
+/// control character, at 6 bytes per `\u00XX` escape) plus the
+/// framing, so the buffer never grows. JSON string escaping:
+/// `"` and `\` escaped, the short escapes for `\n`/`\r`/`\t`,
+/// other control characters as `\u00XX`, everything else raw
+/// UTF-8 — the same output serde_json produces.
+fn unlock_frame(password: &str) -> Zeroizing<String> {
+    let mut frame = Zeroizing::new(String::with_capacity(password.len() * 6 + 32));
+    frame.push_str("{\"op\":\"unlock\",\"password\":\"");
+    for ch in password.chars() {
+        match ch {
+            '"' => frame.push_str("\\\""),
+            '\\' => frame.push_str("\\\\"),
+            '\n' => frame.push_str("\\n"),
+            '\r' => frame.push_str("\\r"),
+            '\t' => frame.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                frame.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => frame.push(c),
+        }
+    }
+    frame.push_str("\"}");
+    frame
 }
 
 /// Run an owner command; print the outcome for the owner.
@@ -195,19 +300,11 @@ fn owner_command(command: &Command) -> ExitCode {
                 eprintln!("kharon: empty password");
                 return ExitCode::from(2);
             }
-            let request = Zeroizing::new(
-                serde_json::json!({"op": "unlock", "password": password.as_str()}).to_string(),
-            );
+            let request = unlock_frame(password.as_str());
             (socket, request)
         }
-        Command::Lock { socket } => (
-            socket,
-            Zeroizing::new(serde_json::json!({"op": "lock"}).to_string()),
-        ),
-        Command::Status { socket } => (
-            socket,
-            Zeroizing::new(serde_json::json!({"op": "status"}).to_string()),
-        ),
+        Command::Lock { socket } => (socket, Zeroizing::new("{\"op\":\"lock\"}".to_owned())),
+        Command::Status { socket } => (socket, Zeroizing::new("{\"op\":\"status\"}".to_owned())),
         Command::Audit(_) => unreachable!(),
     };
     match owner_request(socket, &request) {

@@ -74,16 +74,26 @@ KHARON_FIXTURE_BASE_URL=https://127.0.0.1:8222 \
 KHARON_FIXTURE_CA_CERT="$PWD/tls/ca.pem" \
 KHARON_FIXTURE_API_KEY_JSON=/tmp/api-key.json \
   cargo test -p kharond --test req_cry_005_sync req_cry_005_live -- --ignored
+# REQ-DEP-002 browser half: kharond (sync mode) fills a loopback test
+# page through headless Chromium. Any chrome-headless-shell or
+# Chromium binary works; fixture.yml copies a pinned one out of the
+# chromedp/headless-shell image.
+KHARON_FIXTURE_BASE_URL=https://127.0.0.1:8222 \
+KHARON_FIXTURE_CA_CERT="$PWD/tls/ca.pem" \
+KHARON_FIXTURE_API_KEY_JSON=/tmp/api-key.json \
+KHARON_FIXTURE_CHROMIUM=/path/to/headless-shell \
+  cargo test -p kharond --test req_dep_002_chromium_e2e -- --ignored
 docker compose -f docker-compose.yml down -v
 ```
 
 ## Scope / honest limits
 
-- The full REQ-DEP-002 acceptance criterion — *a seeded fixture fills
-  a test page through headless Chromium* — needs the sync client
-  (issue #8, this harness's stated dependency) and the fill path; its
-  full AC is owned by issue #24. This harness delivers the compose
-  stack, the seeded org/collection/items, and the live decrypt check.
+- The REQ-DEP-002 acceptance criterion — *a seeded fixture fills a
+  test page through headless Chromium* — is this harness plus
+  `crates/kharond/tests/req_dep_002_chromium_e2e.rs`, which the
+  fixture workflow runs right after seeding. The harness delivers the
+  compose stack, the seeded org/collection/items, and the live decrypt
+  check; the E2E drives kharond's sync path and fill API against them.
 - The live seed path is exercised by the fixture workflow
   (`workflow_dispatch` + changes under this directory); the offline
   path is exercised by every normal `cargo test` run.

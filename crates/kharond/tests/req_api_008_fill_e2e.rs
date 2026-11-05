@@ -5,7 +5,9 @@
 //! real ciphertext per fill.
 //!
 //! - `submit: true` is `fill_and_submit`: the in-page call is told to
-//!   submit; without it, it is not (REQ-API-008).
+//!   submit; without it, it is not (REQ-API-008). A loader change after
+//!   a successful submit is that submit's own navigation (`filled`), not
+//!   `navigated` (#102).
 //! - `fill_totp` types the current code; the response never carries it
 //!   (REQ-API-007).
 //! - A claimed `expected_origin` that is not the live origin is
@@ -18,6 +20,7 @@
 mod api_support;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use api_support::{
@@ -93,6 +96,71 @@ async fn cdp_stub_in(t1_context: &'static str) -> (String, Received) {
                     .map(|fs| fs.iter().map(|f| json!({ "kind": f["kind"] })).collect())
                     .unwrap_or_default();
                 json!({ "result": { "type": "object", "value": { "results": kinds } } })
+            } else {
+                script.get(method).cloned().unwrap_or_else(|| json!({}))
+            };
+            let mut reply = json!({ "id": msg["id"], "result": result });
+            if let Some(s) = msg.get("sessionId") {
+                reply["sessionId"] = s.clone();
+            }
+            ws.send(Message::Text(reply.to_string())).await.unwrap();
+        }
+    });
+    (format!("ws://{addr}/devtools/browser"), received)
+}
+
+/// Like [`cdp_stub`], but the second (and later) `Page.getFrameTree`
+/// replies with a new `loaderId`. Models the race where a form submit
+/// commits navigation before the post-fill loader re-check (#102).
+async fn cdp_stub_loader_changes_after_fill() -> (String, Received) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received: Received = Arc::default();
+    let rec = Arc::clone(&received);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let trees = AtomicUsize::new(0);
+        let mut script: HashMap<&str, Value> = HashMap::new();
+        script.insert(
+            "Target.createBrowserContext",
+            json!({ "browserContextId": "ctx-A" }),
+        );
+        script.insert(
+            "Target.getTargetInfo",
+            json!({ "targetInfo": {
+                "targetId": "t1", "browserContextId": "ctx-A",
+                "url": URL, "title": "", "type": "page",
+            } }),
+        );
+        script.insert("Target.attachToTarget", json!({ "sessionId": "sess-1" }));
+        script.insert(
+            "Page.createIsolatedWorld",
+            json!({ "executionContextId": 7 }),
+        );
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let msg: Value = serde_json::from_str(&text).unwrap();
+            rec.lock().unwrap().push(msg.clone());
+            let method = msg["method"].as_str().unwrap_or_default();
+            let result = if method == "Page.getFrameTree" {
+                let n = trees.fetch_add(1, Ordering::SeqCst);
+                let loader = if n == 0 { "l1" } else { "l2" };
+                json!({ "frameTree": { "frame": {
+                    "id": "f1", "loaderId": loader, "url": URL,
+                }, "childFrames": [] } })
+            } else if method == "Runtime.callFunctionOn" {
+                let decl = msg["params"]["functionDeclaration"]
+                    .as_str()
+                    .unwrap_or_default();
+                if decl.contains("clearInPage") {
+                    json!({ "result": { "type": "object", "value": { "cleared": true } } })
+                } else {
+                    let kinds: Vec<Value> = msg["params"]["arguments"][1]["value"]
+                        .as_array()
+                        .map(|fs| fs.iter().map(|f| json!({ "kind": f["kind"] })).collect())
+                        .unwrap_or_default();
+                    json!({ "result": { "type": "object", "value": { "results": kinds } } })
+                }
             } else {
                 script.get(method).cloned().unwrap_or_else(|| json!({}))
             };
@@ -505,4 +573,73 @@ async fn req_aud_003_failed_dispatch_append_reaches_no_cdp() {
     assert_eq!(r.status, 200);
     assert_eq!(e.fill_calls().len(), 1);
     assert_eq!(e.audit.summary().len(), 2);
+}
+
+/// #102 / REQ-API-008: a loader change after a successful `submit: true`
+/// fill is the submit's own navigation — report `filled` with the
+/// fields from the call, and do not scrub via `CLEAR_IN_PAGE`.
+#[tokio::test]
+async fn req_api_008_submit_true_loader_change_reports_filled() {
+    let e = e2e_with(cdp_stub_loader_changes_after_fill().await).await;
+    let fields = json!([{"kind": "username"}, {"kind": "password"}]);
+    let r = e
+        .fill(
+            "/v1/fill",
+            body(&e.item_id, fields, true, "https://example.com"),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json(),
+        json!({"status": "filled", "fields_filled": ["username", "password"]})
+    );
+    let calls = e.fill_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "fill only; no CLEAR_IN_PAGE scrub: {calls:?}"
+    );
+    assert!(
+        calls[0]["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("fillInPage"),
+        "only the fill call"
+    );
+    assert_eq!(calls[0]["params"]["arguments"][3]["value"], json!(true));
+}
+
+/// #102: the same loader change with `submit: false` is still an
+/// unexpected navigation — report `navigated` and attempt the clear.
+#[tokio::test]
+async fn req_api_008_submit_false_loader_change_reports_navigated() {
+    let e = e2e_with(cdp_stub_loader_changes_after_fill().await).await;
+    let fields = json!([{"kind": "username"}, {"kind": "password"}]);
+    let r = e
+        .fill(
+            "/v1/fill",
+            body(&e.item_id, fields, false, "https://example.com"),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json(),
+        json!({"status": "navigated", "fields_filled": []})
+    );
+    let calls = e.fill_calls();
+    assert_eq!(calls.len(), 2, "fill then CLEAR_IN_PAGE: {calls:?}");
+    assert!(
+        calls[0]["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("fillInPage")
+    );
+    assert!(
+        calls[1]["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("clearInPage"),
+        "scrub after unexpected navigation"
+    );
+    assert_eq!(calls[0]["params"]["arguments"][3]["value"], json!(false));
 }

@@ -39,6 +39,9 @@
 //!    agent API on 10.66.0.1:8787 only. The owner unlocks with
 //!    `docker exec kharon unlock` (master password on stdin).
 //! 5. The agent (this test) asks for its browser context and fills.
+//!    The first fill is `pending_approval` (#20, REQ-APR-001); the
+//!    owner approves it (per-origin) through the owner socket and
+//!    the fill is retried — see `owner_approve`.
 //!
 //! Ignored by default. Env: `KHARON_FIXTURE_BASE_URL`,
 //! `KHARON_FIXTURE_CA_CERT`, `KHARON_FIXTURE_API_KEY_JSON` (as for
@@ -76,6 +79,9 @@ const FIXTURE_DIR: &str = concat!(
 const PROJECT: &str = "kharon-e2e";
 const KHAROND: &str = "kharon-e2e-kharond";
 const AGENT_HOST: &str = "kharon-e2e-agent-host";
+/// The agent-host image (compose.e2e.yml): Debian + socat, which
+/// the owner-approve helper below borrows for its socket client.
+const AGENT_HOST_IMAGE: &str = "kharon-e2e-agent-host:local";
 
 /// Addresses on the compose `wg` network (stand-in for the tunnel).
 const AGENT_API: &str = "10.66.0.1:8787";
@@ -552,6 +558,62 @@ fn ss_in(container: &str, args: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Owner-approve a grant request for the compose daemon (#20,
+/// REQ-APR-001).
+///
+/// kharond's owner socket lives in the `kharon-data` volume, and
+/// the daemon accepts only its own uid (10001) as a peer
+/// (REQ-APR-006). The test host has no client for it yet (the
+/// `kharon` CLI's approve surface is #21), so the approval rides a
+/// one-off container: the agent-host image (it carries `socat`),
+/// run as the daemon's uid with the volume mounted — the
+/// operator-with-docker-access move, mirroring how setup unlocks
+/// through `docker exec`. Nothing in the running deployment is
+/// touched: the helper container is gone before the fill retries.
+fn owner_approve(request_id: &str) {
+    let mounts = docker(&[
+        "inspect",
+        "--format",
+        "{{range .Mounts}}{{if eq .Destination \"/data\"}}{{.Name}}{{end}}{{end}}",
+        KHAROND,
+    ]);
+    let volume = mounts.trim();
+    assert!(!volume.is_empty(), "kharon-data volume not found");
+    let line = format!(
+        "{}\n",
+        json!({"op": "approve", "request_id": request_id, "kind": "per-origin"})
+    );
+    let out = docker_raw(
+        &[
+            "run",
+            "--rm",
+            "-i",
+            "--user",
+            "10001:10001",
+            "--entrypoint",
+            "socat",
+            "-v",
+            &format!("{volume}:/data"),
+            AGENT_HOST_IMAGE,
+            "-",
+            "UNIX-CONNECT:/data/owner.sock",
+        ],
+        Some(line.as_bytes()),
+    );
+    assert!(
+        out.status.success(),
+        "owner approve container failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+        panic!(
+            "bad approve reply: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(reply["ok"], json!(true), "approve: {reply}");
+}
+
 async fn setup() -> Run {
     let base = Url::parse(&env("KHARON_FIXTURE_BASE_URL")).unwrap();
     let ca = PathBuf::from(env("KHARON_FIXTURE_CA_CERT"));
@@ -694,6 +756,25 @@ listen = "{AGENT_API}"
         assert!(!r.body.contains(&canary), "canary in a fill reply");
         assert_no_canary(&r.body);
         let res = r.json();
+        // REQ-APR-001 (#20): with no grant yet, a fill is
+        // `pending_approval` and nothing is decrypted. The owner
+        // approves the request (per-origin: this item at this
+        // origin, so the remaining fills are admitted) and the
+        // same fill is retried.
+        let res = if res["status"] == json!("pending_approval") {
+            let grid = res["grant_request_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("pending_approval without a grant_request_id: {res}"))
+                .to_owned();
+            owner_approve(&grid);
+            let r = post_json(api, "/v1/fill", Some(&token), &body.to_string()).await;
+            assert_eq!(r.status, 200, "fill {n} retry: {}", r.body);
+            assert!(!r.body.contains(&canary), "canary in a fill reply");
+            assert_no_canary(&r.body);
+            r.json()
+        } else {
+            res
+        };
         assert_eq!(res["status"], json!("filled"), "fill {n}: {res}");
         assert_eq!(res["fields_filled"], json!(["username", "password"]));
         // The in-page submit posted the canary (a real navigation).

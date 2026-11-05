@@ -1,0 +1,46 @@
+name: compat
+# Official Bitwarden cloud compatibility (issue #25, REQ-DEP-004 /
+# REQ-CRY-005 cloud half). Manual + nightly. Needs repo secrets
+# BW_COMPAT_EMAIL and BW_COMPAT_PASSWORD (Lothrop, 2026-11-05). The
+# job mints a personal API key via the official password-grant path
+# then runs the ignored Rust live test. Results belong in COMPAT.md.
+on:
+  schedule:
+    - cron: "41 4 * * *" # nightly, 04:41 UTC
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  bitwarden-cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install argon2-cffi (mint_api_key.py)
+        run: pip install --user "argon2-cffi==23.1.0"
+      - name: Mint personal API key from BW_COMPAT_* secrets
+        env:
+          BW_COMPAT_EMAIL: ${{ secrets.BW_COMPAT_EMAIL }}
+          BW_COMPAT_PASSWORD: ${{ secrets.BW_COMPAT_PASSWORD }}
+          KHARON_COMPAT_BASE_URL: https://vault.bitwarden.com
+        run: |
+          test -n "$BW_COMPAT_EMAIL" || { echo "BW_COMPAT_EMAIL secret missing"; exit 1; }
+          test -n "$BW_COMPAT_PASSWORD" || { echo "BW_COMPAT_PASSWORD secret missing"; exit 1; }
+          python3 crates/kharon-bwcrypto/tests/fixtures/bitwarden-cloud/mint_api_key.py \
+            --out "${{ runner.temp }}/compat-api-key.json"
+      - name: REQ-DEP-004 / REQ-CRY-005 live cloud sync + decrypt
+        env:
+          KHARON_COMPAT_BASE_URL: https://vault.bitwarden.com
+          KHARON_COMPAT_EMAIL: ${{ secrets.BW_COMPAT_EMAIL }}
+          KHARON_COMPAT_PASSWORD: ${{ secrets.BW_COMPAT_PASSWORD }}
+          KHARON_COMPAT_API_KEY_JSON: ${{ runner.temp }}/compat-api-key.json
+          # Optional pins (unset = first org + first collection of that org):
+          # KHARON_COMPAT_ORG_ID: ${{ secrets.BW_COMPAT_ORG_ID }}
+          # KHARON_COMPAT_COLLECTION_ID: ${{ secrets.BW_COMPAT_COLLECTION_ID }}
+        run: >-
+          cargo test -p kharond --test req_dep_004_compat
+          req_dep_004_live_bitwarden_cloud_api_key_sync_decrypts
+          -- --ignored --exact --nocapture
+      - name: Scrub API-key file
+        if: always()
+        run: rm -f "${{ runner.temp }}/compat-api-key.json"

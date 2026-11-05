@@ -624,15 +624,17 @@ pub const DEFAULT_FILL_DEADLINE: Duration = Duration::from_secs(10);
 ///
 /// # Audit
 ///
-/// This is the engine-level wrapper (used by [`crate::totp::TotpFill`]
-/// and tests). The daemon's fill path is [`crate::api::Broker::fill`],
-/// which owns the REQ-AUD-003† dispatch / outcome pair: a
-/// `fill_dispatch` entry before any CDP write (append failure →
-/// `audit_failed`, no write) and one outcome entry after. This wrapper
-/// writes only the `fill_timeout` outcome entry, and treats its append
-/// exactly as the daemon does: a failed append is surfaced to the caller
-/// as `Err(AuditFailed)` (the API's `audit_failed`), never swallowed. The
-/// non-timeout outcomes are returned unaudited for the caller to record.
+/// This is an engine-level wrapper with no production caller (engine
+/// tests use it; the `TotpFill` wrapper that did was retired in #77).
+/// The daemon's only fill path, `fill` and `fill_totp` alike, is
+/// [`crate::api::Broker::fill`], which owns the REQ-AUD-003† dispatch /
+/// outcome pair: a `fill_dispatch` entry before any CDP write (append
+/// failure → `audit_failed`, no write) and one outcome entry after.
+/// This wrapper writes only the `fill_timeout` outcome entry, and
+/// treats its append exactly as the daemon does: a failed append is
+/// surfaced to the caller as `Err(AuditFailed)` (the API's
+/// `audit_failed`), never swallowed. The non-timeout outcomes are
+/// returned unaudited for the caller to record.
 ///
 /// Ownership note: secrets live canonically in `plan.fields[*].value`
 /// (`Zeroizing<String>`). Copies inside the cancelled fill future are freed
@@ -711,8 +713,7 @@ impl<'a> DeadlineFiller<'a> {
 #[error("audit append failed (fail closed)")]
 pub struct AuditFailed;
 
-/// Shared fixtures for the REQ-API-009 / REQ-AUD-003 deadline tests
-/// (here and in [`crate::totp`]).
+/// Shared fixtures for the REQ-API-009 / REQ-AUD-003 deadline tests.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;

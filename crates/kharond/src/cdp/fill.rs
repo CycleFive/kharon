@@ -611,12 +611,16 @@ pub const DEFAULT_FILL_DEADLINE: Duration = Duration::from_secs(10);
 /// happened in the page". Likewise the post-fill loader re-check and
 /// the `CLEAR_IN_PAGE` scrub (step 4) never run after expiry.
 ///
-/// "Dispatched" is also fuzzier than it looks: if the deadline fires
-/// while the fill frame is mid-`send` on the shared websocket sink, the
-/// frame can sit in the sink's buffer and go out with the next write
-/// on that connection (another request's), i.e. after expiry. No
-/// *new* write is issued for this fill, but the bytes of the one
-/// already handed to the transport are not withdrawn.
+/// "Dispatched" has a crisp boundary (#76): a frame is on the wire once
+/// its `send` returned. If the deadline fires while the fill frame is
+/// still mid-`send` on the shared websocket sink, dropping the future
+/// poisons the connection ([`super::CdpError::Poisoned`]): the sink is
+/// dropped with whatever it buffered unflushed, so no later write on
+/// that connection (another request's, or the close frame) can carry
+/// the frame out after expiry. Bytes the kernel already accepted may
+/// still reach the browser, but a truncated frame is not a command.
+/// The engine then reports [`FillEngine::is_closed`] and the daemon
+/// reconnects on the next fill.
 ///
 /// # Audit
 ///

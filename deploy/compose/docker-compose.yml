@@ -1,0 +1,68 @@
+# kharon compose example (SPEC §9, issue #24 / REQ-DEP-001, 002, 006).
+#
+# kharond on owner hardware next to Vaultwarden. Copy
+# kharon.toml.example to kharon.toml and fill it in, put the kharon
+# account's personal API key JSON at secrets/kharon_bw_api_key.json,
+# then:
+#
+#   docker compose up -d --build
+#   docker compose exec kharon kharon unlock     # master password, once
+#
+# The `wg` network stands for the WireGuard link to the agent host:
+# kharond's agent API binds only its address there (10.66.0.1,
+# REQ-DEP-006) and reaches the agent host's Chromium at 10.66.0.2.
+# Swap it for your real tunnel (see the agent-host guide). The same
+# file runs in CI with e2e/compose.e2e.yml layered on top, which adds
+# the fixture Vaultwarden and an agent-host container
+# (.github/workflows/image.yml).
+name: kharon
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.33.0
+    restart: unless-stopped
+    networks: [vw]
+    volumes: ["vaultwarden-data:/data"]
+
+  kharon:
+    build: { context: ../.. }
+    image: kharon:local
+    restart: unless-stopped
+    # SPEC §9 hardening. read_only works because kharond writes only
+    # to /data (REQ-DEP-001). Note: with a non-root `user`, Docker does
+    # not raise CAP_IPC_LOCK into the effective set, so mlock
+    # (REQ-MEM-002) rests on the unlimited memlock ulimit; the cap is
+    # kept as SPEC lists it. The seccomp profile SPEC §9 names
+    # (kharon-seccomp.json) is not written yet; Docker's default
+    # profile applies.
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [IPC_LOCK]
+    ulimits: { memlock: -1, core: 0 }
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - "kharon-data:/data"
+      - "./kharon.toml:/etc/kharon.toml:ro"
+    secrets: [kharon_bw_api_key]
+    networks:
+      vw: {}
+      wg: { ipv4_address: 10.66.0.1 }
+    # No published ports: the agent API is on the wg address only, and
+    # the owner talks to the unix socket in /data (`kharon` CLI above).
+
+secrets:
+  kharon_bw_api_key:
+    file: ./secrets/kharon_bw_api_key.json
+
+networks:
+  vw: {}
+  wg:
+    ipam:
+      config:
+        - subnet: 10.66.0.0/24
+          gateway: 10.66.0.254
+
+volumes:
+  vaultwarden-data: {}
+  kharon-data: {}

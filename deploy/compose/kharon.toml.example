@@ -1,0 +1,21 @@
+# kharond config for the compose example (SPEC §9). Every value
+# below is a placeholder; kharond refuses unknown keys and refuses to
+# start on unsafe combinations (REQ-DEP-003). Check a file with
+#   docker compose run --rm kharon --check --config /etc/kharon.toml
+
+[bitwarden]
+server = "http://vaultwarden:80"
+email = "kharon@example.net"
+api_key_file = "/run/secrets/kharon_bw_api_key"
+organization_id = "00000000-0000-0000-0000-000000000001"
+collection_ids = ["00000000-0000-0000-0000-000000000002"]
+
+[agents.assistant]
+# `kharon` token tooling prints the hash; never put the token here.
+token_hash = "$argon2id$..."
+# The agent host's Chromium (CDP), reached over the WireGuard link.
+cdp = { endpoint = "ws://10.66.0.2:9222/devtools/browser/<id>", via = "wireguard" }
+
+[api]
+# The wg address only; wildcards are refused (REQ-DEP-006).
+listen = "10.66.0.1:8787"

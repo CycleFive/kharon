@@ -35,8 +35,8 @@ jobs:
           KHARON_COMPAT_PASSWORD: ${{ secrets.BW_COMPAT_PASSWORD }}
           KHARON_COMPAT_API_KEY_JSON: ${{ runner.temp }}/compat-api-key.json
           # Optional pins (unset = first org + first collection of that org):
-          # KHARON_COMPAT_ORG_ID: ${{ secrets.BW_COMPAT_ORG_ID }}
-          # KHARON_COMPAT_COLLECTION_ID: ${{ secrets.BW_COMPAT_COLLECTION_ID }}
+          KHARON_COMPAT_ORG_ID: ${{ secrets.BW_COMPAT_ORG_ID }}
+          KHARON_COMPAT_COLLECTION_ID: ${{ secrets.BW_COMPAT_COLLECTION_ID }}
         run: >-
           cargo test -p kharond --test req_dep_004_compat
           req_dep_004_live_bitwarden_cloud_api_key_sync_decrypts

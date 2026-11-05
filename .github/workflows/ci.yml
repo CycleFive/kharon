@@ -14,3 +14,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # REQ-EXP-001 (#85): hosted runners refuse unprivileged userns, so the
+      # plain run above skips the no-egress AC. Re-run that one test as root
+      # (prebuilt binary; no root cargo) with KHARON_REQUIRE_NETNS=1, which
+      # turns any skip into a failure.
+      - name: req_exp_001 no-egress netns (privileged)
+        shell: bash # -eo pipefail: the test's exit status survives `tee`
+        run: |
+          bin=$(cargo test -p kharond --test req_mem_daemon_unlock --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "req_mem_daemon_unlock" and .executable != null) | .executable')
+          test -x "$bin"
+          sudo env KHARON_REQUIRE_NETNS=1 "$bin" \
+            req_exp_001_export_mode_works_with_no_network_egress --exact --nocapture 2>&1 | tee netns.log
+          grep -q '^EXERCISED req_exp_001' netns.log

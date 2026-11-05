@@ -22,8 +22,9 @@
 //!
 //! Fills (`fill`, `fill_totp`) take the async [`Broker::fill`] instead
 //! of [`Broker::dispatch`] (the browser round trip is async; the read
-//! operations stay sync): authenticate, then the lock gate, then (TODO
-//! #20) the grant check, then resolve the item and decrypt the values
+//! operations stay sync): authenticate, then the lock gate, then the
+//! SPEC §8 fill-time re-sync of a stale vault ([`FillSync`]), then
+//! (TODO #20) the grant check, then resolve the item and decrypt the values
 //! into a [`FillPlan`], then the [`FillBackend`], all under one
 //! wall-clock fill deadline (REQ-API-009); then zeroize the plan, then
 //! append exactly one outcome entry (`fill`, `fill_totp` or
@@ -36,6 +37,8 @@
 //! `fill_aborted`; `kharon audit verify` flags a `fill_dispatch` that
 //! has neither.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -54,7 +57,8 @@ use crate::audit::{AuditLog, Entry, Event};
 use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin};
 use crate::lock::{AuditError, Clock, LockController, LockEvent, SystemClock};
 use crate::origin::{OriginConfig, OriginMatcher};
-use crate::sync::{LiveSync, SecretField, SyncError, Vault};
+use crate::sync::wire::SyncResponse;
+use crate::sync::{LiveSync, SecretField, SyncError, SyncOutcome, Vault};
 use crate::totp::skew::Observation;
 use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy, totp_code};
 
@@ -77,6 +81,32 @@ pub trait VaultView: ZeroizeOnDrop + Send {
         item_id: &str,
         field: SecretField,
     ) -> Result<Zeroizing<Vec<u8>>, SyncError>;
+
+    /// SPEC §8: whether a fill must re-sync first (the vault is older
+    /// than [`crate::sync::MAX_SYNC_INTERVAL`] at `now`). A session
+    /// that never re-syncs (an export snapshot) is never stale.
+    fn is_stale(&self, _now: Instant) -> bool {
+        false
+    }
+
+    /// Apply a `/api/sync` payload fetched by the broker's
+    /// [`FillSync`] (fill-time re-sync, SPEC §8). Only called when
+    /// [`Self::is_stale`] said so; the default never is.
+    fn apply_sync(&mut self, _sync: &SyncResponse) -> Result<SyncOutcome, SyncError> {
+        Ok(SyncOutcome::Synced)
+    }
+}
+
+/// A boxed fill-time `/api/sync` fetch.
+pub type SyncFetch<'a> = Pin<Box<dyn Future<Output = Result<SyncResponse, SyncError>> + Send + 'a>>;
+
+/// Where the fill path fetches a fresh `/api/sync` when the vault is
+/// stale (SPEC §8, issue #100). The fetch runs outside the lock
+/// controller's mutex; only the CPU-only [`VaultView::apply_sync`]
+/// runs under it, as for the background sync.
+pub trait FillSync: Send + Sync {
+    /// Fetch one full `/api/sync` payload.
+    fn fetch(&self) -> SyncFetch<'_>;
 }
 
 impl VaultView for LiveSync {
@@ -91,6 +121,14 @@ impl VaultView for LiveSync {
     ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
         self.session()
             .decrypt_secret(LiveSync::vault(self), item_id, field)
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        LiveSync::is_stale(self, now)
+    }
+
+    fn apply_sync(&mut self, sync: &SyncResponse) -> Result<SyncOutcome, SyncError> {
+        self.apply(sync)
     }
 }
 
@@ -317,6 +355,7 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     fill_backend: Option<Arc<dyn FillBackend>>,
     fill_policy: FillPolicy,
     plan_wiped: Option<PlanWipedHook>,
+    fill_sync: Option<Arc<dyn FillSync>>,
 }
 
 /// Called with every resolved [`FillPlan`] after its values were
@@ -419,7 +458,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             fill_backend: None,
             fill_policy: FillPolicy::default(),
             plan_wiped: None,
+            fill_sync: None,
         }
+    }
+
+    /// Re-sync a stale vault through `source` before a fill resolves
+    /// its item (SPEC §8). Without one, a fill against a stale session
+    /// is refused `error`/`sync_failed`.
+    pub fn with_fill_sync(mut self, source: Arc<dyn FillSync>) -> Self {
+        self.fill_sync = Some(source);
+        self
     }
 
     /// Fill through `backend` (without one every fill is
@@ -660,7 +708,11 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // The live origin the engine read, if the fill got that far
         // (REQ-AUD-003†, #67); copied into the outcome entry.
         let mut live_origin = None;
-        let status = match self.resolve_fill(agent, &req) {
+        let resolved = match self.resync_if_stale(deadline).await {
+            Ok(()) => self.resolve_fill(agent, &req),
+            Err(u) => Err(u),
+        };
+        let status = match resolved {
             Err(Unresolved::Locked) => {
                 self.append(base(event).result("locked"))?;
                 return Err(ApiError::LOCKED);
@@ -816,6 +868,50 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         };
         self.append(entry)?;
         Ok(Outcome::Context(body))
+    }
+
+    /// SPEC §8 (REQ-CRY-009, issue #100): if the unlocked vault is
+    /// older than [`crate::sync::MAX_SYNC_INTERVAL`], fetch a fresh
+    /// `/api/sync` (outside the mutex, within the fill deadline) and
+    /// apply it before the item is resolved. `Ok(())` means "go on to
+    /// [`Self::resolve_fill`]", which runs the lock gate again (so a
+    /// lock meanwhile is still reported `locked`). Fails closed: a
+    /// stale vault is never filled from when the re-sync fails
+    /// (`error`/`sync_failed`) or runs past the deadline (`timeout`);
+    /// a payload that widens the scope or rotates the org key locks,
+    /// exactly as the background sync does (`scope_widened` /
+    /// `key_rotated`), and the fill is `locked`.
+    async fn resync_if_stale(&self, deadline: Instant) -> Result<(), Unresolved> {
+        let generation = {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            match lock.require_unlocked() {
+                Ok(session) if session.is_stale(Instant::now()) => lock.unlocked_at(),
+                // Fresh, or locked (the gate in `resolve_fill` says so).
+                _ => return Ok(()),
+            }
+        };
+        let refuse = |s| Err(Unresolved::Refused(s));
+        let Some(source) = &self.fill_sync else {
+            return refuse(FillStatus::SyncFailed);
+        };
+        let sync = match tokio::time::timeout_at(deadline, source.fetch()).await {
+            Ok(Ok(sync)) => sync,
+            Ok(Err(_)) => return refuse(FillStatus::SyncFailed),
+            Err(_) => return refuse(FillStatus::Engine(FillOutcome::Timeout)),
+        };
+        let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        if lock.unlocked_at() != generation {
+            // Locked, or re-unlocked (a fresh sync), while fetching.
+            return Ok(());
+        }
+        match lock.with_session_mut(|session| session.apply_sync(&sync)) {
+            Ok(Ok(SyncOutcome::Synced)) | Err(_) => Ok(()),
+            Ok(Ok(SyncOutcome::Lock(reason))) => {
+                lock.on_sync_lock(&reason);
+                Err(Unresolved::Locked)
+            }
+            Ok(Err(_)) => refuse(FillStatus::SyncFailed),
+        }
     }
 
     async fn run_fill(

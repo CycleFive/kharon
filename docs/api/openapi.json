@@ -648,7 +648,8 @@
               "unknown_item",
               "item_field_missing",
               "decrypt_failed",
-              "fill_unavailable"
+              "fill_unavailable",
+              "sync_failed"
             ]
           }
         }

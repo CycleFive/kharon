@@ -24,7 +24,8 @@ pub mod surface;
 pub mod token;
 
 pub use self::core::{
-    AgentId, AuditSink, Broker, ContextResult, Outcome, Request, StatusBody, VaultView,
+    AgentId, AuditSink, Broker, ContextResult, FillSync, Outcome, Request, StatusBody, SyncFetch,
+    VaultView,
 };
 pub use error::{ApiError, Detail, ErrorBody, ErrorCode};
 pub use fill::{

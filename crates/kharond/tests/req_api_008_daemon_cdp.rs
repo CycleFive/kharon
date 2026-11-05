@@ -417,6 +417,12 @@ async fn req_api_008_daemon_backend_reconnects_after_the_browser_drops() {
 /// connect-time context creation, and in the in-page fill) is bounded by
 /// `fill_deadline`; nothing is sent after expiry and the audit is one
 /// dispatch plus exactly one `fill_timeout`.
+///
+/// For the in-page stall (the engine-level `DeadlineFiller` tests moved
+/// here in #88): exactly one `Runtime.callFunctionOn` was ever sent, even
+/// with `submit: true` (no clear-scrub, no separate submit write), the
+/// `fill_timeout` entry carries the live origin read before the stall
+/// (origin only, no path, #67), and no canary reaches the log or reply.
 #[tokio::test]
 async fn req_api_009_daemon_backend_respects_fill_deadline() {
     for stall in ["Target.createBrowserContext", "Runtime.callFunctionOn"] {
@@ -445,6 +451,22 @@ async fn req_api_009_daemon_backend_respects_fill_deadline() {
         assert_eq!(e[1]["event"], "fill_timeout");
         assert_eq!(e[1]["detail_code"], "deadline_expired");
         assert_eq!(e[0]["request_id"], e[1]["request_id"]);
+        assert!(took >= Duration::from_millis(300), "{stall}: {took:?}");
+        let text = serde_json::to_string(&e).unwrap();
+        assert!(!text.contains(CANARY_PASSWORD), "{stall}: canary in log");
+        assert!(!resp.body.contains(CANARY_PASSWORD), "{stall}");
+        assert!(!text.contains("/login"), "{stall}: no path in the log");
+        if stall == "Runtime.callFunctionOn" {
+            assert_eq!(
+                stub.methods("Runtime.callFunctionOn"),
+                1,
+                "the stalled fill call only: no scrub, no submit write"
+            );
+            assert_eq!(e[1]["live_origin"], "https://example.com");
+        } else {
+            assert_eq!(stub.methods("Runtime.callFunctionOn"), 0, "{stall}");
+            assert!(e[1].get("live_origin").is_none(), "{stall}: {e:?}");
+        }
     }
 }
 

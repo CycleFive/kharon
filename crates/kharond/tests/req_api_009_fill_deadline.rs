@@ -179,3 +179,27 @@ async fn req_api_009_timeout_with_a_failed_audit_is_audit_failed() {
     *r.h.audit.fail.lock().unwrap() = true;
     assert_eq!(fill(&r, Instant::now()).await, Err(ApiError::AUDIT_FAILED));
 }
+
+/// REQ-API-009 + REQ-AUD-003† on `fill` (#88, the Broker-path form of
+/// the retired engine-level `DeadlineFiller` test): a backend that
+/// stalls past the deadline with a failing `fill_timeout` append is
+/// `audit_failed` exactly at the deadline, not `timeout`; the backend
+/// was reached once and the plan is still zeroized.
+#[tokio::test(start_paused = true)]
+async fn req_api_009_timeout_append_failure_is_audit_failed_at_the_deadline() {
+    fixture_vault();
+    let r = harness(FakeAnswer::Stall, Some(Duration::from_secs(1)));
+    *r.h.audit.fail_event.lock().unwrap() = Some("fill_timeout");
+    let received = Instant::now();
+    assert_eq!(fill(&r, received).await, Err(ApiError::AUDIT_FAILED));
+    assert_eq!(received.elapsed(), Duration::from_secs(1));
+    assert_eq!(r.fake.seen().len(), 1, "dispatched, then cut off");
+    let e = entries(&r);
+    assert_eq!(e.len(), 1, "only the dispatch reached the log: {e:?}");
+    assert_eq!(e[0]["event"], "fill_dispatch");
+    let wiped = r.wiped.lock().unwrap().clone();
+    assert!(
+        wiped.len() == 1 && wiped[0].is_empty(),
+        "plan zeroized before the failed append"
+    );
+}

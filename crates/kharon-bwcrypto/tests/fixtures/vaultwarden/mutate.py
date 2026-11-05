@@ -10,6 +10,11 @@ the web vault:
 
   add --name N            new login in the fixture collection
                           (pushes SyncCipherCreate); prints {"id": ...}
+      [--username U --uri URI --password-env VAR]
+                          ... with these login fields instead of the
+                          push-test defaults; the password is read from
+                          the environment variable VAR, never argv (the
+                          compose E2E's canary item, issue #24)
   edit --id ID --name N   rename it (pushes SyncCipherUpdate)
   delete --id ID          hard delete (pushes SyncCipherDelete)
   add-org                 create a SECOND org owned by the account,
@@ -121,17 +126,18 @@ class Session:
     def call(self, method, path, body=None):
         return http_json(method, self.base + path, body, token=self.token, context=self.ctx)
 
-    def cipher(self, name: str) -> dict:
+    def cipher(self, name: str, username: bytes = b"push-user",
+               password: bytes = b"push-password",
+               uri: str = "https://push.example.test/login") -> dict:
         k = self.org_key
-        uri = "https://push.example.test/login"
         return {
             "type": 1,
             "organizationId": self.org_id,
             "name": enc_type2(k, name.encode()),
             "key": None,
             "login": {
-                "username": enc_type2(k, b"push-user"),
-                "password": enc_type2(k, b"push-password"),
+                "username": enc_type2(k, username),
+                "password": enc_type2(k, password),
                 "uris": [{
                     "uri": enc_type2(k, uri.encode()),
                     "uriChecksum": enc_type2(
@@ -151,6 +157,9 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("add")
     a.add_argument("--name", required=True)
+    a.add_argument("--username")
+    a.add_argument("--uri")
+    a.add_argument("--password-env", metavar="VAR")
     e = sub.add_parser("edit")
     e.add_argument("--id", required=True)
     e.add_argument("--name", required=True)
@@ -161,8 +170,19 @@ def main() -> int:
 
     s = Session(args.base_url.rstrip("/"), args.ca_cert)
     if args.cmd == "add":
+        login = {}
+        if args.username is not None:
+            login["username"] = args.username.encode()
+        if args.uri is not None:
+            login["uri"] = args.uri
+        if args.password_env is not None:
+            password = os.environ.get(args.password_env)
+            if not password:
+                raise SystemExit(f"{args.password_env} is not set")
+            login["password"] = password.encode()
         created = s.call("POST", "/api/ciphers/create",
-                         {"cipher": s.cipher(args.name), "collectionIds": [s.collection_id]})
+                         {"cipher": s.cipher(args.name, **login),
+                          "collectionIds": [s.collection_id]})
         print(json.dumps({"id": pick(created, "id")}))
     elif args.cmd == "edit":
         s.call("PUT", f"/api/ciphers/{args.id}", s.cipher(args.name))

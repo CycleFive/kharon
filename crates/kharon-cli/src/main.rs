@@ -132,20 +132,32 @@ fn read_password() -> Result<Zeroizing<String>, String> {
     } else {
         use std::os::fd::AsFd;
         let stdin = std::io::stdin();
-        read_password_line(stdin.as_fd(), "stdin")
+        read_password_line(&mut FdReader(stdin.as_fd()), "stdin")
     }
 }
 
-/// Read one password line from `fd` into a **fixed** zeroizing
-/// buffer with `rustix::io::read` (#86): no `BufReader` (whose
-/// 8 KiB heap buffer would hold an unwiped copy) and no
-/// `read_line` (whose growth reallocations would free unwiped
-/// prefixes). Stops at the first `\n` or EOF; a trailing `\r` is
-/// stripped. Overlong input is an error, never a truncation.
-fn read_password_line(
-    fd: std::os::fd::BorrowedFd<'_>,
-    source: &str,
-) -> Result<Zeroizing<String>, String> {
+/// Unbuffered [`Read`] over a borrowed fd: each `read` is exactly
+/// one `rustix::io::read`, with no intermediate buffer of its own
+/// (unlike `Stdin`, whose `BufReader` would hold a copy).
+struct FdReader<'fd>(std::os::fd::BorrowedFd<'fd>);
+
+impl Read for FdReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        rustix::io::read(self.0, buf).map_err(std::io::Error::from)
+    }
+}
+
+/// Read one password line from `reader` into a **fixed** zeroizing
+/// buffer (#86): `reader` is unbuffered ([`FdReader`] in the
+/// binary), so there is no `BufReader` (whose 8 KiB heap buffer
+/// would hold an unwiped copy) and no `read_line` (whose growth
+/// reallocations would free unwiped prefixes). Stops at the first
+/// `\n` anywhere in what has been read, or at EOF; a trailing `\r`
+/// is stripped. On a pipe a single read can return `pw\nextra`
+/// (#92): only `pw` is the password, the rest is ignored (and
+/// wiped with the buffer). Overlong input is an error, never a
+/// truncation.
+fn read_password_line(reader: &mut impl Read, source: &str) -> Result<Zeroizing<String>, String> {
     let mut buf = Zeroizing::new([0u8; MAX_PASSWORD_BYTES]);
     let mut n = 0usize;
     loop {
@@ -154,16 +166,17 @@ fn read_password_line(
                 "password from {source} is too long (over {MAX_PASSWORD_BYTES} bytes)"
             ));
         }
-        match rustix::io::read(fd, &mut buf[n..]) {
+        match reader.read(&mut buf[n..]) {
             Ok(0) => break,
             Ok(m) => {
-                n += m;
-                if buf[n - 1] == b'\n' {
-                    n -= 1;
+                // Only the new bytes can hold the first newline.
+                if let Some(i) = buf[n..n + m].iter().position(|b| *b == b'\n') {
+                    n += i;
                     break;
                 }
+                n += m;
             }
-            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(format!("cannot read password from {source}: {e}")),
         }
     }
@@ -186,20 +199,36 @@ fn read_password_line(
 
 /// Restore the terminal on SIGINT (#86). `EchoOff`'s `Drop`
 /// cannot run when the process dies on a signal, so a watcher
-/// thread waits on tokio's `ctrl_c` (handled in a normal thread,
-/// not a signal handler) and, if it fires, restores the saved
-/// termios itself and exits with the conventional 128+SIGINT.
-/// Best effort: if the watcher cannot be installed the prompt
-/// still works; only the interrupt path degrades.
+/// thread waits on a tokio SIGINT stream (handled in a normal
+/// thread, not a signal handler) and, if it fires, restores the
+/// saved termios itself and exits with the conventional
+/// 128+SIGINT.
+///
+/// The SIGINT handler is registered **synchronously, before this
+/// returns** (#92): the caller turns echo off only afterwards, so
+/// there is no window in which a SIGINT kills the process with
+/// echo still off. (Registering inside the spawned thread, as
+/// before, raced the prompt.) Best effort: if the watcher cannot
+/// be installed the prompt still works; only the interrupt path
+/// degrades.
 fn watch_for_sigint(original: rustix::termios::Termios) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    // `signal()` installs the process-level handler right here,
+    // not on first poll.
+    let sigint = {
+        let _ctx = rt.enter();
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    };
+    let Ok(mut sigint) = sigint else {
+        return;
+    };
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        let interrupted = rt.block_on(async { tokio::signal::ctrl_c().await.is_ok() });
+        let interrupted = rt.block_on(sigint.recv()).is_some();
         if interrupted {
             if let Ok(tty) = std::fs::File::open("/dev/tty") {
                 use std::os::fd::AsFd;
@@ -218,9 +247,12 @@ fn watch_for_sigint(original: rustix::termios::Termios) {
 struct EchoOff(rustix::termios::Termios);
 
 impl EchoOff {
-    fn new(fd: std::os::fd::BorrowedFd<'_>) -> Result<Self, String> {
-        let original = rustix::termios::tcgetattr(fd)
-            .map_err(|e| format!("cannot read terminal settings: {e}"))?;
+    /// Turn echo off on `fd`, remembering `original` (from
+    /// `tcgetattr`) for `Drop` to restore.
+    fn new(
+        fd: std::os::fd::BorrowedFd<'_>,
+        original: rustix::termios::Termios,
+    ) -> Result<Self, String> {
         let mut quiet = original.clone();
         quiet.local_modes &= !rustix::termios::LocalModes::ECHO;
         rustix::termios::tcsetattr(fd, rustix::termios::OptionalActions::Now, &quiet)
@@ -246,10 +278,13 @@ fn read_password_tty() -> Result<Zeroizing<String>, String> {
     let tty = std::fs::File::open("/dev/tty").map_err(|e| format!("cannot open /dev/tty: {e}"))?;
     {
         use std::os::fd::AsFd;
-        let guard = EchoOff::new(tty.as_fd())?;
-        watch_for_sigint(guard.0.clone());
+        let original = rustix::termios::tcgetattr(tty.as_fd())
+            .map_err(|e| format!("cannot read terminal settings: {e}"))?;
+        // SIGINT watcher first, echo off second (#92).
+        watch_for_sigint(original.clone());
+        let _guard = EchoOff::new(tty.as_fd(), original)?;
         eprint!("kharon master password: ");
-        let password = read_password_line(tty.as_fd(), "the terminal");
+        let password = read_password_line(&mut FdReader(tty.as_fd()), "the terminal");
         eprintln!();
         password
     }
@@ -264,8 +299,12 @@ fn read_password_tty() -> Result<Zeroizing<String>, String> {
 /// framing, so the buffer never grows. JSON string escaping:
 /// `"` and `\` escaped, the short escapes for `\n`/`\r`/`\t`,
 /// other control characters as `\u00XX`, everything else raw
-/// UTF-8 — the same output serde_json produces.
+/// UTF-8. That is valid JSON that serde_json parses back to the
+/// same password (tested below), but not byte-identical to
+/// serde_json's own output, which uses the short `\b`/`\f`
+/// escapes where this writes `\u0008`/`\u000c`.
 fn unlock_frame(password: &str) -> Zeroizing<String> {
+    use std::fmt::Write as _;
     let mut frame = Zeroizing::new(String::with_capacity(password.len() * 6 + 32));
     frame.push_str("{\"op\":\"unlock\",\"password\":\"");
     for ch in password.chars() {
@@ -276,7 +315,10 @@ fn unlock_frame(password: &str) -> Zeroizing<String> {
             '\r' => frame.push_str("\\r"),
             '\t' => frame.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                frame.push_str(&format!("\\u{:04x}", c as u32));
+                // Straight into the zeroizing buffer: no `format!`
+                // heap temporary holding the escape (#92). Writing
+                // to a `String` cannot fail.
+                let _ = write!(frame, "\\u{:04x}", c as u32);
             }
             c => frame.push(c),
         }
@@ -405,5 +447,159 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// A pipe double: each `read` returns at most the next queued
+    /// chunk (split if the caller's buffer is smaller), `None`
+    /// entries are one `Interrupted` error, and an empty queue is
+    /// EOF.
+    struct Chunks(VecDeque<Option<Vec<u8>>>);
+
+    impl Chunks {
+        fn new(chunks: &[Option<&[u8]>]) -> Self {
+            Self(chunks.iter().map(|c| c.map(<[u8]>::to_vec)).collect())
+        }
+    }
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(None) => Err(std::io::ErrorKind::Interrupted.into()),
+                Some(Some(mut chunk)) => {
+                    let m = chunk.len().min(buf.len());
+                    buf[..m].copy_from_slice(&chunk[..m]);
+                    if m < chunk.len() {
+                        self.0.push_front(Some(chunk.split_off(m)));
+                    }
+                    Ok(m)
+                }
+            }
+        }
+    }
+
+    fn line(chunks: &[Option<&[u8]>]) -> Result<String, String> {
+        read_password_line(&mut Chunks::new(chunks), "test").map(|p| p.as_str().to_owned())
+    }
+
+    #[test]
+    fn read_password_line_stops_at_first_newline_within_one_read() {
+        // #92 item 1: one pipe read returning `pw\nextra`.
+        assert_eq!(line(&[Some(b"pw\nextra")]).unwrap(), "pw");
+        assert_eq!(line(&[Some(b"pw\nextra\n")]).unwrap(), "pw");
+        assert_eq!(line(&[Some(b"pw\r\nextra")]).unwrap(), "pw");
+        assert_eq!(line(&[Some(b"pw"), Some(b"\nextra")]).unwrap(), "pw");
+    }
+
+    #[test]
+    fn read_password_line_newline_split_across_reads() {
+        assert_eq!(line(&[Some(b"p"), Some(b"w"), Some(b"\n")]).unwrap(), "pw");
+        assert_eq!(line(&[Some(b"pw\r"), Some(b"\n")]).unwrap(), "pw");
+        assert_eq!(line(&[Some(b"pw"), None, Some(b"\n")]).unwrap(), "pw");
+    }
+
+    #[test]
+    fn read_password_line_eof_without_newline() {
+        assert_eq!(line(&[Some(b"pw")]).unwrap(), "pw");
+        assert_eq!(line(&[Some(b"pw\r")]).unwrap(), "pw");
+    }
+
+    #[test]
+    fn read_password_line_empty() {
+        assert_eq!(line(&[]).unwrap(), "");
+        assert_eq!(line(&[Some(b"\n")]).unwrap(), "");
+        assert_eq!(line(&[Some(b"\r\n")]).unwrap(), "");
+        assert_eq!(line(&[Some(b"\npw\n")]).unwrap(), "");
+    }
+
+    #[test]
+    fn read_password_line_overlong_is_an_error_not_a_truncation() {
+        let long = vec![b'a'; MAX_PASSWORD_BYTES + 1];
+        let err = line(&[Some(&long)]).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        // Exactly the cap fits only if the newline comes within it.
+        let mut at_cap = vec![b'a'; MAX_PASSWORD_BYTES - 1];
+        at_cap.push(b'\n');
+        assert_eq!(
+            line(&[Some(&at_cap)]).unwrap().len(),
+            MAX_PASSWORD_BYTES - 1
+        );
+        let mut over = vec![b'a'; MAX_PASSWORD_BYTES];
+        over.push(b'\n');
+        assert!(line(&[Some(&over)]).is_err());
+        // A newline after the cap, in pieces, is still overlong.
+        assert!(line(&[Some(&long[..600]), Some(&long[600..]), Some(b"\n")]).is_err());
+    }
+
+    #[test]
+    fn read_password_line_rejects_invalid_utf8() {
+        let err = line(&[Some(b"\xff\xfe\n")]).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn read_password_line_propagates_read_errors() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let err = read_password_line(&mut Broken, "test").unwrap_err();
+        assert!(err.starts_with("cannot read password from test"), "{err}");
+    }
+
+    fn round_trip(password: &str) {
+        let frame = unlock_frame(password);
+        assert!(
+            frame.len() <= password.len() * 6 + 32,
+            "frame outgrew its pre-sized buffer"
+        );
+        let v: serde_json::Value = serde_json::from_str(&frame)
+            .unwrap_or_else(|e| panic!("invalid JSON for {password:?}: {e}: {}", *frame));
+        assert_eq!(v["op"], "unlock");
+        assert_eq!(v["password"].as_str(), Some(password), "frame {}", *frame);
+        assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unlock_frame_round_trips_every_control_and_escape_char() {
+        // Each char on its own, and all of them in one password.
+        let mut all = String::new();
+        for c in (0u32..0x20)
+            .chain([0x22, 0x5c, 0x2f, 0x7f])
+            .filter_map(char::from_u32)
+        {
+            round_trip(&c.to_string());
+            round_trip(&format!("a{c}b"));
+            all.push(c);
+        }
+        round_trip(&all);
+        // Worst case for the capacity bound: all `\u00XX` escapes.
+        round_trip(&"\u{1}".repeat(MAX_PASSWORD_BYTES));
+    }
+
+    #[test]
+    fn unlock_frame_passes_non_ascii_through_raw() {
+        for pw in [
+            "",
+            "plain",
+            "pässwörd",
+            "密码",
+            "🔑\u{2028}\u{2029}",
+            "\u{80}\u{ffff}",
+        ] {
+            round_trip(pw);
+        }
+        assert_eq!(
+            unlock_frame("é\u{8}").as_str(),
+            "{\"op\":\"unlock\",\"password\":\"é\\u0008\"}"
+        );
     }
 }

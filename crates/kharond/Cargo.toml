@@ -6,6 +6,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The owner socket's canary-scan op (REQ-MEM-003 evidence). NOT a
+# default feature: a shipped kharond must not answer "is this byte
+# string in your memory?" for any same-uid peer — PR_SET_DUMPABLE 0
+# (REQ-MEM-001) exists to deny that uid exactly this. Enabled only
+# by the test target (see the dev-dependency on this crate below),
+# so `cargo test` builds the daemon binary with the op and every
+# other build refuses it as `unknown_op`.
+canary-scan = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
@@ -49,6 +59,12 @@ rustls-pki-types = { version = "1", features = ["std"] }
 # (issue #11, REQ-MEM-001/002), and clock_gettime(CLOCK_BOOTTIME) for
 # the lock timers (REQ-MEM-004). Already in the tree via tempfile.
 rustix = { version = "1", default-features = false, features = ["std", "process", "mm", "time"] }
+# Safe wrapper for process_vm_readv(2) only: the canary scan
+# (memscan) reads this process's own memory through it because a
+# hardened (non-dumpable, REQ-MEM-001) daemon's /proc/self/mem
+# cannot be opened by its own non-root uid. kharond forbids unsafe
+# code, so the syscall goes through nix's safe API, as with rustix.
+nix = { version = "0.31", default-features = false, features = ["uio", "process"] }
 # Agent API (issue #14, REQ-API-002..004/006): HTTP/1.1 server on the
 # hyper 1 / tokio stack reqwest already pulls in, and Argon2id agent
 # token hashes (same argon2 crate kharon-bwcrypto uses for the KDF).
@@ -63,6 +79,15 @@ schemars = "1"
 base64ct = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
+# Self-dependency solely to enable the canary-scan feature for test
+# builds (feature unification): the daemon binary the REQ-MEM-003
+# test spawns must carry the scan op, release builds must not.
+kharond = { path = ".", features = ["canary-scan"] }
+# Independent key derivation for the REQ-MEM-003 keys-after-lock
+# scan (the test recomputes the export key itself rather than ask
+# kharon-bwcrypto to expose key bytes). Both already in the tree.
+pbkdf2 = "0.12"
+hkdf = "0.12"
 tempfile = "3"
 rcgen = { version = "0.13", features = ["crypto", "ring"] }
 # Paused clock for the REQ-API-009 deadline tests.

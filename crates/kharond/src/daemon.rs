@@ -16,13 +16,19 @@
 //!    startup.
 //! 4. Agent token store (REQ-API-003; production parameter floor).
 //! 5. Audit log under `<data_dir>/audit` (REQ-AUD-001), exclusive.
-//! 6. Lock controller, **locked** (REQ-MEM-005): there is no unlock
-//!    channel yet, so every vault-touching call answers 423.
+//! 6. Lock controller, **locked** (REQ-MEM-005), with its
+//!    transitions wired to the audit log (REQ-AUD-003). In export
+//!    mode the startup [`ExportFile`] is loaded here, once, and
+//!    kept for every unlock (REQ-EXP-004 load-once: re-reading the
+//!    file at unlock would let a replaced file take effect without
+//!    a restart).
 //! 7. Fill backend: each agent's `cdp` endpoint (REQ-API-008). No
 //!    browser I/O here: an agent's connection and browser context
 //!    (REQ-ARCH-005) are made by its first fill, so startup does not
 //!    depend on the browser being reachable.
-//! 8. Bind the listener last.
+//! 8. Owner socket (issue #11): the unix-socket unlock channel
+//!    ([`crate::owner`]) is bound under `data_dir`, and the agent
+//!    API listener is bound last.
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
@@ -36,17 +42,24 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener};
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
-use crate::api::core::Broker;
+use crate::api::core::{Broker, VaultView};
 use crate::api::fill::{ConnectingCdpBackend, FillPolicy};
 use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
-use crate::audit::{AuditConfig as LogConfig, AuditLog, FileCheckpointSink, OpenError};
-use crate::config::{Config, Source};
-use crate::lock::{HardeningError, LockController, LockPolicy, MemoryHardening, SystemClock};
-use crate::sync::LiveSync;
-use crate::sync::SyncClient;
+use crate::audit::{
+    AuditConfig as LogConfig, AuditLog, Entry, Event, FileCheckpointSink, OpenError,
+};
+use crate::config::{BitwardenConfig, Config, Source};
+use crate::export::{ExportError, ExportFile, ExportSession};
+use crate::lock::{
+    HardeningError, LockController, LockPolicy, LockReason, MemoryHardening, SystemClock,
+    UnlockError,
+};
+use crate::owner::{OwnerFailure, OwnerOps};
+use crate::sync::{LiveSync, SecretField, SyncClient, SyncError, Vault};
 use crate::totp::{SkewPolicy, SkewVerdict};
 
 /// `sysexits.h` `EX_CONFIG`: a configuration refusal.
@@ -58,8 +71,182 @@ pub const EX_CANTCREAT: u8 = 73;
 /// `sysexits.h` `EX_UNAVAILABLE`: the listen address cannot be bound.
 pub const EX_UNAVAILABLE: u8 = 69;
 
-/// The daemon's broker type: live sync session, wall clock.
-pub type DaemonBroker = Broker<LiveSync, SystemClock>;
+/// The daemon's broker type: daemon session, wall clock.
+pub type DaemonBroker = Broker<DaemonSession, SystemClock>;
+
+/// The session a daemon unlock produces, by source mode. Behind
+/// the API's [`VaultView`] seam both modes look identical; dropping
+/// either variant wipes its key material (REQ-MEM-003).
+pub enum DaemonSession {
+    /// `mode = "sync"`: a live-synced Vaultwarden session. Boxed:
+    /// `LiveSync` is over a kilobyte and the export variant is not.
+    Sync(Box<LiveSync>),
+    /// `mode = "export"`: the startup export file's snapshot.
+    Export(ExportSession),
+}
+
+impl ZeroizeOnDrop for DaemonSession {}
+
+impl VaultView for DaemonSession {
+    fn vault(&self) -> &Vault {
+        match self {
+            Self::Sync(s) => s.vault(),
+            Self::Export(s) => s.vault(),
+        }
+    }
+
+    fn decrypt_secret(
+        &self,
+        item_id: &str,
+        field: SecretField,
+    ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
+        match self {
+            Self::Sync(s) => VaultView::decrypt_secret(&**s, item_id, field),
+            Self::Export(s) => VaultView::decrypt_secret(s, item_id, field),
+        }
+    }
+}
+
+/// Where an unlock gets its session (the daemon's half of the
+/// source config, with everything unlock needs kept from startup).
+enum UnlockSource {
+    /// Sync mode: build a fresh client per unlock. Boxed for the
+    /// same size reason as [`DaemonSession::Sync`].
+    Sync(Box<BitwardenConfig>),
+    /// Export mode: the startup [`ExportFile`], loaded **once** in
+    /// [`start`] and used for every unlock (REQ-EXP-004 load-once).
+    Export(Arc<ExportFile>),
+}
+
+/// The daemon's [`OwnerOps`]: unlock / lock / status against the
+/// broker's lock controller, following the lock module's ordering
+/// (network before the controller, derivation inside its closure,
+/// on a blocking thread — never holding the controller's
+/// `std::sync::Mutex` across an `.await`).
+struct DaemonOwner {
+    broker: Arc<DaemonBroker>,
+    source: UnlockSource,
+}
+
+impl DaemonOwner {
+    fn map_unlock_error<E>(e: UnlockError<E>) -> OwnerFailure {
+        match e {
+            UnlockError::AlreadyUnlocked => OwnerFailure::AlreadyUnlocked,
+            UnlockError::MlockUnavailable => OwnerFailure::MlockUnavailable,
+            UnlockError::Audit(_) => OwnerFailure::AuditFailed,
+            UnlockError::DeriveFailed(_) => OwnerFailure::UnlockFailed,
+        }
+    }
+}
+
+/// Why an export-mode derivation closure failed: the export
+/// itself, or the `export_loaded` audit append that is part of the
+/// load (kept distinct so the append maps to `audit_failed`, not
+/// to the indistinguishable `unlock_failed`). Unit variants: the
+/// underlying error is deliberately not carried, per REQ-API-006.
+enum ExportUnlockError {
+    Export,
+    Audit,
+}
+
+impl OwnerOps for DaemonOwner {
+    async fn unlock(&self, password: Zeroizing<String>) -> Result<(), OwnerFailure> {
+        match &self.source {
+            UnlockSource::Export(file) => {
+                let file = Arc::clone(file);
+                let broker = Arc::clone(&self.broker);
+                let sha256 = file.sha256_hex().to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let mut lock = broker
+                        .lock_controller()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    // REQ-EXP-004 / REQ-AUD-003 (PR #81 review,
+                    // item 6): the `export_loaded` entry is
+                    // appended INSIDE the derivation closure —
+                    // after `file.unlock` succeeds, before the
+                    // session is returned and installed. The
+                    // controller mutex is held throughout and the
+                    // lock→audit mutex order is the existing one,
+                    // so there is no window where the agent API
+                    // can serve a load with no audit record, and
+                    // no re-acquire that could lock a *different*
+                    // (concurrent) session on failure. A failed
+                    // append is a derivation failure: no session
+                    // is ever installed.
+                    let audit_broker = Arc::clone(&broker);
+                    lock.unlock(|| {
+                        let session = file
+                            .unlock(&password)
+                            .map_err(|_| ExportUnlockError::Export)?;
+                        let entry = Entry::new(Event::ExportLoaded).file_sha256(sha256.clone());
+                        audit_broker
+                            .append_audit(entry)
+                            .map_err(|_| ExportUnlockError::Audit)?;
+                        Ok(DaemonSession::Export(session))
+                    })
+                    .map_err(|e| match e {
+                        UnlockError::AlreadyUnlocked => OwnerFailure::AlreadyUnlocked,
+                        UnlockError::MlockUnavailable => OwnerFailure::MlockUnavailable,
+                        UnlockError::Audit(_) => OwnerFailure::AuditFailed,
+                        UnlockError::DeriveFailed(ExportUnlockError::Audit) => {
+                            OwnerFailure::AuditFailed
+                        }
+                        UnlockError::DeriveFailed(ExportUnlockError::Export) => {
+                            OwnerFailure::UnlockFailed
+                        }
+                    })
+                })
+                .await
+                .map_err(|_| OwnerFailure::UnlockFailed)?
+            }
+            UnlockSource::Sync(bw) => {
+                // Network first, with no password involved:
+                // prelogin + sync + the REQ-CRY-008 scope check.
+                let client = bw.sync_client().map_err(|_| OwnerFailure::UnlockFailed)?;
+                let prepared = LiveSync::prepare(client, bw.scope(), bw.sync_policy())
+                    .await
+                    .map_err(|_| OwnerFailure::UnlockFailed)?;
+                let broker = Arc::clone(&self.broker);
+                tokio::task::spawn_blocking(move || {
+                    let mut lock = broker
+                        .lock_controller()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    lock.unlock(|| {
+                        prepared
+                            .derive(&password)
+                            .map(|s| DaemonSession::Sync(Box::new(s)))
+                    })
+                    .map_err(Self::map_unlock_error)
+                })
+                .await
+                .map_err(|_| OwnerFailure::UnlockFailed)??;
+                Ok(())
+            }
+        }
+    }
+
+    async fn lock(&self) -> bool {
+        let mut lock = self
+            .broker
+            .lock_controller()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        lock.lock(LockReason::Manual)
+    }
+
+    async fn is_locked(&self) -> bool {
+        let mut lock = self
+            .broker
+            .lock_controller()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Run the expiry check so an expired session reports locked.
+        lock.poll();
+        lock.is_locked()
+    }
+}
 
 /// Why the daemon refused to start after the config was accepted.
 /// Like `ConfigError`, every variant has a stable [`code`](Self::code)
@@ -97,6 +284,18 @@ pub enum StartupError {
     /// The audit log could not be opened.
     #[error("cannot open audit log: {0}")]
     Audit(#[from] OpenError),
+    /// The export file could not be loaded at startup (export
+    /// mode): classification refusals keep their REQ-EXP-002 codes.
+    #[error("cannot load export file: {0}")]
+    Export(#[from] ExportError),
+    /// The owner socket could not be bound.
+    #[error("cannot bind owner socket at {path}: {kind}")]
+    OwnerBind {
+        /// Socket path that failed.
+        path: PathBuf,
+        /// `std::io::ErrorKind` rendering.
+        kind: String,
+    },
     /// The listen address could not be bound.
     #[error("cannot bind agent API on {addr}: {kind}")]
     Bind {
@@ -118,6 +317,8 @@ impl StartupError {
             Self::Tokens(_) => "token_store",
             Self::DataDir { .. } => "data_dir",
             Self::Audit(_) => "audit_open",
+            Self::Export(e) => e.code(),
+            Self::OwnerBind { .. } => "owner_bind",
             Self::Bind { .. } => "bind",
         }
     }
@@ -129,7 +330,8 @@ impl StartupError {
                 EX_CONFIG
             }
             Self::Harden(_) | Self::Mlock(_) => EX_OSERR,
-            Self::DataDir { .. } | Self::Audit(_) => EX_CANTCREAT,
+            Self::Export(_) => EX_CONFIG,
+            Self::DataDir { .. } | Self::Audit(_) | Self::OwnerBind { .. } => EX_CANTCREAT,
             Self::Bind { .. } => EX_UNAVAILABLE,
         }
     }
@@ -150,6 +352,9 @@ pub struct Daemon {
     listener: TcpListener,
     broker: Arc<DaemonBroker>,
     clock: Option<SyncClient>,
+    owner_listener: UnixListener,
+    owner_ops: Arc<DaemonOwner>,
+    owner_path: PathBuf,
 }
 
 /// Assemble the daemon (see the module docs for the order). Must run
@@ -183,6 +388,15 @@ pub async fn start(
         Box::new(sink),
     )?;
 
+    // The unlock source, assembled at startup: sync mode keeps the
+    // source config (a client is built per unlock); export mode
+    // loads the export file ONCE, here — every unlock uses this
+    // instance, never a re-read (REQ-EXP-004 load-once).
+    let source = match &cfg.source {
+        Source::Sync(bw) => UnlockSource::Sync(Box::new(bw.clone())),
+        Source::Export(exp) => UnlockSource::Export(Arc::new(ExportFile::load(&exp.file)?)),
+    };
+
     let lock = LockController::new(
         LockPolicy::from((&cfg.policy, &cfg.memory)),
         SystemClock,
@@ -200,6 +414,8 @@ pub async fn start(
             // deadline. Startup does not need the browser.
             .with_fill_backend(Box::new(ConnectingCdpBackend::from_agents(&cfg.agents))),
     );
+    // Lock/unlock transitions belong in the audit log (REQ-AUD-003).
+    broker.wire_lock_audit();
     // REQ-API-007: the server whose `Date` the clock is checked
     // against. Building the client does no I/O; config validation has
     // already read both files, so a failure here only skips the probe.
@@ -207,6 +423,16 @@ pub async fn start(
         Source::Sync(bw) => bw.sync_client().ok(),
         _ => None,
     };
+
+    let owner_path = crate::owner::socket_path(&cfg.data_dir);
+    let owner_listener = crate::owner::bind(&owner_path).map_err(|e| StartupError::OwnerBind {
+        path: owner_path.clone(),
+        kind: e.kind().to_string(),
+    })?;
+    let owner_ops = Arc::new(DaemonOwner {
+        broker: Arc::clone(&broker),
+        source,
+    });
 
     let listener = TcpListener::bind(listen)
         .await
@@ -218,6 +444,9 @@ pub async fn start(
         listener,
         broker,
         clock,
+        owner_listener,
+        owner_ops,
+        owner_path,
     })
 }
 
@@ -225,6 +454,11 @@ impl Daemon {
     /// The bound address (resolves a configured port 0).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// The owner socket path (`kharon unlock` / `lock` connect here).
+    pub fn owner_socket(&self) -> &std::path::Path {
+        &self.owner_path
     }
 
     /// Serve the agent API until `shutdown` resolves.
@@ -235,7 +469,9 @@ impl Daemon {
         let probe = self
             .clock
             .map(|client| tokio::spawn(clock_probe(client, Arc::clone(&self.broker))));
+        let owner = tokio::spawn(crate::owner::serve(self.owner_listener, self.owner_ops));
         let served = http::serve_with_shutdown(self.listener, self.broker, shutdown).await;
+        owner.abort();
         if let Some(p) = probe {
             p.abort();
         }
@@ -301,4 +537,103 @@ fn create_private_dir(path: &std::path::Path) -> io::Result<()> {
         b.mode(0o700);
     }
     b.create(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::core::AuditSink;
+    use crate::lock::{AuditError, StaticHardening};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// An audit sink that records event names and can be told to
+    /// refuse `export_loaded` appends (PR #81 review, item 6's
+    /// failing-sink test).
+    struct TestSink {
+        events: Arc<Mutex<Vec<String>>>,
+        fail_export_loaded: bool,
+    }
+
+    impl AuditSink for TestSink {
+        fn append(&mut self, entry: Entry) -> Result<(), AuditError> {
+            let name = serde_json::to_value(&entry.event)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if self.fail_export_loaded && name == "export_loaded" {
+                return Err(AuditError);
+            }
+            self.events.lock().unwrap().push(name);
+            Ok(())
+        }
+    }
+
+    fn export_owner(fail_export_loaded: bool) -> (DaemonOwner, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink {
+            events: Arc::clone(&events),
+            fail_export_loaded,
+        };
+        let tokens = TokenStore::from_agents(&BTreeMap::new()).unwrap();
+        let lock = LockController::new(
+            LockPolicy {
+                require_mlock: false,
+                ..LockPolicy::default()
+            },
+            SystemClock,
+            Box::new(StaticHardening::all_ok()),
+        );
+        let broker = Arc::new(Broker::new(
+            tokens,
+            lock,
+            Box::new(sink),
+            crate::origin::OriginConfig { allow_http: false },
+        ));
+        broker.wire_lock_audit();
+        let file = ExportFile::from_bytes(
+            include_bytes!("../tests/fixtures/export/password_protected.json").as_slice(),
+        )
+        .unwrap();
+        (
+            DaemonOwner {
+                broker,
+                source: UnlockSource::Export(Arc::new(file)),
+            },
+            events,
+        )
+    }
+
+    const EXPORT_PASSWORD: &str = "kharon export fixture password 9";
+
+    #[tokio::test]
+    async fn export_loaded_append_failure_means_no_session_is_installed() {
+        let (owner, events) = export_owner(true);
+        let err = owner
+            .unlock(Zeroizing::new(EXPORT_PASSWORD.to_owned()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnerFailure::AuditFailed);
+        assert!(owner.is_locked().await, "status stays locked");
+        assert!(
+            !events.lock().unwrap().iter().any(|e| e == "unlock"),
+            "no unlock entry may stand for an uninstalled session: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn export_loaded_is_recorded_before_the_unlock_entry() {
+        let (owner, events) = export_owner(false);
+        owner
+            .unlock(Zeroizing::new(EXPORT_PASSWORD.to_owned()))
+            .await
+            .unwrap();
+        assert!(!owner.is_locked().await);
+        let events = events.lock().unwrap();
+        let loaded = events.iter().position(|e| e == "export_loaded").unwrap();
+        let unlock = events.iter().position(|e| e == "unlock").unwrap();
+        assert!(loaded < unlock, "export_loaded precedes unlock: {events:?}");
+    }
 }

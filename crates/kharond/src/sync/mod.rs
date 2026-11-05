@@ -22,8 +22,8 @@ pub use client::{
     SyncClient, TlsTrust, device_identifier,
 };
 pub use live::{
-    LiveSync, LockReason, MAX_SYNC_INTERVAL, ScopeViolation, SyncOutcome, SyncPolicy,
-    check_dedicated_scope, preflight, run, scope_violation,
+    LiveSync, LockReason, MAX_SYNC_INTERVAL, PreparedUnlock, ScopeViolation, SyncOutcome,
+    SyncPolicy, check_dedicated_scope, preflight, run, scope_violation,
 };
 pub use push::{HubError, HubStatus, HubTiming, NotificationsHub, UpdateType, run_push};
 pub(crate) use vault::norm_id;

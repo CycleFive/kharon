@@ -6,8 +6,21 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "kharon"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2.1"
 serde_json = "1.0"
+zeroize = "1"
+# Terminal echo control for the unlock password prompt (tty, no
+# echo; SPEC §8), and the owner socket's uid check. Safe wrappers
+# only, the same rustix kharond already uses.
+rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net"] }
 kharond = { path = "../kharond", version = "0.0.0" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

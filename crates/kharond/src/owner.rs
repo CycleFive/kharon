@@ -38,6 +38,21 @@
 //! `scan_unavailable`, `unlock_failed` (wrong password,
 //! unreachable server, bad export — deliberately indistinguishable).
 //!
+//! The codes are indistinguishable; the *timing* is not, in sync
+//! mode: an unreachable server fails during `prepare`, before any
+//! derivation, while a wrong password fails only after the network
+//! round trip and the KDF. That is accepted here (PR #81 review):
+//! this channel is reachable only by a same-uid peer on the
+//! owner's own host, so a timing oracle on it tells that peer
+//! nothing it could not learn from its own client.
+//!
+//! Rejected peers (uid mismatch or unreadable credentials) and
+//! failed unlock attempts are audited as `owner_auth_fail`
+//! (REQ-AUD-003 counts owner actions; the event name is SPEC §7's)
+//! through [`OwnerOps::auth_failed`], best effort: the connection
+//! is dropped / the refusal stands either way, and a failed append
+//! never turns a refusal into a success.
+//!
 //! Buffers that held the request (and with it, possibly, the
 //! password) are zeroizing: the read buffer is pre-sized so it
 //! never reallocates while holding a password prefix, and is wiped
@@ -91,6 +106,15 @@ pub trait OwnerOps: Send + Sync + 'static {
 
     /// Whether the broker is currently locked.
     fn is_locked(&self) -> impl Future<Output = bool> + Send;
+
+    /// Record an `owner_auth_fail` audit entry (rejected peer or
+    /// failed unlock attempt), best effort. `detail` is a fixed
+    /// code (`peer_uid`, `unlock_failed`), never peer-supplied
+    /// text. Default: no audit attached (test doubles).
+    fn auth_failed(&self, detail: &'static str) -> impl Future<Output = ()> + Send {
+        let _ = detail;
+        async {}
+    }
 }
 
 /// Why an owner operation failed. Fixed codes only.
@@ -188,6 +212,9 @@ async fn handle<O: OwnerOps>(mut stream: UnixStream, ops: Arc<O>) -> std::io::Re
         .map(|c| c.uid() == rustix::process::geteuid().as_raw())
         .unwrap_or(false);
     if !peer_ok {
+        // Rejected peers are audited (REQ-AUD-003), then dropped
+        // without a reply, as before.
+        ops.auth_failed("peer_uid").await;
         return Ok(());
     }
 
@@ -262,39 +289,72 @@ fn parse_request(line: &[u8]) -> Result<(Request, Option<Zeroizing<String>>), ()
 }
 
 /// The content range (between the quotes) of the first
-/// `"<field>": "<string>"` value in a flat JSON object line, or
-/// `None` if the field is absent or not a plain string value.
-/// Escape-aware: a `\"` inside the string does not end it.
+/// `"<field>": "<string>"` value among the **top-level keys** of a
+/// JSON object line, or `None` if the field is absent or not a
+/// plain string value.
+///
+/// Only depth-1 keys match (PR #81 re-review, nit 5): a
+/// `"password"` byte sequence inside another string value, or a
+/// `password` key of a nested object, is *not* the field — the
+/// earlier byte-scan took the first match anywhere, which a
+/// crafted value could have shadowed. The scan is a small state
+/// machine over string tokens and brace depth; escape-aware
+/// throughout (a `\"` inside a string neither ends it nor counts
+/// as a key). Key comparison is on the raw content bytes, so a key
+/// spelled with `\u` escapes is not recognized — the owner's own
+/// client never spells it that way, and an unrecognized key simply
+/// leaves the request without a password (`bad_request`).
 fn find_string_field(line: &[u8], field: &[u8]) -> Option<std::ops::Range<usize>> {
-    let mut needle = Vec::with_capacity(field.len() + 2);
-    needle.push(b'"');
-    needle.extend_from_slice(field);
-    needle.push(b'"');
-    let at = line
-        .windows(needle.len())
-        .position(|w| w == needle.as_slice())?;
-    let mut i = at + needle.len();
     let skip_ws = |mut i: usize| {
         while i < line.len() && line[i].is_ascii_whitespace() {
             i += 1;
         }
         i
     };
-    i = skip_ws(i);
-    if line.get(i) != Some(&b':') {
-        return None;
-    }
-    i = skip_ws(i + 1);
-    if line.get(i) != Some(&b'"') {
-        return None;
-    }
-    let start = i + 1;
-    let mut j = start;
-    while j < line.len() {
-        match line[j] {
-            b'\\' => j += 2,
-            b'"' => return Some(start..j),
-            _ => j += 1,
+    // End (index of the closing quote) of the string token whose
+    // content starts at `start`, or None if unterminated.
+    let string_end = |start: usize| {
+        let mut j = start;
+        while j < line.len() {
+            match line[j] {
+                b'\\' => j += 2,
+                b'"' => return Some(j),
+                _ => j += 1,
+            }
+        }
+        None
+    };
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < line.len() {
+        match line[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'"' => {
+                let start = i + 1;
+                let end = string_end(start)?;
+                if depth == 1 && &line[start..end] == field {
+                    // A key: `<field> : "value"`.
+                    let colon = skip_ws(end + 1);
+                    if line.get(colon) == Some(&b':') {
+                        let value = skip_ws(colon + 1);
+                        if line.get(value) == Some(&b'"') {
+                            let vstart = value + 1;
+                            let vend = string_end(vstart)?;
+                            return Some(vstart..vend);
+                        }
+                        return None;
+                    }
+                }
+                i = end + 1;
+            }
+            _ => i += 1,
         }
     }
     None
@@ -356,9 +416,17 @@ fn decode_json_string(content: &[u8]) -> Option<Zeroizing<String>> {
         }
     }
     // Take the allocation over (no copy); the emptied zeroizing
-    // Vec drops harmlessly.
+    // Vec drops harmlessly. On invalid UTF-8 the error owns the
+    // decoded buffer: wipe it explicitly before dropping it
+    // (PR #81 re-review, nit 4 — `.ok()` would drop it unwiped).
     let bytes = std::mem::take(&mut *out);
-    String::from_utf8(bytes).ok().map(Zeroizing::new)
+    match String::from_utf8(bytes) {
+        Ok(s) => Some(Zeroizing::new(s)),
+        Err(e) => {
+            e.into_bytes().zeroize();
+            None
+        }
+    }
 }
 
 async fn dispatch<O: OwnerOps>(
@@ -373,7 +441,18 @@ async fn dispatch<O: OwnerOps>(
             };
             match ops.unlock(password).await {
                 Ok(()) => ok_response(Some(false)),
-                Err(e) => error_response(e.code()),
+                Err(e) => {
+                    // A failed *authentication* (wrong password,
+                    // unreachable server, bad export — the one
+                    // indistinguishable bucket) is audited as
+                    // `owner_auth_fail`. State refusals
+                    // (already unlocked, mlock, audit) are not
+                    // auth failures and are not recorded as one.
+                    if e == OwnerFailure::UnlockFailed {
+                        ops.auth_failed("unlock_failed").await;
+                    }
+                    error_response(e.code())
+                }
             }
         }
         "lock" => {
@@ -492,6 +571,72 @@ mod tests {
         let (req, password) = request(br#"{"op":"status"}"#);
         assert_eq!(req.op, "status");
         assert!(password.is_none());
+    }
+
+    #[test]
+    fn password_key_inside_a_string_value_does_not_shadow_the_field() {
+        // Nit 5: the first `"password"` bytes sit inside the
+        // `note` string value; the depth-1 key must win.
+        let line = br#"{"op":"unlock","note":"x \"password\": \"decoy\" y","password":"real"}"#;
+        let (_, password) = request(line);
+        assert_eq!(password.as_deref().map(String::as_str), Some("real"));
+    }
+
+    #[test]
+    fn password_key_in_a_nested_object_does_not_shadow_the_field() {
+        // Nit 5: a nested object's `password` key is depth 2.
+        let line = br#"{"op":"unlock","nested":{"password":"inner"},"password":"outer"}"#;
+        let (_, password) = request(line);
+        assert_eq!(password.as_deref().map(String::as_str), Some("outer"));
+        // And with no depth-1 key at all, there is no password.
+        let (_, password) = request(br#"{"op":"unlock","nested":{"password":"inner"}}"#);
+        assert!(password.is_none());
+    }
+
+    /// OwnerOps double recording `owner_auth_fail` details.
+    #[derive(Default)]
+    struct MockOps {
+        auth_failed: std::sync::Mutex<Vec<&'static str>>,
+        unlock_err: Option<OwnerFailure>,
+    }
+
+    impl OwnerOps for MockOps {
+        async fn unlock(&self, _password: Zeroizing<String>) -> Result<(), OwnerFailure> {
+            self.unlock_err.map_or(Ok(()), Err)
+        }
+
+        async fn lock(&self) -> bool {
+            true
+        }
+
+        async fn is_locked(&self) -> bool {
+            true
+        }
+
+        async fn auth_failed(&self, detail: &'static str) {
+            self.auth_failed.lock().unwrap().push(detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_unlock_is_audited_as_owner_auth_fail_state_refusals_are_not() {
+        let (req, password) = request(br#"{"op":"unlock","password":"x"}"#);
+        let ops = Arc::new(MockOps {
+            unlock_err: Some(OwnerFailure::UnlockFailed),
+            ..MockOps::default()
+        });
+        let reply = dispatch(req, password, Arc::clone(&ops)).await;
+        assert_eq!(reply, error_response("unlock_failed"));
+        assert_eq!(*ops.auth_failed.lock().unwrap(), ["unlock_failed"]);
+
+        let (req, password) = request(br#"{"op":"unlock","password":"x"}"#);
+        let ops = Arc::new(MockOps {
+            unlock_err: Some(OwnerFailure::AlreadyUnlocked),
+            ..MockOps::default()
+        });
+        let reply = dispatch(req, password, ops.clone()).await;
+        assert_eq!(reply, error_response("already_unlocked"));
+        assert!(ops.auth_failed.lock().unwrap().is_empty());
     }
 
     #[test]

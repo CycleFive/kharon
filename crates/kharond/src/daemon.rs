@@ -122,7 +122,11 @@ enum UnlockSource {
 /// broker's lock controller, following the lock module's ordering
 /// (network before the controller, derivation inside its closure,
 /// on a blocking thread — never holding the controller's
-/// `std::sync::Mutex` across an `.await`).
+/// `std::sync::Mutex` across an `.await`). Lock and status run
+/// through `spawn_blocking` too (PR #81 review carry-over): they
+/// take the same controller mutex an unlock's KDF holds, so on a
+/// runtime worker a `kharon status` during an Argon2id unlock
+/// would park that worker for the whole derivation.
 struct DaemonOwner {
     broker: Arc<DaemonBroker>,
     source: UnlockSource,
@@ -228,23 +232,42 @@ impl OwnerOps for DaemonOwner {
     }
 
     async fn lock(&self) -> bool {
-        let mut lock = self
-            .broker
-            .lock_controller()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        lock.lock(LockReason::Manual)
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || {
+            let mut lock = broker
+                .lock_controller()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            lock.lock(LockReason::Manual)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn is_locked(&self) -> bool {
-        let mut lock = self
-            .broker
-            .lock_controller()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // Run the expiry check so an expired session reports locked.
-        lock.poll();
-        lock.is_locked()
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || {
+            let mut lock = broker
+                .lock_controller()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // Run the expiry check so an expired session reports locked.
+            lock.poll();
+            lock.is_locked()
+        })
+        .await
+        // A panicked blocking task must not read as "unlocked".
+        .unwrap_or(true)
+    }
+
+    async fn auth_failed(&self, detail: &'static str) {
+        // `owner_auth_fail` (SPEC §7's event list, REQ-AUD-003):
+        // fixed detail codes only (`peer_uid`, `unlock_failed`),
+        // best effort — the refusal it records stands either way.
+        let entry = Entry::new(Event::OwnerAuthFail)
+            .channel("owner")
+            .detail_code(detail);
+        let _ = self.broker.append_audit(entry);
     }
 }
 
@@ -542,9 +565,8 @@ fn create_private_dir(path: &std::path::Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::core::AuditSink;
+    use crate::api::core::{AuditSink, Request};
     use crate::lock::{AuditError, StaticHardening};
-    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     /// An audit sink that records event names and can be told to
@@ -570,13 +592,24 @@ mod tests {
         }
     }
 
-    fn export_owner(fail_export_loaded: bool) -> (DaemonOwner, Arc<Mutex<Vec<String>>>) {
+    fn export_owner(
+        fail_export_loaded: bool,
+    ) -> (
+        DaemonOwner,
+        Arc<Mutex<Vec<String>>>,
+        Arc<DaemonBroker>,
+        String,
+    ) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = TestSink {
             events: Arc::clone(&events),
             fail_export_loaded,
         };
-        let tokens = TokenStore::from_agents(&BTreeMap::new()).unwrap();
+        // One real agent, so tests can drive the broker's agent
+        // surface (nit 6's explicit 423 assertion).
+        let (token, hash) = crate::api::token::generate("alpha");
+        let token = token.expose_secret().clone();
+        let tokens = TokenStore::new([("alpha", hash.as_str())]).unwrap();
         let lock = LockController::new(
             LockPolicy {
                 require_mlock: false,
@@ -598,10 +631,12 @@ mod tests {
         .unwrap();
         (
             DaemonOwner {
-                broker,
+                broker: Arc::clone(&broker),
                 source: UnlockSource::Export(Arc::new(file)),
             },
             events,
+            broker,
+            token,
         )
     }
 
@@ -609,13 +644,21 @@ mod tests {
 
     #[tokio::test]
     async fn export_loaded_append_failure_means_no_session_is_installed() {
-        let (owner, events) = export_owner(true);
+        let (owner, events, broker, token) = export_owner(true);
         let err = owner
             .unlock(Zeroizing::new(EXPORT_PASSWORD.to_owned()))
             .await
             .unwrap_err();
         assert_eq!(err, OwnerFailure::AuditFailed);
         assert!(owner.is_locked().await, "status stays locked");
+        // Nit 6: `list` is refused 423 while no session is
+        // installed, not just `is_locked()` in substance.
+        let agent = broker.authenticate(&token).unwrap();
+        let err = broker
+            .dispatch(&agent, Request::List { origin: None })
+            .unwrap_err();
+        assert_eq!(err, crate::api::ApiError::LOCKED);
+        assert_eq!(err.code.http_status(), 423);
         assert!(
             !events.lock().unwrap().iter().any(|e| e == "unlock"),
             "no unlock entry may stand for an uninstalled session: {:?}",
@@ -624,8 +667,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_unlock_appends_owner_auth_fail_and_no_unlock() {
+        let (owner, events, _broker, _token) = export_owner(false);
+        let err = owner
+            .unlock(Zeroizing::new(
+                "kharon export fixture password 8".to_owned(),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnerFailure::UnlockFailed);
+        // The transport records `owner_auth_fail` for this failure
+        // class (owner::dispatch); drive that hook the way it does.
+        owner.auth_failed("unlock_failed").await;
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e == "owner_auth_fail"),
+            "owner_auth_fail recorded: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e == "unlock"),
+            "no unlock entry for a failed unlock: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn export_loaded_is_recorded_before_the_unlock_entry() {
-        let (owner, events) = export_owner(false);
+        let (owner, events, _broker, _token) = export_owner(false);
         owner
             .unlock(Zeroizing::new(EXPORT_PASSWORD.to_owned()))
             .await

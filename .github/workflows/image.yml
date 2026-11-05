@@ -1,0 +1,84 @@
+name: image
+# kharond image and compose E2E (issue #24):
+# - image: REQ-DEP-001 (static, non-root, read-only rootfs, < 30 MB,
+#   Trivy 0 high/critical);
+# - compose-e2e: the compose example plus its CI overlay against the
+#   seeded Vaultwarden fixture, filling through the agent host's
+#   headless Chromium (REQ-DEP-002, REQ-DEP-006, REQ-ARCH-004,
+#   REQ-GOAL-002).
+on:
+  workflow_dispatch:
+  push: { branches: [master] }
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "Cargo.lock"
+      - "deploy/**"
+      - "crates/kharond/src/**"
+      - "crates/kharon-cli/src/**"
+      - "crates/kharond/tests/docker_support/**"
+      - "crates/kharond/tests/req_dep_001_image.rs"
+      - "crates/kharond/tests/req_dep_002_compose_e2e.rs"
+      - "crates/kharon-bwcrypto/tests/fixtures/vaultwarden/**"
+      - ".github/workflows/image.yml"
+permissions: { contents: read }
+env:
+  KHARON_IMAGE: kharon:e2e
+  # Trivy, pinned by digest (0.76.1); it runs as a container against
+  # the local Docker daemon.
+  TRIVY: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the image
+        run: docker build -t "$KHARON_IMAGE" .
+      - name: REQ-DEP-001 Trivy reports 0 high/critical
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY"
+          image --severity HIGH,CRITICAL --exit-code 1 --no-progress "$KHARON_IMAGE"
+      - name: REQ-DEP-001 size, non-root, no shell, docker run --read-only
+        run: cargo test -p kharond --test req_dep_001_image -- --ignored
+
+  compose-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      COMPOSE: >-
+        docker compose -f deploy/compose/docker-compose.yml
+        -f deploy/compose/e2e/compose.e2e.yml -p kharon-e2e
+      FIXTURE: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install "cryptography==43.0.3"
+      - name: Build the kharond and agent-host images
+        run: |
+          docker build -t "$KHARON_IMAGE" .
+          $COMPOSE build agent-host
+      - name: Start and seed the Vaultwarden fixture
+        run: |
+          sh "$FIXTURE/gen-tls.sh"
+          $COMPOSE up -d --no-build vaultwarden
+          python3 "$FIXTURE/seed.py" --live --base-url https://127.0.0.1:8222 \
+            --ca-cert "$PWD/$FIXTURE/tls/ca.pem" \
+            --out "${{ runner.temp }}/sync.live.json" \
+            --api-key-out "${{ runner.temp }}/api-key.json"
+      - name: Compose E2E (REQ-DEP-002, REQ-DEP-006, REQ-ARCH-004, REQ-GOAL-002)
+        env:
+          KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222
+          KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
+          KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
+        run: cargo test -p kharond --test req_dep_002_compose_e2e -- --ignored
+      - name: Container logs
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: $COMPOSE down -v

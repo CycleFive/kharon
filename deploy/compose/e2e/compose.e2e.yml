@@ -1,0 +1,54 @@
+# CI overlay for the compose example (issue #24, REQ-DEP-002 E2E):
+#
+#   docker compose -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/e2e/compose.e2e.yml -p kharon-e2e ...
+#
+# - vaultwarden becomes the seeded loopback fixture (same pinned image
+#   and settings as the fixture harness; its TLS cert also names
+#   `vaultwarden`, so kharond verifies it inside the network);
+# - kharon takes the config and API key the E2E test writes to
+#   e2e/run/ (gitignored) and trusts the fixture CA;
+# - agent-host is a Chromium-only stand-in for the agent host on the
+#   wg network (10.66.0.2), with CDP relayed from its loopback.
+#
+# Relative paths resolve against deploy/compose (the first file).
+services:
+  vaultwarden:
+    extends:
+      file: ../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/docker-compose.yml
+      service: vaultwarden
+    restart: "no"
+    volumes: !override
+      - "vaultwarden-fixture-data:/data"
+      - "../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls:/ssl:ro"
+
+  kharon:
+    image: kharon:e2e
+    container_name: kharon-e2e-kharond
+    restart: "no"
+    volumes: !override
+      - "kharon-data:/data"
+      - "./e2e/run/kharon.toml:/etc/kharon.toml:ro"
+      - "../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem:/etc/kharon/vault-ca.pem:ro"
+
+  agent-host:
+    build: { context: ./e2e/agent-host }
+    image: kharon-e2e-agent-host:local
+    container_name: kharon-e2e-agent-host
+    restart: "no"
+    environment:
+      AGENT_HOST_ADDR: 10.66.0.2
+      # The E2E's test page runs on the docker host, at the wg gateway.
+      PAGE_HOST_RULES: "MAP canary.example.test 10.66.0.254"
+    volumes:
+      - "./e2e/run/page:/e2e:ro"
+    networks:
+      wg: { ipv4_address: 10.66.0.2 }
+
+secrets:
+  kharon_bw_api_key:
+    file: ./e2e/run/api-key.json
+
+volumes:
+  vaultwarden-fixture-data:
+    name: kharon-e2e-vaultwarden-data

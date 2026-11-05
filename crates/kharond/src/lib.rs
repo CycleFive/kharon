@@ -11,6 +11,8 @@ pub mod config;
 pub mod daemon;
 pub mod export;
 pub mod lock;
+pub mod memscan;
 pub mod origin;
+pub mod owner;
 pub mod sync;
 pub mod totp;

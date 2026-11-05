@@ -51,6 +51,14 @@ VALIDATION_GUID = "01234567-89ab-cdef-0123-456789abcdef"
 IV_VALIDATION = bytes(range(0x10, 0x20))
 IV_DATA_A = bytes(range(0x20, 0x30))
 IV_DATA_B = bytes(range(0x30, 0x40))
+IV_DATA_C = bytes(range(0x40, 0x50))
+
+# A password containing the two characters that force JSON string
+# escapes on the owner socket (`"` and `\`): the fixture for the
+# REQ-MEM-003 escaped-password canary case (PR #81 review, item 7 —
+# a serde escape-decoding scratch copy of this password must never
+# survive in daemon memory).
+ESCAPED_PASSWORD = "kharon \"escape\" \\ fixture 9"
 
 
 def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
@@ -97,8 +105,8 @@ def enc_string(plaintext: bytes, key64: bytes, iv: bytes) -> str:
     return f"2.{b64(iv)}|{b64(ct)}|{b64(mac)}"
 
 
-def export_file(data_obj: dict, iv_data: bytes) -> dict:
-    key = stretch(derive_pbkdf2(PASSWORD, SALT, KDF_ITERATIONS))
+def export_file(data_obj: dict, iv_data: bytes, password: str = PASSWORD) -> dict:
+    key = stretch(derive_pbkdf2(password, SALT, KDF_ITERATIONS))
     return {
         "encrypted": True,
         "passwordProtected": True,
@@ -227,13 +235,14 @@ def main() -> None:
 
     if "--write" in sys.argv:
         out_dir = os.path.join(os.path.dirname(__file__), "..", "export")
-        for name, obj, iv in [
-            ("password_protected.json", DATA_A, IV_DATA_A),
-            ("password_protected_replaced.json", DATA_B, IV_DATA_B),
+        for name, obj, iv, pw in [
+            ("password_protected.json", DATA_A, IV_DATA_A, PASSWORD),
+            ("password_protected_replaced.json", DATA_B, IV_DATA_B, PASSWORD),
+            ("password_protected_escaped.json", DATA_A, IV_DATA_C, ESCAPED_PASSWORD),
         ]:
             path = os.path.join(out_dir, name)
             with open(path, "w") as f:
-                json.dump(export_file(obj, iv), f, indent=2)
+                json.dump(export_file(obj, iv, pw), f, indent=2)
                 f.write("\n")
             print("wrote", path)
 

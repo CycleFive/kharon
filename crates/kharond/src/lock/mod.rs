@@ -534,6 +534,22 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
             .map(|u| &u.session)
             .ok_or(LockedError)
     }
+
+    /// Mutable access to the held session for the background sync
+    /// (REQ-CRY-009: the daemon applies each fresh `/api/sync` to the
+    /// unlocked session in place). Runs the same expiry check as
+    /// [`Self::require_unlocked`] first, so an expired session is
+    /// locked rather than refreshed. It is **not** activity: a sync
+    /// never resets the idle timer (REQ-MEM-004 counts fills only).
+    pub fn with_session_mut<R>(&mut self, f: impl FnOnce(&mut S) -> R) -> Result<R, LockedError> {
+        if let Some(reason) = self.expiry_reason() {
+            self.lock(reason);
+        }
+        self.unlocked
+            .as_mut()
+            .map(|u| f(&mut u.session))
+            .ok_or(LockedError)
+    }
 }
 
 impl<S: ZeroizeOnDrop, C: Clock> Drop for LockController<S, C> {

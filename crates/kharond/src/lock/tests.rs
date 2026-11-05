@@ -646,3 +646,25 @@ fn req_mem_003_every_lock_path_runs_the_lock_hook_after_the_wipe() {
         ]
     );
 }
+
+#[test]
+fn req_cry_009_background_sync_access_is_not_activity_and_respects_expiry() {
+    // The daemon's live-sync loop updates the session through
+    // `with_session_mut`; that must neither keep an idle session
+    // alive nor reach an expired one.
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    clock.advance(Duration::from_secs(20 * 60));
+    assert_eq!(c.with_session_mut(|_| 7).unwrap(), 7);
+    clock.advance(Duration::from_secs(11 * 60));
+    assert!(
+        c.with_session_mut(|_| ()).is_err(),
+        "a background sync revived an idle session"
+    );
+    assert!(c.is_locked(), "the expired session was locked");
+}

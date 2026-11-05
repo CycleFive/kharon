@@ -32,7 +32,10 @@
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
-//! In `mode = "sync"` it also runs the REQ-API-007 clock probe in the
+//! In `mode = "sync"` every unlock also starts the REQ-CRY-009 live
+//! sync ([`live_sync`]: poll ≤ 5 min plus notifications-hub push,
+//! applied in place, ending with the session), and the daemon runs
+//! the REQ-API-007 clock probe in the
 //! background (see [`clock_probe`]): startup is not delayed by, and
 //! does not depend on, the Vaultwarden server being reachable.
 
@@ -59,7 +62,9 @@ use crate::lock::{
     UnlockError,
 };
 use crate::owner::{OwnerFailure, OwnerOps};
-use crate::sync::{LiveSync, SecretField, SyncClient, SyncError, Vault};
+use crate::sync::{
+    HubStatus, LiveSync, SecretField, SyncClient, SyncError, SyncOutcome, Vault, run_push,
+};
 use crate::totp::{SkewPolicy, SkewVerdict};
 
 /// `sysexits.h` `EX_CONFIG`: a configuration refusal.
@@ -130,9 +135,59 @@ enum UnlockSource {
 struct DaemonOwner {
     broker: Arc<DaemonBroker>,
     source: UnlockSource,
+    /// The current unlock's background sync task (REQ-CRY-009), if
+    /// any. Replaced on every sync-mode unlock; it also ends by
+    /// itself once its session is gone.
+    sync_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DaemonOwner {
+    /// REQ-CRY-009: start the live sync for the session just
+    /// installed. The session is identified by its unlock instant
+    /// (the controller's `unlocked_at`), so the task stops when that
+    /// session is locked even if a later unlock installs another.
+    /// A client that cannot be built (config was validated at
+    /// startup, so this is not expected) leaves the session without
+    /// live sync, and says so.
+    fn start_live_sync(&self, bw: &BitwardenConfig) {
+        let generation = {
+            let lock = self
+                .broker
+                .lock_controller()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            lock.unlocked_at()
+        };
+        let Some(generation) = generation else {
+            return;
+        };
+        let client = match bw.sync_client() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("kharond: warning: live sync disabled for this unlock: {e}");
+                return;
+            }
+        };
+        let task = tokio::spawn(live_sync(
+            Arc::clone(&self.broker),
+            client,
+            generation,
+            bw.sync_policy().interval,
+        ));
+        let mut slot = self.sync_task.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = slot.replace(task) {
+            old.abort();
+        }
+    }
+
+    /// Stop the background sync (daemon shutdown).
+    fn stop_live_sync(&self) {
+        let mut slot = self.sync_task.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(task) = slot.take() {
+            task.abort();
+        }
+    }
+
     fn map_unlock_error<E>(e: UnlockError<E>) -> OwnerFailure {
         match e {
             UnlockError::AlreadyUnlocked => OwnerFailure::AlreadyUnlocked,
@@ -226,6 +281,7 @@ impl OwnerOps for DaemonOwner {
                 })
                 .await
                 .map_err(|_| OwnerFailure::UnlockFailed)??;
+                self.start_live_sync(bw);
                 Ok(())
             }
         }
@@ -455,6 +511,7 @@ pub async fn start(
     let owner_ops = Arc::new(DaemonOwner {
         broker: Arc::clone(&broker),
         source,
+        sync_task: std::sync::Mutex::new(None),
     });
 
     let listener = TcpListener::bind(listen)
@@ -492,14 +549,185 @@ impl Daemon {
         let probe = self
             .clock
             .map(|client| tokio::spawn(clock_probe(client, Arc::clone(&self.broker))));
+        let owner_ops = Arc::clone(&self.owner_ops);
         let owner = tokio::spawn(crate::owner::serve(self.owner_listener, self.owner_ops));
         let served = http::serve_with_shutdown(self.listener, self.broker, shutdown).await;
         owner.abort();
+        owner_ops.stop_live_sync();
         if let Some(p) = probe {
             p.abort();
         }
         served
     }
+}
+
+/// How often the live sync re-checks that its session still exists
+/// (and enforces the idle/absolute timers, REQ-MEM-004) between
+/// syncs, so a lock tears down the hub connection and the sync
+/// client's access token promptly instead of at the next poll.
+pub const LIVE_SYNC_LOCK_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What one step of [`live_sync`] decided.
+enum LiveStep {
+    /// Keep going.
+    Continue,
+    /// The session this task serves is gone: stop.
+    Stop,
+    /// The fetched payload could not be applied; the vault is kept.
+    Failed(SyncError),
+}
+
+/// Run `f` on the controller if the session this task serves (by
+/// unlock instant) is still the one held; [`LiveStep::Stop`] if not.
+async fn with_generation(
+    broker: &Arc<DaemonBroker>,
+    generation: std::time::Duration,
+    f: impl FnOnce(&mut crate::lock::LockController<DaemonSession, SystemClock>) -> LiveStep
+    + Send
+    + 'static,
+) -> LiveStep {
+    let broker = Arc::clone(broker);
+    tokio::task::spawn_blocking(move || {
+        let mut lock = broker
+            .lock_controller()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Enforce the timers first (not activity), so an expired
+        // session is locked with its reason and this task stops.
+        lock.poll();
+        if lock.unlocked_at() != Some(generation) {
+            return LiveStep::Stop;
+        }
+        f(&mut lock)
+    })
+    .await
+    .unwrap_or(LiveStep::Stop)
+}
+
+/// REQ-CRY-009 live sync for one sync-mode unlock: a full
+/// `/api/sync` every `interval` (≤ [`crate::sync::MAX_SYNC_INTERVAL`])
+/// and on every notifications-hub push, applied to the unlocked
+/// session in place, so agent `list` reflects web-vault changes
+/// without a restart. The network round trip runs on this task's
+/// own client, never under the controller's mutex; only the
+/// CPU-only apply does (on a blocking thread). A payload that
+/// widens the account's scope (REQ-CRY-008) or rotates the org key
+/// (REQ-MEM-006) locks via `on_sync_lock`, whose audit entry the
+/// lock wiring writes (`scope_widened` / `key_rotated`). Transport
+/// and apply errors keep the last good vault and retry on the next
+/// tick or push. Ends when the session it serves is locked; the
+/// client (and with it the hub connection and its access token) is
+/// dropped then.
+async fn live_sync(
+    broker: Arc<DaemonBroker>,
+    mut client: SyncClient,
+    generation: std::time::Duration,
+    interval: std::time::Duration,
+) {
+    let (nudge_tx, mut nudge) = tokio::sync::mpsc::channel(1);
+    let mut hub_state: Option<&'static str> = None;
+    let push = tokio::spawn(run_push(
+        client.notifications_hub(),
+        nudge_tx,
+        move |status| {
+            // Operator signal on transitions only (no secrets in
+            // `HubStatus`; tokens are never Debug-printed).
+            let now = match status {
+                HubStatus::Connected => Some("connected"),
+                HubStatus::Unsupported { .. } => Some("unsupported"),
+                HubStatus::Disconnected(_) => Some("disconnected"),
+                _ => None,
+            };
+            if let Some(now) = now
+                && hub_state != Some(now)
+            {
+                match now {
+                    "connected" => eprintln!("kharond: notifications hub connected"),
+                    "unsupported" => eprintln!(
+                        "kharond: notifications hub not supported by the server; polling only"
+                    ),
+                    _ => eprintln!("kharond: notifications hub disconnected; reconnecting"),
+                }
+                hub_state = Some(now);
+            }
+        },
+    ));
+    let start = tokio::time::Instant::now();
+    let mut tick = tokio::time::interval_at(start + interval, interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut check = tokio::time::interval_at(start + LIVE_SYNC_LOCK_CHECK, LIVE_SYNC_LOCK_CHECK);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut push_open = true;
+    let mut last_error: Option<String> = None;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            n = nudge.recv(), if push_open => {
+                if n.is_none() {
+                    push_open = false;
+                    continue;
+                }
+            }
+            _ = check.tick() => {
+                match with_generation(&broker, generation, |_| LiveStep::Continue).await {
+                    LiveStep::Stop => break,
+                    _ => continue,
+                }
+            }
+        }
+        let step = match client.sync().await {
+            Ok(sync) => {
+                with_generation(&broker, generation, move |lock| {
+                    let outcome = lock.with_session_mut(|session| match session {
+                        DaemonSession::Sync(live) => live.apply(&sync),
+                        // Not reachable: this task only runs for
+                        // sync-mode unlocks.
+                        DaemonSession::Export(_) => Ok(SyncOutcome::Synced),
+                    });
+                    match outcome {
+                        Err(_locked) => LiveStep::Stop,
+                        Ok(Ok(SyncOutcome::Synced)) => LiveStep::Continue,
+                        Ok(Ok(SyncOutcome::Lock(reason))) => {
+                            lock.on_sync_lock(&reason);
+                            LiveStep::Stop
+                        }
+                        Ok(Err(e)) => LiveStep::Failed(e),
+                    }
+                })
+                .await
+            }
+            Err(e) => {
+                // The session may have gone while the request ran.
+                match with_generation(&broker, generation, |_| LiveStep::Continue).await {
+                    LiveStep::Stop => LiveStep::Stop,
+                    _ => LiveStep::Failed(e),
+                }
+            }
+        };
+        match step {
+            LiveStep::Stop => break,
+            LiveStep::Continue => {
+                tick.reset();
+                if last_error.take().is_some() {
+                    eprintln!("kharond: live sync recovered");
+                }
+            }
+            LiveStep::Failed(e) => {
+                // Once per distinct error; the last good vault stays.
+                let msg = e.to_string();
+                if last_error.as_deref() != Some(msg.as_str()) {
+                    eprintln!(
+                        "kharond: warning: live sync failed ({msg}); keeping the last synced vault"
+                    );
+                    last_error = Some(msg);
+                }
+            }
+        }
+    }
+    // Dropping the client drops its token source, which ends the
+    // push task; abort covers a task parked in a connect.
+    drop(client);
+    push.abort();
 }
 
 /// How often the clock probe retries while the server is unreachable
@@ -633,6 +861,7 @@ mod tests {
             DaemonOwner {
                 broker: Arc::clone(&broker),
                 source: UnlockSource::Export(Arc::new(file)),
+                sync_task: std::sync::Mutex::new(None),
             },
             events,
             broker,

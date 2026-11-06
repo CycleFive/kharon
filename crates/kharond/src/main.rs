@@ -92,6 +92,10 @@ async fn serve(cfg: Config) -> ExitCode {
         Ok(addr) => {
             eprintln!("kharond: agent API listening on {addr} (locked)");
             eprintln!("kharond: owner socket {}", daemon.owner_socket().display());
+            if let Some(ui) = daemon.owner_ui_addr() {
+                let origin = daemon.owner_ui_origin().unwrap_or("");
+                eprintln!("kharond: owner UI listening on {ui} (origin {origin})");
+            }
         }
         Err(e) => {
             eprintln!("kharond: cannot read listen address: {}", e.kind());

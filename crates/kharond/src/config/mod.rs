@@ -327,6 +327,23 @@ pub enum ConfigError {
         /// `std::io::ErrorKind` rendering.
         kind: String,
     },
+    /// `owner_ui.listen` is not `<ip>:<port>` with an IP literal.
+    #[error("`owner_ui.listen` must be an IP literal and port, e.g. \"127.0.0.1:8787\"")]
+    OwnerUiListenInvalid,
+    /// The owner UI must bind a loopback address (SPEC §9, REQ-DEP-006).
+    #[error("`owner_ui.listen` must be a loopback address")]
+    OwnerUiNotLoopback,
+    /// `owner_ui.origin` is not an origin the browser will report.
+    #[error(
+        "`owner_ui.origin` must be an http(s) URL with host equal to `rp_id` and no userinfo, path, query, or fragment"
+    )]
+    OwnerUiOrigin,
+    /// Origin port and listen port disagree (except listen port 0).
+    #[error("`owner_ui.origin` port must match `owner_ui.listen`")]
+    OwnerUiOriginPort,
+    /// `owner_ui.rp_id` is not a domain name.
+    #[error("`owner_ui.rp_id` must be a domain name (not an IP address)")]
+    OwnerUiRpId,
 }
 
 impl ConfigError {
@@ -373,6 +390,11 @@ impl ConfigError {
             Self::ExportKdfInvalid => "export_kdf_invalid",
             Self::ExportAuthFailed => "export_auth_failed",
             Self::ExportRead { .. } => "export_read",
+            Self::OwnerUiListenInvalid => "owner_ui_listen_invalid",
+            Self::OwnerUiNotLoopback => "owner_ui_not_loopback",
+            Self::OwnerUiOrigin => "owner_ui_origin",
+            Self::OwnerUiOriginPort => "owner_ui_origin_port",
+            Self::OwnerUiRpId => "owner_ui_rp_id",
         }
     }
 }
@@ -703,6 +725,43 @@ pub struct Config {
     pub api: Option<ApiConfig>,
     /// `data_dir`: persistent state (audit log and keys under `audit/`).
     pub data_dir: PathBuf,
+    /// `[owner_ui]`: the WebAuthn owner UI (REQ-APR-005). `None` =
+    /// not configured; the daemon serves the owner socket only.
+    pub owner_ui: Option<OwnerUiConfig>,
+}
+
+/// `[owner_ui]` (REQ-APR-005). Loopback only. `origin` is what the
+/// browser puts in `clientDataJSON` (`http://localhost:8787`, no
+/// path). When `listen`'s port is 0, [`Self::origin_for_bound_port`]
+/// substitutes the port the kernel chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerUiConfig {
+    /// Loopback listen address. Port 0 is ephemeral.
+    pub listen: SocketAddr,
+    /// WebAuthn relying party id. A domain, default `localhost`.
+    pub rp_id: String,
+    /// Browser origin from the config file, canonicalized.
+    pub origin: String,
+}
+
+impl OwnerUiConfig {
+    /// Origin for a listener that bound `port` (the file's port when
+    /// it was fixed, the kernel's port when the file said 0).
+    pub fn origin_for_bound_port(&self, port: u16) -> String {
+        let Ok(url) = Url::parse(&self.origin) else {
+            return self.origin.clone();
+        };
+        let Some(host) = url.host_str() else {
+            return self.origin.clone();
+        };
+        let scheme = url.scheme();
+        let default = if scheme == "https" { 443 } else { 80 };
+        if port == default {
+            format!("{scheme}://{host}")
+        } else {
+            format!("{scheme}://{host}:{port}")
+        }
+    }
 }
 
 /// Default `data_dir`: the SPEC §9 compose volume (`./kharon/data:/data`).

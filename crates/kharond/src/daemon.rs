@@ -179,6 +179,9 @@ struct DaemonOwner {
     /// any. Replaced on every sync-mode unlock; it also ends by
     /// itself once its session is gone.
     sync_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Owner web UI, when `[owner_ui]` is configured (REQ-APR-005).
+    /// `passkey_enroll` mints into this; absent → `unknown_op`.
+    owner_ui: Option<Arc<crate::owner_ui::OwnerUi>>,
 }
 
 impl DaemonOwner {
@@ -422,6 +425,13 @@ impl OwnerOps for DaemonOwner {
         .unwrap_or_default()
     }
 
+    async fn passkey_enroll(&self) -> Result<Zeroizing<String>, OwnerFailure> {
+        match &self.owner_ui {
+            Some(ui) => Ok(ui.mint_enroll_token()),
+            None => Err(OwnerFailure::Unsupported),
+        }
+    }
+
     async fn revoke_grant(&self, grant_id: String) -> Result<bool, OwnerFailure> {
         let broker = Arc::clone(&self.broker);
         tokio::task::spawn_blocking(move || broker.revoke_grant(&grant_id).map_err(map_grant_error))
@@ -520,6 +530,20 @@ pub enum StartupError {
         /// `std::io::ErrorKind` rendering.
         kind: String,
     },
+    /// The owner UI listen address could not be bound.
+    #[error("cannot bind owner UI on {addr}: {kind}")]
+    OwnerUiBind {
+        /// Configured address.
+        addr: SocketAddr,
+        /// `std::io::ErrorKind` rendering.
+        kind: String,
+    },
+    /// The passkey store under `data_dir/owner` could not be opened.
+    #[error("cannot open owner passkey store: {kind}")]
+    OwnerUiStore {
+        /// `std::io::ErrorKind` rendering. No file contents.
+        kind: String,
+    },
 }
 
 impl StartupError {
@@ -536,6 +560,8 @@ impl StartupError {
             Self::Export(e) => e.code(),
             Self::OwnerBind { .. } => "owner_bind",
             Self::Bind { .. } => "bind",
+            Self::OwnerUiBind { .. } => "owner_ui_bind",
+            Self::OwnerUiStore { .. } => "owner_ui_store",
         }
     }
 
@@ -547,8 +573,11 @@ impl StartupError {
             }
             Self::Harden(_) | Self::Mlock(_) => EX_OSERR,
             Self::Export(_) => EX_CONFIG,
-            Self::DataDir { .. } | Self::Audit(_) | Self::OwnerBind { .. } => EX_CANTCREAT,
-            Self::Bind { .. } => EX_UNAVAILABLE,
+            Self::DataDir { .. }
+            | Self::Audit(_)
+            | Self::OwnerBind { .. }
+            | Self::OwnerUiStore { .. } => EX_CANTCREAT,
+            Self::Bind { .. } | Self::OwnerUiBind { .. } => EX_UNAVAILABLE,
         }
     }
 }
@@ -571,6 +600,10 @@ pub struct Daemon {
     owner_listener: UnixListener,
     owner_ops: Arc<DaemonOwner>,
     owner_path: PathBuf,
+    /// Bound owner UI, when `[owner_ui]` is set (REQ-APR-005).
+    owner_ui: Option<(TcpListener, Arc<crate::owner_ui::OwnerUi>)>,
+    owner_ui_addr: Option<SocketAddr>,
+    owner_ui_origin: Option<String>,
 }
 
 /// Assemble the daemon (see the module docs for the order). Must run
@@ -652,10 +685,12 @@ pub async fn start(
         path: owner_path.clone(),
         kind: e.kind().to_string(),
     })?;
+    let (owner_ui, owner_ui_addr, owner_ui_origin) = bind_owner_ui(cfg, &broker).await?;
     let owner_ops = Arc::new(DaemonOwner {
         broker: Arc::clone(&broker),
         source,
         sync_task: std::sync::Mutex::new(None),
+        owner_ui: owner_ui.as_ref().map(|(_, ui)| Arc::clone(ui)),
     });
 
     let listener = TcpListener::bind(listen)
@@ -671,7 +706,94 @@ pub async fn start(
         owner_listener,
         owner_ops,
         owner_path,
+        owner_ui,
+        owner_ui_addr,
+        owner_ui_origin,
     })
+}
+
+/// Bind `[owner_ui]` when it is configured. The origin uses the
+/// port the kernel actually assigned (load-bearing when the file
+/// says port 0).
+async fn bind_owner_ui(
+    cfg: &Config,
+    broker: &Arc<DaemonBroker>,
+) -> Result<
+    (
+        Option<(TcpListener, Arc<crate::owner_ui::OwnerUi>)>,
+        Option<SocketAddr>,
+        Option<String>,
+    ),
+    StartupError,
+> {
+    let Some(ui_cfg) = &cfg.owner_ui else {
+        return Ok((None, None, None));
+    };
+    let listener =
+        TcpListener::bind(ui_cfg.listen)
+            .await
+            .map_err(|e| StartupError::OwnerUiBind {
+                addr: ui_cfg.listen,
+                kind: e.kind().to_string(),
+            })?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| StartupError::OwnerUiBind {
+            addr: ui_cfg.listen,
+            kind: e.kind().to_string(),
+        })?;
+    let origin = ui_cfg.origin_for_bound_port(addr.port());
+    let ui = crate::owner_ui::OwnerUi::open(
+        &cfg.data_dir,
+        ui_cfg.rp_id.clone(),
+        origin.clone(),
+        Arc::new(DaemonShell {
+            broker: Arc::clone(broker),
+        }),
+        Arc::new(DaemonUiAudit {
+            broker: Arc::clone(broker),
+        }),
+    )
+    .map_err(|e| StartupError::OwnerUiStore {
+        kind: e.kind().to_string(),
+    })?;
+    Ok((Some((listener, ui)), Some(addr), Some(origin)))
+}
+
+/// Shell facts from the live broker. Called on the UI's blocking
+/// thread: it takes the lock-controller mutex.
+struct DaemonShell {
+    broker: Arc<DaemonBroker>,
+}
+
+impl crate::owner_ui::OwnerShell for DaemonShell {
+    fn view(&self) -> crate::owner_ui::ShellView {
+        let locked = {
+            let mut lock = self
+                .broker
+                .lock_controller()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            lock.poll();
+            lock.is_locked()
+        };
+        let pending = self.broker.pending_grant_requests().len();
+        crate::owner_ui::ShellView { locked, pending }
+    }
+}
+
+struct DaemonUiAudit {
+    broker: Arc<DaemonBroker>,
+}
+
+impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
+    fn auth_failed(&self, detail: &'static str) {
+        let entry = Entry::new(Event::OwnerAuthFail)
+            .channel("web_ui")
+            .result("denied")
+            .detail_code(detail);
+        let _ = self.broker.append_audit(entry);
+    }
 }
 
 impl Daemon {
@@ -685,6 +807,16 @@ impl Daemon {
         &self.owner_path
     }
 
+    /// The owner UI's bound address, when `[owner_ui]` is set.
+    pub fn owner_ui_addr(&self) -> Option<SocketAddr> {
+        self.owner_ui_addr
+    }
+
+    /// The WebAuthn origin the owner UI expects (`clientDataJSON`).
+    pub fn owner_ui_origin(&self) -> Option<&str> {
+        self.owner_ui_origin.as_deref()
+    }
+
     /// Serve the agent API until `shutdown` resolves.
     pub async fn run<F>(self, shutdown: F) -> io::Result<()>
     where
@@ -695,8 +827,16 @@ impl Daemon {
             .map(|client| tokio::spawn(clock_probe(client, Arc::clone(&self.broker))));
         let owner_ops = Arc::clone(&self.owner_ops);
         let owner = tokio::spawn(crate::owner::serve(self.owner_listener, self.owner_ops));
+        let owner_ui = self.owner_ui.map(|(listener, ui)| {
+            tokio::spawn(async move {
+                let _ = crate::owner_ui::serve(listener, ui).await;
+            })
+        });
         let served = http::serve_with_shutdown(self.listener, self.broker, shutdown).await;
         owner.abort();
+        if let Some(task) = owner_ui {
+            task.abort();
+        }
         owner_ops.stop_live_sync();
         if let Some(p) = probe {
             p.abort();
@@ -1031,6 +1171,7 @@ mod tests {
                 broker: Arc::clone(&broker),
                 source: UnlockSource::Export(Arc::new(file)),
                 sync_task: std::sync::Mutex::new(None),
+                owner_ui: None,
             },
             events,
             broker,

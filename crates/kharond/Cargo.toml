@@ -77,6 +77,13 @@ argon2 = { version = "0.5", features = ["std", "zeroize"] }
 # header's `=?base64?…?=` form.
 schemars = "1"
 base64ct = { version = "1", features = ["alloc"] }
+# Owner web UI (REQ-APR-005): CBOR for WebAuthn attestation objects
+# and COSE keys, and P-256 for assertion signatures. aws-lc-rs is
+# already the rustls provider; pinning the same major keeps one copy.
+# `ring-sig-verify` is the ECDSA verify API. Default features would
+# also pull `ring-io`, which this crate does not use.
+ciborium = "0.2"
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys", "alloc", "ring-sig-verify"] }
 
 [dev-dependencies]
 # Self-dependency solely to enable the canary-scan feature for test

@@ -11,7 +11,7 @@ use url::Url;
 use super::{
     AgentConfig, ApiConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config, ConfigError,
     DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind, MemoryConfig, NtfyConfig,
-    PolicyConfig, Redacted, Source, parse_duration, tunnel_from_config,
+    OwnerUiConfig, PolicyConfig, Redacted, Source, parse_duration, tunnel_from_config,
 };
 use crate::api::token::{HashProblem, ParamFloor, check_token_hash};
 use crate::cdp::{CdpEndpoint, CertSha256};
@@ -54,12 +54,22 @@ struct RawConfig {
     memory: RawMemory,
     api: Option<RawApi>,
     data_dir: Option<PathBuf>,
+    owner_ui: Option<RawOwnerUi>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawApi {
     listen: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOwnerUi {
+    listen: String,
+    #[serde(default)]
+    rp_id: Option<String>,
+    origin: String,
 }
 
 #[derive(Deserialize)]
@@ -296,6 +306,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     }
 
     let api = raw.api.map(validate_api).transpose()?;
+    let owner_ui = raw.owner_ui.map(validate_owner_ui).transpose()?;
     let data_dir = raw
         .data_dir
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
@@ -314,6 +325,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         },
         api,
         data_dir,
+        owner_ui,
     })
 }
 
@@ -328,6 +340,86 @@ fn validate_api(raw: RawApi) -> Result<ApiConfig, ConfigError> {
         .map_err(|_| ConfigError::ApiListenInvalid)?;
     check_listen_ip(listen.ip())?;
     Ok(ApiConfig { listen })
+}
+
+/// REQ-APR-005 / REQ-DEP-006: the owner UI binds loopback only, and
+/// its WebAuthn origin's host is the rp id. A non-zero listen port
+/// must be the origin's port so the browser's `clientDataJSON`
+/// matches. Port 0 keeps the file's origin port as a placeholder;
+/// the daemon rewrites it once the kernel picks a port.
+fn validate_owner_ui(raw: RawOwnerUi) -> Result<OwnerUiConfig, ConfigError> {
+    let listen: SocketAddr = raw
+        .listen
+        .parse()
+        .map_err(|_| ConfigError::OwnerUiListenInvalid)?;
+    if !listen.ip().is_loopback() {
+        return Err(ConfigError::OwnerUiNotLoopback);
+    }
+    let rp_id = raw.rp_id.unwrap_or_else(|| "localhost".to_owned());
+    if !valid_rp_id(&rp_id) {
+        return Err(ConfigError::OwnerUiRpId);
+    }
+    let origin = canonical_origin(&raw.origin, &rp_id, listen.port())?;
+    Ok(OwnerUiConfig {
+        listen,
+        rp_id,
+        origin,
+    })
+}
+
+fn valid_rp_id(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 || s.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+fn canonical_origin(raw: &str, rp_id: &str, listen_port: u16) -> Result<String, ConfigError> {
+    let url = Url::parse(raw).map_err(|_| ConfigError::OwnerUiOrigin)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ConfigError::OwnerUiOrigin);
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(ConfigError::OwnerUiOrigin);
+    }
+    let host = url.host_str().ok_or(ConfigError::OwnerUiOrigin)?;
+    if host != rp_id {
+        return Err(ConfigError::OwnerUiOrigin);
+    }
+    let url_port = url
+        .port_or_known_default()
+        .ok_or(ConfigError::OwnerUiOrigin)?;
+    if listen_port != 0 && url_port != listen_port {
+        return Err(ConfigError::OwnerUiOriginPort);
+    }
+    let port = if listen_port == 0 {
+        url_port
+    } else {
+        listen_port
+    };
+    Ok(serialize_origin(url.scheme(), host, port))
+}
+
+fn serialize_origin(scheme: &str, host: &str, port: u16) -> String {
+    let default = if scheme == "https" { 443 } else { 80 };
+    if port == default {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    }
 }
 
 fn check_listen_ip(ip: IpAddr) -> Result<(), ConfigError> {

@@ -29,6 +29,9 @@
 //!   invalidation, never connecting); a reconnect or a lock gives a new
 //!   id, tabs of the old context stay `target_not_owned`; `context_open`
 //!   is written before any CDP I/O and the deadline bounds the call.
+//! - A base-address endpoint (`ws://host:port`, issue #113) asks
+//!   `/json/version` on each connect, so the fill after a browser
+//!   restart finds the new `<id>`; a full URL is used as written.
 //!
 //! The browser-level E2E (a real Chromium and form) is #24.
 
@@ -50,9 +53,12 @@ use kharond::export::{ExportFile, ExportSession};
 use kharond::lock::{LockController, LockPolicy, LockReason, ManualClock, StaticHardening};
 use kharond::origin::OriginConfig;
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
-use tokio_tungstenite::accept_async;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::{WebSocketStream, accept_async, accept_hdr_async};
 use zeroize::Zeroizing;
 
 const EXPORT: &[u8] = include_bytes!("fixtures/export/password_protected.json");
@@ -108,64 +114,204 @@ async fn cdp_stub(mode: Mode) -> (String, Stub) {
             let n = s.connections.fetch_add(1, Ordering::SeqCst) + 1;
             let s = s.clone();
             tokio::spawn(async move {
-                let Ok(mut ws) = accept_async(stream).await else {
+                let Ok(ws) = accept_async(stream).await else {
                     return;
                 };
-                let ctx = format!("ctx-{n}");
-                while let Some(Ok(Message::Text(text))) = ws.next().await {
-                    let msg: Value = serde_json::from_str(&text).unwrap();
-                    s.frames.lock().unwrap().push(msg.clone());
-                    let method = msg["method"].as_str().unwrap_or_default().to_owned();
-                    if matches!(mode, Mode::Stall(m) if m == method) {
-                        continue;
-                    }
-                    if let Mode::Delay(m, delay) = mode
-                        && m == method
-                    {
-                        tokio::time::sleep(delay).await;
-                    }
-                    let result = match method.as_str() {
-                        "Target.createBrowserContext" => json!({ "browserContextId": ctx }),
-                        "Target.getTargetInfo" if msg["params"]["targetId"] == "t-ctx1" => {
-                            json!({ "targetInfo": {
-                                "targetId": "t-ctx1", "browserContextId": "ctx-1",
-                                "url": URL, "title": "", "type": "page",
-                            } })
-                        }
-                        "Target.getTargetInfo" => json!({ "targetInfo": {
-                            "targetId": "t1", "browserContextId": ctx,
-                            "url": URL, "title": "", "type": "page",
-                        } }),
-                        "Target.attachToTarget" => json!({ "sessionId": "sess-1" }),
-                        "Page.getFrameTree" => json!({ "frameTree": { "frame": {
-                            "id": "f1", "loaderId": "l1", "url": URL,
-                        }, "childFrames": [] } }),
-                        "Page.createIsolatedWorld" => json!({ "executionContextId": 7 }),
-                        "Runtime.callFunctionOn" => {
-                            let kinds: Vec<Value> = msg["params"]["arguments"][1]["value"]
-                                .as_array()
-                                .map(|fs| fs.iter().map(|f| json!({ "kind": f["kind"] })).collect())
-                                .unwrap_or_default();
-                            json!({ "result": { "type": "object", "value": { "results": kinds } } })
-                        }
-                        _ => json!({}),
-                    };
-                    let mut reply = json!({ "id": msg["id"], "result": result });
-                    if let Some(sid) = msg.get("sessionId") {
-                        reply["sessionId"] = sid.clone();
-                    }
-                    ws.send(Message::Text(reply.to_string())).await.unwrap();
-                    if mode == Mode::CloseAfterFill && method == "Runtime.callFunctionOn" {
-                        let _ = ws.close(None).await;
-                        s.closed.fetch_add(1, Ordering::SeqCst);
-                        return;
-                    }
-                }
-                s.closed.fetch_add(1, Ordering::SeqCst);
+                serve_cdp(ws, &s, mode, n).await;
             });
         }
     });
     (format!("ws://{addr}/devtools/browser"), stub)
+}
+
+/// Answer CDP on one accepted WebSocket until it ends (see [`cdp_stub`]).
+async fn serve_cdp(mut ws: WebSocketStream<TcpStream>, s: &Stub, mode: Mode, n: usize) {
+    let ctx = format!("ctx-{n}");
+    while let Some(Ok(Message::Text(text))) = ws.next().await {
+        let msg: Value = serde_json::from_str(&text).unwrap();
+        s.frames.lock().unwrap().push(msg.clone());
+        let method = msg["method"].as_str().unwrap_or_default().to_owned();
+        if matches!(mode, Mode::Stall(m) if m == method) {
+            continue;
+        }
+        if let Mode::Delay(m, delay) = mode
+            && m == method
+        {
+            tokio::time::sleep(delay).await;
+        }
+        let result = match method.as_str() {
+            "Target.createBrowserContext" => json!({ "browserContextId": ctx }),
+            "Target.getTargetInfo" if msg["params"]["targetId"] == "t-ctx1" => {
+                json!({ "targetInfo": {
+                    "targetId": "t-ctx1", "browserContextId": "ctx-1",
+                    "url": URL, "title": "", "type": "page",
+                } })
+            }
+            "Target.getTargetInfo" => json!({ "targetInfo": {
+                "targetId": "t1", "browserContextId": ctx,
+                "url": URL, "title": "", "type": "page",
+            } }),
+            "Target.attachToTarget" => json!({ "sessionId": "sess-1" }),
+            "Page.getFrameTree" => json!({ "frameTree": { "frame": {
+                "id": "f1", "loaderId": "l1", "url": URL,
+            }, "childFrames": [] } }),
+            "Page.createIsolatedWorld" => json!({ "executionContextId": 7 }),
+            "Runtime.callFunctionOn" => {
+                let kinds: Vec<Value> = msg["params"]["arguments"][1]["value"]
+                    .as_array()
+                    .map(|fs| fs.iter().map(|f| json!({ "kind": f["kind"] })).collect())
+                    .unwrap_or_default();
+                json!({ "result": { "type": "object", "value": { "results": kinds } } })
+            }
+            _ => json!({}),
+        };
+        let mut reply = json!({ "id": msg["id"], "result": result });
+        if let Some(sid) = msg.get("sessionId") {
+            reply["sessionId"] = sid.clone();
+        }
+        ws.send(Message::Text(reply.to_string())).await.unwrap();
+        if mode == Mode::CloseAfterFill && method == "Runtime.callFunctionOn" {
+            let _ = ws.close(None).await;
+            s.closed.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+    }
+    s.closed.fetch_add(1, Ordering::SeqCst);
+}
+
+/// What the Chromium-like stub ([`chromium_stub`]) saw on its HTTP side.
+#[derive(Clone, Default)]
+struct Discovery {
+    /// The current browser id; a restart bumps it.
+    browser: Arc<AtomicUsize>,
+    /// `Host` header of each `GET /json/version`.
+    version_hosts: Arc<Mutex<Vec<String>>>,
+    /// Path of each WebSocket upgrade, accepted or not.
+    upgrades: Arc<Mutex<Vec<String>>>,
+}
+
+impl Discovery {
+    fn browser_path(&self) -> String {
+        format!(
+            "/devtools/browser/b{}-0000-4000-8000-000000000000",
+            self.browser.load(Ordering::SeqCst)
+        )
+    }
+
+    /// Chromium restarts: a new `<id>`, and the live socket is gone.
+    fn restart(&self) {
+        self.browser.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A CDP peer shaped like Chromium behind the agent host's relay (issue
+/// #113): `GET /json/version` names the current browser socket as
+/// `ws://127.0.0.1:9222/devtools/browser/<id>` (the address Chromium
+/// binds, not the one dialled), a `Host` that is neither an IP nor
+/// `localhost` gets a 500, and only the current `<id>` upgrades. With
+/// `Mode::CloseAfterFill`, closing after a fill is a browser restart.
+async fn chromium_stub(mode: Mode) -> (String, Stub, Discovery) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stub = Stub::default();
+    let disc = Discovery {
+        browser: Arc::new(AtomicUsize::new(1)),
+        ..Discovery::default()
+    };
+    let (s, d) = (stub.clone(), disc.clone());
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let s = s.clone();
+            let d = d.clone();
+            tokio::spawn(async move {
+                let mut peek = [0u8; 64];
+                let Ok(k) = stream.peek(&mut peek).await else {
+                    return;
+                };
+                if peek[..k].starts_with(b"GET /json/version ") {
+                    answer_json_version(&mut stream, &d).await;
+                    return;
+                }
+                let path = Arc::new(Mutex::new(String::new()));
+                let p = Arc::clone(&path);
+                let current = d.browser_path();
+                // tungstenite's callback type returns the whole error response.
+                #[allow(clippy::result_large_err)]
+                let check = move |req: &Request, resp: Response| {
+                    let got = req.uri().path().to_owned();
+                    *p.lock().unwrap() = got.clone();
+                    if got == current {
+                        Ok(resp)
+                    } else {
+                        let mut e = ErrorResponse::new(None);
+                        *e.status_mut() = StatusCode::NOT_FOUND;
+                        Err(e)
+                    }
+                };
+                let accepted = accept_hdr_async(stream, check).await;
+                d.upgrades
+                    .lock()
+                    .unwrap()
+                    .push(path.lock().unwrap().clone());
+                let Ok(ws) = accepted else {
+                    return;
+                };
+                let n = s.connections.fetch_add(1, Ordering::SeqCst) + 1;
+                serve_cdp(ws, &s, mode, n).await;
+                if mode == Mode::CloseAfterFill {
+                    d.restart();
+                }
+            });
+        }
+    });
+    (format!("ws://{addr}"), stub, disc)
+}
+
+/// One `GET /json/version`, answered the way Chromium does (keeping the
+/// socket open after the body).
+async fn answer_json_version(stream: &mut TcpStream, d: &Discovery) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read_exact(&mut byte).await.is_err() {
+            return;
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let host = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Host: "))
+        .unwrap_or_default()
+        .to_owned();
+    d.version_hosts.lock().unwrap().push(host.clone());
+    let name = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
+    let safe = name == "localhost"
+        || name.parse::<std::net::IpAddr>().is_ok()
+        || name
+            .trim_matches(['[', ']'])
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok();
+    let (status, body) = if safe {
+        let ws = format!("ws://127.0.0.1:9222{}", d.browser_path());
+        (
+            "200 OK",
+            json!({ "Browser": "HeadlessChrome/157.0.8103.27", "webSocketDebuggerUrl": ws })
+                .to_string(),
+        )
+    } else {
+        (
+            "500 Internal Server Error",
+            "Host header is specified and is not an IP address or localhost.".to_owned(),
+        )
+    };
+    let reply = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(reply.as_bytes()).await;
+    // Chromium leaves the connection open; the client must not wait for EOF.
+    tokio::time::sleep(Duration::from_secs(5)).await;
 }
 
 /// An export-mode config whose only agent's CDP endpoint is `cdp`.
@@ -440,6 +586,64 @@ async fn req_api_008_daemon_backend_reconnects_after_the_browser_drops() {
     assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
     assert_eq!(stub.methods("Target.createBrowserContext"), 2);
     assert_eq!(r.audit.summary().len(), 4);
+}
+
+/// Issue #113: with a base address (`ws://host:port`) the backend asks
+/// `/json/version` for the browser socket on each connect, so after a
+/// Chromium restart (new `<id>`, old socket gone) the next fill finds the
+/// new one with no config change. Only the path of
+/// `webSocketDebuggerUrl` is used: the stub names `127.0.0.1:9222`, as
+/// Chromium behind the agent host's relay does, and the backend still
+/// dials the configured address. Startup asks nothing.
+#[tokio::test]
+async fn req_arch_002_base_address_resolves_the_browser_id_again_after_a_restart() {
+    let (base, stub, disc) = chromium_stub(Mode::CloseAfterFill).await;
+    let first = disc.browser_path();
+    let r = run(&base, DEADLINE).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(disc.version_hosts.lock().unwrap().is_empty(), "lazy");
+
+    assert_eq!(r.fill(false).await.json(), filled());
+    // The stub closed after the fill and "restarted" with a new id.
+    eventually("browser restart", || disc.browser_path() != first).await;
+    let second = disc.browser_path();
+    let resp = r.fill(false).await;
+    assert_eq!(resp.json(), filled(), "{}", resp.body);
+
+    assert_eq!(*disc.upgrades.lock().unwrap(), vec![first, second]);
+    let authority = base.strip_prefix("ws://").unwrap().to_owned();
+    assert_eq!(
+        *disc.version_hosts.lock().unwrap(),
+        vec![authority.clone(), authority]
+    );
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(stub.methods("Target.createBrowserContext"), 2);
+    assert_eq!(
+        r.audit.summary(),
+        [
+            dispatch_then("fill", "filled"),
+            dispatch_then("fill", "filled")
+        ]
+        .concat()
+    );
+}
+
+/// The full-URL form is still used as written (no `/json/version`), so
+/// it goes stale when Chromium restarts: the problem #113 fixes for base
+/// addresses.
+#[tokio::test]
+async fn req_arch_002_full_url_is_used_as_written_and_goes_stale_on_restart() {
+    let (base, _stub, disc) = chromium_stub(Mode::CloseAfterFill).await;
+    let first = disc.browser_path();
+    let r = run(&format!("{base}{first}"), DEADLINE).await;
+    assert_eq!(r.fill(false).await.json(), filled());
+    eventually("browser restart", || disc.browser_path() != first).await;
+    assert_eq!(
+        r.fill(false).await.json(),
+        json!({"status": "error", "fields_filled": [], "detail": "cdp_error"})
+    );
+    assert!(disc.version_hosts.lock().unwrap().is_empty());
+    assert_eq!(*disc.upgrades.lock().unwrap(), vec![first.clone(), first]);
 }
 
 /// REQ-API-009 on the daemon path: a stall anywhere (here: in the

@@ -1,0 +1,686 @@
+//! REQ-RL-001/002/003, REQ-REV-001/002/003/004, REQ-MEM-007 (issue #23).
+//!
+//! Rate limits, suspension, revoke, panic, revision pinning, and
+//! rollback detection at the broker. MEM-007's standing-grant/locked
+//! AC already lands in `req_apr_grants.rs` (#109); this file covers
+//! the rest and re-checks lock-dominates under a rate-limit load.
+
+mod api_support;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use api_support::{
+    CHEAP_FLOOR, FakeAnswer, FakeFill, ITEM_A, RecordingAudit, TestSession, cheap_argon,
+};
+use kharond::api::grant::{Channel, GrantAction, GrantScope, GrantTerms};
+use kharond::api::rate::RatePolicy;
+use kharond::api::token::{TokenStore, generate_with};
+use kharond::api::{Broker, FillOperation, Outcome, VaultView, parse_fill};
+use kharond::audit::Event;
+use kharond::config::GrantKind;
+use kharond::lock::{Clock, LockController, LockPolicy, LockReason, ManualClock, StaticHardening};
+use kharond::origin::OriginConfig;
+use kharond::sync::{Item, SecretField, SyncError, SyncReport, Vault};
+use serde_json::{Value, json};
+use tokio::time::Instant;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
+
+struct CountingSession {
+    inner: TestSession,
+}
+
+impl ZeroizeOnDrop for CountingSession {}
+
+impl VaultView for CountingSession {
+    fn vault(&self) -> &Vault {
+        self.inner.vault()
+    }
+
+    fn decrypt_secret(
+        &self,
+        item_id: &str,
+        field: SecretField,
+    ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
+        self.inner.decrypt_secret(item_id, field)
+    }
+}
+
+/// Mutable vault session for revision / removal tests.
+struct MutVaultSession {
+    vault: Vault,
+    inner: TestSession,
+}
+
+impl ZeroizeOnDrop for MutVaultSession {}
+
+impl VaultView for MutVaultSession {
+    fn vault(&self) -> &Vault {
+        &self.vault
+    }
+
+    fn decrypt_secret(
+        &self,
+        item_id: &str,
+        field: SecretField,
+    ) -> Result<Zeroizing<Vec<u8>>, SyncError> {
+        self.inner.decrypt_secret(item_id, field)
+    }
+}
+
+struct Rig {
+    broker: Arc<Broker<CountingSession, Arc<ManualClock>>>,
+    #[allow(dead_code)]
+    clock: Arc<ManualClock>,
+    audit: RecordingAudit,
+    fake: FakeFill,
+    alpha: String,
+}
+
+impl Rig {
+    fn new(live_url: &'static str) -> Self {
+        Self::with_policy(live_url, RatePolicy::default())
+    }
+
+    fn with_policy(live_url: &'static str, rate: RatePolicy) -> Self {
+        let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
+        let (_beta, hb) = generate_with(&cheap_argon(), "beta");
+        let tokens = TokenStore::with_floor(
+            [("alpha", ha.as_str()), ("beta", hb.as_str())],
+            &CHEAP_FLOOR,
+        )
+        .unwrap();
+        let clock = Arc::new(ManualClock::new());
+        let mut lock = LockController::new(
+            LockPolicy::default(),
+            clock.clone(),
+            Box::new(StaticHardening::all_ok()),
+        );
+        lock.unlock(|| {
+            Ok::<_, ()>(CountingSession {
+                inner: TestSession::fixture(),
+            })
+        })
+        .unwrap();
+        let audit = RecordingAudit::default();
+        let fake = FakeFill::new(FakeAnswer::Filled).with_live_url(live_url);
+        let grant_clock: Arc<dyn Clock> = clock.clone();
+        let broker = Broker::new(
+            tokens,
+            lock,
+            Box::new(audit.clone()),
+            OriginConfig::default(),
+        )
+        .with_grant_clock(grant_clock)
+        .with_rate_policy(rate)
+        .with_fill_backend(Box::new(fake.clone()));
+        // Seed rollback high-water from the fixture vault.
+        let _ = broker.observe_vault_after_sync(TestSession::fixture().vault());
+        Self {
+            broker: Arc::new(broker),
+            clock,
+            audit,
+            fake,
+            alpha: alpha.expose_secret().clone(),
+        }
+    }
+
+    fn agent(&self) -> kharond::api::AgentId {
+        self.broker.authenticate(&self.alpha).unwrap()
+    }
+
+    async fn fill_password(
+        &self,
+        item: &str,
+        origin: &str,
+    ) -> Result<Value, kharond::api::ApiError> {
+        let req = parse_fill(
+            FillOperation::Fill,
+            json!({
+                "item_id": item,
+                "target": {"cdp_target_id": "tab-1", "expected_origin": origin},
+                "fields": [{"kind": "password"}],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        match self.broker.fill(&self.agent(), req, Instant::now()).await {
+            Ok(Outcome::Fill(r)) => Ok(serde_json::to_value(r).unwrap()),
+            Ok(other) => panic!("expected fill, got {other:?}"),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[tokio::test]
+async fn req_rl_001_eleventh_fill_in_sixty_seconds_is_rate_limited() {
+    let rig = Rig::with_policy(
+        "https://login.example.com/",
+        RatePolicy {
+            item_fills_per_window: 100, // isolate the per-agent minute bucket
+            ..RatePolicy::default()
+        },
+    );
+    // Approve a standing-ish once grant with high uses via per-origin
+    // so fills can actually run past pending_approval.
+    let first = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(first["status"], "pending_approval", "{first}");
+    let rid = first["grant_request_id"].as_str().unwrap();
+    let terms = GrantTerms {
+        scope: GrantScope::Item(ITEM_A.to_owned()),
+        kind: GrantKind::PerOrigin,
+        ttl: Some(Duration::from_secs(3600)),
+        max_uses: Some(100),
+    };
+    rig.broker
+        .approve_grant_request(rid, &terms, Channel::Cli)
+        .unwrap();
+
+    // The pending_approval above already spent one fill token; nine
+    // more succeed (10/min), the 11th API call is rate_limited.
+    for i in 0..9 {
+        let r = rig
+            .fill_password(ITEM_A, "https://login.example.com")
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "filled", "fill {i}: {r}");
+    }
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "rate_limited", "{r}");
+    let entries = rig.audit.entries.lock().unwrap().clone();
+    assert!(
+        entries.iter().any(|e| e.event == Event::RateLimit),
+        "rate_limit audited"
+    );
+}
+
+#[tokio::test]
+async fn req_rl_002_fifth_consecutive_origin_mismatch_suspends_agent() {
+    let rig = Rig::with_policy(
+        "https://other.example.com/",
+        RatePolicy {
+            item_fills_per_window: 100,
+            fills_per_minute: 100,
+            ..RatePolicy::default()
+        },
+    );
+    // Claim login.example.com while live is other → origin_mismatch.
+    for i in 0..5 {
+        let r = rig
+            .fill_password(ITEM_A, "https://login.example.com")
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "origin_mismatch", "mismatch {i}: {r}");
+    }
+    assert!(
+        rig.broker
+            .rate_limiter()
+            .lock()
+            .unwrap()
+            .is_suspended("alpha")
+    );
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "rate_limited", "{r}");
+    let suspended = rig
+        .audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.event == Event::RateLimit && e.result.as_deref() == Some("suspended"));
+    assert!(suspended, "suspension audited");
+    rig.broker.unsuspend_agent("alpha").unwrap();
+    // After reset, mismatch is allowed again (not rate_limited).
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "origin_mismatch", "{r}");
+}
+
+#[tokio::test]
+async fn req_rl_003_fourth_pending_grant_is_rate_limited_without_notification() {
+    let rig = Rig::with_policy(
+        "https://login.example.com/",
+        RatePolicy {
+            fills_per_minute: 100,
+            item_fills_per_window: 100,
+            ..RatePolicy::default()
+        },
+    );
+    {
+        let mut store = rig.broker.grant_store().lock().unwrap();
+        let now = Duration::from_secs(0);
+        for n in 0..3 {
+            let (req, created) = store.create_request(
+                "alpha",
+                &format!("00000000-0000-0000-0000-00000000000{n}"),
+                GrantAction::Fill,
+                "https://login.example.com",
+                "https://login.example.com",
+                now,
+            );
+            assert!(created);
+            assert_eq!(req.state, kharond::api::grant::RequestState::Pending);
+        }
+        assert_eq!(store.pending_count("alpha"), 3);
+    }
+    let before = rig
+        .audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.event == Event::GrantRequest)
+        .count();
+    use api_support::HOST_CLONE;
+    let r4 = rig
+        .fill_password(HOST_CLONE, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r4["status"], "rate_limited", "{r4}");
+    let after = rig
+        .audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.event == Event::GrantRequest)
+        .count();
+    assert_eq!(after, before, "no notification on 4th pending");
+}
+
+#[tokio::test]
+async fn req_rev_001_revoke_grant_denies_next_fill() {
+    let rig = Rig::new("https://login.example.com/");
+    let first = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    let rid = first["grant_request_id"].as_str().unwrap();
+    let gid = rig
+        .broker
+        .approve_grant_request(
+            rid,
+            &GrantTerms {
+                scope: GrantScope::Item(ITEM_A.to_owned()),
+                kind: GrantKind::PerOrigin,
+                ttl: Some(Duration::from_secs(3600)),
+                max_uses: Some(10),
+            },
+            Channel::Cli,
+        )
+        .unwrap()
+        .id;
+    assert!(rig.broker.revoke_grant(&gid).unwrap());
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    // Grant gone → pending again (or denied if named). Without grant_id: pending.
+    assert_eq!(r["status"], "pending_approval", "{r}");
+}
+
+#[tokio::test]
+async fn req_rev_001_revoke_agent_refuses_token_and_grants() {
+    let rig = Rig::new("https://login.example.com/");
+    let first = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    let rid = first["grant_request_id"].as_str().unwrap();
+    rig.broker
+        .approve_grant_request(
+            rid,
+            &GrantTerms {
+                scope: GrantScope::Item(ITEM_A.to_owned()),
+                kind: GrantKind::PerOrigin,
+                ttl: Some(Duration::from_secs(3600)),
+                max_uses: Some(10),
+            },
+            Channel::Cli,
+        )
+        .unwrap();
+    rig.broker.revoke_agent("alpha").unwrap();
+    assert!(rig.broker.authenticate(&rig.alpha).is_err());
+}
+
+#[tokio::test]
+async fn req_rev_002_panic_locks_revokes_and_zeroizes() {
+    let rig = Rig::new("https://login.example.com/");
+    let first = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    let rid = first["grant_request_id"].as_str().unwrap();
+    rig.broker
+        .approve_grant_request(
+            rid,
+            &GrantTerms {
+                scope: GrantScope::Item(ITEM_A.to_owned()),
+                kind: GrantKind::PerOrigin,
+                ttl: Some(Duration::from_secs(3600)),
+                max_uses: Some(10),
+            },
+            Channel::Cli,
+        )
+        .unwrap();
+    rig.broker.panic_lock().unwrap();
+    assert!(rig.broker.lock_controller().lock().unwrap().is_locked());
+    let err = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap_err();
+    assert_eq!(err, kharond::api::ApiError::LOCKED);
+    assert!(
+        rig.broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .grants_for("alpha", Duration::from_secs(0))
+            .is_empty()
+    );
+    assert!(
+        rig.audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.event == Event::Panic)
+    );
+    // CDP close: FakeFill records on_lock.
+    assert!(rig.fake.lock_count() >= 1, "panic closes CDP via lock hook");
+}
+
+#[tokio::test]
+async fn req_rev_003_item_removal_invalidates_per_item_grants() {
+    let (_alpha, ha) = generate_with(&cheap_argon(), "alpha");
+    let tokens = TokenStore::with_floor([("alpha", ha.as_str())], &CHEAP_FLOOR).unwrap();
+    let clock = Arc::new(ManualClock::new());
+    let fixture = TestSession::fixture();
+    // Build a vault clone with ITEM_A present, then remove it.
+    let mut items: Vec<Item> = fixture
+        .vault()
+        .items()
+        .map(|i| i.with_revision(Some("2026-11-05T12:00:00Z".into())))
+        .collect();
+    let vault = Vault::with_report(items.clone(), SyncReport::default());
+    let mut lock = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    lock.unlock(|| {
+        Ok::<_, ()>(MutVaultSession {
+            vault: vault.clone(),
+            inner: fixture,
+        })
+    })
+    .unwrap();
+    let audit = RecordingAudit::default();
+    let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://login.example.com/");
+    let broker = Broker::new(
+        tokens,
+        lock,
+        Box::new(audit.clone()),
+        OriginConfig::default(),
+    )
+    .with_grant_clock(clock.clone())
+    .with_fill_backend(Box::new(fake));
+    let _ = broker.observe_vault_after_sync(&vault);
+    // Issue a grant for ITEM_A directly.
+    let now = Duration::from_secs(0);
+    let grant = {
+        let mut store = broker.grant_store().lock().unwrap();
+        let g = store
+            .issue(
+                "alpha",
+                ITEM_A,
+                GrantAction::Fill,
+                "login.example.com",
+                &GrantTerms {
+                    scope: GrantScope::Item(ITEM_A.to_owned()),
+                    kind: GrantKind::PerOrigin,
+                    ttl: Some(Duration::from_secs(3600)),
+                    max_uses: Some(10),
+                },
+                Channel::Cli,
+                None,
+                now,
+            )
+            .unwrap();
+        store.pin_revision(&g.id, Some("2026-11-05T12:00:00Z".into()));
+        g
+    };
+    assert!(
+        !broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .grants_for("alpha", now)
+            .is_empty()
+    );
+    // Remove ITEM_A and observe.
+    items.retain(|i| i.id() != ITEM_A);
+    let vault2 = Vault::with_report(items, SyncReport::default());
+    assert!(!broker.observe_vault_after_sync(&vault2).unwrap());
+    assert!(
+        broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .grant(&grant.id)
+            .is_none()
+    );
+    assert!(
+        audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.event == Event::GrantRevoke
+                && e.detail_code.as_deref() == Some("item_revised_or_removed"))
+    );
+}
+
+#[tokio::test]
+async fn req_rev_004_revision_change_denies_fill_and_older_sync_locks() {
+    let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
+    let tokens = TokenStore::with_floor([("alpha", ha.as_str())], &CHEAP_FLOOR).unwrap();
+    let clock = Arc::new(ManualClock::new());
+    let fixture = TestSession::fixture();
+    let items: Vec<Item> = fixture
+        .vault()
+        .items()
+        .map(|i| i.with_revision(Some("2026-11-05T12:00:00Z".into())))
+        .collect();
+    let vault = Vault::with_report(items.clone(), SyncReport::default());
+    let mut lock = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    lock.unlock(|| {
+        Ok::<_, ()>(MutVaultSession {
+            vault: vault.clone(),
+            inner: TestSession::fixture(),
+        })
+    })
+    .unwrap();
+    let audit = RecordingAudit::default();
+    let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://login.example.com/");
+    let broker = Arc::new(
+        Broker::new(
+            tokens,
+            lock,
+            Box::new(audit.clone()),
+            OriginConfig::default(),
+        )
+        .with_grant_clock(clock.clone())
+        .with_fill_backend(Box::new(fake)),
+    );
+    assert!(!broker.observe_vault_after_sync(&vault).unwrap());
+    let now = Duration::from_secs(0);
+    let gid = {
+        let mut store = broker.grant_store().lock().unwrap();
+        let g = store
+            .issue(
+                "alpha",
+                ITEM_A,
+                GrantAction::Fill,
+                "login.example.com",
+                &GrantTerms {
+                    scope: GrantScope::Item(ITEM_A.to_owned()),
+                    kind: GrantKind::PerOrigin,
+                    ttl: Some(Duration::from_secs(3600)),
+                    max_uses: Some(10),
+                },
+                Channel::Cli,
+                None,
+                now,
+            )
+            .unwrap();
+        store.pin_revision(&g.id, Some("2026-11-05T12:00:00Z".into()));
+        g.id
+    };
+    // Change revision on ITEM_A in a new vault snapshot.
+    let mut items2 = items.clone();
+    for i in &mut items2 {
+        if i.id() == ITEM_A {
+            i.set_revision(Some("2026-11-05T13:00:00Z".into()));
+        }
+    }
+    let vault2 = Vault::with_report(items2, SyncReport::default());
+    // Replace session vault so fill sees the new revision.
+    {
+        let mut lock = broker.lock_controller().lock().unwrap();
+        lock.lock(LockReason::Manual);
+        lock.unlock(|| {
+            Ok::<_, ()>(MutVaultSession {
+                vault: vault2.clone(),
+                inner: TestSession::fixture(),
+            })
+        })
+        .unwrap();
+    }
+    let _ = broker.observe_vault_after_sync(&vault2);
+    // Grant may have been invalidated by REV-003 on observe; if it
+    // survived (collection?) — for item scope it should be gone.
+    // Re-issue with old pin against new vault to test fill denial:
+    {
+        let mut store = broker.grant_store().lock().unwrap();
+        let g = store
+            .issue(
+                "alpha",
+                ITEM_A,
+                GrantAction::Fill,
+                "login.example.com",
+                &GrantTerms {
+                    scope: GrantScope::Item(ITEM_A.to_owned()),
+                    kind: GrantKind::PerOrigin,
+                    ttl: Some(Duration::from_secs(3600)),
+                    max_uses: Some(10),
+                },
+                Channel::Cli,
+                None,
+                now,
+            )
+            .unwrap();
+        store.pin_revision(&g.id, Some("2026-11-05T12:00:00Z".into()));
+    }
+    let token = alpha.expose_secret().clone();
+    let agent = broker.authenticate(&token).unwrap();
+    let req = parse_fill(
+        FillOperation::Fill,
+        json!({
+            "item_id": ITEM_A,
+            "target": {"cdp_target_id": "tab-1", "expected_origin": "https://login.example.com"},
+            "fields": [{"kind": "password"}],
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let r = match broker.fill(&agent, req, Instant::now()).await {
+        Ok(Outcome::Fill(r)) => serde_json::to_value(r).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(r["status"], "denied", "{r}");
+
+    // Older cipher → rollback lock.
+    let mut items3 = items;
+    for i in &mut items3 {
+        if i.id() == ITEM_A {
+            i.set_revision(Some("2026-11-05T11:00:00Z".into()));
+        }
+    }
+    let vault3 = Vault::with_report(items3, SyncReport::default());
+    assert!(broker.observe_vault_after_sync(&vault3).unwrap());
+    assert!(broker.lock_controller().lock().unwrap().is_locked());
+    assert!(
+        audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.event == Event::RollbackDetected)
+    );
+    let _ = gid;
+}
+
+#[tokio::test]
+async fn req_mem_007_lock_dominates_even_under_rate_pressure() {
+    // Standing grant + locked → locked (not rate_limited).
+    let rig = Rig::with_policy(
+        "https://login.example.com/",
+        RatePolicy {
+            fills_per_minute: 1, // would rate-limit a second fill
+            ..RatePolicy::default()
+        },
+    );
+    rig.broker
+        .grant_store()
+        .lock()
+        .unwrap()
+        .set_allow_standing(true);
+    let now = Duration::from_secs(0);
+    rig.broker
+        .grant_store()
+        .lock()
+        .unwrap()
+        .issue(
+            "alpha",
+            ITEM_A,
+            GrantAction::Fill,
+            "login.example.com",
+            &GrantTerms {
+                scope: GrantScope::Item(ITEM_A.to_owned()),
+                kind: GrantKind::Standing,
+                ttl: Some(Duration::from_secs(3600)),
+                max_uses: None,
+            },
+            Channel::Cli,
+            None,
+            now,
+        )
+        .unwrap();
+    {
+        let mut lock = rig.broker.lock_controller().lock().unwrap();
+        lock.lock(LockReason::Manual);
+    }
+    let err = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap_err();
+    assert_eq!(err, kharond::api::ApiError::LOCKED);
+}

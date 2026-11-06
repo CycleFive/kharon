@@ -260,6 +260,11 @@ pub struct Grant {
     pub created_by_channel: Channel,
     /// The request this grant was issued from, if any.
     pub request_id: Option<String>,
+    /// Item `revisionDate` pinned at issuance (REQ-REV-004). A fill
+    /// against a different revision is `denied` (re-approval).
+    /// `None` when the item had no revision at issuance (export mode
+    /// / fixtures without `revisionDate`).
+    pub item_revision: Option<String>,
 }
 
 impl Grant {
@@ -285,6 +290,16 @@ impl Grant {
             && self.actions.contains(&action)
             && origin_matches(&self.origin, origin)
             && self.is_live(now)
+    }
+
+    /// REQ-REV-004: a grant that pinned a revision only admits fills
+    /// against that same revision. Unpinned grants (`None`) admit any
+    /// current revision (export items, fixtures without dates).
+    pub fn revision_matches(&self, item_revision: Option<&str>) -> bool {
+        match &self.item_revision {
+            None => true,
+            Some(pinned) => item_revision == Some(pinned.as_str()),
+        }
     }
 
     /// The status view (SPEC §4 `Grant`).
@@ -550,6 +565,57 @@ impl GrantStore {
         self.grants.len() != before
     }
 
+    /// Revoke every grant (and drop every request) for `agent_id`
+    /// (REQ-REV-001 `revoke agent`). Returns how many grants were
+    /// removed.
+    pub fn revoke_agent(&mut self, agent_id: &str) -> Vec<Grant> {
+        let (keep, removed): (Vec<_>, Vec<_>) =
+            self.grants.drain(..).partition(|g| g.agent_id != agent_id);
+        self.grants = keep;
+        self.requests.retain(|r| r.agent_id != agent_id);
+        removed
+    }
+
+    /// Revoke every grant and drop every request (REQ-REV-002 panic).
+    pub fn revoke_all(&mut self) -> Vec<Grant> {
+        let removed = std::mem::take(&mut self.grants);
+        self.requests.clear();
+        removed
+    }
+
+    /// Pending request count for `agent` (REQ-RL-003).
+    pub fn pending_count(&self, agent_id: &str) -> usize {
+        self.requests
+            .iter()
+            .filter(|r| r.state == RequestState::Pending && r.agent_id == agent_id)
+            .count()
+    }
+
+    /// REQ-REV-003: drop per-item grants whose item is gone or whose
+    /// pinned revision no longer matches. Collection-scoped grants
+    /// survive (their items are re-checked at fill time). Returns
+    /// the revoked grants for audit.
+    pub fn invalidate_for_vault(&mut self, vault: &crate::sync::Vault) -> Vec<Grant> {
+        let (keep, removed): (Vec<_>, Vec<_>) =
+            self.grants.drain(..).partition(|g| match &g.scope {
+                GrantScope::Collection(_) => true,
+                GrantScope::Item(id) => match vault.get(id) {
+                    Err(_) => false,
+                    Ok(item) => g.revision_matches(item.revision()),
+                },
+            });
+        self.grants = keep;
+        removed
+    }
+
+    /// Pin `item_revision` on an already-issued grant (broker sets
+    /// this at approval time from the live vault).
+    pub fn pin_revision(&mut self, grant_id: &str, revision: Option<String>) {
+        if let Some(g) = self.grants.iter_mut().find(|g| g.id == grant_id) {
+            g.item_revision = revision;
+        }
+    }
+
     /// A request by id.
     pub fn request(&self, request_id: &str) -> Option<&GrantRequest> {
         self.requests.iter().find(|r| r.id == request_id)
@@ -692,6 +758,7 @@ impl GrantStore {
             kind: terms.kind,
             created_by_channel: channel,
             request_id: request_id.map(str::to_owned),
+            item_revision: None,
         };
         self.grants.push(grant.clone());
         Ok(grant)

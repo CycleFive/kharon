@@ -526,6 +526,8 @@ pub struct FakeFill {
     /// Agents whose context was requested (`kharon_context`, #65), in
     /// call order; a `Stall` answer stalls these calls too.
     pub context_calls: Arc<Mutex<Vec<String>>>,
+    /// How many times [`FillBackend::on_lock`] ran (REQ-REV-002).
+    pub locks: Arc<Mutex<u32>>,
 }
 
 impl FakeFill {
@@ -535,6 +537,7 @@ impl FakeFill {
             answer,
             live_url: None,
             context_calls: Arc::default(),
+            locks: Arc::default(),
         }
     }
 
@@ -546,6 +549,11 @@ impl FakeFill {
 
     pub fn seen(&self) -> Vec<SeenPlan> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// Lock-hook invocations (CDP close path).
+    pub fn lock_count(&self) -> u32 {
+        *self.locks.lock().unwrap()
     }
 }
 
@@ -621,6 +629,10 @@ impl FillBackend for FakeFill {
         let calls = self.context_calls.lock().unwrap();
         (!matches!(self.answer, FakeAnswer::Stall) && calls.iter().any(|a| a == agent_id))
             .then(|| format!("ctx-{agent_id}"))
+    }
+
+    fn on_lock(&self) {
+        *self.locks.lock().unwrap() += 1;
     }
 }
 

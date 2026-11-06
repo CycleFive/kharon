@@ -359,6 +359,9 @@ pub enum FillStatus {
     /// fill's item / origin / action. Naming a grant and failing its
     /// terms is a refusal, not a new request.
     GrantDenied,
+    /// REQ-RL-001/002/003: a rate limit or suspension refused the
+    /// fill before any decrypt or CDP write.
+    RateLimited,
 }
 
 impl FillStatus {
@@ -369,6 +372,7 @@ impl FillStatus {
             Self::UnknownItem => "not_found",
             Self::PendingApproval => "pending_approval",
             Self::GrantDenied => "denied",
+            Self::RateLimited => "rate_limited",
             Self::ItemFieldMissing | Self::DecryptFailed | Self::Unavailable | Self::SyncFailed => {
                 "error"
             }
@@ -386,6 +390,7 @@ impl FillStatus {
             Self::SyncFailed => Some("sync_failed"),
             Self::PendingApproval => None,
             Self::GrantDenied => Some("grant_denied"),
+            Self::RateLimited => Some("rate_limited"),
         }
     }
 

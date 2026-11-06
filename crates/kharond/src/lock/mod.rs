@@ -172,6 +172,11 @@ pub enum LockReason {
     /// The account's view widened past the dedicated org mid-run
     /// (REQ-CRY-008).
     ScopeWidened,
+    /// Owner `kharon panic` (REQ-REV-002): audited as `panic`.
+    Panic,
+    /// Sync rollback detected (REQ-REV-004): audited as
+    /// `rollback_detected`.
+    RollbackDetected,
 }
 
 impl LockReason {
@@ -197,6 +202,8 @@ impl LockReason {
                 Entry::new(Event::Lock).detail_code("unknown_crypto_version")
             }
             Self::ScopeWidened => Entry::new(Event::ScopeWidened),
+            Self::Panic => Entry::new(Event::Panic),
+            Self::RollbackDetected => Entry::new(Event::RollbackDetected),
         }
     }
 }

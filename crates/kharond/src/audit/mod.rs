@@ -40,7 +40,9 @@ mod keys;
 mod log;
 mod verify;
 
-pub use checkpoint::{Checkpoint, CheckpointSink, FileCheckpointSink, NullCheckpointSink};
+pub use checkpoint::{
+    Checkpoint, CheckpointSink, FileCheckpointSink, NtfyCheckpointSink, NullCheckpointSink,
+};
 pub use entry::{Entry, Event, GENESIS_PREV_HASH};
 pub use keys::{AuditKeys, KeysError};
 pub use log::{

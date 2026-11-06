@@ -150,11 +150,28 @@ impl VaultView for LiveSync {
 pub trait AuditSink: Send {
     /// Append `entry`, or fail (the request then fails closed).
     fn append(&mut self, entry: Entry) -> Result<(), AuditError>;
+    /// REQ-AUD-002 timer leg (#127): anchor the tail if the checkpoint
+    /// period has elapsed. Only the real log implements this; test
+    /// sinks have nothing to anchor.
+    fn checkpoint_if_due(&mut self) -> bool {
+        false
+    }
+    /// REQ-AUD-002 shutdown anchor (#127): checkpoint the head now if
+    /// it is not already anchored.
+    fn checkpoint_now(&mut self) -> bool {
+        false
+    }
 }
 
 impl AuditSink for AuditLog {
     fn append(&mut self, entry: Entry) -> Result<(), AuditError> {
         AuditLog::append(self, entry).map_err(|_| AuditError)
+    }
+    fn checkpoint_if_due(&mut self) -> bool {
+        AuditLog::checkpoint_if_due(self)
+    }
+    fn checkpoint_now(&mut self) -> bool {
+        AuditLog::checkpoint_now(self)
     }
 }
 
@@ -646,6 +663,27 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// audited path (REQ-AUD-003).
     pub fn append_audit(&self, entry: Entry) -> Result<(), ApiError> {
         self.append(entry)
+    }
+
+    /// REQ-AUD-002 timer leg (#127): ask the audit log to anchor its
+    /// tail if the checkpoint period has elapsed. Called by the
+    /// daemon's timer task on a blocking thread (a checkpoint push is
+    /// network I/O). Returns whether a checkpoint was delivered.
+    pub fn checkpoint_audit_if_due(&self) -> bool {
+        self.audit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .checkpoint_if_due()
+    }
+
+    /// REQ-AUD-002 shutdown anchor (#127): checkpoint the audit head
+    /// now if it is not already anchored. Same blocking-thread rule as
+    /// [`Self::checkpoint_audit_if_due`].
+    pub fn checkpoint_audit_now(&self) -> bool {
+        self.audit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .checkpoint_now()
     }
 
     /// Route the lock controller's transitions into the audit log

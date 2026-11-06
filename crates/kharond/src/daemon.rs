@@ -7,8 +7,11 @@
 //!
 //! 1. `[api] listen` must be configured (the daemon never picks an
 //!    address; REQ-DEP-006 refused wildcards at config load).
-//! 2. The audit checkpoint sink must be one this build can provide
-//!    (see [`StartupError::OffHostCheckpointUnimplemented`]).
+//! 2. The audit checkpoint sink must be resolvable: local-only, or
+//!    the off-host ntfy sink when `[approval].ntfy` is configured
+//!    (REQ-AUD-002, #127; the loader already refuses off-host mode
+//!    with no ntfy channel, and [`start`] fails closed if the sink
+//!    cannot be built, e.g. an unreadable ntfy token file).
 //! 3. Process hardening: `harden_process()` (REQ-MEM-001), then
 //!    `lock_memory()` when `require_mlock` is set (REQ-MEM-002; the
 //!    lock module asks for this at startup so the master password is
@@ -57,7 +60,8 @@ use crate::api::http;
 use crate::api::token::{TokenStore, TokenStoreError};
 use crate::api::{Channel, GrantError, GrantScope, GrantTerms};
 use crate::audit::{
-    AuditConfig as LogConfig, AuditLog, Entry, Event, FileCheckpointSink, OpenError,
+    AuditConfig as LogConfig, AuditLog, CheckpointSink, Entry, Event, FileCheckpointSink,
+    NtfyCheckpointSink, OpenError,
 };
 use crate::config::{BitwardenConfig, Config, Source};
 use crate::export::{ExportError, ExportFile, ExportSession};
@@ -485,14 +489,23 @@ pub enum StartupError {
     /// No `[api]` section: refuse rather than guess an address.
     #[error("no `[api] listen` configured; set it to the WireGuard interface address")]
     ApiListenMissing,
-    /// `audit.checkpoint_local_only = false` needs the off-host (ntfy)
-    /// checkpoint sink, which is not implemented yet. Refused rather
-    /// than silently downgraded to local-only.
+    /// `audit.checkpoint_local_only = false` but no `[approval].ntfy`
+    /// channel is configured. The config loader refuses this first
+    /// (`audit_no_off_host_sink`); this is defence in depth so the
+    /// daemon never silently downgrades to local-only checkpoints.
     #[error(
-        "off-host audit checkpoints (ntfy) are not implemented yet; \
-         set audit.checkpoint_local_only = true to run with local checkpoints"
+        "audit checkpoints need an off-host sink ([approval].ntfy) \
+         or audit.checkpoint_local_only = true"
     )]
-    OffHostCheckpointUnimplemented,
+    OffHostCheckpointNotConfigured,
+    /// The off-host checkpoint sink could not be built at startup
+    /// (e.g. the ntfy token file is unreadable). Fail closed rather
+    /// than run with checkpoints going nowhere (REQ-AUD-002, #127).
+    #[error("cannot set up off-host audit checkpoint sink: {kind}")]
+    CheckpointSinkSetup {
+        /// `std::io::ErrorKind` rendering. No file contents.
+        kind: String,
+    },
     /// `harden_process()` failed (REQ-MEM-001).
     #[error("process hardening failed: {0}")]
     Harden(HardeningError),
@@ -554,7 +567,8 @@ impl StartupError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::ApiListenMissing => "api_listen_missing",
-            Self::OffHostCheckpointUnimplemented => "audit_off_host_unimplemented",
+            Self::OffHostCheckpointNotConfigured => "audit_off_host_not_configured",
+            Self::CheckpointSinkSetup { .. } => "audit_checkpoint_sink_setup",
             Self::Harden(_) => "harden_failed",
             Self::Mlock(_) => "mlock_failed",
             Self::Tokens(_) => "token_store",
@@ -571,9 +585,10 @@ impl StartupError {
     /// Process exit status (`sysexits.h`).
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::ApiListenMissing | Self::OffHostCheckpointUnimplemented | Self::Tokens(_) => {
-                EX_CONFIG
-            }
+            Self::ApiListenMissing
+            | Self::OffHostCheckpointNotConfigured
+            | Self::CheckpointSinkSetup { .. }
+            | Self::Tokens(_) => EX_CONFIG,
             Self::Harden(_) | Self::Mlock(_) => EX_OSERR,
             Self::Export(_) => EX_CONFIG,
             Self::DataDir { .. }
@@ -589,8 +604,13 @@ impl StartupError {
 /// side effects: what `kharond --check` runs after `load_for_startup`.
 pub fn check(cfg: &Config) -> Result<SocketAddr, StartupError> {
     let api = cfg.api.ok_or(StartupError::ApiListenMissing)?;
-    if !cfg.audit.checkpoint_local_only {
-        return Err(StartupError::OffHostCheckpointUnimplemented);
+    // REQ-AUD-002 (#127): off-host checkpoints are served by the ntfy
+    // sink; the loader already guarantees the channel exists in this
+    // mode, and `--check` must not read the token file or touch the
+    // network, so presence is all that is verified here. Sink
+    // construction (fail-closed) happens in `start`.
+    if !cfg.audit.checkpoint_local_only && cfg.approval.ntfy.is_none() {
+        return Err(StartupError::OffHostCheckpointNotConfigured);
     }
     Ok(api.listen)
 }
@@ -629,15 +649,37 @@ pub async fn start(
         path: audit_dir.clone(),
         kind: e.kind().to_string(),
     })?;
-    let sink =
-        FileCheckpointSink::create(&audit_dir.join("checkpoints.jsonl")).map_err(OpenError::Io)?;
+    // REQ-AUD-002 (#127): local-only runs keep the file checkpoint
+    // stream; SPEC-default runs publish checkpoints to the configured
+    // ntfy topic (the off-host stream). Building the ntfy sink reads
+    // its token file eagerly — an unreadable token refuses startup
+    // here instead of silently downgrading.
+    let sink: Box<dyn CheckpointSink> = if cfg.audit.checkpoint_local_only {
+        Box::new(
+            FileCheckpointSink::create(&audit_dir.join("checkpoints.jsonl"))
+                .map_err(OpenError::Io)?,
+        )
+    } else {
+        let ntfy = cfg
+            .approval
+            .ntfy
+            .as_ref()
+            .ok_or(StartupError::OffHostCheckpointNotConfigured)?;
+        Box::new(
+            NtfyCheckpointSink::new(&ntfy.url, &ntfy.topic, ntfy.token_file.as_deref()).map_err(
+                |e| StartupError::CheckpointSinkSetup {
+                    kind: e.kind().to_string(),
+                },
+            )?,
+        )
+    };
     let audit = AuditLog::open(
         &audit_dir,
         LogConfig {
             plaintext_item_names: cfg.audit.item_names,
             ..LogConfig::default()
         },
-        Box::new(sink),
+        sink,
     )?;
 
     // The unlock source, assembled at startup: sync mode keeps the
@@ -828,6 +870,19 @@ impl Daemon {
         let probe = self
             .clock
             .map(|client| tokio::spawn(clock_probe(client, Arc::clone(&self.broker))));
+        // REQ-AUD-002 10-minute leg (#127): appends piggy-back the
+        // checkpoint cadence, but a quiet broker appends nothing — this
+        // timer asks the log to anchor its tail once the configured
+        // period (10 min by default) has elapsed. The push itself is
+        // network I/O on a blocking thread.
+        let timer_broker = Arc::clone(&self.broker);
+        let checkpoint_timer = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CHECKPOINT_TIMER_TICK).await;
+                let broker = Arc::clone(&timer_broker);
+                let _ = tokio::task::spawn_blocking(move || broker.checkpoint_audit_if_due()).await;
+            }
+        });
         let owner_ops = Arc::clone(&self.owner_ops);
         let owner = tokio::spawn(crate::owner::serve(self.owner_listener, self.owner_ops));
         let owner_ui = self.owner_ui.map(|(listener, ui)| {
@@ -837,7 +892,9 @@ impl Daemon {
                 let _ = crate::owner_ui::serve(listener, ui, redeem).await;
             })
         });
+        let shutdown_broker = Arc::clone(&self.broker);
         let served = http::serve_with_shutdown(self.listener, self.broker, shutdown).await;
+        checkpoint_timer.abort();
         owner.abort();
         if let Some(task) = owner_ui {
             task.abort();
@@ -846,9 +903,21 @@ impl Daemon {
         if let Some(p) = probe {
             p.abort();
         }
+        // Anchor the tail before exiting (#127): whatever was appended
+        // since the last checkpoint (the final lock, say) leaves the
+        // host with the daemon, not at the next start. Best effort —
+        // a dead sink must not hang or fail the shutdown; the cadence
+        // counters were not reset, so the next run retries.
+        let _ = tokio::task::spawn_blocking(move || shutdown_broker.checkpoint_audit_now()).await;
         served
     }
 }
+
+/// How often the daemon's checkpoint timer wakes to ask the audit log
+/// whether its 10-minute checkpoint is due (REQ-AUD-002, #127). The
+/// due decision itself lives in the log (`AuditConfig::checkpoint_period`),
+/// so this only bounds how late a due checkpoint can be.
+pub const CHECKPOINT_TIMER_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often the live sync re-checks that its session still exists
 /// (and enforces the idle/absolute timers, REQ-MEM-004) between

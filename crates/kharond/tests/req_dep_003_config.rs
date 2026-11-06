@@ -43,8 +43,9 @@ impl Parts {
             approval:
                 "[approval]\nntfy = { url = \"https://ntfy.example.net\", topic = \"kharon\" }\n"
                     .to_owned(),
-            // Off-host (ntfy) checkpoints are not implemented yet, so a
-            // config the daemon will actually serve is local-only (#14).
+            // This fixture exercises the loader, not the checkpoint
+            // sink, so it keeps the explicit local-only opt-out (#14;
+            // the ntfy sink itself is #127 / req_aud_002_offhost).
             audit: "[audit]\ncheckpoint_local_only = true\n".to_owned(),
             memory: "[memory]\nrequire_mlock = false\n".to_owned(),
             api: "[api]\nlisten = \"10.66.0.1:8787\"\n".to_owned(),

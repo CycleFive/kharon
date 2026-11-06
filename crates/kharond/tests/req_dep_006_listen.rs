@@ -19,8 +19,9 @@ use serde_json::json;
 
 const TOKEN_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo";
 
-/// A servable export-mode config: local-only checkpoints (no off-host
-/// sink yet), no mlock requirement, `data_dir` and `[api]` as given.
+/// A servable export-mode config: local-only checkpoints (the
+/// off-host ntfy sink is exercised in req_aud_002_offhost), no mlock
+/// requirement, `data_dir` and `[api]` as given.
 /// The export file is the real password-protected fixture from #12:
 /// since REQ-EXP-002 the daemon classifies the export file at
 /// startup, so a dummy path no longer boots.
@@ -162,21 +163,21 @@ fn req_dep_006_daemon_refuses_missing_listen() {
     }
 }
 
-/// Off-host checkpoints are required by default but not implemented
-/// yet: refused, not silently downgraded to local-only.
+/// Off-host checkpoints (the SPEC default) are served by the ntfy
+/// checkpoint sink since #127: a config with `[approval].ntfy` and no
+/// local-only opt-out passes `--check`. (Before #127 this was refused
+/// as unimplemented; sink construction failures still fail closed at
+/// serve time — see req_aud_002_offhost.)
 #[test]
-fn req_dep_006_daemon_refuses_unimplemented_off_host_checkpoints() {
+fn req_dep_006_daemon_accepts_ntfy_off_host_checkpoints() {
     let data = tempfile::tempdir().unwrap();
     let text = config(TOKEN_HASH, data.path(), &listen("127.0.0.1:0")).replace(
         "[audit]\ncheckpoint_local_only = true\n",
         "[approval]\nntfy = { url = \"https://ntfy.example.net\", topic = \"kharon\" }\n",
     );
     let (code, stderr) = run(&["--check"], &text);
-    assert_eq!(code, Some(78), "{stderr}");
-    assert!(
-        stderr.contains("startup error [audit_off_host_unimplemented]"),
-        "{stderr}"
-    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("config ok"), "{stderr}");
 }
 
 #[test]

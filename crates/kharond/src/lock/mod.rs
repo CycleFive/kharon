@@ -58,15 +58,18 @@
 //!    [`UnlockError::Audit`]). Only then are the timers recorded
 //!    as started.
 //!
-//! Forced locks (REQ-MEM-006, REQ-CRY-008): the sync layer reports
-//! a rotated org key, an unknown crypto version, or a widened
-//! dedicated-org scope, and the controller locks with the matching
-//! [`LockReason`]; the audit event names are `key_rotated` and
-//! `scope_widened`, as the ACs name them. A `Locked` audit entry is
-//! written best-effort: the lock stands regardless of whether the
-//! write succeeds (REQ-AUD-003's fail-closed rule governs the
-//! request path, and there is no request left to fail once the
-//! session is gone).
+//! Forced locks (REQ-MEM-006, REQ-CRY-008, REQ-REV-002, REQ-REV-004):
+//! the sync layer reports a rotated org key, an unknown crypto
+//! version, or a widened dedicated-org scope, and the controller
+//! locks with the matching [`LockReason`]; panic and a detected
+//! rollback lock the same way. The audit event names are
+//! `key_rotated`, `scope_widened`, `panic`, and `rollback_detected`,
+//! as the ACs name them. That sink entry is the only one for each
+//! transition — callers must not append a second copy. A `Locked`
+//! audit entry is written best-effort: the lock stands regardless
+//! of whether the write succeeds (REQ-AUD-003's fail-closed rule
+//! governs the request path, and there is no request left to fail
+//! once the session is gone).
 //!
 //! Every transition is reported to an optional fallible event sink
 //! as a [`LockEvent`]; the daemon wires the sink to the audit log

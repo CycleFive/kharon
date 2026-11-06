@@ -20,8 +20,12 @@
 //! - `{"op":"lock"}` — lock now, destroying the session.
 //! - `{"op":"status"}` — `{"ok":true,"locked":<bool>}`.
 //! - `{"op":"revoke_grant","grant_id":"g_…"}` — REQ-REV-001.
-//! - `{"op":"revoke_agent","agent_id":"…"}` — REQ-REV-001 (token + grants).
-//! - `{"op":"unsuspend","agent_id":"…"}` — REQ-RL-002 owner reset.
+//! - `{"op":"revoke_agent","agent_id":"…"}` — REQ-REV-001 (token +
+//!   grants). In-memory until the daemon process exits; `unsuspend`
+//!   does not clear it, and there is no un-revoke op. The token hash
+//!   stays in the store, so a restart accepts the token again.
+//! - `{"op":"unsuspend","agent_id":"…"}` — REQ-RL-002 owner reset of
+//!   a suspension. Does not restore a revoked token.
 //! - `{"op":"panic"}` — REQ-REV-002.
 //! - `{"op":"grants"}` — `{"ok":true,"pending":[…]}`: the pending
 //!   grant requests (SPEC §5, #20), each as the approval prompt an

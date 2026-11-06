@@ -645,13 +645,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
 
     /// Route the lock controller's transitions into the audit log
     /// (REQ-AUD-003): `Unlocked` → `unlock`, locks → `lock` /
-    /// `key_rotated` / `scope_widened` (via
-    /// [`LockEvent::audit_entry`]). The daemon calls this at
-    /// startup; until it is called, transitions are unaudited (the
-    /// state machine's unit tests wire their own sink instead).
-    /// Because the controller enforces REQ-AUD-003 fail-closed on
-    /// the `Unlocked` entry, an audit failure rolls the unlock
-    /// back — exactly as if the sink had been wired by hand.
+    /// `key_rotated` / `scope_widened` / `panic` /
+    /// `rollback_detected` (via [`LockEvent::audit_entry`]). The
+    /// daemon calls this at startup; until it is called, transitions
+    /// are unaudited (the state machine's unit tests wire their own
+    /// sink instead). Panic and rollback have no separate broker
+    /// append — this sink is their only entry, so a second append
+    /// would double-write (REQ-AUD-003). Because the controller
+    /// enforces REQ-AUD-003 fail-closed on the `Unlocked` entry, an
+    /// audit failure rolls the unlock back — exactly as if the sink
+    /// had been wired by hand.
     pub fn wire_lock_audit(&self) {
         let audit = Arc::clone(&self.audit);
         let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1355,8 +1358,11 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 
     /// Revoke an agent: drop its grants/requests and refuse its
-    /// token until the owner clears revocation (REQ-REV-001).
-    /// Audited as `token_revoke` + per-grant `grant_revoke`.
+    /// token until the daemon process exits (REQ-REV-001). The flag
+    /// is in-memory; [`Self::unsuspend_agent`] does not clear it,
+    /// and there is no un-revoke op. The token hash stays in the
+    /// store, so a restart accepts the token again. Audited as
+    /// `token_revoke` + per-grant `grant_revoke`.
     pub fn revoke_agent(&self, agent_id: &str) -> Result<usize, GrantError> {
         let removed = self
             .grants
@@ -1395,7 +1401,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 
     /// Clear an agent's suspension (REQ-RL-002 owner reset). Does
-    /// not restore a revoked token.
+    /// not restore a revoked token; revocation lasts until the
+    /// daemon process exits.
     pub fn unsuspend_agent(&self, agent_id: &str) -> Result<(), GrantError> {
         self.rates
             .lock()
@@ -1410,13 +1417,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         .map_err(|_| GrantError::AuditFailed)
     }
 
-    /// `kharon panic` (REQ-REV-002): audit `panic`, revoke every
-    /// grant, lock (zeroize + CDP close via the lock hook). Notify
-    /// is best-effort via the audit/ntfy path (checkpoints); a
-    /// dedicated ntfy push is not yet wired (#16).
+    /// `kharon panic` (REQ-REV-002): revoke every grant, then lock
+    /// (zeroize + CDP close via the lock hook). The single `panic`
+    /// audit entry is that lock ([`LockReason::Panic`] through
+    /// [`Self::wire_lock_audit`]); appending it here as well would
+    /// record the transition twice (REQ-AUD-003). Notify is
+    /// best-effort via the audit/ntfy checkpoint path; a dedicated
+    /// ntfy push is not yet wired (#16).
     pub fn panic_lock(&self) -> Result<(), GrantError> {
-        self.append(Entry::new(Event::Panic).result("panic"))
-            .map_err(|_| GrantError::AuditFailed)?;
         let removed = self
             .grants
             .lock()
@@ -1438,16 +1446,33 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .reset();
-        let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-        lock.lock(LockReason::Panic);
+        self.lock_audited(LockReason::Panic);
         Ok(())
+    }
+
+    /// Lock for `reason`. [`LockReason::Panic`] and
+    /// [`LockReason::RollbackDetected`] have no other audit entry:
+    /// the lock sink writes [`LockReason::audit_entry`] when this
+    /// call actually transitions to locked. If the broker is already
+    /// locked the sink does not run, so that same entry is appended
+    /// here — exactly one of the two paths, never both (REQ-AUD-003).
+    fn lock_audited(&self, reason: LockReason) {
+        let transitioned = {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            lock.lock(reason)
+        };
+        if !transitioned && matches!(reason, LockReason::Panic | LockReason::RollbackDetected) {
+            let _ = self.append(reason.audit_entry());
+        }
     }
 
     /// Observe a freshly applied vault for rollback (REQ-REV-004).
     /// On `Err`, the caller must lock with [`LockReason::RollbackDetected`]
     /// (and may already hold the controller — this method never takes
-    /// the lock). Resets the high-water marks after a detected rollback
-    /// so the next unlock starts clean.
+    /// the lock). That lock is the single `rollback_detected` audit
+    /// entry; this method does not append one, or a wired lock sink
+    /// would record a second (REQ-AUD-003). Resets the high-water
+    /// marks after a detected rollback so the next unlock starts clean.
     pub fn detect_rollback(
         &self,
         vault: &Vault,
@@ -1457,18 +1482,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .observe(vault);
-        if let Err(ref reason) = result {
-            let detail = match reason {
-                crate::api::rollback::RollbackReason::RevisionRegressed { .. } => {
-                    "revision_regressed"
-                }
-                crate::api::rollback::RollbackReason::SetRegressed => "set_regressed",
-            };
-            let _ = self.append(
-                Entry::new(Event::RollbackDetected)
-                    .result("rollback_detected")
-                    .detail_code(detail),
-            );
+        if result.is_err() {
             self.rollback
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1502,11 +1516,11 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
 
     /// Convenience for callers that do not already hold the lock
     /// controller: detect rollback (locking if needed) then invalidate
-    /// grants. Returns whether a rollback forced a lock.
+    /// grants. Returns whether a rollback forced a lock. The single
+    /// `rollback_detected` entry is that lock's, not a second append.
     pub fn observe_vault_after_sync(&self, vault: &Vault) -> Result<bool, GrantError> {
         if self.detect_rollback(vault).is_err() {
-            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-            lock.lock(LockReason::RollbackDetected);
+            self.lock_audited(LockReason::RollbackDetected);
             return Ok(true);
         }
         self.invalidate_grants_for_vault(vault)?;

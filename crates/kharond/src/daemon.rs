@@ -844,6 +844,11 @@ async fn live_sync(
                                 Err(_) => return LiveStep::Stop,
                             };
                             if broker_sync.detect_rollback(&vault).is_err() {
+                                // The session is unlocked here, so this
+                                // lock transitions and the sink
+                                // (`wire_lock_audit`) writes the one
+                                // `rollback_detected` entry.
+                                // `detect_rollback` does not append one.
                                 lock.lock(crate::lock::LockReason::RollbackDetected);
                                 return LiveStep::Stop;
                             }

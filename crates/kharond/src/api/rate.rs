@@ -184,7 +184,9 @@ impl RateLimiter {
     }
 
     /// Clear revocation so a reconfigured token can authenticate
-    /// again. Suspension is cleared too (owner reset).
+    /// again. Suspension is cleared too (owner reset). Not wired to
+    /// the owner socket: `unsuspend` does not call this, so a
+    /// revoked agent stays revoked until the daemon process exits.
     pub fn clear_revocation(&mut self, agent: &str) {
         self.revoked.remove(agent);
         self.unsuspend(agent);

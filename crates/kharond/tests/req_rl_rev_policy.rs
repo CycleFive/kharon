@@ -375,6 +375,9 @@ async fn req_rev_002_panic_locks_revokes_and_zeroizes() {
             Channel::Cli,
         )
         .unwrap();
+    // Same wiring as the daemon: the lock sink, not a second broker
+    // append, owns the single `panic` entry (REQ-AUD-003).
+    rig.broker.wire_lock_audit();
     rig.broker.panic_lock().unwrap();
     assert!(rig.broker.lock_controller().lock().unwrap().is_locked());
     let err = rig
@@ -390,14 +393,15 @@ async fn req_rev_002_panic_locks_revokes_and_zeroizes() {
             .grants_for("alpha", Duration::from_secs(0))
             .is_empty()
     );
-    assert!(
-        rig.audit
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| e.event == Event::Panic)
-    );
+    let panics = rig
+        .audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.event == Event::Panic)
+        .count();
+    assert_eq!(panics, 1, "exactly one panic audit entry");
     // CDP close: FakeFill records on_lock.
     assert!(rig.fake.lock_count() >= 1, "panic closes CDP via lock hook");
 }
@@ -529,6 +533,9 @@ async fn req_rev_004_revision_change_denies_fill_and_older_sync_locks() {
         .with_grant_clock(clock.clone())
         .with_fill_backend(Box::new(fake)),
     );
+    // Same wiring as the daemon, before any rollback lock, so a
+    // broker append plus the sink would show up as two entries.
+    broker.wire_lock_audit();
     assert!(!broker.observe_vault_after_sync(&vault).unwrap());
     let now = Duration::from_secs(0);
     let gid = {
@@ -627,14 +634,14 @@ async fn req_rev_004_revision_change_denies_fill_and_older_sync_locks() {
     let vault3 = Vault::with_report(items3, SyncReport::default());
     assert!(broker.observe_vault_after_sync(&vault3).unwrap());
     assert!(broker.lock_controller().lock().unwrap().is_locked());
-    assert!(
-        audit
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| e.event == Event::RollbackDetected)
-    );
+    let rollbacks = audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.event == Event::RollbackDetected)
+        .count();
+    assert_eq!(rollbacks, 1, "exactly one rollback_detected audit entry");
     let _ = gid;
 }
 

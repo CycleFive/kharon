@@ -66,10 +66,10 @@ enum Command {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
-    /// Revoke a grant or an agent (REQ-REV-001).
+    /// Revoke a grant, or an agent until the daemon restarts (REQ-REV-001).
     #[command(subcommand)]
     Revoke(RevokeCommand),
-    /// Clear an agent's suspension (REQ-RL-002).
+    /// Clear an agent's suspension (REQ-RL-002). Does not un-revoke.
     Unsuspend {
         /// Agent id.
         agent_id: String,
@@ -94,7 +94,12 @@ enum RevokeCommand {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
-    /// Revoke an agent (token + grants).
+    /// Revoke an agent's token and grants until the daemon restarts.
+    ///
+    /// The flag is in-memory for the life of the process. `kharon
+    /// unsuspend` does not clear it, and there is no un-revoke
+    /// command. The token hash stays in the token store, so
+    /// restarting the daemon lets the agent authenticate again.
     Agent {
         /// Agent id.
         id: String,

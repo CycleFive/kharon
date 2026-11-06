@@ -5,6 +5,13 @@
 //! unlock. A sync that regresses a per-item revision, or that
 //! revisits an earlier item-set fingerprint after a different one,
 //! is a rollback: the broker locks and audits `rollback_detected`.
+//!
+//! A fingerprint revisit locks only when items come back (the new
+//! id set is not a subset of the previous sync). Pure add-then-remove
+//! that recreates an earlier fingerprint does not lock — REQ-REV-003
+//! treats that deletion as grant invalidation. Re-adding those items
+//! so the earlier fingerprint returns inside the same unlock does
+//! lock; that churn is fail-closed.
 
 use std::collections::{BTreeMap, BTreeSet};
 

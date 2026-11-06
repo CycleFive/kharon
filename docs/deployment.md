@@ -7,8 +7,8 @@ kharon runs on two machines (SPEC §3.3, option (a)):
   decrypted items while unlocked.
 - **Agent host.** Where the agent and its Chromium run. It is
   partially trusted (SPEC §2): the agent may be curious or
-  compromised, but root on this host is not. It holds no kharon
-  binary, no kharon config and no vault credential (REQ-ARCH-001).
+  compromised, but root on this host is not. It holds no vault-secret-bearing
+  kharon binary or config and no vault credential (REQ-ARCH-001).
 
 kharond reaches the agent host's Chromium over CDP through an
 authenticated tunnel and fills forms there. Two transport classes

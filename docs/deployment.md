@@ -190,6 +190,73 @@ A full `ws://10.66.0.2:9222/devtools/browser/<id>` endpoint still
 works and is used as written, but it goes stale when Chromium
 restarts.
 
+### Path (B) broker (agent connector)
+
+Use this when the agent host can open outbound TCP/TLS and nothing
+else (no UDP, no `CAP_NET_ADMIN`). The broker grows two TLS listeners,
+both on a specific address, never `0.0.0.0` or `::` (REQ-DEP-006):
+
+- `[api]` — the agent API, HTTPS, bearer agent token. Plain HTTP on a
+  non-loopback address is refused when any agent uses
+  `via = "agent_connector"`.
+- `[connector]` — the raw TLS accept the connector dials. Different
+  port from `[api]`. Same certificate is fine.
+
+On the broker host, mint a tunnel credential. It is not an agent API
+token and cannot call `fill`:
+
+```sh
+kharon tunnel mint assistant
+```
+
+The credential is printed on the terminal only. stdout is one Argon2id
+line: `connector_token_hash`. Put that line in the broker config. Copy
+the credential into a file on the agent host (mode `0400`); do not put
+it in the broker config and do not give it to the connector as an
+agent API token.
+
+```toml
+[agents.assistant]
+token_hash = "<kharon token mint stdout>"
+connector_token_hash = "<kharon tunnel mint stdout>"
+cdp = { endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }
+
+[api]
+listen = "203.0.113.4:8787"
+tls_cert_file = "/etc/kharon/tls.crt"
+tls_key_file = "/etc/kharon/tls.key"
+
+[connector]
+listen = "203.0.113.4:8788"
+tls_cert_file = "/etc/kharon/tls.crt"
+tls_key_file = "/etc/kharon/tls.key"
+```
+
+`203.0.113.4` stands for the broker's reachable address. A self-signed
+certificate is enough: the connector pins the SHA-256 of the
+certificate's DER, and it does not use WebPKI or the certificate's
+expiry. The agent process that calls the API has to trust the same
+certificate (its own CA bundle or pin). The owner UI stays on loopback.
+
+```sh
+openssl x509 -in /etc/kharon/tls.crt -outform DER | sha256sum
+```
+
+The hex digest is `BROKER_PIN` on the agent host. Build the connector
+on a machine that has this repo, not on the agent host:
+
+```sh
+cargo build --release -p kharon-agent-connector
+```
+
+The binary is `target/release/kharon-agent-connector`. Copy it and the
+tunnel credential file to the agent host, then follow path (B) under
+Agent host. Open inbound TCP `8787` and `8788` on the broker only. The
+agent host accepts nothing.
+
+kharond still reads `/json/version` on each connect, over the
+connector, so a Chromium restart needs no config edit.
+
 ### ntfy approve and deny (REQ-APR-004, REQ-DEP-006)
 
 `GET` and `POST` on `/owner/approve/<token>` and `/owner/deny/<token>`
@@ -252,10 +319,14 @@ Transport is dual-path (SPEC REQ-DEP-005 / REQ-ARCH-002):
   Chromium/`browser`/`ptrace_scope`/password-manager rules below still
   apply.
 
-Path (A) provisioning follows.
+Path (A) provisioning follows. Path (B) is the section after it.
+Path (A) installs no kharon binary. Path (B) installs only
+`kharon-agent-connector`, which holds the tunnel credential and not
+an agent API token, a vault key, or the account password
+(REQ-ARCH-001).
 
-The agent host needs four things, and nothing else from kharon
-(REQ-ARCH-001):
+The agent host needs four things, and on path (A) nothing else from
+kharon (REQ-ARCH-001):
 
 | What | Why |
 |---|---|
@@ -306,6 +377,58 @@ CI runs the script in a fresh Debian VM and checks the result
 (`.github/workflows/agent-host.yml`), and checks that it installs
 only Chromium flags and tunnel config
 (`crates/kharond/tests/req_arch_001_agent_host_docs.rs`).
+
+### Path (B) — agent-connector
+
+Same Chromium user, ptrace scope, and password-manager policy as path
+(A). No WireGuard, no `cdp-relay`, no UDP listen.
+[`deploy/agent-host/provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
+installs that, plus the connector, on Debian 12 or 13. The binary and
+the tunnel credential file are produced on the broker side (above);
+this host only receives them.
+
+```sh
+sudo CONNECTOR_BIN=./kharon-agent-connector \
+  BROKER_ADDR=203.0.113.4:8788 \
+  BROKER_PIN=<64 hex sha256 of the broker certificate DER> \
+  AGENT_ID=assistant \
+  TUNNEL_TOKEN_FILE=./tunnel.token \
+  ./provision-connector.sh
+```
+
+It:
+
+- installs `chromium` and `fonts-liberation` (not `wireguard-tools`,
+  not `socat`);
+- creates the `browser` user and `/var/lib/browser` (0700);
+- writes `/etc/sysctl.d/60-ptrace-scope.conf`;
+- writes `/etc/chromium/policies/managed/no-password-manager.json`;
+- writes `browser.service` (CDP on `127.0.0.1:9222`);
+- creates a `connector` user that is neither `browser` nor the agent;
+- installs the binary at `/usr/local/bin/kharon-agent-connector`;
+- writes `/etc/kharon-connector/connector.toml` and
+  `/etc/kharon-connector/token` (mode `0400`, owner `connector`);
+- writes `kharon-agent-connector.service`, which dials the broker and
+  relays to `127.0.0.1:9222`, and restarts itself if the process
+  exits. The process also reconnects on its own.
+
+`CDP_PORT` defaults to `9222`. `PROXY=http://proxy-host:3128` is an
+optional HTTP CONNECT proxy with no userinfo; the connector refuses a
+proxy URL that embeds a password. Re-running the script is safe.
+
+The tunnel credential is the only kharon secret on this host, and
+only the `connector` user can read it. It is not the agent API token.
+Someone holding it could attach a connector and receive the CDP
+session the broker opens, so treat it like an SSH key: do not copy it
+further, and mint a new one (`kharon tunnel mint` on the broker, then
+re-run with the new file) if this host is rebuilt. The broker
+certificate pin is not a secret.
+
+Point the agent harness at `https://203.0.113.4:8787` with its agent
+API token, and trust the broker certificate there. The connector does
+not carry that token. CI checks this script the same way as path (A)
+(`req_arch_001_agent_host_docs`) and fills through the connector
+against a CDP stub (`req_arch_002_agent_connector`).
 
 ### Running the agent
 

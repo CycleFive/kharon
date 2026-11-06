@@ -1,0 +1,19 @@
+[package]
+name = "kharon-agent-connector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Agent-host connector: outbound TLS relay to loopback CDP"
+
+[[bin]]
+name = "kharon-agent-connector"
+path = "src/main.rs"
+
+[dependencies]
+kharon-connector = { version = "0.0.0", path = "../kharon-connector" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+zeroize = "1"

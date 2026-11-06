@@ -8,6 +8,7 @@ pub mod api;
 pub mod audit;
 pub mod cdp;
 pub mod config;
+pub mod connector;
 pub mod daemon;
 pub mod export;
 pub mod lock;

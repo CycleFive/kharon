@@ -11,11 +11,14 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use api_support::get;
-use kharond::api::token::generate;
-use kharond::config::Config;
+use kharond::api::token::{generate, generate_tunnel};
+use kharond::config::{Config, StaticMlockProbe};
+use kharond::connector::connect_pinned;
 use kharond::daemon::{self, StartupError};
 use kharond::lock::{HardeningError, StaticHardening};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TOKEN_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo";
 
@@ -328,4 +331,194 @@ async fn req_dep_006_daemon_binary_serves_status_on_loopback() {
         .await
         .unwrap();
     assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+fn path_b_config(
+    api_hash: &str,
+    tunnel_hash: &str,
+    data_dir: &Path,
+    api_listen: &str,
+    tls: Option<(&Path, &Path)>,
+    connector_listen: &str,
+) -> String {
+    let tls_keys = match tls {
+        Some((cert, key)) => format!(
+            "tls_cert_file = \"{}\"\ntls_key_file = \"{}\"\n",
+            cert.display(),
+            key.display()
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"mode = "export"
+data_dir = "{}"
+
+[export]
+file = "{}"
+
+[agents.assistant]
+token_hash = "{api_hash}"
+connector_token_hash = "{tunnel_hash}"
+cdp = {{ endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }}
+
+[audit]
+checkpoint_local_only = true
+
+[memory]
+require_mlock = false
+
+[api]
+listen = "{api_listen}"
+{tls_keys}
+[connector]
+listen = "{connector_listen}"
+tls_cert_file = "{cert}"
+tls_key_file = "{key}"
+"#,
+        data_dir.display(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/export/password_protected.json"
+        ),
+        cert = tls
+            .map(|(c, _)| c.display().to_string())
+            .unwrap_or_else(|| "/tmp/missing-cert.pem".into()),
+        key = tls
+            .map(|(_, k)| k.display().to_string())
+            .unwrap_or_else(|| "/tmp/missing-key.pem".into()),
+    )
+}
+
+fn write_cert(dir: &Path) -> ([u8; 32], std::path::PathBuf, std::path::PathBuf) {
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+    let pin = kharond::connector::pin_of_der(cert.der());
+    let cert_path = dir.join("tls.crt");
+    let key_path = dir.join("tls.key");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+    (pin, cert_path, key_path)
+}
+
+#[test]
+fn req_dep_006_path_b_refuses_wildcard_and_plain_http_non_loopback() {
+    let data = Path::new("/data");
+    let base = path_b_config(
+        TOKEN_HASH,
+        TOKEN_HASH,
+        data,
+        "10.66.0.1:8787",
+        None,
+        "10.66.0.1:8788",
+    );
+    let err = Config::from_toml_str(&base).expect_err("plain http");
+    assert_eq!(err.code(), "api_plain_http_non_loopback");
+    for addr in WILDCARDS {
+        let text = path_b_config(TOKEN_HASH, TOKEN_HASH, data, addr, None, "10.66.0.1:8788");
+        let err = Config::from_toml_str(&text).expect_err(addr);
+        assert_eq!(err.code(), "api_wildcard_bind", "{addr}: {err:?}");
+    }
+    let text = path_b_config(
+        TOKEN_HASH,
+        TOKEN_HASH,
+        data,
+        "10.66.0.1:8787",
+        Some((Path::new("/tmp/c.pem"), Path::new("/tmp/k.pem"))),
+        "0.0.0.0:8788",
+    );
+    let err = Config::from_toml_str(&text).expect_err("connector wildcard");
+    assert_eq!(err.code(), "connector_wildcard_bind");
+    let agents_only = config(TOKEN_HASH, data, &listen("127.0.0.1:8787")).replace(
+        "cdp = { endpoint = \"ws://127.0.0.1:9222\" }",
+        "cdp = { endpoint = \"ws://127.0.0.1:9222\", via = \"agent_connector\" }",
+    );
+    let err = Config::from_toml_str(&agents_only).expect_err("no connector token");
+    assert_eq!(err.code(), "connector_token_missing", "{err}");
+}
+
+#[test]
+fn req_dep_006_path_b_tls_material_checked_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pin, cert, key) = write_cert(dir.path());
+    let data = dir.path().join("data");
+    let text = path_b_config(
+        TOKEN_HASH,
+        TOKEN_HASH,
+        &data,
+        "203.0.113.4:8787",
+        Some((&cert, &key)),
+        "203.0.113.4:8788",
+    );
+    let cfg = Config::from_toml_str(&text).unwrap();
+    assert!(cfg.api.as_ref().unwrap().tls.is_some());
+    assert!(cfg.connector.is_some());
+    cfg.check_startup(&StaticMlockProbe(Ok(())))
+        .expect("cert and key parse");
+    let broken = text.replace(&cert.display().to_string(), "/tmp/does-not-exist.pem");
+    let cfg = Config::from_toml_str(&broken).unwrap();
+    let err = cfg.check_startup(&StaticMlockProbe(Ok(()))).unwrap_err();
+    assert_eq!(err.code(), "tls_material");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_dep_006_path_b_agent_api_over_tls() {
+    let (api_token, api_hash) = generate("assistant");
+    let api_token = api_token.expose_secret().clone();
+    let (_tunnel, tunnel_hash) = generate_tunnel("assistant");
+    let dir = tempfile::tempdir().unwrap();
+    let (pin, cert, key) = write_cert(dir.path());
+    let data = dir.path().join("data");
+    let text = path_b_config(
+        &api_hash,
+        &tunnel_hash,
+        &data,
+        "127.0.0.1:0",
+        Some((&cert, &key)),
+        "127.0.0.2:0",
+    );
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    let addr = daemon.local_addr().unwrap();
+    assert!(daemon.agent_api_tls());
+    assert!(daemon.connector_addr().unwrap().ip().is_loopback());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(daemon.run(async {
+        let _ = stopped.await;
+    }));
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut tls = connect_pinned("127.0.0.1", pin, tcp).await.unwrap();
+    let req = format!(
+        "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {api_token}\r\nConnection: close\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut body = Vec::new();
+    tls.read_to_end(&mut body).await.unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("HTTP/1.1 200"), "{body}");
+    assert!(body.contains("\"locked\":true"), "{body}");
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut tls = connect_pinned("127.0.0.1", pin, tcp).await.unwrap();
+    let req = "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer kh_agent_assistant_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nConnection: close\r\n\r\n";
+    tls.write_all(req.as_bytes()).await.unwrap();
+    let mut body = Vec::new();
+    tls.read_to_end(&mut body).await.unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("HTTP/1.1 401"), "{body}");
+
+    let mut plain = tokio::net::TcpStream::connect(addr).await.unwrap();
+    plain
+        .write_all(b"GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = plain.read(&mut buf).await.unwrap_or(0);
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(!text.contains("HTTP/1.1 200"), "{text}");
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
 }

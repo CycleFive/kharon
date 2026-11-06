@@ -3,12 +3,13 @@
 //! The broker talks to Chromium's CDP socket over one of four transports
 //! (SPEC §3.3):
 //!
-//! | `via`        | who encrypts                          | kharon's role |
-//! |--------------|---------------------------------------|---------------|
-//! | `direct`     | nobody — loopback only                | plain ws      |
-//! | `wireguard`  | the WireGuard interface               | validate only |
-//! | `ssh`        | the ssh `-R` tunnel                   | validate only |
-//! | `mtls`       | kharon itself (TLS, pinned peer cert) | TLS client    |
+//! | `via`              | who encrypts                          | kharon's role |
+//! |--------------------|---------------------------------------|---------------|
+//! | `direct`           | nobody — loopback only                | plain ws      |
+//! | `wireguard`        | the WireGuard interface               | validate only |
+//! | `ssh`              | the ssh `-R` tunnel                   | validate only |
+//! | `mtls`             | kharon itself (TLS, pinned peer cert) | TLS client    |
+//! | `agent_connector`  | the agent's outbound TLS session      | bytes over the reverse mux |
 //!
 //! Fail closed at config load: plain `ws://` to a non-loopback address
 //! with `via = direct` is refused before any connection exists. `wss://`
@@ -47,6 +48,11 @@ pub enum Tunnel {
     Ssh,
     /// kharon terminates TLS itself with a pinned peer certificate.
     Mtls,
+    /// The agent dials the broker; CDP bytes ride that TLS session to
+    /// loopback Chromium (path B, SPEC OQ-14). The endpoint URL is the
+    /// address on the agent host (`ws://127.0.0.1:9222`), not a socket
+    /// the broker dials.
+    AgentConnector,
 }
 
 impl Tunnel {
@@ -57,6 +63,7 @@ impl Tunnel {
             "wireguard" => Some(Self::WireGuard),
             "ssh" => Some(Self::Ssh),
             "mtls" => Some(Self::Mtls),
+            "agent_connector" => Some(Self::AgentConnector),
             _ => None,
         }
     }
@@ -71,7 +78,7 @@ pub enum EndpointError {
     /// `via = direct` with a non-loopback host: plaintext CDP on the
     /// network, refused at config load (REQ-ARCH-002).
     #[error(
-        "plain ws:// to a non-loopback address refused (via = direct); use wireguard, ssh, or mtls"
+        "plain ws:// to a non-loopback address refused (via = direct); use wireguard, ssh, mtls, or agent_connector"
     )]
     PlainWsNonLoopback,
     /// `via = mtls` speaks TLS in-crate, so the endpoint must be `wss://`.
@@ -88,6 +95,19 @@ pub enum EndpointError {
     /// (empty host, bad port, …).
     #[error("CDP endpoint host is missing or invalid")]
     BadHost,
+    /// `via = agent_connector` carries CDP inside the agent's TLS session.
+    /// The inner hop is loopback `ws://`, not a second TLS layer.
+    #[error("via = agent_connector requires a ws:// loopback endpoint")]
+    AgentConnectorRequiresWs,
+    /// The connector dials this address on the agent host. It must be
+    /// loopback so the connector cannot be aimed at another machine.
+    #[error("via = agent_connector requires a loopback endpoint (127.0.0.1 or localhost)")]
+    AgentConnectorRequiresLoopback,
+    /// The pin for path B is the broker certificate on the connector, not
+    /// a CDP peer pin. Setting one here would look like a check that does
+    /// not run.
+    #[error("via = agent_connector does not take peer_cert_sha256")]
+    AgentConnectorRejectsPeerPin,
 }
 
 /// SHA-256 of the peer's DER certificate, configured out of band.
@@ -143,6 +163,17 @@ impl CdpEndpoint {
                 // pin is mandatory for mtls (same fail-closed rule).
                 if peer_cert_sha256.is_none() {
                     return Err(EndpointError::WssRequiresPeerPin);
+                }
+            }
+            Tunnel::AgentConnector => {
+                if url.scheme() != "ws" {
+                    return Err(EndpointError::AgentConnectorRequiresWs);
+                }
+                if !is_loopback(host) {
+                    return Err(EndpointError::AgentConnectorRequiresLoopback);
+                }
+                if peer_cert_sha256.is_some() {
+                    return Err(EndpointError::AgentConnectorRejectsPeerPin);
                 }
             }
         }
@@ -242,6 +273,37 @@ mod tests {
         let ep =
             CdpEndpoint::validate("wss://10.66.0.2:9222/", Tunnel::WireGuard, Some(pin)).unwrap();
         assert_eq!(ep.peer_pin, Some(pin));
+    }
+
+    #[test]
+    fn req_arch_002_agent_connector_is_loopback_ws_only() {
+        let ep =
+            CdpEndpoint::validate("ws://127.0.0.1:9222", Tunnel::AgentConnector, None).unwrap();
+        assert_eq!(ep.tunnel, Tunnel::AgentConnector);
+        assert!(ep.discovers());
+        assert_eq!(
+            CdpEndpoint::validate("ws://10.66.0.2:9222", Tunnel::AgentConnector, None).unwrap_err(),
+            EndpointError::AgentConnectorRequiresLoopback
+        );
+        assert_eq!(
+            CdpEndpoint::validate(
+                "wss://127.0.0.1:9222",
+                Tunnel::AgentConnector,
+                Some([1u8; 32])
+            )
+            .unwrap_err(),
+            EndpointError::AgentConnectorRequiresWs
+        );
+        assert_eq!(
+            CdpEndpoint::validate(
+                "ws://127.0.0.1:9222",
+                Tunnel::AgentConnector,
+                Some([1u8; 32])
+            )
+            .unwrap_err(),
+            EndpointError::AgentConnectorRejectsPeerPin
+        );
+        assert!(Tunnel::from_config("agent_connector").is_some());
     }
 
     #[test]

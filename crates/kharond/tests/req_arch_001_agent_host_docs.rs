@@ -209,6 +209,17 @@ fn code_blocks(text: &str) -> Vec<String> {
     blocks
 }
 
+/// Names the path (B) guide and script may use for the connector binary
+/// and its config directory. Stripped before the "no kharon" scan so the
+/// connector is allowed and a vault binary still is not (REQ-ARCH-001).
+fn scrub_connector_names(text: &str) -> String {
+    text.replace("kharon-agent-connector", "")
+        .replace("provision-connector.sh", "")
+        .replace("/etc/kharon-connector", "")
+        .replace("/var/lib/kharon-connector", "")
+        .replace("kharon-connector", "")
+}
+
 fn guide_problems(guide: &str, script: &str) -> Vec<String> {
     let Some(section) = agent_host_section(guide) else {
         return vec!["the guide has no \"## Agent host\" section".to_owned()];
@@ -224,11 +235,143 @@ fn guide_problems(guide: &str, script: &str) -> Vec<String> {
         }
     }
     for block in code_blocks(section) {
-        let lower = block.to_lowercase();
+        let lower = scrub_connector_names(&block).to_lowercase();
         for word in FORBIDDEN {
             if lower.contains(word) {
                 problems.push(format!("an agent-host command names {word:?}: {block}"));
             }
+        }
+    }
+    problems
+}
+
+const CONNECTOR_PACKAGES: &[&str] = &["chromium", "fonts-liberation"];
+const CONNECTOR_FILE_PREFIXES: &[&str] = &[
+    "/etc/chromium/policies/managed/",
+    "/etc/sysctl.d/",
+    "/etc/systemd/system/",
+    "/etc/kharon-connector/",
+];
+const CONNECTOR_EXEC: &[&str] = &["/usr/bin/chromium", "/usr/local/bin/kharon-agent-connector"];
+const CONNECTOR_INSTALL: &[&str] = &[
+    "/var/lib/browser",
+    "/var/lib/kharon-connector",
+    "/etc/kharon-connector",
+    "/usr/local/bin/kharon-agent-connector",
+    "/etc/kharon-connector/token",
+];
+/// After connector names are stripped, path (B) code must not name these.
+const CONNECTOR_FORBIDDEN: &[&str] = &[
+    "kharon",
+    "kharond",
+    "bitwarden",
+    "vaultwarden",
+    "api_key",
+    "kh_agent_",
+    "token_hash",
+    "wireguard",
+    "wg0",
+    "socat",
+    "cargo",
+    "docker",
+    "curl",
+    "wget",
+    "51820",
+];
+
+fn connector_script_problems(script: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let lines = code_lines(script);
+    let mut packages = BTreeSet::new();
+    let mut in_put_file_def = false;
+    for line in &lines {
+        let scrubbed = scrub_connector_names(line).to_lowercase();
+        for word in CONNECTOR_FORBIDDEN {
+            if scrubbed.contains(word) {
+                problems.push(format!("names {word:?}: {line}"));
+            }
+        }
+        if line.starts_with("put_file()") {
+            in_put_file_def = true;
+            continue;
+        }
+        if in_put_file_def {
+            if line == "}" {
+                in_put_file_def = false;
+            }
+            continue;
+        }
+        let words: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || "|;&()".contains(c))
+            .filter(|w| !w.is_empty())
+            .collect();
+        for cmd in FORBIDDEN_COMMANDS {
+            if words.first() == Some(cmd) || line.contains(&format!("| {cmd} ")) {
+                problems.push(format!("runs {cmd}: {line}"));
+            }
+        }
+        if let Some(pos) = words.iter().position(|w| *w == "put_file") {
+            match words.get(pos + 1) {
+                Some(path)
+                    if CONNECTOR_FILE_PREFIXES
+                        .iter()
+                        .any(|p| path.starts_with(p) && !path.contains("..")) => {}
+                other => problems.push(format!("writes {other:?}: {line}")),
+            }
+        }
+        if words.first() == Some(&"install") {
+            let dest = words.iter().rev().find(|w| w.starts_with('/'));
+            match dest {
+                Some(path) if CONNECTOR_INSTALL.contains(path) => {}
+                other => problems.push(format!("installs {other:?}: {line}")),
+            }
+        }
+        if let Some(pos) = words.iter().position(|w| *w == "apt-get")
+            && words.get(pos + 1) == Some(&"install")
+        {
+            packages.extend(
+                words[pos + 2..]
+                    .iter()
+                    .filter(|w| !w.starts_with('-'))
+                    .map(|w| (*w).to_owned()),
+            );
+        }
+        if let Some(exec) = line.strip_prefix("ExecStart=") {
+            let prog = exec.split_whitespace().next().unwrap_or("");
+            if !CONNECTOR_EXEC.contains(&prog) {
+                problems.push(format!("unit starts {prog:?}"));
+            }
+        }
+    }
+    for pkg in &packages {
+        if !CONNECTOR_PACKAGES.contains(&pkg.as_str()) {
+            problems.push(format!("installs package {pkg:?}"));
+        }
+    }
+    if packages.is_empty() {
+        problems.push("installs no packages".to_owned());
+    }
+    if !script.contains("127.0.0.1") {
+        problems.push("does not bind CDP to loopback".to_owned());
+    }
+    problems
+}
+
+fn connector_guide_problems(guide: &str, script: &str) -> Vec<String> {
+    let Some(section) = agent_host_section(guide) else {
+        return vec!["the guide has no \"## Agent host\" section".to_owned()];
+    };
+    let mut problems = Vec::new();
+    if !section.contains("deploy/agent-host/provision-connector.sh") {
+        problems.push("the agent-host section does not link provision-connector.sh".to_owned());
+    }
+    if !section.contains("No `wg0`") && !section.contains("No WireGuard") {
+        problems.push("path B does not say there is no WireGuard".to_owned());
+    }
+    for path in put_file_paths(script) {
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        if !section.contains(name) {
+            problems.push(format!("the agent-host section does not list {path}"));
         }
     }
     problems
@@ -249,6 +392,44 @@ fn req_arch_001_guide_agent_host_steps_match_the_script() {
     let script = repo_file("deploy/agent-host/provision.sh");
     let problems = guide_problems(&guide, &script);
     assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn req_arch_001_connector_script_installs_only_chromium_and_tunnel_config() {
+    let script = repo_file("deploy/agent-host/provision-connector.sh");
+    let problems = connector_script_problems(&script);
+    assert!(problems.is_empty(), "{problems:#?}");
+    let guide = repo_file("docs/deployment.md");
+    let guide_problems = connector_guide_problems(&guide, &script);
+    assert!(guide_problems.is_empty(), "{guide_problems:#?}");
+}
+
+#[test]
+fn req_arch_001_connector_checker_rejects_vault_material_and_wireguard() {
+    let good = repo_file("deploy/agent-host/provision-connector.sh");
+    let bad_scripts = [
+        good.replace(
+            "chromium fonts-liberation",
+            "chromium fonts-liberation wireguard-tools",
+        ),
+        good.replace(
+            "/usr/local/bin/kharon-agent-connector",
+            "/usr/local/bin/kharond",
+        ),
+        format!("{good}\ncurl -o /tmp/x https://example.net/x\n"),
+        good.replace(
+            "ExecStart=/usr/local/bin/kharon-agent-connector",
+            "ExecStart=/usr/bin/wg-quick",
+        ),
+        format!("{good}\nprintf 'token_hash = \"x\"\\n'\n"),
+    ];
+    for (i, bad) in bad_scripts.iter().enumerate() {
+        assert_ne!(bad, &good, "bad script {i} did not change the script");
+        assert!(
+            !connector_script_problems(bad).is_empty(),
+            "bad script {i} passed the checker"
+        );
+    }
 }
 
 #[test]

@@ -91,6 +91,12 @@ async fn serve(cfg: Config) -> ExitCode {
     match daemon.local_addr() {
         Ok(addr) => {
             eprintln!("kharond: agent API listening on {addr} (locked)");
+            if daemon.agent_api_tls() {
+                eprintln!("kharond: agent API TLS enabled");
+            }
+            if let Some(connector) = daemon.connector_addr() {
+                eprintln!("kharond: agent connector listening on {connector}");
+            }
             eprintln!("kharond: owner socket {}", daemon.owner_socket().display());
             if let Some(ui) = daemon.owner_ui_addr() {
                 let origin = daemon.owner_ui_origin().unwrap_or("");

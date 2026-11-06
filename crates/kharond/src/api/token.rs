@@ -42,8 +42,12 @@ use zeroize::Zeroizing;
 
 use crate::config::AgentConfig;
 
-/// Every token starts with this.
+/// Every agent API token starts with this.
 pub const TOKEN_PREFIX: &str = "kh_agent_";
+/// Every connector tunnel credential starts with this. Distinct from
+/// [`TOKEN_PREFIX`] so a tunnel token is not an agent API token and the
+/// connector refuses to load one (REQ-ARCH-001).
+pub const TUNNEL_PREFIX: &str = "kh_tunnel_";
 /// Random bytes per token (hex-encoded: twice as many characters).
 pub const TOKEN_RANDOM_BYTES: usize = 32;
 
@@ -142,7 +146,16 @@ pub fn valid_agent_id(id: &str) -> bool {
 /// The agent id a token claims, if it is well-formed. Says nothing
 /// about whether the token is valid.
 pub fn claimed_agent_id(token: &str) -> Option<&str> {
-    let rest = token.strip_prefix(TOKEN_PREFIX)?;
+    claimed_id(token, TOKEN_PREFIX)
+}
+
+/// The agent id a tunnel credential claims, if it is well-formed.
+pub fn claimed_tunnel_agent_id(token: &str) -> Option<&str> {
+    claimed_id(token, TUNNEL_PREFIX)
+}
+
+fn claimed_id<'a>(token: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = token.strip_prefix(prefix)?;
     let (id, random) = rest.rsplit_once('_')?;
     let random_ok = random.len() == 2 * TOKEN_RANDOM_BYTES
         && random
@@ -177,11 +190,26 @@ pub fn generate(agent_id: &str) -> (Secret<String>, String) {
 
 /// [`generate`] with explicit Argon2 parameters (tests use cheap ones).
 pub fn generate_with(argon: &Argon2<'_>, agent_id: &str) -> (Secret<String>, String) {
+    generate_prefixed(argon, TOKEN_PREFIX, agent_id)
+}
+
+/// Mint a tunnel credential (`kh_tunnel_<id>_<random>`) and its Argon2id
+/// hash (the `connector_token_hash` config value). Not an agent API token.
+pub fn generate_tunnel(agent_id: &str) -> (Secret<String>, String) {
+    generate_prefixed(&Argon2::default(), TUNNEL_PREFIX, agent_id)
+}
+
+/// [`generate_tunnel`] with explicit Argon2 parameters (tests use cheap ones).
+pub fn generate_tunnel_with(argon: &Argon2<'_>, agent_id: &str) -> (Secret<String>, String) {
+    generate_prefixed(argon, TUNNEL_PREFIX, agent_id)
+}
+
+fn generate_prefixed(argon: &Argon2<'_>, prefix: &str, agent_id: &str) -> (Secret<String>, String) {
     assert!(valid_agent_id(agent_id), "invalid agent id");
     let mut random = Zeroizing::new([0u8; TOKEN_RANDOM_BYTES]);
     OsRng.fill_bytes(random.as_mut());
     let token = Zeroizing::new(format!(
-        "{TOKEN_PREFIX}{agent_id}_{}",
+        "{prefix}{agent_id}_{}",
         Zeroizing::new(hex::encode(random.as_ref())).as_str()
     ));
     let hash = hash_with(argon, &token);
@@ -192,6 +220,9 @@ pub fn generate_with(argon: &Argon2<'_>, agent_id: &str) -> (Secret<String>, Str
 pub struct TokenStore {
     hashes: BTreeMap<String, PasswordHashString>,
     decoy: PasswordHashString,
+    /// `kh_agent_` or `kh_tunnel_`. A token with the other prefix never
+    /// verifies against this store.
+    prefix: &'static str,
 }
 
 impl std::fmt::Debug for TokenStore {
@@ -208,7 +239,7 @@ impl TokenStore {
     pub fn new<'a>(
         hashes: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<Self, TokenStoreError> {
-        Self::with_floor(hashes, &ParamFloor::PRODUCTION)
+        Self::with_floor_and_prefix(hashes, &ParamFloor::PRODUCTION, TOKEN_PREFIX)
     }
 
     /// [`TokenStore::new`] with an explicit parameter floor. The daemon
@@ -217,6 +248,15 @@ impl TokenStore {
     pub fn with_floor<'a>(
         hashes: impl IntoIterator<Item = (&'a str, &'a str)>,
         floor: &ParamFloor,
+    ) -> Result<Self, TokenStoreError> {
+        Self::with_floor_and_prefix(hashes, floor, TOKEN_PREFIX)
+    }
+
+    /// [`with_floor`] for a chosen token prefix.
+    pub fn with_floor_and_prefix<'a>(
+        hashes: impl IntoIterator<Item = (&'a str, &'a str)>,
+        floor: &ParamFloor,
+        prefix: &'static str,
     ) -> Result<Self, TokenStoreError> {
         let mut map = BTreeMap::new();
         for (agent, phc) in hashes {
@@ -249,7 +289,11 @@ impl TokenStore {
         let decoy = PasswordHash::new(&decoy_hash)
             .expect("invariant: freshly generated PHC parses")
             .serialize();
-        Ok(Self { hashes: map, decoy })
+        Ok(Self {
+            hashes: map,
+            decoy,
+            prefix,
+        })
     }
 
     /// From the config's `[agents.*]` tables (REQ-API-003), at the
@@ -262,6 +306,21 @@ impl TokenStore {
         )
     }
 
+    /// Tunnel credentials for agents with `via = agent_connector`.
+    pub fn from_connector_agents(
+        agents: &BTreeMap<String, AgentConfig>,
+    ) -> Result<Self, TokenStoreError> {
+        Self::with_floor_and_prefix(
+            agents.iter().filter_map(|(id, a)| {
+                a.connector_token_hash
+                    .as_ref()
+                    .map(|h| (id.as_str(), h.expose().as_str()))
+            }),
+            &ParamFloor::PRODUCTION,
+            TUNNEL_PREFIX,
+        )
+    }
+
     /// Configured agent ids.
     pub fn agents(&self) -> impl Iterator<Item = &str> {
         self.hashes.keys().map(String::as_str)
@@ -271,7 +330,7 @@ impl TokenStore {
     /// authenticates. CPU-bound (one Argon2id evaluation): async
     /// callers run it on a blocking thread.
     pub fn authenticate(&self, token: &str) -> Result<String, AuthError> {
-        let claimed = claimed_agent_id(token);
+        let claimed = claimed_id(token, self.prefix);
         let (stored, agent) = match claimed.and_then(|id| self.hashes.get_key_value(id)) {
             Some((id, h)) => (h, Some(id)),
             None => (&self.decoy, None),
@@ -281,6 +340,16 @@ impl TokenStore {
             .is_ok();
         match (ok, agent) {
             (true, Some(id)) => Ok(id.clone()),
+            _ => Err(AuthError),
+        }
+    }
+
+    /// Verify `token` as the tunnel credential for exactly `agent_id`.
+    /// A token whose prefix or claimed id does not match still costs one
+    /// Argon2id evaluation (the decoy), and the error carries no detail.
+    pub fn authenticate_for(&self, agent_id: &str, token: &str) -> Result<(), AuthError> {
+        match self.authenticate(token) {
+            Ok(id) if id == agent_id => Ok(()),
             _ => Err(AuthError),
         }
     }
@@ -344,6 +413,37 @@ mod tests {
         assert!(!hash.contains(t.as_str()));
         let store = TokenStore::with_floor([("assistant", hash.as_str())], &TEST_FLOOR).unwrap();
         assert_eq!(store.authenticate(t).unwrap(), "assistant");
+    }
+
+    #[test]
+    fn req_arch_002_tunnel_credential_is_not_an_agent_token() {
+        let (tunnel, hash) = generate_tunnel_with(&cheap(), "assistant");
+        let presented = tunnel.expose_secret();
+        assert!(presented.starts_with("kh_tunnel_assistant_"));
+        assert_eq!(claimed_tunnel_agent_id(presented), Some("assistant"));
+        assert_eq!(claimed_agent_id(presented), None);
+        let api = TokenStore::with_floor([("assistant", hash.as_str())], &TEST_FLOOR).unwrap();
+        assert!(api.authenticate(presented).is_err());
+        let connector = TokenStore::with_floor_and_prefix(
+            [("assistant", hash.as_str())],
+            &TEST_FLOOR,
+            TUNNEL_PREFIX,
+        )
+        .unwrap();
+        assert!(connector.authenticate_for("assistant", presented).is_ok());
+        assert!(connector.authenticate_for("other", presented).is_err());
+        let (agent_tok, agent_hash) = generate_with(&cheap(), "assistant");
+        let confused = TokenStore::with_floor_and_prefix(
+            [("assistant", agent_hash.as_str())],
+            &TEST_FLOOR,
+            TUNNEL_PREFIX,
+        )
+        .unwrap();
+        assert!(
+            confused
+                .authenticate_for("assistant", agent_tok.expose_secret())
+                .is_err()
+        );
     }
 
     #[test]

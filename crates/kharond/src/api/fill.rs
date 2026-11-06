@@ -33,7 +33,8 @@ use url::Url;
 use super::error::{ApiError, Detail};
 use crate::cdp::fill::DEFAULT_FILL_DEADLINE;
 use crate::cdp::{
-    AgentContext, Browser, CdpClient, CdpEndpoint, FieldKind, FillEngine, FillOutcome, FillPlan,
+    AgentContext, Browser, CdpClient, CdpDial, CdpEndpoint, FieldKind, FillEngine, FillOutcome,
+    FillPlan, Tunnel,
 };
 use crate::config::{AgentConfig, PolicyConfig};
 
@@ -657,6 +658,7 @@ type Live = Option<Cached>;
 
 struct AgentBrowser {
     endpoint: CdpEndpoint,
+    hub: Option<Arc<crate::connector::Hub>>,
     live: Arc<tokio::sync::Mutex<Live>>,
     /// A copy of `*live`, updated whenever it changes, for readers that
     /// must not wait on a connect in flight (`kharon_status`, #65). A
@@ -688,6 +690,7 @@ impl ConnectingCdpBackend {
                         id.into(),
                         AgentBrowser {
                             endpoint,
+                            hub: None,
                             live: Arc::new(tokio::sync::Mutex::new(None)),
                             published: Arc::new(std::sync::Mutex::new(None)),
                         },
@@ -715,6 +718,14 @@ impl ConnectingCdpBackend {
     /// Every `[agents.<id>]` with its validated `cdp` endpoint.
     pub fn from_agents(agents: &BTreeMap<String, AgentConfig>) -> Self {
         Self::new(agents.iter().map(|(id, a)| (id.clone(), a.cdp.clone())))
+    }
+
+    /// Path B: CDP for `via = agent_connector` opens streams on `hub`.
+    pub fn with_connector(mut self, hub: Arc<crate::connector::Hub>) -> Self {
+        for agent in self.agents.values_mut() {
+            agent.hub = Some(Arc::clone(&hub));
+        }
+        self
     }
 }
 
@@ -758,11 +769,25 @@ impl AgentBrowser {
             tokio::spawn(async move { teardown(stale, &agent, teardown_budget).await });
         }
         let endpoint = self.endpoint.clone();
+        let dial = match endpoint.tunnel {
+            Tunnel::AgentConnector => {
+                let Some(hub) = self.hub.clone() else {
+                    return Err(FillOutcome::Error(
+                        "agent connector is not configured".into(),
+                    ));
+                };
+                CdpDial::Connector {
+                    hub,
+                    agent_id: agent_id.to_owned(),
+                }
+            }
+            _ => CdpDial::Tcp,
+        };
         let agent_id = agent_id.to_owned();
         let current = Arc::clone(current);
         let published = Arc::clone(&self.published);
         let connect = tokio::spawn(async move {
-            let opened = open_agent_browser(&endpoint, &agent_id, budget, generation).await?;
+            let opened = open_agent_browser(&endpoint, &agent_id, budget, generation, dial).await?;
             // Checked while holding the agent's lock: a lock that bumps
             // the generation after this point queues its teardown behind
             // us and finds the entry we store.
@@ -843,9 +868,11 @@ async fn open_agent_browser(
     agent_id: &str,
     budget: Duration,
     generation: u64,
+    dial: CdpDial,
 ) -> Result<Cached, String> {
     let until = tokio::time::Instant::now() + budget;
-    let client = match tokio::time::timeout_at(until, CdpClient::connect(endpoint)).await {
+    let client = match tokio::time::timeout_at(until, CdpClient::connect_via(endpoint, &dial)).await
+    {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => return Err(e.to_string()),
         Err(_) => return Err("cdp connect timed out".into()),

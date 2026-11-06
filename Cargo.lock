@@ -1001,6 +1001,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kharon-agent-connector"
+version = "0.0.0"
+dependencies = [
+ "kharon-connector",
+ "serde",
+ "tokio",
+ "toml",
+ "zeroize",
+]
+
+[[package]]
 name = "kharon-bwcrypto"
 version = "0.0.0"
 dependencies = [
@@ -1036,6 +1047,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kharon-connector"
+version = "0.0.0"
+dependencies = [
+ "base64ct",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "zeroize",
+]
+
+[[package]]
 name = "kharond"
 version = "0.0.0"
 dependencies = [
@@ -1052,6 +1078,7 @@ dependencies = [
  "hmac",
  "httpdate",
  "kharon-bwcrypto",
+ "kharon-connector",
  "kharond",
  "nix",
  "pbkdf2",

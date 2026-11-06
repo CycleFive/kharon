@@ -205,8 +205,10 @@ pub enum ConfigError {
         /// Agent id.
         agent: String,
     },
-    /// `cdp.via` is not one of direct, wireguard, ssh, mtls.
-    #[error("agents.{agent}.cdp.via `{via}` is not one of direct, wireguard, ssh, mtls")]
+    /// `cdp.via` is not one of direct, wireguard, ssh, mtls, agent_connector.
+    #[error(
+        "agents.{agent}.cdp.via `{via}` is not one of direct, wireguard, ssh, mtls, agent_connector"
+    )]
     UnknownTunnel {
         /// Agent id.
         agent: String,
@@ -295,8 +297,75 @@ pub enum ConfigError {
     )]
     ApiListenInvalid,
     /// `api.listen` is a wildcard (unspecified) address (REQ-DEP-006).
-    #[error("`api.listen` is a wildcard address; bind the WireGuard interface address instead")]
+    #[error(
+        "`api.listen` is a wildcard address; bind a specific unicast address (WireGuard on path A, the TLS address on path B)"
+    )]
     ApiWildcardBind,
+    /// Path B forbids plain HTTP on a non-loopback agent API (REQ-DEP-006).
+    #[error(
+        "`api.listen` is plain HTTP on a non-loopback address while an agent uses via = agent_connector; set api.tls_cert_file and api.tls_key_file"
+    )]
+    ApiPlainHttpNonLoopback,
+    /// TLS cert and key must be set together.
+    #[error("`{which}` TLS config needs both tls_cert_file and tls_key_file")]
+    TlsMaterialIncomplete {
+        /// `api` or `connector`.
+        which: &'static str,
+    },
+    /// A TLS file could not be read or parsed. `reason` is fixed text.
+    #[error("tls material: {reason}")]
+    TlsMaterial {
+        /// Fixed-text reason.
+        reason: &'static str,
+    },
+    /// `via = agent_connector` without `connector_token_hash`.
+    #[error("agents.{agent}.connector_token_hash is required when cdp.via = agent_connector")]
+    ConnectorTokenMissing {
+        /// Agent id.
+        agent: String,
+    },
+    /// `connector_token_hash` on an agent that is not path B.
+    #[error("agents.{agent}.connector_token_hash is only valid when cdp.via = agent_connector")]
+    ConnectorTokenUnexpected {
+        /// Agent id.
+        agent: String,
+    },
+    /// `connector_token_hash` is not an Argon2id PHC string.
+    #[error("agents.{agent}.connector_token_hash must be an Argon2id PHC string ($argon2id$...)")]
+    ConnectorTokenHashNotArgon2id {
+        /// Agent id.
+        agent: String,
+    },
+    /// `connector_token_hash` is Argon2id but below the parameter floor.
+    #[error(
+        "agent `{agent}`: connector_token_hash Argon2id parameters are below the floor \
+         (need m >= 19456, t >= 2, p >= 1); regenerate with `kharon tunnel mint`"
+    )]
+    ConnectorTokenHashWeak {
+        /// Agent id.
+        agent: String,
+    },
+    /// An agent uses `agent_connector` but `[connector]` is absent.
+    #[error("via = agent_connector requires [connector] listen, tls_cert_file, and tls_key_file")]
+    ConnectorMissing,
+    /// `[connector]` is set but no agent uses it.
+    #[error("[connector] is set but no agent has cdp.via = agent_connector")]
+    ConnectorUnexpected,
+    /// Connector listen is not `<ip>:<port>`.
+    #[error("`connector.listen` must be an IP literal and port")]
+    ConnectorListenInvalid,
+    /// Connector listen is a wildcard.
+    #[error("`connector.listen` is a wildcard address")]
+    ConnectorWildcardBind,
+    /// Connector listen is not unicast.
+    #[error("`connector.listen` must be a unicast address")]
+    ConnectorListenNotUnicast,
+    /// Connector TLS files are missing.
+    #[error("[connector] requires tls_cert_file and tls_key_file")]
+    ConnectorTlsMissing,
+    /// The connector and the agent API cannot share a socket.
+    #[error("[connector].listen and [api].listen must be different addresses")]
+    ConnectorListenConflict,
     /// `api.listen` is a multicast or broadcast address.
     #[error("`api.listen` must be a unicast address")]
     ApiListenNotUnicast,
@@ -371,6 +440,13 @@ impl ConfigError {
                 EndpointError::WssRequiresPeerPin => "cdp_wss_requires_peer_pin",
                 EndpointError::UnknownTunnel(_) => "unknown_tunnel",
                 EndpointError::BadHost => "cdp_bad_host",
+                EndpointError::AgentConnectorRequiresWs => "cdp_agent_connector_requires_ws",
+                EndpointError::AgentConnectorRequiresLoopback => {
+                    "cdp_agent_connector_requires_loopback"
+                }
+                EndpointError::AgentConnectorRejectsPeerPin => {
+                    "cdp_agent_connector_rejects_peer_pin"
+                }
             },
             Self::InvalidDuration { .. } => "invalid_duration",
             Self::ZeroDuration { .. } => "zero_duration",
@@ -384,6 +460,20 @@ impl ConfigError {
             Self::TokenHashWeakParams { .. } => "token_hash_weak_params",
             Self::ApiListenInvalid => "api_listen_invalid",
             Self::ApiWildcardBind => "api_wildcard_bind",
+            Self::ApiPlainHttpNonLoopback => "api_plain_http_non_loopback",
+            Self::TlsMaterialIncomplete { .. } => "tls_material_incomplete",
+            Self::TlsMaterial { .. } => "tls_material",
+            Self::ConnectorTokenMissing { .. } => "connector_token_missing",
+            Self::ConnectorTokenUnexpected { .. } => "connector_token_unexpected",
+            Self::ConnectorTokenHashNotArgon2id { .. } => "connector_token_hash_not_argon2id",
+            Self::ConnectorTokenHashWeak { .. } => "connector_token_hash_weak_params",
+            Self::ConnectorMissing => "connector_missing",
+            Self::ConnectorUnexpected => "connector_unexpected",
+            Self::ConnectorListenInvalid => "connector_listen_invalid",
+            Self::ConnectorWildcardBind => "connector_wildcard_bind",
+            Self::ConnectorListenNotUnicast => "connector_listen_not_unicast",
+            Self::ConnectorTlsMissing => "connector_tls_missing",
+            Self::ConnectorListenConflict => "connector_listen_conflict",
             Self::ApiListenNotUnicast => "api_listen_not_unicast",
             Self::DataDirNotAbsolute => "data_dir_not_absolute",
             Self::ExportNotPasswordEncrypted => "export_not_password_encrypted",
@@ -575,6 +665,9 @@ pub struct AgentConfig {
     /// Argon2id PHC hash of the agent token (REQ-API-003). Not the token,
     /// but still redacted from `Debug` (offline-attackable).
     pub token_hash: Redacted<String>,
+    /// Argon2id PHC hash of the path-B tunnel credential. Set only when
+    /// `cdp.via = agent_connector`. Not an agent API token.
+    pub connector_token_hash: Option<Redacted<String>>,
     /// Validated CDP endpoint (REQ-ARCH-002).
     pub cdp: CdpEndpoint,
 }
@@ -723,6 +816,9 @@ pub struct Config {
     /// `[api]`: the agent API listener. `None` = not configured; the
     /// daemon refuses to serve (it never picks an address itself).
     pub api: Option<ApiConfig>,
+    /// `[connector]`: the path-B accept listener. `None` unless an agent
+    /// uses `via = agent_connector`.
+    pub connector: Option<ConnectorConfig>,
     /// `data_dir`: persistent state (audit log and keys under `audit/`).
     pub data_dir: PathBuf,
     /// `[owner_ui]`: the WebAuthn owner UI (REQ-APR-005). `None` =
@@ -767,13 +863,35 @@ impl OwnerUiConfig {
 /// Default `data_dir`: the SPEC §9 compose volume (`./kharon/data:/data`).
 pub const DEFAULT_DATA_DIR: &str = "/data";
 
+/// PEM paths for a TLS listener. The private key stays on disk; config
+/// holds the paths, not the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsMaterial {
+    /// PEM certificate (leaf first).
+    pub cert_file: PathBuf,
+    /// PEM private key (PKCS#8 or SEC1).
+    pub key_file: PathBuf,
+}
+
+/// `[connector]`: where agents dial for path B.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorConfig {
+    /// Specific unicast address. Never a wildcard.
+    pub listen: SocketAddr,
+    /// Broker certificate presented to the agent.
+    pub tls: TlsMaterial,
+}
+
 /// `[api]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiConfig {
     /// Agent API listen address (REQ-DEP-006): a specific unicast IP —
-    /// the WireGuard interface address in deployment, loopback in dev.
-    /// Never a wildcard; port 0 (ephemeral) is accepted.
+    /// the WireGuard interface address on path A, a TLS address on path B,
+    /// loopback in dev. Never a wildcard; port 0 (ephemeral) is accepted.
     pub listen: SocketAddr,
+    /// Set when the agent API speaks TLS. Required for path B on a
+    /// non-loopback address. Plain HTTP stays the path A default.
+    pub tls: Option<TlsMaterial>,
 }
 
 impl Config {
@@ -806,6 +924,14 @@ impl Config {
             warnings = keyfile::check_api_key_file(&bw.api_key_file)
                 .map_err(|reason| ConfigError::ApiKeyFile { reason })?;
             bw.sync_client()?;
+        }
+        if let Some(api) = &self.api
+            && let Some(tls) = &api.tls
+        {
+            load_tls(tls)?;
+        }
+        if let Some(connector) = &self.connector {
+            load_tls(&connector.tls)?;
         }
         if let Source::Export(exp) = &self.source {
             // REQ-EXP-002: the export file must classify as a
@@ -853,6 +979,23 @@ impl Config {
         }
         w
     }
+}
+
+/// Read a certificate and private key. The bytes are not retained by
+/// the caller of [`Config::check_startup`]; the daemon loads them again
+/// when it binds. Errors are fixed text (no PEM contents).
+pub fn load_tls(
+    material: &TlsMaterial,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, ConfigError> {
+    let cert = std::fs::read(&material.cert_file).map_err(|_| ConfigError::TlsMaterial {
+        reason: "unreadable certificate",
+    })?;
+    let key = std::fs::read(&material.key_file).map_err(|_| ConfigError::TlsMaterial {
+        reason: "unreadable private key",
+    })?;
+    kharon_connector::server_config_from_pem(&cert, &key).map_err(|_| ConfigError::TlsMaterial {
+        reason: "not a PEM certificate and private key",
+    })
 }
 
 /// Load, validate, and run startup checks: what the daemon does at boot.

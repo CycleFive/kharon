@@ -23,6 +23,16 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # The wg address only; wildcards are refused (REQ-DEP-006).
 listen = "10.66.0.1:8787"
 
+[approval]
+# ntfy is both the approval-prompt channel (REQ-APR-004) and the
+# off-host audit checkpoint sink (REQ-AUD-002): kharond publishes a
+# signed checkpoint to this topic every 100 entries or 10 minutes.
+# Without this section the daemon refuses to start unless
+# [audit] checkpoint_local_only = true is set instead — local-only
+# checkpoints are a temporary pilot posture, not the release one.
+ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit" }
+# token_file = "/run/secrets/ntfy_token"   # if the topic needs auth
+
 # Owner web UI (REQ-APR-005). Loopback only; sign-in is a passkey.
 # ntfy http actions (REQ-APR-004) POST here, for example
 # http://127.0.0.1:8788/owner/approve/<token> (and /owner/deny/...).

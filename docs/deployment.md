@@ -32,6 +32,26 @@ Start from the Compose example in
 from this repository's image next to Vaultwarden, with the agent API
 bound to the WireGuard address only (REQ-DEP-006).
 
+### Audit checkpoints off-host (REQ-AUD-002)
+
+By default kharond pushes a signed audit checkpoint to the
+`[approval].ntfy` topic every 100 entries or 10 minutes (and once
+more at shutdown), so truncating the local audit log is detectable
+against a stream the broker host does not control. Point
+`[approval].ntfy` at an ntfy server you trust (self-hosted is fine)
+and keep the topic access-controlled; `token_file` supplies the
+bearer token when the topic requires one, and startup refuses to
+run if a configured token file cannot be read. The checkpoint
+stream is one JSON checkpoint per ntfy message — save it (ntfy
+server logs or a subscriber) and feed it to
+`kharon audit verify --checkpoints <file>`.
+
+Setting `[audit] checkpoint_local_only = true` instead keeps
+checkpoints in `<data_dir>/audit/checkpoints.jsonl` and logs a
+startup warning. That is a temporary pilot posture, not the
+release one: nothing leaves the host, so a host compromise can
+rewrite both the log and its checkpoints.
+
 ### The kharon account and its master password (REQ-DEP-007)
 
 kharond logs in to a dedicated Bitwarden account with an API key and

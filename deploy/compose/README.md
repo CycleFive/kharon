@@ -42,6 +42,13 @@ docker compose exec kharon kharon status
 - `memlock` is unlimited so `require_mlock` holds, and core dumps are
   off. `cap_add: IPC_LOCK` has no effect for a non-root uid; the
   ulimit is what makes `mlock` succeed.
+- The example config sets `[approval].ntfy`, which is also the
+  off-host audit checkpoint sink (REQ-AUD-002): signed checkpoints
+  are published to that topic every 100 entries or 10 minutes.
+  Fill in a real ntfy server/topic before starting — with no
+  `[approval].ntfy` section kharond refuses to start unless
+  `[audit] checkpoint_local_only = true` is set instead (a temporary
+  pilot posture; see the deployment guide).
 - All capabilities are dropped and `no-new-privileges` is set.
   `security_opt` also points at [`kharon-seccomp.json`](./kharon-seccomp.json)
   (SPEC §9). That file is the Docker/moby **default** seccomp profile

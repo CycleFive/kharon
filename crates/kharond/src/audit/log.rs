@@ -243,15 +243,42 @@ impl AuditLog {
     /// to alarm on, not a reason to keep accepting fills unaudited upstream.
     /// The cadence counters are only reset on a *successful* push, so the
     /// next append retries instead of silently skipping a checkpoint window.
-    fn emit_checkpoint(&mut self) {
-        if self.head_seq == 0 {
-            return;
+    /// Returns whether a checkpoint was delivered.
+    fn emit_checkpoint(&mut self) -> bool {
+        if self.head_seq == 0 || self.since_checkpoint == 0 {
+            return false;
         }
         let cp = Checkpoint::new(self.head_seq, self.head_hash.clone(), &self.keys);
         if self.sink.push(&cp).is_ok() {
             self.since_checkpoint = 0;
             self.last_checkpoint_at = OffsetDateTime::now_utc();
+            true
+        } else {
+            false
         }
+    }
+
+    /// The 10-minute leg of REQ-AUD-002 (#127): emit a checkpoint if
+    /// the configured period has elapsed since the last delivered one
+    /// and entries appended since then are still unanchored. Called by
+    /// the daemon's timer task, so a quiet broker — no appends to piggy
+    /// back on — still anchors its tail within roughly one period.
+    /// Returns whether a checkpoint was delivered.
+    pub fn checkpoint_if_due(&mut self) -> bool {
+        if self.since_checkpoint == 0
+            || OffsetDateTime::now_utc() - self.last_checkpoint_at < self.config.checkpoint_period
+        {
+            return false;
+        }
+        self.emit_checkpoint()
+    }
+
+    /// Emit a checkpoint of the current head right now, if any entry
+    /// is unanchored — the shutdown/lock anchor (#127). A no-op when
+    /// the head is already checkpointed. Returns whether a checkpoint
+    /// was delivered.
+    pub fn checkpoint_now(&mut self) -> bool {
+        self.emit_checkpoint()
     }
 
     pub fn head_seq(&self) -> u64 {
@@ -731,6 +758,53 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn checkpoint_timer_anchors_quiet_tail() {
+        // REQ-AUD-002 10-minute leg (#127): with the count cadence far
+        // away, appends alone deliver nothing; once the period has
+        // elapsed, `checkpoint_if_due` anchors the tail without any
+        // new append, and is a no-op until more entries land.
+        let dir = tempfile::tempdir().unwrap();
+        let cp_path = dir.path().join("checkpoints.jsonl");
+        let cfg = AuditConfig {
+            checkpoint_every: 100,
+            checkpoint_period: Duration::from_millis(50),
+            ..AuditConfig::default()
+        };
+        let mut log = AuditLog::open(
+            dir.path(),
+            cfg,
+            Box::new(super::super::FileCheckpointSink::create(&cp_path).unwrap()),
+        )
+        .unwrap();
+        log.append(Entry::new(Event::List).agent_id("a")).unwrap();
+        log.append(Entry::new(Event::List).agent_id("a")).unwrap();
+        assert!(!log.checkpoint_if_due(), "period has not elapsed yet");
+        assert!(!cp_path.exists() || std::fs::read_to_string(&cp_path).unwrap().is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        assert!(log.checkpoint_if_due(), "due checkpoint must be delivered");
+        let text = std::fs::read_to_string(&cp_path).unwrap();
+        let cps: Vec<super::super::Checkpoint> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].seq, 2, "the quiet tail (both entries) is anchored");
+
+        assert!(!log.checkpoint_if_due(), "nothing new to anchor");
+        assert!(!log.checkpoint_now(), "head already checkpointed");
+
+        log.append(Entry::new(Event::List).agent_id("a")).unwrap();
+        assert!(
+            log.checkpoint_now(),
+            "shutdown anchor delivers the new head"
+        );
+        let text = std::fs::read_to_string(&cp_path).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().last().unwrap().contains("\"seq\":3"));
     }
 
     #[test]

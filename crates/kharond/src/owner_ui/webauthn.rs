@@ -301,6 +301,10 @@ fn parse_cose_p256(bytes: &[u8]) -> Result<[u8; P256_POINT_LEN], VerifyError> {
     point[0] = 0x04;
     point[1..33].copy_from_slice(&x);
     point[33..65].copy_from_slice(&y);
+    // Shape only. The point is not checked to lie on P-256, so an
+    // off-curve point can be stored. Assertion verification then
+    // fails closed: aws-lc rejects a point that is not on the curve.
+    // Registration still requires an enrollment code or a session.
     Ok(point)
 }
 

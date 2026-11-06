@@ -641,6 +641,93 @@ async fn req_apr_005_virtual_authenticator_login() {
     run.shutdown().await;
 }
 
+/// Enroll a software passkey and sign in. Returns the `Cookie` value.
+async fn enroll_and_sign_in(run: &Running) -> String {
+    let origin = &run.origin;
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    assert_eq!(minted["ok"], json!(true), "{minted}");
+    let token = minted["enroll_token"].as_str().unwrap();
+    let mut auth = VirtAuth::new();
+    let opts = http(
+        run.ui,
+        origin,
+        Http::post("/owner/register/options", None, "").bearer(token),
+    )
+    .await;
+    assert_eq!(opts.status, 200, "{}", opts.body);
+    let opts: Json = serde_json::from_str(&opts.body).unwrap();
+    auth.user_handle = b64url_dec(opts["publicKey"]["user"]["id"].as_str().unwrap());
+    let ceremony = opts["ceremony_id"].as_str().unwrap();
+    let challenge = opts["publicKey"]["challenge"].as_str().unwrap();
+    let reg = auth.registration(challenge, origin, "localhost");
+    let body = json!({"ceremony_id": ceremony, "credential": reg}).to_string();
+    let registered = http(
+        run.ui,
+        origin,
+        Http::post("/owner/register/finish", Some("application/json"), &body),
+    )
+    .await;
+    assert_eq!(registered.status, 200, "{}", registered.body);
+    assert!(session_cookie(&registered).is_none());
+
+    let login_opts = http(run.ui, origin, Http::post("/owner/login/options", None, "")).await;
+    assert_eq!(login_opts.status, 200, "{}", login_opts.body);
+    let login_opts: Json = serde_json::from_str(&login_opts.body).unwrap();
+    let ceremony = login_opts["ceremony_id"].as_str().unwrap();
+    let challenge = login_opts["publicKey"]["challenge"].as_str().unwrap();
+    let assertion = auth.assertion(challenge, origin, "localhost");
+    let body = json!({"ceremony_id": ceremony, "credential": assertion}).to_string();
+    let ok = http(
+        run.ui,
+        origin,
+        Http::post("/owner/login/finish", Some("application/json"), &body),
+    )
+    .await;
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    session_cookie(&ok).expect("session cookie")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_logout_replay_is_refused() {
+    let run = start(true).await;
+    let origin = run.origin.clone();
+    let cookie = enroll_and_sign_in(&run).await;
+
+    let who = http(run.ui, &origin, Http::get("/owner/session").cookie(&cookie)).await;
+    assert_eq!(who.status, 200, "login did not stick: {}", who.body);
+
+    let out = http(
+        run.ui,
+        &origin,
+        Http::post("/owner/logout", None, "").cookie(&cookie),
+    )
+    .await;
+    assert_eq!(out.status, 200, "{}", out.body);
+    let cleared = out.header("set-cookie").unwrap();
+    assert!(
+        cleared.starts_with("kharon_owner=") && cleared.contains("Max-Age=0"),
+        "{cleared}"
+    );
+
+    // The browser may have dropped the cookie. A copy of the old one
+    // must still be refused: logout removed the session, not only the
+    // Set-Cookie.
+    let replay = http(run.ui, &origin, Http::get("/owner/session").cookie(&cookie)).await;
+    assert_eq!(
+        replay.status, 401,
+        "revoked cookie still worked: {}",
+        replay.body
+    );
+    assert!(replay.body.contains("unauthenticated"), "{}", replay.body);
+    let home = http(run.ui, &origin, Http::get("/").cookie(&cookie)).await;
+    assert!(
+        !home.body.contains("signed-in"),
+        "revoked cookie still rendered the shell"
+    );
+
+    run.shutdown().await;
+}
+
 fn chromium_bin() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("KHARON_CHROMIUM") {
         return Some(PathBuf::from(p));

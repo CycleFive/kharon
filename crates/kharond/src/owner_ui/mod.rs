@@ -5,7 +5,8 @@
 //! field, no password route, and a JSON body that carries a
 //! `password` key is refused before any session is issued. A session
 //! lasts at most [`SESSION_TTL`] (15 minutes, SPEC §5) and is an
-//! `HttpOnly; SameSite=Strict` cookie.
+//! `HttpOnly; SameSite=Strict` cookie. Logout drops that session
+//! on the server; clearing the cookie alone does not end it.
 //!
 //! Registering the first passkey is not a login. The owner socket
 //! (same-uid) mints a single-use enrollment code via `passkey_enroll`;
@@ -23,7 +24,7 @@
 //! | POST | `/owner/login/finish` | Finish it; sets the session cookie |
 //! | POST | `/owner/register/options` | Begin registration |
 //! | POST | `/owner/register/finish` | Store the passkey; no session |
-//! | POST | `/owner/logout` | Clear the session cookie |
+//! | POST | `/owner/logout` | Revoke the session and clear the cookie |
 //! | GET | `/owner/session` | Shell JSON, or 401 |
 //!
 //! Responses use fixed error codes only (REQ-API-006). Failed login
@@ -321,7 +322,7 @@ impl OwnerUi {
             "/owner/login/finish" => self.login_finish(&req),
             "/owner/register/options" => self.register_options(&req),
             "/owner/register/finish" => self.register_finish(&req),
-            "/owner/logout" => self.logout(),
+            "/owner/logout" => self.logout(&req),
             _ => unreachable!("path was matched above"),
         }
     }
@@ -544,7 +545,11 @@ impl OwnerUi {
         )
     }
 
-    fn logout(&self) -> Response {
+    /// End the session named by the request cookie, then clear it.
+    /// A copied token must not keep working until [`SESSION_TTL`].
+    /// Logout with no cookie still clears the cookie and succeeds.
+    fn logout(&self, req: &Incoming) -> Response {
+        self.revoke_session(req.cookie.as_deref());
         json_body(
             StatusCode::OK,
             json!({"ok": true}).to_string(),
@@ -663,14 +668,23 @@ impl OwnerUi {
     }
 
     fn session_alive(&self, cookie_header: Option<&str>) -> bool {
-        let Some(token) = cookie_value(cookie_header, SESSION_COOKIE) else {
+        let Some(hash) = session_hash(cookie_header) else {
             return false;
         };
-        let hash = sha256(token.as_bytes());
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         guard.retain(|s| s.expires > now);
         guard.iter().any(|s| ct_eq(&s.hash, &hash))
+    }
+
+    /// Remove the session that matches this cookie, expired or not.
+    /// Other sessions stay. A missing or unknown cookie is a no-op.
+    fn revoke_session(&self, cookie_header: Option<&str>) {
+        let Some(hash) = session_hash(cookie_header) else {
+            return;
+        };
+        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|s| !ct_eq(&s.hash, &hash));
     }
 
     fn store_credential(&self, cred: RegisteredCredential) -> std::io::Result<()> {
@@ -779,6 +793,11 @@ fn header_str(headers: &axum::http::HeaderMap, name: header::HeaderName) -> Opti
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
+}
+
+fn session_hash(cookie_header: Option<&str>) -> Option<[u8; 32]> {
+    let token = cookie_value(cookie_header, SESSION_COOKIE)?;
+    Some(sha256(token.as_bytes()))
 }
 
 fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
@@ -1164,5 +1183,60 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
         assert!(!ui.session_alive(None));
+    }
+
+    #[test]
+    fn req_apr_005_logout_removes_only_the_presented_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = OwnerUi::open(
+            dir.path(),
+            "localhost",
+            "http://localhost:9",
+            Arc::new(StaticShell(ShellView {
+                locked: true,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+        )
+        .unwrap();
+        let kept = ui.issue_session();
+        let dropped = ui.issue_session();
+        let kept_header = kept.split(';').next().unwrap().to_owned();
+        let dropped_header = dropped.split(';').next().unwrap().to_owned();
+        let response = ui.dispatch(Incoming {
+            method: Method::POST,
+            path: "/owner/logout".into(),
+            cookie: Some(dropped_header.clone()),
+            origin: Some("http://localhost:9".into()),
+            authorization: None,
+            content_type: None,
+            body: Vec::new(),
+        });
+        assert_eq!(response.status(), StatusCode::OK);
+        let cleared = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(
+            !ui.session_alive(Some(&dropped_header)),
+            "logout left the session in place"
+        );
+        assert!(
+            ui.session_alive(Some(&kept_header)),
+            "logout revoked a different session"
+        );
+        let replay = ui.dispatch(Incoming {
+            method: Method::GET,
+            path: "/owner/session".into(),
+            cookie: Some(dropped_header),
+            origin: None,
+            authorization: None,
+            content_type: None,
+            body: Vec::new(),
+        });
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
 }

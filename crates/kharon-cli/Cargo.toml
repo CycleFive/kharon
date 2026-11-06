@@ -21,9 +21,10 @@ tokio = { version = "1", features = ["rt", "signal"] }
 serde_json = "1.0"
 zeroize = "1"
 # Terminal echo control for the unlock password prompt (tty, no
-# echo; SPEC §8), and the owner socket's uid check. Safe wrappers
-# only, the same rustix kharond already uses.
-rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net"] }
+# echo; SPEC §8), the owner socket's uid check, and the OS RNG for
+# `kharon init`'s master password (REQ-DEP-007). Safe wrappers only,
+# the same rustix kharond already uses.
+rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net", "rand"] }
 kharond = { path = "../kharond", version = "0.0.0" }
 
 [dev-dependencies]

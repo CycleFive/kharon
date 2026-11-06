@@ -2,15 +2,21 @@
 
 `docker-compose.yml` runs kharond from the repository's `Dockerfile`
 next to a Vaultwarden server (REQ-DEP-001, REQ-DEP-002). It is an
-example to adapt, not a hardened deployment.
+example to adapt, not a hardened deployment. The
+[deployment guide](../../docs/deployment.md) covers the rest: the
+kharon account's master password, the WireGuard link, and setting up
+the agent host.
 
 ## Run it
 
 ```sh
 cd deploy/compose
+docker compose build kharon
+docker run --rm -it --entrypoint kharon kharon:local init  # the account's master password, shown once
+# create the kharon account with it, then its org, collection and API key (see the guide)
 cp kharon.toml.example kharon.toml        # then edit: org, collections, agents, CDP endpoint
 cp /path/to/bw-api-key.json secrets/kharon_bw_api_key.json
-docker compose up -d --build
+docker compose up -d
 docker compose exec kharon kharon unlock  # owner unlock, master password on the tty
 docker compose exec kharon kharon status
 ```
@@ -36,7 +42,7 @@ docker compose exec kharon kharon status
 The CDP endpoint in `kharon.toml` is used as written, so it must be
 the agent host's full browser WebSocket URL
 (`ws://<agent-host>:9222/devtools/browser/<id>`), which changes each
-time Chromium starts.
+time Chromium starts; the guide shows how to read it.
 
 ## The E2E overlay
 

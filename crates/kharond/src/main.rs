@@ -94,7 +94,9 @@ async fn serve(cfg: Config) -> ExitCode {
             eprintln!("kharond: owner socket {}", daemon.owner_socket().display());
             if let Some(ui) = daemon.owner_ui_addr() {
                 let origin = daemon.owner_ui_origin().unwrap_or("");
-                eprintln!("kharond: owner UI listening on {ui} (origin {origin})");
+                eprintln!(
+                    "kharond: owner UI listening on {ui} (origin {origin}; ntfy approve/deny on this address)"
+                );
             }
         }
         Err(e) => {

@@ -27,8 +27,11 @@
 //!    (REQ-ARCH-005) are made by its first fill, so startup does not
 //!    depend on the browser being reachable.
 //! 8. Owner socket (issue #11): the unix-socket unlock channel
-//!    ([`crate::owner`]) is bound under `data_dir`, and the agent
-//!    API listener is bound last.
+//!    ([`crate::owner`]) is bound under `data_dir`. When `[owner_ui]`
+//!    is set, that loopback listener also serves ntfy redeem
+//!    (`/owner/approve/<token>`, `/owner/deny/<token>`; REQ-DEP-006,
+//!    #136). The agent API listener is bound last and leaves those
+//!    paths unrouted.
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
@@ -828,8 +831,10 @@ impl Daemon {
         let owner_ops = Arc::clone(&self.owner_ops);
         let owner = tokio::spawn(crate::owner::serve(self.owner_listener, self.owner_ops));
         let owner_ui = self.owner_ui.map(|(listener, ui)| {
+            let broker = Arc::clone(&self.broker);
+            let redeem: Arc<dyn crate::api::http::ApprovalRedeemer> = broker;
             tokio::spawn(async move {
-                let _ = crate::owner_ui::serve(listener, ui).await;
+                let _ = crate::owner_ui::serve(listener, ui, redeem).await;
             })
         });
         let served = http::serve_with_shutdown(self.listener, self.broker, shutdown).await;

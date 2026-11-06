@@ -14,7 +14,7 @@
 //! session, and does not set a session cookie. Signing in still
 //! requires an assertion.
 //!
-//! Routes (the complete set):
+//! Fixed routes (no token in the path):
 //!
 //! | Method | Path | |
 //! |---|---|---|
@@ -26,6 +26,12 @@
 //! | POST | `/owner/register/finish` | Store the passkey; no session |
 //! | POST | `/owner/logout` | Revoke the session and clear the cookie |
 //! | GET | `/owner/session` | Shell JSON, or 401 |
+//!
+//! The same listener serves ntfy redeem (REQ-APR-004, REQ-DEP-006,
+//! #136): `GET`/`POST` `/owner/approve/<token>` and
+//! `/owner/deny/<token>`. GET confirms and POST decides. There is no
+//! session cookie; the token is the credential. A used or expired
+//! token is 410. Those paths are absent from the agent API.
 //!
 //! Responses use fixed error codes only (REQ-API-006). Failed login
 //! and enrollment attempts are audited as `owner_auth_fail`.
@@ -51,6 +57,9 @@ use zeroize::Zeroizing;
 
 use self::store::PasskeyStore;
 use self::webauthn::{RegisteredCredential, b64url_decode, b64url_encode, ct_eq};
+use crate::api::http::{
+    ApprovalRedeemer, OWNER_APPROVE_PREFIX, OWNER_DENY_PREFIX, dispatch_owner_approval,
+};
 
 /// SPEC §5: an owner web session is at most 15 minutes.
 pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -63,8 +72,10 @@ pub const CEREMONY_TTL: Duration = Duration::from_secs(120);
 /// stored; the server keeps its SHA-256.
 const SESSION_COOKIE: &str = "kharon_owner";
 
-/// Every route this UI serves. Tests assert none of them is a
-/// password login.
+/// Fixed routes this UI serves (no token in the path). Tests assert
+/// none of them is a password login. ntfy redeem is the
+/// `/owner/approve/<token>` and `/owner/deny/<token>` prefixes on
+/// this same listener.
 pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/"),
     ("GET", "/enroll"),
@@ -224,32 +235,53 @@ impl OwnerUi {
     }
 }
 
+/// Owner UI plus the ntfy redeem routes on one listener.
+struct OwnerServer {
+    ui: Arc<OwnerUi>,
+    redeem: Arc<dyn ApprovalRedeemer>,
+}
+
 /// Serve until the future is dropped.
-pub async fn serve(listener: TcpListener, ui: Arc<OwnerUi>) -> std::io::Result<()> {
-    axum::serve(listener, router(ui)).await
+///
+/// `redeem` handles `/owner/approve/<token>` and `/owner/deny/<token>`
+/// on this listener (REQ-DEP-006, #136). Those requests skip the
+/// WebAuthn origin check so an ntfy client can POST its action.
+pub async fn serve(
+    listener: TcpListener,
+    ui: Arc<OwnerUi>,
+    redeem: Arc<dyn ApprovalRedeemer>,
+) -> std::io::Result<()> {
+    axum::serve(listener, router(ui, redeem)).await
 }
 
 /// [`serve`], returning once `shutdown` resolves.
 pub async fn serve_with_shutdown<F>(
     listener: TcpListener,
     ui: Arc<OwnerUi>,
+    redeem: Arc<dyn ApprovalRedeemer>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, router(ui))
+    axum::serve(listener, router(ui, redeem))
         .with_graceful_shutdown(shutdown)
         .await
 }
 
-fn router(ui: Arc<OwnerUi>) -> Router {
-    Router::new().fallback(handle).with_state(ui)
+fn router(ui: Arc<OwnerUi>, redeem: Arc<dyn ApprovalRedeemer>) -> Router {
+    let state = Arc::new(OwnerServer { ui, redeem });
+    Router::new().fallback(handle).with_state(state)
 }
 
-async fn handle(State(ui): State<Arc<OwnerUi>>, req: Request) -> Response {
+async fn handle(State(state): State<Arc<OwnerServer>>, req: Request) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    if path.starts_with(OWNER_APPROVE_PREFIX) || path.starts_with(OWNER_DENY_PREFIX) {
+        let redeem = Arc::clone(&state.redeem);
+        return dispatch_owner_approval(redeem, method, path).await;
+    }
+    let ui = Arc::clone(&state.ui);
     let headers = req.headers().clone();
     let cookie = header_str(&headers, header::COOKIE);
     let origin = header_str(&headers, header::ORIGIN);
@@ -260,7 +292,6 @@ async fn handle(State(ui): State<Arc<OwnerUi>>, req: Request) -> Response {
         Ok(b) => b.to_vec(),
         Err(_) => return respond(StatusCode::PAYLOAD_TOO_LARGE, "bad_request", None),
     };
-    let ui = Arc::clone(&ui);
     let joined = tokio::task::spawn_blocking(move || {
         ui.dispatch(Incoming {
             method,

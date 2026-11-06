@@ -147,6 +147,10 @@ impl ApprovalTokenStore {
     /// owner surfaces that render or send them. Tokens that are used
     /// or expired are omitted; a request with no live pair yields
     /// `None`.
+    ///
+    /// Follow-up #128: these paths are relative. The publisher's
+    /// absolute URL uses the owner listener's address (`[owner_ui]
+    /// listen`), which is where the routes are served (#136).
     pub fn paths_for(&self, request_id: &str, now: Duration) -> Option<(String, String)> {
         let mut approve = None;
         let mut deny = None;

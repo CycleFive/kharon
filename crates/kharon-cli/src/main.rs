@@ -1,5 +1,8 @@
 //! kharon owner CLI.
 //!
+//! Owner tool: unlock/lock/status, audit verify, revoke, unsuspend, panic.
+//! (Approve/deny also land via the owner socket; CLI approve/deny land
+//! with the web/ntfy surfaces.)
 //! The full surface (approve/deny, grants, revoke, panic, …) lands
 //! with the daemon milestones; this binary currently provides the
 //! audit verifier, REQ-AUD-001/002's "owner or offline tool can
@@ -65,9 +68,49 @@ enum Command {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
+    /// Revoke a grant, or an agent until the daemon restarts (REQ-REV-001).
+    #[command(subcommand)]
+    Revoke(RevokeCommand),
+    /// Clear an agent's suspension (REQ-RL-002). Does not un-revoke.
+    Unsuspend {
+        /// Agent id.
+        agent_id: String,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Panic: lock, zeroize, revoke all grants, close CDP (REQ-REV-002).
+    Panic {
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
     /// Generate the kharon account's master password (REQ-DEP-007)
     /// and print it once to the terminal.
     Init,
+}
+
+#[derive(Subcommand)]
+enum RevokeCommand {
+    /// Revoke one grant by id.
+    Grant {
+        /// `g_…` grant id.
+        id: String,
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Revoke an agent's token and grants until the daemon restarts.
+    ///
+    /// The flag is in-memory for the life of the process. `kharon
+    /// unsuspend` does not clear it, and there is no un-revoke
+    /// command. The token hash stays in the token store, so
+    /// restarting the daemon lets the agent authenticate again.
+    Agent {
+        /// Agent id.
+        id: String,
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -352,6 +395,28 @@ fn owner_command(command: &Command) -> ExitCode {
         }
         Command::Lock { socket } => (socket, Zeroizing::new("{\"op\":\"lock\"}".to_owned())),
         Command::Status { socket } => (socket, Zeroizing::new("{\"op\":\"status\"}".to_owned())),
+        Command::Revoke(RevokeCommand::Grant { id, socket }) => (
+            socket,
+            Zeroizing::new(format!(
+                "{{\"op\":\"revoke_grant\",\"grant_id\":{}}}",
+                serde_json::to_string(id).expect("string")
+            )),
+        ),
+        Command::Revoke(RevokeCommand::Agent { id, socket }) => (
+            socket,
+            Zeroizing::new(format!(
+                "{{\"op\":\"revoke_agent\",\"agent_id\":{}}}",
+                serde_json::to_string(id).expect("string")
+            )),
+        ),
+        Command::Unsuspend { agent_id, socket } => (
+            socket,
+            Zeroizing::new(format!(
+                "{{\"op\":\"unsuspend\",\"agent_id\":{}}}",
+                serde_json::to_string(agent_id).expect("string")
+            )),
+        ),
+        Command::Panic { socket } => (socket, Zeroizing::new("{\"op\":\"panic\"}".to_owned())),
         Command::Audit(_) | Command::Init => unreachable!(),
     };
     match owner_request(socket, &request) {
@@ -465,9 +530,12 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => init_command(),
-        Command::Unlock { .. } | Command::Lock { .. } | Command::Status { .. } => {
-            owner_command(&cli.command)
-        }
+        Command::Unlock { .. }
+        | Command::Lock { .. }
+        | Command::Status { .. }
+        | Command::Revoke(_)
+        | Command::Unsuspend { .. }
+        | Command::Panic { .. } => owner_command(&cli.command),
         Command::Audit(AuditCommand::Verify { data, checkpoints }) => {
             let key_path = data.join("keys").join("audit_sign.pub");
             let key_bytes = match std::fs::read(&key_path) {

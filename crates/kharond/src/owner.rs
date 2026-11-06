@@ -19,6 +19,14 @@
 //!   the future web UI) is the only way in.
 //! - `{"op":"lock"}` — lock now, destroying the session.
 //! - `{"op":"status"}` — `{"ok":true,"locked":<bool>}`.
+//! - `{"op":"revoke_grant","grant_id":"g_…"}` — REQ-REV-001.
+//! - `{"op":"revoke_agent","agent_id":"…"}` — REQ-REV-001 (token +
+//!   grants). In-memory until the daemon process exits; `unsuspend`
+//!   does not clear it, and there is no un-revoke op. The token hash
+//!   stays in the store, so a restart accepts the token again.
+//! - `{"op":"unsuspend","agent_id":"…"}` — REQ-RL-002 owner reset of
+//!   a suspension. Does not restore a revoked token.
+//! - `{"op":"panic"}` — REQ-REV-002.
 //! - `{"op":"grants"}` — `{"ok":true,"pending":[…]}`: the pending
 //!   grant requests (SPEC §5, #20), each as the approval prompt an
 //!   owner decides on — the request id, agent, item, action, and the
@@ -155,6 +163,35 @@ pub trait OwnerOps: Send + Sync + 'static {
     fn pending_grants(&self) -> impl Future<Output = Vec<crate::api::ApprovalPrompt>> + Send {
         async { Vec::new() }
     }
+
+    /// Revoke one grant (REQ-REV-001). Default: unsupported.
+    fn revoke_grant(
+        &self,
+        grant_id: String,
+    ) -> impl Future<Output = Result<bool, OwnerFailure>> + Send {
+        let _ = grant_id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Revoke an agent (token + grants; REQ-REV-001). Default: unsupported.
+    fn revoke_agent(
+        &self,
+        agent_id: String,
+    ) -> impl Future<Output = Result<usize, OwnerFailure>> + Send {
+        let _ = agent_id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Clear suspension (REQ-RL-002). Default: unsupported.
+    fn unsuspend(&self, agent_id: String) -> impl Future<Output = Result<(), OwnerFailure>> + Send {
+        let _ = agent_id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Panic lock (REQ-REV-002). Default: unsupported.
+    fn panic_lock(&self) -> impl Future<Output = Result<(), OwnerFailure>> + Send {
+        async { Err(OwnerFailure::Unsupported) }
+    }
 }
 
 /// Owner-chosen approval terms from an `approve` request line.
@@ -245,6 +282,12 @@ struct Request {
     /// Grant ops: use-cap override.
     #[serde(default)]
     max_uses: Option<u64>,
+    /// Revoke / unsuspend: grant id.
+    #[serde(default)]
+    grant_id: Option<String>,
+    /// Revoke agent / unsuspend: agent id.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 /// The socket path for a daemon with this `data_dir`.
@@ -603,6 +646,43 @@ async fn dispatch<O: OwnerOps>(
                 Err(e) => error_response(e.code()),
             }
         }
+        "revoke_grant" => {
+            let Some(grant_id) = req.grant_id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.revoke_grant(grant_id).await {
+                Ok(true) => ok_response(None),
+                Ok(false) => error_response("not_found"),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "revoke_agent" => {
+            let Some(agent_id) = req.agent_id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.revoke_agent(agent_id).await {
+                Ok(n) => {
+                    let mut out =
+                        serde_json::json!({ "ok": true, "grants_revoked": n }).to_string();
+                    out.push('\n');
+                    out
+                }
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "unsuspend" => {
+            let Some(agent_id) = req.agent_id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.unsuspend(agent_id).await {
+                Ok(()) => ok_response(None),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "panic" => match ops.panic_lock().await {
+            Ok(()) => ok_response(Some(true)),
+            Err(e) => error_response(e.code()),
+        },
         "scan" => scan_response(req),
         _ => error_response("unknown_op"),
     }

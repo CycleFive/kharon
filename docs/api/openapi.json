@@ -445,7 +445,8 @@
               "bad_request",
               "not_found",
               "method_not_allowed",
-              "audit_failed"
+              "audit_failed",
+              "rate_limited"
             ]
           },
           "detail": {
@@ -667,7 +668,8 @@
               "target_not_owned",
               "not_found",
               "timeout",
-              "error"
+              "error",
+              "rate_limited"
             ]
           },
           "fields_filled": {

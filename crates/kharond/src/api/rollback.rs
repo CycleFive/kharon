@@ -22,6 +22,11 @@ pub struct RollbackGuard {
     seen_sets: BTreeSet<[u8; 32]>,
     /// Fingerprint of the most recent accepted sync.
     last_set: Option<[u8; 32]>,
+    /// Item ids of the most recent accepted sync. Used so a pure
+    /// deletion (new ids ⊆ last ids) that happens to recreate an
+    /// earlier fingerprint is not a false rollback; items *coming
+    /// back* after deletion against a previously seen fingerprint is.
+    last_ids: BTreeSet<String>,
 }
 
 /// Why a sync was refused as a rollback.
@@ -72,12 +77,20 @@ impl RollbackGuard {
             }
         }
         let set = set_fingerprint(vault);
-        if self.seen_sets.contains(&set) && self.last_set.is_some_and(|last| last != set) {
+        let new_ids: BTreeSet<String> = vault.items().map(|i| i.id().to_owned()).collect();
+        // A fingerprint revisit is a rollback only when items reappear
+        // (new ids not ⊆ last ids). Pure deletions that recreate an
+        // earlier fingerprint (add → delete) must not lock the broker.
+        if self.seen_sets.contains(&set)
+            && self.last_set.is_some_and(|last| last != set)
+            && !new_ids.is_subset(&self.last_ids)
+        {
             return Err(RollbackReason::SetRegressed);
         }
         self.high_water = proposed_hw;
         self.seen_sets.insert(set);
         self.last_set = Some(set);
+        self.last_ids = new_ids;
         Ok(())
     }
 
@@ -143,13 +156,25 @@ mod tests {
     fn req_rev_004_revisiting_an_earlier_set_is_rollback() {
         let mut g = RollbackGuard::new();
         let a = vault(vec![item("a", Some("2026-11-05T10:00:00Z"))]);
-        let b = vault(vec![
+        // A disjoint set (item a replaced by item b) — not a pure deletion.
+        let b = vault(vec![item("b", Some("2026-11-05T10:00:00Z"))]);
+        assert!(g.observe(&a).is_ok());
+        assert!(g.observe(&b).is_ok());
+        // Restoring the earlier snapshot brings `a` back (not ⊆ {b}).
+        assert_eq!(g.observe(&a), Err(RollbackReason::SetRegressed));
+    }
+
+    #[test]
+    fn req_rev_004_pure_deletion_that_recreates_an_earlier_fingerprint_is_ok() {
+        let mut g = RollbackGuard::new();
+        let a = vault(vec![item("a", Some("2026-11-05T10:00:00Z"))]);
+        let ab = vault(vec![
             item("a", Some("2026-11-05T10:00:00Z")),
             item("b", Some("2026-11-05T10:00:00Z")),
         ]);
         assert!(g.observe(&a).is_ok());
-        assert!(g.observe(&b).is_ok());
-        // Same content as the first sync → set fingerprint revisit.
-        assert_eq!(g.observe(&a), Err(RollbackReason::SetRegressed));
+        assert!(g.observe(&ab).is_ok());
+        // Delete b → fingerprint equals the first sync, but ids ⊆ last.
+        assert!(g.observe(&a).is_ok());
     }
 }

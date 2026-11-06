@@ -46,7 +46,7 @@ A1: plaintext secrets of items in the kharon collection. A2: kharon account mast
 
 ### 2.3 Trust boundaries
 
-B1 agent ↔ broker API: authN with agent token, authZ with grants. B2 broker ↔ Chromium: mTLS/WireGuard tunnel, CDP. B3 broker ↔ Vaultwarden: TLS, Bitwarden API. B4 owner ↔ broker: approval channel with owner authN. B5 renderer page ↔ field value: not enforceable by kharon.
+B1 agent ↔ broker API: authN with agent token, authZ with grants. B2 broker ↔ Chromium: authenticated encrypted tunnel (WireGuard/mTLS or agent-initiated TLS reverse), CDP. B3 broker ↔ Vaultwarden: TLS, Bitwarden API. B4 owner ↔ broker: approval channel with owner authN. B5 renderer page ↔ field value: not enforceable by kharon.
 
 ### 2.4 Protects / does not protect
 
@@ -73,12 +73,17 @@ B1 agent ↔ broker API: authN with agent token, authZ with grants. B2 broker �
 
 ```
  owner hw                                     agent host
-┌──────────────────────────┐   WireGuard/mTLS   ┌─────────────────────────┐
-│ vaultwarden  ◄─TLS─ kharond ├──── CDP (ws) ─────►│ chromium (user: browser) │
-│                 │  ▲  ▲   │                    │   ▲ CDP (agent session)  │
+┌──────────────────────────┐  WG / mTLS /       ┌─────────────────────────┐
+│ vaultwarden  ◄─TLS─ kharond │  agent-connector  │ chromium (user: browser) │
+│                 │  ▲  ▲   ├──── CDP (ws) ─────►│   ▲ CDP (agent session)  │
 │                 │  │  └─ approvals (ntfy/web/CLI)  │ agent (user: agent)     │
-│                 │  └── MCP/HTTP (agent token) ◄──┤                         │
+│                 │  └── MCP/HTTP (agent token) ◄──┤  (path B: agent dials)  │
 └──────────────────────────┘                    └─────────────────────────┘
+
+Two transport classes for B2 (REQ-ARCH-002):
+  (A) WireGuard/mTLS — broker dials agent host (capable hosts).
+  (B) agent-connector — agent holds outbound TLS; broker CDP rides the reverse
+      path (egress-shaped hosts: outbound TCP/TLS only, no UDP / CAP_NET_ADMIN).
 ```
 
 ### 3.1 Bitwarden account and crypto model
@@ -163,12 +168,17 @@ Risks:
 
 (a) is the stronger boundary. Plaintext and all policy code stay on owner hardware. The only new thing on the agent host is a path into a browser the agent already drives, so it adds no agent-reachable component that holds secrets or credentials to the broker. (b) adds a local privileged peer whose isolation depends on the agent host's Unix permissions, which the threat model assumes are partly compromised. Both share the N1 limit.
 
-Recommendation: (a). Chromium runs as OS user `browser` with `--remote-debugging-port` bound to 127.0.0.1, or `--remote-debugging-pipe` behind a small root-owned relay. The broker reaches it through WireGuard (preferred) or an `ssh -R`/mTLS stunnel. The agent keeps its own CDP session (Playwright/puppeteer `connectOverCDP`). kharon opens a separate CDP session. Running as a separate user does not stop the agent attaching to CDP, because it does that already. It does stop the agent reading the profile dir and `/proc/<pid>/mem` (`ptrace_scope`).
+Recommendation: (a). Chromium runs as OS user `browser` with `--remote-debugging-port` bound to 127.0.0.1, or `--remote-debugging-pipe` behind a small root-owned relay. The broker reaches CDP through one of two transport classes (both satisfy REQ-ARCH-002):
+
+- **(A) WireGuard / mTLS stunnel / `ssh -R`** — broker dials the agent host. Preferred when the agent host can accept or peer a tunnel (UDP/WG or inbound TCP).
+- **(B) Agent-initiated connector** — a non-secret-bearing tunnel client on the agent host dials the broker over outbound HTTPS/TLS (proxy-friendly); the broker's CDP client rides that reverse path to `127.0.0.1:9222`. Preferred when the agent host is egress-shaped (outbound TCP/TLS only, NAT/proxy, no UDP egress, no `CAP_NET_ADMIN`). This is the connector pattern used by systems kharon is modeled on.
+
+The agent keeps its own CDP session (Playwright/puppeteer `connectOverCDP`). kharon opens a separate CDP session. Running as a separate user does not stop the agent attaching to CDP, because it does that already. It does stop the agent reading the profile dir and `/proc/<pid>/mem` (`ptrace_scope`).
 
 | ID | Requirement | AC |
 |---|---|---|
-| REQ-ARCH-001 | No kharon binary or secret-bearing config on the agent host. | The deployment guide's agent-host steps install only Chromium flags and tunnel config. CI checks the docs. |
-| REQ-ARCH-002 | Broker ↔ CDP traffic is authenticated and encrypted. | Plain `ws://` to a non-loopback address is refused at config load. A tunnel test with a wrong peer key fails to connect. |
+| REQ-ARCH-001 | No vault-secret-bearing kharon binary or config on the agent host. Allowed: Chromium flags, cdp-relay, WireGuard/mTLS peer config, or a minimal agent-connector that holds only tunnel credentials to the broker (never vault keys, agent API tokens, or master-password material). | The deployment guide's agent-host steps install only Chromium flags and tunnel/connector config. CI checks the docs. |
+| REQ-ARCH-002 | Broker ↔ CDP traffic is authenticated and encrypted over a supported transport: WireGuard, mTLS stunnel, `ssh -R`, or an agent-initiated TLS connector (`cdp.via`). | Plain `ws://` to a non-loopback address is refused at config load (REQ-DEP-003). A tunnel/connector test with a wrong peer key or wrong agent identity fails to connect. Unauthenticated reverse paths are refused. |
 | REQ-ARCH-003 | Broker uses its own CDP session and never enables domains that echo secrets to other sessions. | In an E2E with a second CDP client subscribed to `Runtime`, `Log`, `Network`, and `Page`, the canary is not received by the second client during fill. Mutation observers in page JS are excluded per N1. The second client does receive `Runtime.executionContextCreated` for the broker's isolated world (expected, since context creation is visible), but zero canary bytes appear in any event or response it receives (byte search over its full CDP transcript). |
 | REQ-ARCH-005 | Target ownership. The broker creates one browser context per agent (`Target.createBrowserContext`) and hands the agent its `browserContextId` via `kharon_context` / `POST /v1/context` (#65): the call connects if needed (the broker stays lazy, no connect at startup), creates or returns the agent's cached context, and replies `browser_context_id`. It is idempotent while the CDP connection lives; a reconnect or a lock invalidates the id (the next call returns a new one, and fills into tabs of the old context get `target_not_owned`). It is lock-gated (`423` while locked), runs under the `fill_deadline`, and is audited like a fill (`context_open` before any CDP write, then exactly one `context` outcome; REQ-AUD-003†). `kharon_status` reports the cached id or `null` and never connects. `fill` is accepted only if `cdp_target_id` is in the requesting agent's context. Targets in the default context are refused unless `allow_default_context=true`, for single-agent setups. | E2E: agent A fills into a tab in agent B's context → `target_not_owned`. Default-context tab with the flag off → refused. Daemon + CDP stub: no connection before the first `kharon_context`; two calls → same id, one `createBrowserContext`; after a reconnect or lock+unlock → new id; `423` while locked; `status.browser_context_id` is `null` before the first call and after invalidation. |
 | REQ-ARCH-004 | Chromium launched with password manager and autofill save disabled. | Profile `Login Data` contains 0 rows after 10 fills. |
@@ -354,7 +364,10 @@ organization_id = "uuid"
 collection_ids = ["uuid"]
 [agents.assistant]
 token_hash = "$argon2id$..."
+# Path (A) capable host:
 cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
+# Path (B) egress-shaped host (agent dials broker; CDP over reverse TLS):
+# cdp = { endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }
 [policy]
 idle_lock = "30m"
 max_unlocked = "12h"
@@ -372,10 +385,10 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 | REQ-DEP-002 | Compose example runs E2E against Vaultwarden. | CI job: compose up, then a seeded fixture fills a test page through headless Chromium. |
 | REQ-DEP-003 | Config validated at startup. Unsafe combos refused (non-loopback plain CDP, standing grants without flag, missing mlock). | Table of bad configs → each exits non-zero with a specific error. |
 | REQ-DEP-004 | Official Bitwarden compatibility tested. | A manual or nightly job against a cloud test account passes REQ-CRY-005. Result recorded in `COMPAT.md`. |
-| REQ-DEP-006 | Agent API binds only to the configured WireGuard interface address. Owner API binds to loopback or a unix socket. Wildcard binds are refused. | Config with `0.0.0.0` → startup error. `ss -ltn` in E2E shows only the expected addresses. |
+| REQ-DEP-006 | Agent API bind rules by transport class. **(A)** When `cdp.via` is WireGuard/mTLS, the agent API binds only to the configured WireGuard (or tunnel) interface address. **(B)** When `cdp.via = "agent_connector"`, the agent API binds to a configured TLS-capable listen address reached by the agent over outbound HTTPS (bearer agent token); plain-HTTP non-loopback listens are refused. Owner API binds to loopback or a unix socket in both classes. Wildcard binds (`0.0.0.0` / `::`) are refused. | Config with `0.0.0.0` → startup error. Path (A) E2E: `ss -ltn` shows only the WG address for the agent API. Path (B) E2E: agent reaches API over TLS with a valid token; wrong token / plain HTTP to non-loopback fails. |
 | REQ-DEP-007 | The kharon account master password is generated with ≥ 128 bits of entropy and stored by the owner outside the kharon org. The API-key file plus server access reduces to an offline attack on it. | Guide documents it. `kharon init` generates the password and prints it once to the tty. |
 | REQ-DEP-008 | `api_key_file` should be owned by kharond's effective uid with mode 0400 or 0600. Startup fails (exit 78, `EX_CONFIG`) if it is not a regular file or is group- or world-writable. If it is group- or world-readable or owned by another uid, kharond logs a warning and continues; this accommodates Docker secrets mounted 0444 inside a single-purpose container. | Tempfile tests: 0600/0400 → ok; 0444 → warning; 0620/0602 → exit 78 `api_key_file`; directory → exit 78; foreign owner → warning. |
-| REQ-DEP-005 | Agent-host guide: Chromium as `browser` user, `ptrace_scope=1`, WireGuard peer, password manager disabled. | The doc exists and an Ansible/shell snippet is tested in a VM. |
+| REQ-DEP-005 | Agent-host guide covers both transport classes: Chromium as `browser` user, `ptrace_scope=1`, password manager disabled; **(A)** WireGuard peer + cdp-relay, or **(B)** agent-connector install (outbound TLS dial to broker, no `wg0`, no UDP 51820 listen). | The doc exists. Path (A) snippet tested in a VM (existing). Path (B) snippet tested in CI or a VM with no UDP egress. |
 
 ## 10. Open questions
 
@@ -394,6 +407,7 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 | OQ-11 | Official cloud: new-device verification / captcha on API-key login, `Bitwarden-Client-Version` minimums. |
 | OQ-12 | Resolved: per-agent browser contexts are v1 (REQ-ARCH-005). |
 | OQ-13 | Resolved: dual `MIT OR Apache-2.0` (Lothrop). |
+| OQ-14 | Agent-connector wire (path B): v1 targets a raw TLS reverse (`cdp.via = "agent_connector"`) multiplexed to loopback CDP; SSH-over-Access and DERP-shaped relays remain acceptable alternate `via` values iff they meet REQ-ARCH-002. Exact framing / reconnect / backpressure — pick in the connector implementation issue. |
 
 ## 11. Milestones and issues
 

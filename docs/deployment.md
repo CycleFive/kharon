@@ -7,30 +7,48 @@ kharon runs on two machines (SPEC §3.3, option (a)):
   decrypted items while unlocked.
 - **Agent host.** Where the agent and its Chromium run. It is
   partially trusted (SPEC §2): the agent may be curious or
-  compromised, but root on this host is not. It holds no kharon
-  binary, no kharon config and no vault credential (REQ-ARCH-001).
+  compromised, but root on this host is not. It holds no vault-secret-bearing
+  kharon binary or config and no vault credential (REQ-ARCH-001).
 
-kharond reaches the agent host's Chromium over CDP through a
-WireGuard tunnel and fills forms there. The agent keeps its own CDP
-session to the same browser; kharond never hands it the filled
-values (see the harness policy below for what the agent should not
-read back from the page).
+kharond reaches the agent host's Chromium over CDP through an
+authenticated tunnel and fills forms there. Two transport classes
+(SPEC §3, REQ-ARCH-002 / REQ-DEP-005):
+
+- **(A) WireGuard / mTLS** — broker dials the agent host (capable hosts).
+- **(B) Agent-initiated connector** — the agent host dials the broker
+  over outbound HTTPS/TLS; CDP rides the reverse path (egress-shaped
+  hosts: no UDP egress / no `CAP_NET_ADMIN`).
+
+The agent keeps its own CDP session to the same browser; kharond
+never hands it the filled values (see the harness policy below for
+what the agent should not read back from the page).
 
 ```
+ Path (A) — WireGuard
  broker host (10.66.0.1)                      agent host (10.66.0.2)
  ┌──────────────────────┐   WireGuard   ┌──────────────────────────────┐
  │ kharond ─────────────┼───────────────┼─▶ cdp-relay ─▶ 127.0.0.1:9222│
  │ Vaultwarden          │               │                Chromium      │
  │ owner CLI            │               │ agent ──────▶ (user browser) │
  └──────────────────────┘               └──────────────────────────────┘
+
+ Path (B) — agent-connector (egress-shaped)
+ broker host                                  agent host
+ ┌──────────────────────┐   TLS (agent    ┌──────────────────────────────┐
+ │ kharond ◄────────────┼──── dials out) ─┼─ connector ─▶ 127.0.0.1:9222│
+ │ Vaultwarden          │                 │                Chromium      │
+ │ owner CLI            │   HTTPS API ◄───┼─ agent ────▶ (user browser) │
+ └──────────────────────┘                 └──────────────────────────────┘
 ```
 
 ## Broker host
 
 Start from the Compose example in
 [`deploy/compose`](../deploy/compose/README.md). It runs kharond
-from this repository's image next to Vaultwarden, with the agent API
-bound to the WireGuard address only (REQ-DEP-006).
+from this repository's image next to Vaultwarden. Under path (A) the
+agent API binds to the WireGuard address only; under path (B) it
+binds to a TLS-capable listen address the agent reaches over outbound
+HTTPS (REQ-DEP-006).
 
 ### Audit checkpoints off-host (REQ-AUD-002)
 
@@ -219,6 +237,22 @@ nothing is published either. An `[owner_ui] listen` port of 0
 URLs need the stable configured address.
 
 ## Agent host (REQ-DEP-005)
+
+Transport is dual-path (SPEC REQ-DEP-005 / REQ-ARCH-002):
+
+- **Path (A)** — WireGuard peer + cdp-relay (this section's historical
+  default). Use when the agent host can peer WG (UDP 51820, or a
+  site-to-site path that lands the same).
+- **Path (B)** — agent-connector: install a minimal outbound TLS
+  dialer that authenticates to the broker and relays CDP to
+  `127.0.0.1:9222`. No `wg0`, no UDP listen, no `CAP_NET_ADMIN`.
+  Use when the agent host is egress-shaped. Config:
+  `cdp = { endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }`.
+  The connector binary holds only tunnel credentials (REQ-ARCH-001);
+  Chromium/`browser`/`ptrace_scope`/password-manager rules below still
+  apply.
+
+Path (A) provisioning follows.
 
 The agent host needs four things, and nothing else from kharon
 (REQ-ARCH-001):

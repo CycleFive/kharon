@@ -82,6 +82,44 @@ not something a person chose:
    account's API key and save it as
    `deploy/compose/secrets/kharon_bw_api_key.json`.
 
+### Agent tokens (REQ-API-003)
+
+Each agent has one bearer token, `kh_agent_<id>_<64 hex>`. kharond
+stores only its Argon2id PHC hash (`token_hash`). Mint the token on
+any machine that has the CLI, in an interactive terminal, for
+example from the Compose example's image:
+
+```sh
+docker compose build kharon
+docker run --rm -it --entrypoint kharon kharon:local token mint assistant
+```
+
+The command prints the token once, to the terminal only, and writes
+the `token_hash` to stdout: one line beginning `$argon2id$`. Paste
+that line into `[agents.assistant]`. Put the token in the agent's
+own secret store. kharon does not keep either, and the command
+refuses to run without a terminal.
+
+With a terminal and stdout redirected, the hash goes to the file and
+the token stays on the terminal:
+
+```sh
+kharon token mint assistant > assistant.token_hash
+```
+
+Do not redirect a `docker run -it` session the same way: Docker's
+tty is the client's stdout, so the redirect would capture the token
+too. Copy the hash by hand from that session.
+
+Provisioning is out of band. The daemon is not running yet and is
+not contacted, so this mint does not append `token_create` to the
+audit log (SPEC §7). `kharon revoke agent` still appends
+`token_revoke` while the daemon is running.
+
+The hash must meet the production Argon2id floor (m = 19456 KiB,
+t = 2, p = 1). `kharon token mint` uses that floor. A weaker
+`token_hash` is refused at startup (`token_hash_weak_params`).
+
 ### The broker's WireGuard peer
 
 Give the broker host a WireGuard interface at `10.66.0.1` with the

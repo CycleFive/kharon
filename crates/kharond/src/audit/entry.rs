@@ -24,6 +24,10 @@ pub enum Event {
     GrantRequest,
     GrantIssue,
     GrantRevoke,
+    /// Recognized, but not emitted for v1. Agent tokens are minted out
+    /// of band (`kharon token mint`); the daemon never sees the plaintext,
+    /// so it does not append this event (SPEC §7). The name stays so a
+    /// later in-daemon rotation can use it. [`Event::TokenRevoke`] is emitted.
     TokenCreate,
     TokenRevoke,
     OwnerAuthFail,

@@ -4,8 +4,8 @@
 next to a Vaultwarden server (REQ-DEP-001, REQ-DEP-002). It is an
 example to adapt, not a hardened deployment. The
 [deployment guide](../../docs/deployment.md) covers the rest: the
-kharon account's master password, the WireGuard link, and setting up
-the agent host.
+kharon account's master password, agent tokens, the WireGuard link,
+and setting up the agent host.
 
 ## Run it
 
@@ -14,7 +14,9 @@ cd deploy/compose
 docker compose build kharon
 docker run --rm -it --entrypoint kharon kharon:local init  # the account's master password, shown once
 # create the kharon account with it, then its org, collection and API key (see the guide)
-cp kharon.toml.example kharon.toml        # then edit: org, collections, agents, CDP endpoint
+docker run --rm -it --entrypoint kharon kharon:local token mint assistant
+# token once on the terminal; paste the $argon2id$ token_hash line into kharon.toml
+cp kharon.toml.example kharon.toml        # then edit: org, collections, agents, CDP endpoint, token_hash
 cp /path/to/bw-api-key.json secrets/kharon_bw_api_key.json
 docker compose up -d
 docker compose exec kharon kharon unlock  # owner unlock, master password on the tty

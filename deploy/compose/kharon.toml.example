@@ -11,7 +11,8 @@ organization_id = "00000000-0000-0000-0000-000000000001"
 collection_ids = ["00000000-0000-0000-0000-000000000002"]
 
 [agents.assistant]
-# `kharon` token tooling prints the hash; never put the token here.
+# `kharon token mint assistant` prints the token once (terminal only)
+# and this hash on stdout. Paste the hash here; never put the token here.
 token_hash = "$argon2id$..."
 # The agent host's Chromium (CDP), reached over the WireGuard link.
 # No path: kharond reads the current /devtools/browser/<id> from

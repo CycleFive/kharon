@@ -17,6 +17,19 @@
 //! is the stricter, dependency-free choice). `via = mtls` is terminated
 //! in-crate: the TLS handshake authenticates the peer against the pinned
 //! certificate, so a wrong peer key fails to connect (REQ-ARCH-002 AC).
+//!
+//! Two endpoint forms are accepted (issue #113):
+//!
+//! - **A base address**, `ws://host:port` (no path, as in SPEC §9). On
+//!   every connect kharond asks the browser for its current WebSocket
+//!   path with `GET /json/version` over the same transport, so the
+//!   `/devtools/browser/<id>` that Chromium makes up at each start never
+//!   goes in the config. See [`super::discover`].
+//! - **A full WebSocket URL**, `ws://host:port/devtools/browser/<id>`,
+//!   used as written (the form kharond required before #113).
+//!
+//! Either way the scheme, host and port are the configured ones and are
+//! validated here; discovery only ever supplies a path.
 
 use std::net::IpAddr;
 
@@ -141,6 +154,14 @@ impl CdpEndpoint {
         })
     }
 
+    /// Whether this is a base address (`ws://host:port`, no path), which
+    /// kharond resolves to the browser's current WebSocket URL through
+    /// `/json/version` on each connect (issue #113). A URL with any path
+    /// is used as written.
+    pub fn discovers(&self) -> bool {
+        self.url.path() == "/" && self.url.query().is_none()
+    }
+
     /// Whether kharon terminates TLS for this endpoint itself.
     pub fn terminates_tls(&self) -> bool {
         self.url.scheme() == "wss"
@@ -237,6 +258,34 @@ mod tests {
         let ep =
             CdpEndpoint::validate("wss://10.66.0.2:9222/", Tunnel::Mtls, Some([1u8; 32])).unwrap();
         assert!(ep.terminates_tls());
+    }
+
+    #[test]
+    fn base_address_discovers_full_url_does_not() {
+        for base in ["ws://127.0.0.1:9222", "ws://127.0.0.1:9222/"] {
+            let ep = CdpEndpoint::validate(base, Tunnel::Direct, None).unwrap();
+            assert!(ep.discovers(), "{base}");
+        }
+        for full in [
+            "ws://127.0.0.1:9222/devtools/browser/0f1e2d3c-aaaa-bbbb-cccc-000000000000",
+            "ws://127.0.0.1:9222/devtools/browser",
+            "ws://127.0.0.1:9222/?x=1",
+        ] {
+            let ep = CdpEndpoint::validate(full, Tunnel::Direct, None).unwrap();
+            assert!(!ep.discovers(), "{full}");
+        }
+    }
+
+    #[test]
+    fn req_arch_002_base_address_keeps_the_transport_rules() {
+        // Discovery doesn't loosen REQ-ARCH-002: a bare non-loopback
+        // ws:// base is refused with via = direct like a full URL.
+        assert_eq!(
+            CdpEndpoint::validate("ws://10.66.0.2:9222", Tunnel::Direct, None).unwrap_err(),
+            EndpointError::PlainWsNonLoopback
+        );
+        let ep = CdpEndpoint::validate("ws://10.66.0.2:9222", Tunnel::WireGuard, None).unwrap();
+        assert!(ep.discovers());
     }
 
     #[test]

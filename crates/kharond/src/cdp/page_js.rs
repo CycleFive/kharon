@@ -15,7 +15,7 @@
 //! Failure contract: every refusal throws `Error` whose message is
 //! `kharon:<code>`; the broker reads the code out of
 //! `exceptionDetails.exception.description`. Codes:
-//! `origin_mismatch`, `non_secure`, `field_not_found`.
+//! `origin_mismatch`, `non_secure`, `field_not_found`, `deadline`.
 
 /// Fill function. Arguments, in order:
 /// 1. `specs` — array of `InPageSpec` (any may match; mirrors the
@@ -33,6 +33,18 @@
 ///    successfully, dispatch submit (`form.requestSubmit()` on the
 ///    last element's form, else Enter key events). Never reached on
 ///    any refusal: failures throw before this point.
+/// 5. `budgetMs` — REQ-API-009 page-side relative budget (#118,
+///    design in #75/#117): milliseconds the in-page task may spend,
+///    measured with `performance.now()` sampled at entry in this
+///    isolated world — a relative duration, never a wall clock, and
+///    never a page-reported value the broker trusts (the broker's own
+///    deadline still governs the reply). `0`/absent = no page-side
+///    check. The budget is checked before each field write and
+///    immediately before the submit dispatch; on expiry the written
+///    fields are cleared (as for any failure) and the call throws
+///    `kharon:deadline`, which the broker maps to `timeout`. One
+///    step's overshoot is the residual: a single field write whose
+///    synchronous page handlers never return cannot be preempted.
 ///
 /// Clear-on-failure (SPEC §2, #101): when a field fails after earlier
 /// fields were written, every element this call wrote is blanked
@@ -42,13 +54,22 @@
 ///
 /// Returns `{ results: [{ kind, filled: true }] }` by value.
 pub const FILL_IN_PAGE: &str = r#"
-function fillInPage(specs, fields, expectedTopOrigin, submitRequested) {
+function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs) {
   "use strict";
 
   function fail(code) {
     const e = new Error("kharon:" + code);
     e.kharonCode = code;
     throw e;
+  }
+
+  // REQ-API-009 page-side budget (#118): relative milliseconds from
+  // entry, on the isolated world's own monotonic clock. 0/absent
+  // disables the check entirely (performance.now is not even read).
+  const budget = typeof budgetMs === "number" && budgetMs > 0 ? budgetMs : 0;
+  const startedAt = budget ? performance.now() : 0;
+  function checkBudget() {
+    if (budget && performance.now() - startedAt >= budget) fail("deadline");
   }
 
   function matchOne(spec, loc) {
@@ -153,6 +174,7 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested) {
   let lastFilledElement = null;
   try {
     for (const f of fields) {
+      checkBudget();
       const el = resolveField(f.kind, f.selector);
       if (!el) fail("field_not_found:" + f.kind);
       written.push(el);
@@ -170,6 +192,15 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested) {
   // constraint validation and fires one submit event; the Enter
   // fallback synthesizes what a real keyboard press delivers.
   if (submitRequested && lastFilledElement) {
+    // The important check (#118): a submit is never *dispatched*
+    // after the budget expires. Expiry here is a failure like any
+    // other — the written fields are cleared before the throw.
+    try {
+      checkBudget();
+    } catch (e) {
+      clearWritten(written);
+      throw e;
+    }
     const last = lastFilledElement;
     const form = last.form || (last.closest ? last.closest("form") : null);
     if (form && typeof form.requestSubmit === "function") {
@@ -242,7 +273,12 @@ mod tests {
         assert!(trimmed.starts_with("function fillInPage("), "{trimmed:.60}");
         assert!(!FILL_IN_PAGE.contains("document.title ="), "leak probe");
         // Codes the broker depends on (message is "kharon:" + code):
-        for code in ["origin_mismatch", "non_secure", "field_not_found"] {
+        for code in [
+            "origin_mismatch",
+            "non_secure",
+            "field_not_found",
+            "deadline",
+        ] {
             assert!(FILL_IN_PAGE.contains(code), "missing {code}");
         }
     }
@@ -480,6 +516,164 @@ console.log("ok");
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         for case in ["case A ok", "case B ok", "case C ok"] {
+            assert!(stdout.contains(case), "missing {case} in {stdout}");
+        }
+    }
+
+    /// REQ-API-009 page-side budget (#118, test plan in #117 §6):
+    /// executes the shipped `FILL_IN_PAGE` verbatim in node against a
+    /// stubbed DOM whose `performance.now()` is fake. The first
+    /// field's `input` handler advances the clock (a slow page handler
+    /// runs inside the fill task — the window this budget narrows).
+    ///   A. handler pushes the clock past the budget mid-fill → the
+    ///      later field is never written, the written field is
+    ///      cleared, submit is never dispatched, code is `deadline`;
+    ///   B. clock held under budget → fill + submit complete;
+    ///   C. budget exhausted only after the last write (handler on
+    ///      the last field) → the pre-submit check fires: fields
+    ///      cleared, no submit, code is `deadline`;
+    ///   D. no budget argument (0) → no check at all, however far the
+    ///      clock has run.
+    #[test]
+    fn req_api_009_page_side_budget() {
+        let mut script = String::new();
+        script.push_str(
+            r#"
+class HTMLInputElement {
+  constructor(name) {
+    this._v = "";
+    this.name = name;
+    this.events = [];
+    this.form = null;
+    this.onInput = null;
+  }
+  dispatchEvent(ev) {
+    this.events.push(ev);
+    if (ev.type === "input" && this.onInput) this.onInput();
+    return true;
+  }
+  closest() { return null; }
+}
+Object.defineProperty(HTMLInputElement.prototype, "value", {
+  get() { return this._v; },
+  set(v) { this._v = v; },
+});
+class HTMLTextAreaElement extends HTMLInputElement {}
+class Event { constructor(type, opts) { this.type = type; this.bubbles = !!(opts && opts.bubbles); } }
+class KeyboardEvent extends Event {
+  constructor(type, opts) { super(type, opts);
+    this.key = opts.key; this.code = opts.code; this.keyCode = opts.keyCode; this.which = opts.which;
+  }
+}
+"#,
+        );
+        script.push_str(FILL_IN_PAGE);
+        script.push_str(
+            r#"
+const specs = [{ kind: "host", scheme: "https", origin: "https://accounts.example.com" }];
+const origin = "https://accounts.example.com";
+let now = 0;
+globalThis.performance = { now: () => now };
+
+function setEnv(advanceOn, advanceBy) {
+  now = 0;
+  globalThis.window = { isSecureContext: true, top: { location: { origin } } };
+  globalThis.location = {
+    protocol: "https:", hostname: "accounts.example.com", origin, href: origin + "/login",
+  };
+  const userEl = new HTMLInputElement("user");
+  const passEl = new HTMLInputElement("pass");
+  let submits = 0;
+  const form = { requestSubmit: () => { submits += 1; } };
+  userEl.form = form;
+  passEl.form = form;
+  if (advanceOn === "user") userEl.onInput = () => { now += advanceBy; };
+  if (advanceOn === "pass") passEl.onInput = () => { now += advanceBy; };
+  globalThis.document = {
+    querySelector: (sel) => {
+      if (sel.includes("password")) return passEl;
+      if (sel.includes("email") || sel.includes("username")) return userEl;
+      return null;
+    },
+  };
+  return { userEl, passEl, submits: () => submits };
+}
+const fields = [
+  { kind: "username", selector: null, value: "alice" },
+  { kind: "password", selector: null, value: "s3cret" },
+];
+function attempt(budget) {
+  try {
+    const r = fillInPage(specs, fields, origin, true, budget);
+    return { code: "returned", results: r.results.length };
+  } catch (e) {
+    return { code: (e && e.kharonCode) || e.message, results: 0 };
+  }
+}
+
+// A. First field's handler runs the clock past the budget.
+{
+  const env = setEnv("user", 1000);
+  const out = attempt(100);
+  if (out.code !== "deadline") throw new Error(`A: expected deadline, got ${out.code}`);
+  if (env.passEl._v !== "") throw new Error(`A: later field written: ${env.passEl._v}`);
+  if (env.userEl._v !== "") throw new Error(`A: written field not cleared: ${env.userEl._v}`);
+  if (env.submits() !== 0) throw new Error("A: submit dispatched after expiry");
+  console.log("case A ok");
+}
+
+// B. Under budget: fill and submit complete.
+{
+  const env = setEnv("user", 10);
+  const out = attempt(1000);
+  if (out.code !== "returned" || out.results !== 2) throw new Error(`B: ${JSON.stringify(out)}`);
+  if (env.userEl._v !== "alice" || env.passEl._v !== "s3cret") throw new Error("B: values missing");
+  if (env.submits() !== 1) throw new Error(`B: submits ${env.submits()}`);
+  console.log("case B ok");
+}
+
+// C. Budget expires during the last field's handler: pre-submit check.
+{
+  const env = setEnv("pass", 1000);
+  const out = attempt(100);
+  if (out.code !== "deadline") throw new Error(`C: expected deadline, got ${out.code}`);
+  if (env.submits() !== 0) throw new Error("C: submit dispatched after expiry");
+  if (env.userEl._v !== "" || env.passEl._v !== "") throw new Error("C: fields not cleared");
+  console.log("case C ok");
+}
+
+// D. No budget: the clock is irrelevant.
+{
+  const env = setEnv("user", 100000);
+  const out = attempt(0);
+  if (out.code !== "returned" || out.results !== 2) throw new Error(`D: ${JSON.stringify(out)}`);
+  if (env.submits() !== 1) throw new Error(`D: submits ${env.submits()}`);
+  console.log("case D ok");
+}
+console.log("ok");
+"#,
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kharon_fill_budget_{}.js", std::process::id()));
+        std::fs::write(&path, &script).expect("write harness");
+        let output = std::process::Command::new("node").arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        let output = match output {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node not on PATH; skipping budget harness test");
+                return;
+            }
+            Err(e) => panic!("spawn node: {e}"),
+        };
+        assert!(
+            output.status.success(),
+            "harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for case in ["case A ok", "case B ok", "case C ok", "case D ok"] {
             assert!(stdout.contains(case), "missing {case} in {stdout}");
         }
     }

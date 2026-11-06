@@ -29,7 +29,7 @@
 //! [`FillEngine::fill`] (#73, #77, #88).
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
@@ -95,6 +95,15 @@ pub struct FillPlan {
     /// read it from the browser (REQ-AUD-003†, #67). The broker copies
     /// it into the fill's outcome audit entry.
     pub live_origin: LiveOrigin,
+    /// The REQ-API-009 end-to-end deadline for this fill, when the
+    /// caller runs under one (the broker sets it; engine-level callers
+    /// leave `None`). At dispatch the engine converts what remains of
+    /// it into the page-side relative budget (#118): the in-page call
+    /// gets `remaining − RETURN_MARGIN` as `budgetMs` (margin capped
+    /// at half the remainder), and a remainder that is already gone
+    /// is not dispatched at all — the fill is
+    /// [`FillOutcome::Timeout`] before the call is sent.
+    pub deadline: Option<Instant>,
 }
 
 /// The live origin one fill observed (REQ-AUD-003†, #67): the
@@ -147,13 +156,16 @@ pub enum FillOutcome {
     TargetNotOwned,
     DefaultContextRefused,
     UnknownTarget,
-    /// REQ-API-009: the end-to-end fill deadline expired. Never returned
-    /// by [`FillEngine::fill`] itself: [`crate::api::Broker::fill`] owns
-    /// the deadline and reports this after dropping the engine future
-    /// (no further broker-side CDP writes) and zeroizing the plan. Not a
-    /// guarantee that nothing happened in the page: an in-page fill call
-    /// dispatched before expiry may still fill (and submit) afterwards
-    /// (see [`FillEngine::fill`], #46).
+    /// REQ-API-009: the end-to-end fill deadline expired. Reported by
+    /// [`crate::api::Broker::fill`] after dropping the engine future
+    /// (no further broker-side CDP writes) and zeroizing the plan, and
+    /// also returned by [`FillEngine::fill`] itself when the page-side
+    /// budget (#118) ends the fill: the in-page call threw
+    /// `kharon:deadline`, or the remainder at dispatch was already at
+    /// or under the return margin so the call was never sent. Not a
+    /// guarantee that nothing happened in the page: an in-page fill
+    /// call dispatched before expiry may still complete a step already
+    /// running (see [`FillEngine::fill`], #46).
     Timeout,
     /// REQ-API-007: `fill_totp` refused because the last clock sample
     /// exceeded `clock_skew_refuse`. No CDP call was made.
@@ -284,7 +296,13 @@ impl FillEngine {
     /// `FILL_IN_PAGE` dispatched before the deadline runs the in-page
     /// function to completion: it fills every field **and, when
     /// `plan.submit` is set, submits the form**, possibly *after* the
-    /// broker has replied `timeout`. "Submit not dispatched" holds in the
+    /// broker has replied `timeout`. The page-side relative budget
+    /// (#118) narrows this for an honest-but-slow page: the in-page
+    /// function checks its budget before each field write and before
+    /// the submit dispatch, and aborts (fields cleared) at the first
+    /// step boundary past it — but a single step already running (a
+    /// page handler that never returns) still cannot be preempted.
+    /// "Submit not dispatched" holds in the
     /// strong sense only when the deadline expires before the fill call
     /// is sent (ownership check, attach, frame tree, isolated world);
     /// after that it means "no *separate* submit write is sent", which is
@@ -408,6 +426,7 @@ impl FillEngine {
                 &clear_args,
                 &info.url,
                 plan.submit,
+                plan.deadline,
             )
             .await;
 
@@ -431,6 +450,7 @@ impl FillEngine {
     }
 
     /// Steps 2–4 with the session attached.
+    #[allow(clippy::too_many_arguments)]
     async fn fill_attached(
         &self,
         session: &super::client::CdpSession,
@@ -439,6 +459,7 @@ impl FillEngine {
         clear_args: &[Value],
         live_url: &str,
         submit: bool,
+        deadline: Option<Instant>,
     ) -> FillOutcome {
         // Step 1's frame-tree read: the loader id we'll re-check against.
         let tree = match session.request("Page.getFrameTree", json!({})).await {
@@ -477,6 +498,18 @@ impl FillEngine {
             None => return FillOutcome::Error("createIsolatedWorld lacked context id".into()),
         };
 
+        // #118: convert what is left of the REQ-API-009 deadline into
+        // the page-side relative budget at the last moment, so the
+        // setup above is charged against it. A remainder at or under
+        // the return margin is refused here, before the call is sent
+        // (the broker maps this to the same `timeout` outcome as an
+        // expiry it observed itself).
+        let budget_ms = match page_budget(deadline, Instant::now()) {
+            PageBudget::Exhausted => return FillOutcome::Timeout,
+            PageBudget::Budget(ms) => ms,
+            PageBudget::NoCheck => 0,
+        };
+
         let call = session
             .request_with_timeout(
                 "Runtime.callFunctionOn",
@@ -488,6 +521,7 @@ impl FillEngine {
                         { "value": field_args },
                         { "value": expected_top_origin },
                         { "value": submit },
+                        { "value": budget_ms },
                     ],
                     "returnByValue": true,
                     "awaitPromise": false,
@@ -596,7 +630,13 @@ fn parse_fill_results(result: &Value) -> FillOutcome {
 }
 
 fn classify_exception(description: &str) -> FillOutcome {
-    if description.contains("kharon:origin_mismatch") {
+    if description.contains("kharon:deadline") {
+        // #118: the page-side budget expired and the in-page call
+        // aborted itself (fields cleared, submit not dispatched).
+        // The broker maps this to `timeout` + `fill_timeout`, exactly
+        // as for a deadline it observed itself — no new status value.
+        FillOutcome::Timeout
+    } else if description.contains("kharon:origin_mismatch") {
         FillOutcome::OriginMismatch
     } else if description.contains("kharon:non_secure") {
         FillOutcome::NonSecureContext
@@ -660,6 +700,46 @@ fn expected_origin(href: &str) -> String {
 /// enforced by [`crate::api::Broker::fill`], not by the engine.
 pub const DEFAULT_FILL_DEADLINE: Duration = Duration::from_secs(10);
 
+/// #118: the fixed slice of the remaining deadline the broker keeps
+/// for the fill call's return trip when it converts the remainder
+/// into the page-side budget. A named constant, not config (design
+/// locked in #117 §4): the page aborts this far ahead of the broker's
+/// own deadline, so its `kharon:deadline` reply normally lands before
+/// the broker stops waiting. For a remainder too short to spare the
+/// full margin the margin is capped at half of it (see
+/// [`page_budget`]), so a short-deadline fill still gets a usable
+/// budget instead of none.
+pub const RETURN_MARGIN: Duration = Duration::from_millis(250);
+
+/// The page-side budget for one dispatch (#118).
+#[derive(Debug, PartialEq, Eq)]
+enum PageBudget {
+    /// No deadline on the plan: pass `0` (no page-side check).
+    NoCheck,
+    /// Milliseconds the in-page task may spend.
+    Budget(u64),
+    /// The remainder is already gone: do not dispatch; the fill is a
+    /// timeout before the call is sent.
+    Exhausted,
+}
+
+fn page_budget(deadline: Option<Instant>, now: Instant) -> PageBudget {
+    let Some(deadline) = deadline else {
+        return PageBudget::NoCheck;
+    };
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return PageBudget::Exhausted;
+    }
+    // The budget never exceeds what remains (a submit is never
+    // dispatched past the broker's deadline on the page's clock), and
+    // never collapses to 0 — which the in-page contract reads as "no
+    // check". The margin comes off first, capped at half the
+    // remainder so short deadlines keep a usable budget.
+    let margin = RETURN_MARGIN.min(remaining / 2);
+    PageBudget::Budget(((remaining - margin).as_millis() as u64).max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +764,42 @@ mod tests {
             classify_exception("Error: boom"),
             FillOutcome::Error(_)
         ));
+        // #118: the page-side budget's own code maps to Timeout.
+        assert_eq!(
+            classify_exception("Error: kharon:deadline\n    at fillInPage"),
+            FillOutcome::Timeout
+        );
+    }
+
+    /// #118: the budget conversion — no deadline means no page-side
+    /// check; the margin comes off the remainder (capped at half of
+    /// it, so short deadlines keep a usable budget); only a remainder
+    /// that is already gone is exhausted and must not be dispatched.
+    #[test]
+    fn req_api_009_page_budget_conversion() {
+        let now = Instant::now();
+        assert_eq!(page_budget(None, now), PageBudget::NoCheck);
+        assert_eq!(
+            page_budget(Some(now + Duration::from_secs(10)), now),
+            PageBudget::Budget(9750)
+        );
+        assert_eq!(
+            page_budget(Some(now + RETURN_MARGIN), now),
+            PageBudget::Budget(125)
+        );
+        assert_eq!(
+            page_budget(Some(now + Duration::from_millis(200)), now),
+            PageBudget::Budget(100)
+        );
+        assert_eq!(
+            page_budget(Some(now + Duration::from_millis(1)), now),
+            PageBudget::Budget(1)
+        );
+        assert_eq!(
+            page_budget(Some(now - Duration::from_secs(1)), now),
+            PageBudget::Exhausted
+        );
+        assert_eq!(RETURN_MARGIN, Duration::from_millis(250));
     }
 
     #[test]

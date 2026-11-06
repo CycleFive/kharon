@@ -76,6 +76,9 @@ enum Mode {
     Delay(&'static str, Duration),
     /// Close the WebSocket right after answering the in-page fill.
     CloseAfterFill,
+    /// Answer the in-page fill with a `kharon:deadline` exception
+    /// (#118: the page-side budget aborted the fill in-page).
+    PageDeadline,
 }
 
 #[derive(Clone, Default)]
@@ -97,6 +100,16 @@ impl Stub {
     }
     fn frame_count(&self) -> usize {
         self.frames.lock().unwrap().len()
+    }
+    /// The `arguments` array of the first `Runtime.callFunctionOn`
+    /// frame, if any was sent.
+    fn fill_arguments(&self) -> Option<Value> {
+        self.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m["method"] == "Runtime.callFunctionOn")
+            .map(|m| m["params"]["arguments"].clone())
     }
 }
 
@@ -156,6 +169,13 @@ async fn serve_cdp(mut ws: WebSocketStream<TcpStream>, s: &Stub, mode: Mode, n: 
                 "id": "f1", "loaderId": "l1", "url": URL,
             }, "childFrames": [] } }),
             "Page.createIsolatedWorld" => json!({ "executionContextId": 7 }),
+            "Runtime.callFunctionOn" if mode == Mode::PageDeadline => {
+                json!({
+                    "result": { "type": "object" },
+                    "exceptionDetails": { "exception": { "description":
+                        "Error: kharon:deadline\n    at fillInPage (<anonymous>:1:1)" } },
+                })
+            }
             "Runtime.callFunctionOn" => {
                 let kinds: Vec<Value> = msg["params"]["arguments"][1]["value"]
                     .as_array()
@@ -701,6 +721,47 @@ async fn req_api_009_daemon_backend_respects_fill_deadline() {
             assert!(e[1].get("live_origin").is_none(), "{stall}: {e:?}");
         }
     }
+}
+
+/// #118 on the daemon path: the in-page call carries the page-side
+/// relative budget as its fifth argument (remaining deadline minus
+/// the 250 ms return margin), and a `kharon:deadline` exception reply
+/// — the page aborting itself before the broker's deadline — maps to
+/// the existing outcome: `timeout` reply, `fill_dispatch` plus exactly
+/// one `fill_timeout`, no new status value, no further CDP write.
+#[tokio::test]
+async fn req_api_009_page_deadline_exception_is_timeout() {
+    let (url, stub) = cdp_stub(Mode::PageDeadline).await;
+    let r = run(&url, DEADLINE).await;
+    let started = std::time::Instant::now();
+    let resp = r.fill(true).await;
+    let took = started.elapsed();
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(
+        resp.json(),
+        json!({"status": "timeout", "fields_filled": []})
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "page deadline answered well before the 10 s broker deadline: {took:?}"
+    );
+    assert_eq!(stub.methods("Runtime.callFunctionOn"), 1);
+    let args = stub.fill_arguments().expect("the fill call was sent");
+    let args = args.as_array().expect("arguments array");
+    assert_eq!(args.len(), 5, "specs, fields, top origin, submit, budget");
+    let budget = args[4]["value"].as_u64().expect("budgetMs is a number");
+    assert!(
+        budget > 0 && budget <= 9750,
+        "budget is the remaining 10 s minus the 250 ms margin: {budget}"
+    );
+    let e = r.entries();
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!(e[0]["event"], "fill_dispatch");
+    assert_eq!(e[1]["event"], "fill_timeout");
+    assert_eq!(e[1]["detail_code"], "deadline_expired");
+    assert_eq!(e[0]["request_id"], e[1]["request_id"]);
+    assert_eq!(e[1]["live_origin"], "https://example.com");
+    assert!(!resp.body.contains(CANARY_PASSWORD));
 }
 
 /// #68: the deadline fires after `createBrowserContext` was sent but

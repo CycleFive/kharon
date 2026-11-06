@@ -821,8 +821,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// CDP writes), the plan is zeroized, a `fill_timeout` entry is
     /// appended, and the result is `timeout`. A `Runtime.callFunctionOn`
     /// already dispatched is not recalled: the in-page function may
-    /// still fill, and submit, after the timeout reply (#46; REQ-API-009
-    /// is enforced broker-side only).
+    /// still complete a step already running after the timeout reply
+    /// (#46). Since #118 the dispatched call also carries a page-side
+    /// relative budget (`deadline` on the plan), so an honest-but-slow
+    /// page aborts itself at the next step boundary — fields cleared,
+    /// submit never dispatched — and its `kharon:deadline` reply maps
+    /// to this same `timeout` / `fill_timeout` outcome.
     ///
     /// If this future is dropped after `fill_dispatch` (the client went
     /// away), the plan is still wiped and a `fill_aborted` entry is
@@ -921,6 +925,15 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     audit: &self.audit,
                     abort_entry: None,
                 };
+                // #118: the engine converts what remains of this
+                // deadline into the page-side relative budget at
+                // dispatch (see `FillPlan::deadline`). The plan
+                // carries a std-clock instant: the remaining duration
+                // is mapped onto it here, so a paused tokio clock in
+                // tests still yields the full remaining budget.
+                guard.plan.deadline = Some(
+                    std::time::Instant::now() + deadline.saturating_duration_since(Instant::now()),
+                );
                 if Instant::now() >= deadline {
                     // Expired before dispatch: no CDP write, no
                     // dispatch entry, just the `fill_timeout` outcome.
@@ -1977,6 +1990,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             submit: req.submit,
             expected_origin: Some(req.expected_origin.clone()),
             live_origin: LiveOrigin::new(),
+            // Set by `Broker::fill` once the plan is admitted (it owns
+            // the deadline); `resolve_fill` runs without one in scope.
+            deadline: None,
         };
         Ok((plan, generation, admitted))
     }

@@ -402,7 +402,7 @@ M0 skeleton · M1 vault read path · M2 fill path · M3 policy and approvals · 
 | 1 | Workspace skeleton: crates `kharon-bwcrypto`, `kharond`, `kharon-cli`. CI (fmt, clippy, deny, test). `Secret` type. | REQ-API-005 | — |
 | 2 | Config loader and validation | REQ-DEP-003 | 1 |
 | 3 | EncString parser and type 2/4 decrypt with constant-time MAC. Fuzz target. | REQ-CRY-002, 003 | 1 |
-| 4 | KDFs (PBKDF2, Argon2id), stretch, key unwrap chain incl. cipher key. `bw` vectors. | REQ-CRY-001, 004, 010 | 3 |
+| 4 | KDFs (PBKDF2, Argon2id), stretch, key unwrap chain incl. cipher key. `bw` vectors. Org-key unwrap once-per-unlock / cap / poison. | REQ-CRY-001, 004, 010, 011 | 3 |
 | 5 | Identity/sync client (prelogin, API-key token, sync), collection filter | REQ-CRY-005, 007 | 4 |
 | 5b | Dedicated-org scope check and live sync (poll + notifications hub) | REQ-CRY-008, 009 | 5 |
 | 6 | Vaultwarden fixture harness (compose, seeded org/collection/items via `bw`) | REQ-DEP-002 (part) | 5 |

@@ -418,7 +418,7 @@ M0 skeleton · M1 vault read path · M2 fill path · M3 policy and approvals · 
 | 16 | Approval channels: CLI socket, ntfy one-time actions | REQ-APR-004, 006 | 15 |
 | 17 | Owner web UI with WebAuthn (approvals, grants, audit tail, unlock) | REQ-APR-005 | 15, 7 |
 | 18 | Rate limits, suspension, revocation, panic | REQ-RL-001..003, REQ-REV-001..004, REQ-MEM-007 | 13, 15 |
-| 19 | Docker image, compose, agent-host guide, canary E2E suite | REQ-DEP-001, 002, 005, 006, 007, REQ-ARCH-001, 004, REQ-GOAL-002 | 13, 16 |
+| 19 | Docker image, compose, agent-host guide, canary E2E suite | REQ-DEP-001, 002, 005, 006, 007, 008, REQ-ARCH-001, 004, REQ-GOAL-002 | 13, 16 |
 | 20 | Official Bitwarden compat run plus `COMPAT.md` | REQ-DEP-004 | 5 |
 | 21 | Export mode loader | REQ-EXP-001..005 | 4, 7 |
 

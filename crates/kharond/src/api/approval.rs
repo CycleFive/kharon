@@ -148,9 +148,10 @@ impl ApprovalTokenStore {
     /// or expired are omitted; a request with no live pair yields
     /// `None`.
     ///
-    /// Follow-up #128: these paths are relative. The publisher's
-    /// absolute URL uses the owner listener's address (`[owner_ui]
-    /// listen`), which is where the routes are served (#136).
+    /// These paths are relative; the ntfy publisher (#128,
+    /// [`super::notify`]) joins them onto the owner listener's
+    /// address (`[owner_ui] listen`), which is where the routes are
+    /// served (#136).
     pub fn paths_for(&self, request_id: &str, now: Duration) -> Option<(String, String)> {
         let mut approve = None;
         let mut deny = None;

@@ -64,6 +64,7 @@ use super::grant::{
     GrantRequestBody, GrantScope, GrantStore, GrantTerms, GrantView, RequestState,
 };
 use super::meta::{ItemMeta, matches_origin, matches_query};
+use super::notify::ApprovalNotifier;
 use super::rate::{RateDenied, RateLimiter, RatePolicy};
 use super::rollback::RollbackGuard;
 use super::token::TokenStore;
@@ -395,6 +396,10 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// One-time ntfy approval tokens (REQ-APR-004, #21): a pair is
     /// minted for every pending grant request when it is created.
     approval_tokens: Mutex<ApprovalTokenStore>,
+    /// Publishes new grant requests to the owner's approval channel
+    /// (REQ-APR-004 send half, #128). `None` = no channel configured;
+    /// requests then wait on the CLI / web UI alone.
+    approval_notifier: Option<Arc<dyn ApprovalNotifier>>,
     /// Rate limits, suspension, and agent revocation (REQ-RL-*,
     /// REQ-REV-001). Separate from the lock controller so owner
     /// revoke/panic never needs the session.
@@ -529,6 +534,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             grants: Mutex::new(GrantStore::new(false)),
             grant_clock: Arc::new(SystemClock),
             approval_tokens: Mutex::new(ApprovalTokenStore::new()),
+            approval_notifier: None,
             rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
             rollback: Mutex::new(RollbackGuard::new()),
         }
@@ -539,6 +545,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// one `ManualClock`).
     pub fn with_grant_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.grant_clock = clock;
+        self
+    }
+
+    /// Publish new grant requests (and panic locks) to the owner's
+    /// approval channel (REQ-APR-004 send half, #128). Without one,
+    /// requests are visible only on the CLI / web UI channels.
+    pub fn with_approval_notifier(mut self, notifier: Arc<dyn ApprovalNotifier>) -> Self {
+        self.approval_notifier = Some(notifier);
         self
     }
 
@@ -1150,6 +1164,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             self.append(Self::grant_creation_entry(&greq))?;
             if greq.state == RequestState::Pending {
                 self.mint_approval_tokens(&greq.id);
+                self.notify_grant_request(&greq);
             }
         }
         let status = match greq.state {
@@ -1244,6 +1259,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             self.append(Self::grant_creation_entry(&greq))?;
             if greq.state == RequestState::Pending {
                 self.mint_approval_tokens(&greq.id);
+                self.notify_grant_request(&greq);
             }
         }
         Ok(Outcome::GrantRequest(GrantRequestBody::of(&greq)))
@@ -1399,15 +1415,34 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         store.mint(request_id, ApprovalAction::Deny, now);
     }
 
+    /// Tell the owner's approval channel about a freshly created
+    /// pending request (REQ-APR-004 send half, #128): the prompt and
+    /// its live token paths go to the configured notifier, if any.
+    /// Best-effort by construction — a request whose creation entry
+    /// is already audited is pending regardless of whether the
+    /// publish lands.
+    fn notify_grant_request(&self, greq: &GrantRequest) {
+        let Some(notifier) = &self.approval_notifier else {
+            return;
+        };
+        let Some(prompt) = greq.prompt() else {
+            return;
+        };
+        let Some((approve, deny)) = self.approval_token_paths(&greq.id) else {
+            return;
+        };
+        notifier.notify_grant_request(&prompt, &approve, &deny);
+    }
+
     /// The live ntfy action paths for `request_id`
     /// (`/owner/approve/<token>`, `/owner/deny/<token>`), or `None`
     /// when no live pair exists (REQ-APR-004, #21). Owner surfaces
     /// only: the paths carry bearer-grade tokens.
     ///
-    /// Follow-up #128: the publisher joins these paths to the owner
-    /// listener (`[owner_ui] listen`, loopback). That listener is
-    /// where redeem is served (REQ-DEP-006, #136). The URL host is
-    /// that address.
+    /// The ntfy publisher (#128, [`super::notify`]) joins these paths
+    /// to the owner listener's address (`[owner_ui] listen`,
+    /// loopback) — that listener is where redeem is served
+    /// (REQ-DEP-006, #136).
     pub fn approval_token_paths(&self, request_id: &str) -> Option<(String, String)> {
         self.approval_tokens
             .lock()
@@ -1569,9 +1604,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// (zeroize + CDP close via the lock hook). The single `panic`
     /// audit entry is that lock ([`LockReason::Panic`] through
     /// [`Self::wire_lock_audit`]); appending it here as well would
-    /// record the transition twice (REQ-AUD-003). Notify is
-    /// best-effort via the audit/ntfy checkpoint path; a dedicated
-    /// ntfy push is not yet wired (#16).
+    /// record the transition twice (REQ-AUD-003). The approval
+    /// channel is notified best-effort when one is configured
+    /// (#128); the audited `panic` checkpoint also reaches the
+    /// off-host sink on its own cadence (REQ-AUD-002).
     pub fn panic_lock(&self) -> Result<(), GrantError> {
         let removed = self
             .grants
@@ -1595,6 +1631,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .unwrap_or_else(|p| p.into_inner())
             .reset();
         self.lock_audited(LockReason::Panic);
+        if let Some(notifier) = &self.approval_notifier {
+            notifier.notify_panic();
+        }
         Ok(())
     }
 

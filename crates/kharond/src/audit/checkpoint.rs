@@ -117,46 +117,56 @@ impl CheckpointSink for FileCheckpointSink {
     }
 }
 
-/// Production off-host sink (REQ-AUD-002, #127): every checkpoint is
-/// published as one ntfy message whose body is the checkpoint JSON, so
-/// the ntfy topic *is* the off-host checkpoint stream the verifier
-/// consumes. The publisher is a minimal synchronous HTTP/1.1 POST —
-/// plain TCP for `http`, rustls (OS roots, no client auth, mirroring
-/// the sync client's trust setup) for `https` — because the audit log
-/// appends synchronously from both blocking and async callers, where
-/// an async client runtime cannot be assumed. Redirects are never
-/// followed: a redirect could carry the ntfy token to another host.
+/// The synchronous ntfy publish transport shared by the checkpoint
+/// sink (REQ-AUD-002, #127) and the approval-prompt publisher
+/// (REQ-APR-004, #128): a minimal synchronous HTTP/1.1 POST — plain
+/// TCP for `http`, rustls (OS roots, no client auth, mirroring the
+/// sync client's trust setup) for `https` — because its callers run
+/// from both blocking and async contexts, where an async client
+/// runtime cannot be assumed. Redirects are never followed: a
+/// redirect could carry the ntfy token to another host.
 ///
 /// Fail-closed setup: construction reads the token file eagerly, so a
 /// deployment that configured a token it cannot read refuses to start
 /// instead of silently publishing unauthenticated (or not at all).
-/// A failed `push` returns `Err`; [`super::AuditLog`] does not count
-/// the checkpoint as delivered and retries it on the next append or
-/// timer tick.
-pub struct NtfyCheckpointSink {
+pub(crate) struct NtfyTransport {
     /// `http` or `https`.
     scheme: String,
     host: String,
     port: u16,
-    /// Request path: the base URL's path prefix plus the topic.
-    path: String,
+    /// The base URL's path prefix (`""` or `"/…"`), no trailing slash.
+    prefix: String,
     token: Option<zeroize::Zeroizing<String>>,
 }
 
-/// How long a single checkpoint publish may take before it is a
-/// failure the cadence retries (the append that triggered it is
-/// already durable locally; see `AuditLog::emit_checkpoint`).
+/// How long a single ntfy publish may take before it is a failure
+/// (the checkpoint cadence retries; see `AuditLog::emit_checkpoint`).
 const NTFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-impl NtfyCheckpointSink {
-    /// Build a sink publishing to `base/topic`, reading the bearer
-    /// token from `token_file` when one is configured.
-    pub fn new(base: &url::Url, topic: &str, token_file: Option<&Path>) -> io::Result<Self> {
+/// ntfy's topic charset, shared by every publisher on the channel.
+pub(crate) fn validate_ntfy_topic(topic: &str) -> io::Result<()> {
+    if topic.is_empty()
+        || !topic
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ntfy topic is empty or has characters outside [A-Za-z0-9._-]",
+        ));
+    }
+    Ok(())
+}
+
+impl NtfyTransport {
+    /// Build a transport for the ntfy server at `base`, reading the
+    /// bearer token from `token_file` when one is configured.
+    pub(crate) fn new(base: &url::Url, token_file: Option<&Path>) -> io::Result<Self> {
         let scheme = base.scheme();
         if !matches!(scheme, "http" | "https") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "ntfy checkpoint sink needs an http(s) base URL",
+                "ntfy transport needs an http(s) base URL",
             ));
         }
         let host = base
@@ -166,18 +176,6 @@ impl NtfyCheckpointSink {
         let port = base
             .port_or_known_default()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ntfy URL has no port"))?;
-        if topic.is_empty()
-            || !topic
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ntfy topic is empty or has characters outside [A-Za-z0-9._-]",
-            ));
-        }
-        let prefix = base.path().trim_end_matches('/');
-        let path = format!("{prefix}/{topic}");
         let token = match token_file {
             Some(p) => {
                 let raw = std::fs::read_to_string(p)?;
@@ -196,18 +194,30 @@ impl NtfyCheckpointSink {
             scheme: scheme.to_string(),
             host,
             port,
-            path,
+            prefix: base.path().trim_end_matches('/').to_string(),
             token,
         })
     }
 
-    fn post(&self, body: &str) -> io::Result<()> {
+    /// The base URL's path prefix (`""` or `"/…"`).
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// POST `body` (JSON) to `path` on the ntfy server. `title`, when
+    /// given, goes out as the `X-Title` header (the plain-publish
+    /// shape; JSON-publish callers carry the title in the body and
+    /// pass `None`).
+    pub(crate) fn post(&self, path: &str, title: Option<&str>, body: &str) -> io::Result<()> {
         let mut request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: kharond\r\nContent-Type: application/json\r\nX-Title: kharon audit checkpoint\r\nContent-Length: {}\r\nConnection: close\r\n",
-            self.path,
+            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: kharond\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            path,
             self.host,
             body.len()
         );
+        if let Some(title) = title {
+            request.push_str(&format!("X-Title: {title}\r\n"));
+        }
         if let Some(token) = &self.token {
             request.push_str(&format!("Authorization: Bearer {}\r\n", token.as_str()));
         }
@@ -240,16 +250,40 @@ impl NtfyCheckpointSink {
             Ok(())
         } else {
             Err(io::Error::other(format!(
-                "ntfy checkpoint publish refused: HTTP {status}"
+                "ntfy publish refused: HTTP {status}"
             )))
         }
+    }
+}
+
+/// Production off-host sink (REQ-AUD-002, #127): every checkpoint is
+/// published as one ntfy message whose body is the checkpoint JSON, so
+/// the ntfy topic *is* the off-host checkpoint stream the verifier
+/// consumes. A failed `push` returns `Err`; [`super::AuditLog`] does
+/// not count the checkpoint as delivered and retries it on the next
+/// append or timer tick.
+pub struct NtfyCheckpointSink {
+    transport: NtfyTransport,
+    /// Request path: the base URL's path prefix plus the topic.
+    path: String,
+}
+
+impl NtfyCheckpointSink {
+    /// Build a sink publishing to `base/topic`, reading the bearer
+    /// token from `token_file` when one is configured.
+    pub fn new(base: &url::Url, topic: &str, token_file: Option<&Path>) -> io::Result<Self> {
+        validate_ntfy_topic(topic)?;
+        let transport = NtfyTransport::new(base, token_file)?;
+        let path = format!("{}/{topic}", transport.prefix());
+        Ok(Self { transport, path })
     }
 }
 
 impl CheckpointSink for NtfyCheckpointSink {
     fn push(&mut self, cp: &Checkpoint) -> io::Result<()> {
         let body = serde_json::to_string(cp)?;
-        self.post(&body)
+        self.transport
+            .post(&self.path, Some("kharon audit checkpoint"), &body)
     }
 }
 

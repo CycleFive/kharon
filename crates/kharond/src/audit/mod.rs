@@ -34,7 +34,7 @@
 //! which must fail the operation it was about to acknowledge — the daemon must
 //! not perform a CDP write for a request whose audit entry did not reach disk.
 
-mod checkpoint;
+pub(crate) mod checkpoint;
 mod entry;
 mod keys;
 mod log;

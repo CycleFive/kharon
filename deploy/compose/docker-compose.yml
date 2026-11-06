@@ -11,7 +11,7 @@
 # The `wg` network stands for the WireGuard link to the agent host:
 # kharond's agent API binds only its address there (10.66.0.1,
 # REQ-DEP-006) and reaches the agent host's Chromium at 10.66.0.2.
-# Swap it for your real tunnel (see the agent-host guide). The same
+# Swap it for your real tunnel (docs/deployment.md). The same
 # file runs in CI with e2e/compose.e2e.yml layered on top, which adds
 # the fixture Vaultwarden and an agent-host container
 # (.github/workflows/image.yml).

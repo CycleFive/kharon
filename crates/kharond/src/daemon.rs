@@ -506,6 +506,16 @@ pub enum StartupError {
         /// `std::io::ErrorKind` rendering. No file contents.
         kind: String,
     },
+    /// The approval-prompt ntfy publisher could not be built at
+    /// startup (e.g. the ntfy token file is unreadable, when
+    /// `[approval].ntfy` and `[owner_ui]` are both configured). Fail
+    /// closed rather than run with prompts going nowhere
+    /// (REQ-APR-004, #128) — the same posture as the checkpoint sink.
+    #[error("cannot set up approval ntfy publisher: {kind}")]
+    ApprovalNotifierSetup {
+        /// `std::io::ErrorKind` rendering. No file contents.
+        kind: String,
+    },
     /// `harden_process()` failed (REQ-MEM-001).
     #[error("process hardening failed: {0}")]
     Harden(HardeningError),
@@ -569,6 +579,7 @@ impl StartupError {
             Self::ApiListenMissing => "api_listen_missing",
             Self::OffHostCheckpointNotConfigured => "audit_off_host_not_configured",
             Self::CheckpointSinkSetup { .. } => "audit_checkpoint_sink_setup",
+            Self::ApprovalNotifierSetup { .. } => "approval_notifier_setup",
             Self::Harden(_) => "harden_failed",
             Self::Mlock(_) => "mlock_failed",
             Self::Tokens(_) => "token_store",
@@ -588,6 +599,7 @@ impl StartupError {
             Self::ApiListenMissing
             | Self::OffHostCheckpointNotConfigured
             | Self::CheckpointSinkSetup { .. }
+            | Self::ApprovalNotifierSetup { .. }
             | Self::Tokens(_) => EX_CONFIG,
             Self::Harden(_) | Self::Mlock(_) => EX_OSERR,
             Self::Export(_) => EX_CONFIG,
@@ -710,6 +722,30 @@ pub async fn start(
         // call's `fill_dispatch`/`context_open` entry and inside the
         // deadline. Startup does not need the browser.
         .with_fill_backend(Box::new(ConnectingCdpBackend::from_agents(&cfg.agents)));
+    // REQ-APR-004 send half (#128): publish approval prompts to the
+    // configured ntfy topic, with action URLs on the owner listener.
+    // Needs both halves: no `[approval].ntfy` → no channel; no
+    // `[owner_ui]` → the redeem routes are served nowhere, so the
+    // action URLs would be dead. A configured owner port of 0 is an
+    // ephemeral test address — no stable redeem base exists to
+    // publish, so prompts stay unpublished in that shape. Building
+    // the notifier reads its token file eagerly — an unreadable
+    // token refuses startup here instead of silently never prompting.
+    let broker = match (&cfg.approval.ntfy, &cfg.owner_ui) {
+        (Some(ntfy), Some(ui)) if ui.listen.port() != 0 => {
+            let notifier = crate::api::NtfyApprovalNotifier::new(
+                &ntfy.url,
+                &ntfy.topic,
+                ntfy.token_file.as_deref(),
+                format!("http://{}", ui.listen),
+            )
+            .map_err(|e| StartupError::ApprovalNotifierSetup {
+                kind: e.kind().to_string(),
+            })?;
+            broker.with_approval_notifier(Arc::new(notifier))
+        }
+        _ => broker,
+    };
     // SPEC §8: a fill against a vault older than 5 min re-syncs first.
     let broker = Arc::new(match &cfg.source {
         Source::Sync(bw) => broker.with_fill_sync(Arc::new(DaemonFillSync(Box::new(bw.clone())))),

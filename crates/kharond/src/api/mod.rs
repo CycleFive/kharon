@@ -17,6 +17,8 @@
 //! - [`approval`]: one-time ntfy approval tokens (REQ-APR-004; #21),
 //!   redeemed on the owner listener (`/owner/approve|deny/<token>`
 //!   in [`http`], mounted by the owner UI).
+//! - [`notify`]: publishing approval prompts to the owner's ntfy
+//!   topic (REQ-APR-004 send half; #128).
 
 pub mod approval;
 pub mod core;
@@ -26,6 +28,7 @@ pub mod grant;
 pub mod http;
 pub mod mcp;
 pub mod meta;
+pub mod notify;
 pub mod rate;
 pub mod rollback;
 pub mod surface;
@@ -49,6 +52,7 @@ pub use grant::{
     RequestState, parse_grant,
 };
 pub use meta::ItemMeta;
+pub use notify::{ApprovalNotifier, NtfyApprovalNotifier};
 pub use rate::{RateDenied, RateLimiter, RatePolicy};
 pub use rollback::{RollbackGuard, RollbackReason};
 pub use token::{ParamFloor, TokenStore};

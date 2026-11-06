@@ -203,9 +203,20 @@ and keep the action URL on that owner address.
 The owner unix socket remains the CLI channel (`kharon unlock`,
 `kharon approve`). It does not speak this HTTP.
 
-Follow-up #128: the publisher that builds the ntfy message must emit
-absolute action URLs whose host is this owner listen address. The path
-shape (`/owner/approve/<token>`, `/owner/deny/<token>`) stays as it is.
+The publisher (#128) emits exactly those absolute action URLs. When
+a grant request is created and both `[approval].ntfy` and
+`[owner_ui]` are configured, kharond publishes one message to the
+ntfy topic naming the agent, the item and the origin observed at
+request time, with single-use Approve / Deny `http` actions (POST)
+on the URLs above. Publishing is best-effort and off the grant path:
+a dead ntfy server never blocks or fails a request, which stays
+pending for the CLI and web UI channels. `kharon panic` publishes a
+plain notice (no actions) to the same topic. With no
+`[approval].ntfy` nothing is published and the CLI path is
+unchanged; with no `[owner_ui]` there is no redeem listener, so
+nothing is published either. An `[owner_ui] listen` port of 0
+(ephemeral, a test shape) likewise publishes nothing — the action
+URLs need the stable configured address.
 
 ## Agent host (REQ-DEP-005)
 

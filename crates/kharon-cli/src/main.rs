@@ -15,7 +15,11 @@
 //! read from stdin instead (one line), which is what automation
 //! and tests use. `kharon init` generates the kharon account's
 //! master password and prints it once to the terminal
-//! (REQ-DEP-007).
+//! (REQ-DEP-007). `kharon token mint` mints an agent token the
+//! same way (once, on the terminal only) and prints the Argon2id
+//! PHC `token_hash` on stdout for the config (REQ-API-003). That
+//! mint is out of band: it does not talk to the daemon and does
+//! not append `token_create` (SPEC §7).
 //!
 //! Password hygiene in this short-lived CLI (#86, closing the
 //! PR #81 carry-overs): the password is read with `rustix::io::read`
@@ -132,6 +136,23 @@ enum Command {
     /// Generate the kharon account's master password (REQ-DEP-007)
     /// and print it once to the terminal.
     Init,
+    /// Mint an agent bearer token (REQ-API-003). Offline: the daemon
+    /// is not contacted, and no `token_create` audit entry is written.
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+/// `kharon token` — out-of-band agent token provisioning (REQ-API-003).
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Mint a token for one agent.
+    ///
+    /// The token is shown once, on the terminal only. The Argon2id PHC
+    /// string (the `[agents.<id>]` `token_hash`) is printed on stdout.
+    Mint {
+        /// Agent id: `[a-z0-9-]{1,64}`, the `[agents.<id>]` table name.
+        agent_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -518,7 +539,9 @@ fn owner_command(command: &Command) -> ExitCode {
             )),
         ),
         Command::Panic { socket } => (socket, Zeroizing::new("{\"op\":\"panic\"}".to_owned())),
-        Command::Audit(_) | Command::Init | Command::PasskeyEnroll { .. } => unreachable!(),
+        Command::Audit(_) | Command::Init | Command::Token(_) | Command::PasskeyEnroll { .. } => {
+            unreachable!()
+        }
     };
     match owner_request(socket, &request) {
         Ok(reply) if reply["ok"] == serde_json::Value::Bool(true) => {
@@ -605,6 +628,66 @@ fn generate_master_password() -> Result<Zeroizing<String>, String> {
     Ok(out)
 }
 
+/// `kharon token mint`: print a new agent token once, to the
+/// controlling terminal only, and its Argon2id PHC hash to stdout
+/// (the `token_hash` config value). The token never goes to stdout,
+/// stderr, a file or the daemon. Without a terminal the command
+/// refuses and mints nothing. Provisioning is out of band (SPEC §7):
+/// this does not append `token_create`.
+fn mint_token_command(agent_id: &str) -> ExitCode {
+    if !kharond::api::token::valid_agent_id(agent_id) {
+        eprintln!("kharon: agent id must match [a-z0-9-]{{1,64}} (the [agents.<id>] table name)");
+        return ExitCode::from(2);
+    }
+    let mut tty = match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "kharon: token mint shows the token only on a terminal, and /dev/tty is \
+                 unavailable ({e}); run it in an interactive shell"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let (token, hash) = kharond::api::token::generate(agent_id);
+    let secret = token.expose_secret();
+    let mut text = Zeroizing::new(String::with_capacity(secret.len() + 640));
+    text.push_str("\nAgent token for `");
+    text.push_str(agent_id);
+    text.push_str("` (shown once; store it outside kharon):\n\n    ");
+    text.push_str(secret);
+    text.push_str(
+        "\n\n\
+         token_hash for [agents.",
+    );
+    text.push_str(agent_id);
+    text.push_str(
+        "] is the next line of stdout (one Argon2id PHC line). Paste that\n\
+         line into the config and never put this token there. kharon does\n\
+         not keep the token, the daemon is not contacted, and this mint is not\n\
+         an audit event (SPEC §7).\n\n",
+    );
+    if let Err(e) = tty.write_all(text.as_bytes()).and_then(|()| tty.flush()) {
+        eprintln!("kharon: cannot write to the terminal: {e}");
+        return ExitCode::from(2);
+    }
+    // The token-bearing buffer is dropped before the hash is written,
+    // so a failure while printing the hash has nothing left to leak.
+    drop(text);
+    drop(token);
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{hash}").and_then(|()| stdout.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "kharon: the token was shown, but the token_hash could not be written ({e}); \
+                 discard that token and run the command again"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// `kharon init`: print a new master password once, to the
 /// controlling terminal only. It never goes to stdout, stderr, a
 /// file or the daemon, so it cannot end up in a pipe, a log or a
@@ -651,6 +734,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => init_command(),
+        Command::Token(TokenCommand::Mint { agent_id }) => mint_token_command(&agent_id),
         Command::Unlock { .. }
         | Command::Lock { .. }
         | Command::Status { .. }

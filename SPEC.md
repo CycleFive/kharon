@@ -175,7 +175,7 @@ Recommendation: (a). Chromium runs as OS user `browser` with `--remote-debugging
 
 ## 4. Agent-facing API
 
-Exposed as MCP (tools below) and HTTP `/v1/*`, with identical semantics. Auth: `Authorization: Bearer kh_agent_<id>_<random32>`. Only the Argon2id hash of the token is stored. One token per agent identity.
+Exposed as MCP (tools below) and HTTP `/v1/*`, with identical semantics. Auth: `Authorization: Bearer kh_agent_<id>_<random32>`. Only the Argon2id hash of the token is stored. One token per agent identity. The owner mints the token out of band with `kharon token mint <id>` (§7); the daemon does not.
 
 | MCP tool | HTTP | Returns |
 |---|---|---|
@@ -287,6 +287,8 @@ The fallback path, `Input.insertText` for sites that ignore programmatic value s
 
 Audit: append-only JSONL at `/data/audit/audit.jsonl`, opened `O_APPEND`, with `chattr +a` recommended. Entry:
 `{seq, ts, prev_hash, event, agent_id, item_id, item_name_hash, origin, grant_id, channel, result, detail_code}` (fill entries also carry `request_id`, `fill_dispatch` a `field_count`, and fill outcome entries a `live_origin`; REQ-AUD-003†), with `hash = SHA-256(prev_hash ‖ JCS(entry without hash))` (RFC 8785 canonical JSON). Every N=100 entries or 10 min, a checkpoint `{seq, hash}` is signed with the broker's Ed25519 audit key and pushed off-host (ntfy or remote syslog) by default. Local-only checkpoints require `audit_checkpoint_local_only=true`, which is logged as a startup warning. Events: unlock, lock, sync, list, search, fill_*, context_open, context, grant_request, grant_issue, grant_revoke, token_create/revoke, owner_auth_fail, rate_limit, panic.
+
+Agent token provisioning is out of band (REQ-API-003, #129). `kharon token mint <id>` prints the token once and the Argon2id PHC string the operator stores as `[agents.<id>] token_hash`. The daemon never sees the plaintext and does not append `token_create` for that mint. `token_revoke` is still appended when `kharon revoke agent` runs (REQ-REV-001). `token_create` stays a recognized event name so a later in-daemon rotation can emit it; v1 does not.
 
 | ID | Requirement | AC |
 |---|---|---|

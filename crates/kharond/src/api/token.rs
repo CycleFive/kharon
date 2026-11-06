@@ -7,9 +7,11 @@
 //! Only the Argon2id PHC hash of a token is stored: it is the
 //! `token_hash` of the agent's config table (SPEC §9), so the config
 //! file is the token store and never holds a plaintext token. The
-//! token itself is shown once at creation ([`generate`]; the owner
-//! CLI command that wraps it lands with the owner channel) and handled as a [`Secret`] / [`Zeroizing`] buffer after
-//! that.
+//! token itself is shown once at creation ([`generate`], wrapped by
+//! `kharon token mint`) and handled as a [`Secret`] / [`Zeroizing`]
+//! buffer after that. Minting is out of band: the command does not
+//! talk to the daemon, and the daemon does not append `token_create`
+//! (SPEC §7).
 //!
 //! Verification ([`TokenStore::authenticate`]) parses the id out of
 //! the presented token, looks up that agent's hash, and runs the
@@ -302,6 +304,34 @@ mod tests {
         t_cost: 1,
         p_cost: 1,
     };
+
+    /// `generate` (not the cheap test hasher) at [`ParamFloor::PRODUCTION`]:
+    /// the PHC clears the floor, and [`TokenStore`] verifies the token.
+    #[test]
+    fn req_api_003_generate_round_trip_at_production_floor() {
+        let (token, hash) = generate("assistant");
+        let presented = token.expose_secret();
+        assert_eq!(claimed_agent_id(presented), Some("assistant"));
+        assert!(!hash.contains(presented.as_str()));
+        check_token_hash(&hash, &ParamFloor::PRODUCTION).unwrap();
+        let parsed = PasswordHash::new(&hash).unwrap();
+        let params = argon2::Params::try_from(&parsed).unwrap();
+        assert_eq!(
+            (params.m_cost(), params.t_cost(), params.p_cost()),
+            (
+                ParamFloor::PRODUCTION.m_cost,
+                ParamFloor::PRODUCTION.t_cost,
+                ParamFloor::PRODUCTION.p_cost,
+            ),
+            "{hash}"
+        );
+        let store = TokenStore::new([("assistant", hash.as_str())]).unwrap();
+        assert_eq!(store.authenticate(presented).unwrap(), "assistant");
+        let mut wrong = presented.clone();
+        let last = wrong.pop().unwrap();
+        wrong.push(if last == 'a' { 'b' } else { 'a' });
+        assert!(store.authenticate(&wrong).is_err());
+    }
 
     #[test]
     fn req_api_003_token_format_round_trips() {

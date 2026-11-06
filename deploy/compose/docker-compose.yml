@@ -32,15 +32,15 @@ services:
     # to /data (REQ-DEP-001). Note: with a non-root `user`, Docker does
     # not raise CAP_IPC_LOCK into the effective set, so mlock
     # (REQ-MEM-002) rests on the unlimited memlock ulimit; the cap is
-    # kept as SPEC lists it. The seccomp profile SPEC §9 names
-    # (kharon-seccomp.json) is not written yet; Docker's default
-    # profile applies.
+    # kept as SPEC lists it. seccomp=./kharon-seccomp.json is the
+    # Docker/moby default profile checked in under the SPEC §9 name
+    # (see README); tighten later by forking that file.
     user: "10001:10001"
     read_only: true
     cap_drop: [ALL]
     cap_add: [IPC_LOCK]
     ulimits: { memlock: -1, core: 0 }
-    security_opt: ["no-new-privileges:true"]
+    security_opt: ["no-new-privileges:true", "seccomp=./kharon-seccomp.json"]
     volumes:
       - "kharon-data:/data"
       - "./kharon.toml:/etc/kharon.toml:ro"

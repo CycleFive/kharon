@@ -36,8 +36,13 @@ docker compose exec kharon kharon status
 - `memlock` is unlimited so `require_mlock` holds, and core dumps are
   off. `cap_add: IPC_LOCK` has no effect for a non-root uid; the
   ulimit is what makes `mlock` succeed.
-- All capabilities are dropped and `no-new-privileges` is set. A
-  seccomp profile (SPEC §9) is not written yet.
+- All capabilities are dropped and `no-new-privileges` is set.
+  `security_opt` also points at [`kharon-seccomp.json`](./kharon-seccomp.json)
+  (SPEC §9). That file is the Docker/moby **default** seccomp profile
+  checked in under the SPEC path so the example matches §9 and CI
+  exercises the same filter the daemon would get from Docker's
+  built-in default (source: docker/engine `profiles/seccomp/default.json`,
+  fetched 2026-11-06); fork it to tighten later.
 
 The CDP endpoint in `kharon.toml` is the agent host's CDP address
 (`ws://10.66.0.2:9222`). kharond looks up the browser's current

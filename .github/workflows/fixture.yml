@@ -20,6 +20,8 @@ on:
       - "crates/kharond/tests/req_cry_009_daemon_live_sync.rs"
       # REQ-DEP-002 browser half: the fill path it drives end to end.
       - "crates/kharond/tests/req_dep_002_chromium_e2e.rs"
+      # Issue #113: base-address CDP endpoint across a Chromium restart.
+      - "crates/kharond/tests/req_arch_002_cdp_restart_chromium.rs"
       - "crates/kharond/src/cdp/**"
       - "crates/kharond/src/api/fill.rs"
       - "crates/kharond/src/daemon.rs"
@@ -134,6 +136,11 @@ jobs:
           KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
           KHARON_FIXTURE_CHROMIUM: ${{ runner.temp }}/headless-shell/headless-shell
         run: cargo test -p kharond --test req_dep_002_chromium_e2e -- --ignored
+      - name: CDP base address follows a Chromium restart (issue #113)
+        working-directory: ${{ github.workspace }}
+        env:
+          KHARON_FIXTURE_CHROMIUM: ${{ runner.temp }}/headless-shell/headless-shell
+        run: cargo test -p kharond --test req_arch_002_cdp_restart_chromium -- --ignored
       - name: Live REQ-CRY-008/009 dedicated-org preflight + live re-sync (kharond)
         working-directory: ${{ github.workspace }}
         env:

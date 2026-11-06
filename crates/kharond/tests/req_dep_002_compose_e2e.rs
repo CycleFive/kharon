@@ -153,7 +153,7 @@ fn write_public(path: &Path, contents: &[u8]) {
 /// Compose-harness daemon config. Fill budgets cover [`FILL_ADMISSIONS`];
 /// every other `[policy]` knob is omitted so it stays at the production
 /// default.
-fn kharond_toml(email: &str, org: &str, coll: &str, hash: &str, browser_ws: &str) -> String {
+fn kharond_toml(email: &str, org: &str, coll: &str, hash: &str, cdp: &str) -> String {
     format!(
         r#"mode = "sync"
 
@@ -167,7 +167,7 @@ ca_file = "/etc/kharon/vault-ca.pem"
 
 [agents.alpha]
 token_hash = "{hash}"
-cdp = {{ endpoint = "{browser_ws}", via = "wireguard" }}
+cdp = {{ endpoint = "{cdp}", via = "wireguard" }}
 
 [policy]
 # Harness only: {FILL_ADMISSIONS} admissions of one item inside a minute
@@ -700,7 +700,15 @@ async fn setup() -> Run {
     // agent API on the wg address, CDP to the agent host over wg.
     let (token, hash) = generate("alpha");
     let token = token.expose_secret().clone();
-    let toml = kharond_toml(&email, &org, &coll, &hash, &browser_ws);
+    // The base address, as the deployment guide configures it: kharond
+    // resolves the browser id through the relay itself (issue #113).
+    let toml = kharond_toml(
+        &email,
+        &org,
+        &coll,
+        &hash,
+        &format!("ws://{AGENT_HOST_CDP}"),
+    );
     write_public(&run_dir.join("kharon.toml"), toml.as_bytes());
     compose(&["up", "-d", "--no-build", "kharon"]);
     wait_for_log(

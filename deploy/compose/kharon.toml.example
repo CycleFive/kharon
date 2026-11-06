@@ -14,7 +14,9 @@ collection_ids = ["00000000-0000-0000-0000-000000000002"]
 # `kharon` token tooling prints the hash; never put the token here.
 token_hash = "$argon2id$..."
 # The agent host's Chromium (CDP), reached over the WireGuard link.
-cdp = { endpoint = "ws://10.66.0.2:9222/devtools/browser/<id>", via = "wireguard" }
+# No path: kharond reads the current /devtools/browser/<id> from
+# /json/version on each connect, so a Chromium restart needs no edit.
+cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 
 [api]
 # The wg address only; wildcards are refused (REQ-DEP-006).

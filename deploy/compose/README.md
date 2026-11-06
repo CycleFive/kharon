@@ -39,10 +39,11 @@ docker compose exec kharon kharon status
 - All capabilities are dropped and `no-new-privileges` is set. A
   seccomp profile (SPEC §9) is not written yet.
 
-The CDP endpoint in `kharon.toml` is used as written, so it must be
-the agent host's full browser WebSocket URL
-(`ws://<agent-host>:9222/devtools/browser/<id>`), which changes each
-time Chromium starts; the guide shows how to read it.
+The CDP endpoint in `kharon.toml` is the agent host's CDP address
+(`ws://10.66.0.2:9222`). kharond looks up the browser's current
+`/devtools/browser/<id>` from `/json/version` each time it connects,
+so restarting Chromium needs no config change (see the
+[deployment guide](../../docs/deployment.md#pointing-kharond-at-the-browser)).
 
 ## The E2E overlay
 

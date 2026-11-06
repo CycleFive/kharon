@@ -86,23 +86,33 @@ the one listening, set `BROKER_ENDPOINT` when you run
 
 ### Pointing kharond at the browser
 
-kharond uses the configured CDP endpoint as written, so it must be
-the browser's full WebSocket URL. Read it through the tunnel:
+Give kharond the agent host's CDP address through the tunnel, with no
+path:
+
+```toml
+[agents.assistant]
+cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
+```
+
+Chromium serves its DevTools socket at `/devtools/browser/<id>` and
+picks a new `<id>` each time it starts. kharond asks
+`http://10.66.0.2:9222/json/version` for the current one every time it
+connects, so a restart of the agent host's `browser.service` needs no
+config change: the next fill reconnects to the new browser. kharond
+takes only the path from Chromium's answer and keeps the configured
+address and transport, so the answer can never send kharond to
+another host.
+
+To check the tunnel by hand:
 
 ```sh
 curl -s http://10.66.0.2:9222/json/version | jq -r .webSocketDebuggerUrl
 # ws://10.66.0.2:9222/devtools/browser/<id>
 ```
 
-and put it in `kharon.toml`:
-
-```toml
-[agents.assistant]
-cdp = { endpoint = "ws://10.66.0.2:9222/devtools/browser/<id>", via = "wireguard" }
-```
-
-The `<id>` changes each time Chromium starts, so update it after a
-restart of the agent host's `browser.service`.
+A full `ws://10.66.0.2:9222/devtools/browser/<id>` endpoint still
+works and is used as written, but it goes stale when Chromium
+restarts.
 
 ## Agent host (REQ-DEP-005)
 

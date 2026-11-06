@@ -10,6 +10,7 @@
 
 pub mod browser;
 pub mod client;
+pub mod discover;
 pub mod endpoint;
 pub mod fill;
 pub(crate) mod page_js;

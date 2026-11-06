@@ -83,6 +83,11 @@ pub enum CdpError {
     /// the connection was dropped (issue #76). Reconnect.
     #[error("connection poisoned by a request cancelled mid-send")]
     Poisoned,
+    /// Resolving a base address through `/json/version` failed (issue
+    /// #113). The reason is kharond's own wording, never the browser's
+    /// response text.
+    #[error("cdp /json/version: {0}")]
+    Discovery(&'static str),
 }
 
 impl From<WsError> for CdpError {
@@ -186,6 +191,36 @@ impl tokio::io::AsyncWrite for MaybeTls {
     }
 }
 
+/// Open the transport to `endpoint`'s host and port: plain TCP for
+/// `ws://`, pinned TLS for `wss://` (REQ-ARCH-002). Shared by the
+/// WebSocket connect and the `/json/version` lookup
+/// ([`super::discover`]), so both go the same way.
+pub(super) async fn open_stream(endpoint: &CdpEndpoint) -> Result<MaybeTls, CdpError> {
+    let host = endpoint
+        .url
+        .host_str()
+        .ok_or_else(|| CdpError::Connect("endpoint has no host".into()))?
+        .to_string();
+    let port = endpoint.url.port_or_known_default().unwrap_or(80);
+    let stream = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| CdpError::Connect(e.to_string()))?;
+
+    let stream = if endpoint.url.scheme() == "wss" {
+        let pin = endpoint
+            .peer_pin
+            .ok_or_else(|| CdpError::Connect("wss endpoint missing peer pin".into()))?;
+        MaybeTls::Tls(Box::new(
+            super::tls::connect_tls_pinned(&host, pin, stream)
+                .await
+                .map_err(|e| CdpError::Transport(e.to_string()))?,
+        ))
+    } else {
+        MaybeTls::Plain(stream)
+    };
+    Ok(stream)
+}
+
 /// A connection to the browser-level CDP endpoint.
 #[derive(Clone)]
 pub struct CdpClient {
@@ -265,33 +300,24 @@ impl CdpClient {
 
     /// Connect per a validated endpoint. `ws://` connects plainly;
     /// `wss://` runs the pinned-TLS handshake first (REQ-ARCH-002).
+    ///
+    /// A base address (`ws://host:port`, [`CdpEndpoint::discovers`]) is
+    /// resolved first: `GET /json/version` over the same transport gives
+    /// the browser's current `/devtools/browser/<id>` path, and the
+    /// WebSocket opens on a fresh connection to the configured host and
+    /// port with that path (issue #113). Every connect resolves again,
+    /// so a reconnect after a Chromium restart finds the new `<id>`.
     pub async fn connect(endpoint: &CdpEndpoint) -> Result<Self, CdpError> {
-        let host = endpoint
-            .url
-            .host_str()
-            .ok_or_else(|| CdpError::Connect("endpoint has no host".into()))?
-            .to_string();
-        let port = endpoint.url.port_or_known_default().unwrap_or(80);
-        let stream = TcpStream::connect((host.as_str(), port))
-            .await
-            .map_err(|e| CdpError::Connect(e.to_string()))?;
-
-        let stream = if endpoint.url.scheme() == "wss" {
-            let pin = endpoint
-                .peer_pin
-                .ok_or_else(|| CdpError::Connect("wss endpoint missing peer pin".into()))?;
-            MaybeTls::Tls(Box::new(
-                super::tls::connect_tls_pinned(&host, pin, stream)
-                    .await
-                    .map_err(|e| CdpError::Transport(e.to_string()))?,
-            ))
+        let url = if endpoint.discovers() {
+            super::discover::browser_url(endpoint).await?
         } else {
-            MaybeTls::Plain(stream)
+            endpoint.url.clone()
         };
+        let stream = open_stream(endpoint).await?;
 
         let request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
-            .uri(endpoint.url.as_str())
-            .header("Host", host)
+            .uri(url.as_str())
+            .header("Host", super::discover::host_header(&url, false))
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")

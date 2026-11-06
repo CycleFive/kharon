@@ -38,7 +38,8 @@ cd "$work"
 log() { printf '\n== %s\n' "$*"; }
 
 cleanup() {
-    sudo wg-quick down "$work/$wg_if.conf" >/dev/null 2>&1 || true
+    sudo wg-quick down "$wg_if" >/dev/null 2>&1 || true
+    sudo rm -f "/etc/wireguard/$wg_if.conf"
     if [ -s qemu.pid ]; then
         sudo kill "$(cat qemu.pid)" 2>/dev/null || kill "$(cat qemu.pid)" 2>/dev/null || true
     fi
@@ -109,7 +110,9 @@ agent_pub="$(sed -n 's/^  PublicKey = //p' provision.log)"
 test -n "$agent_pub"
 
 log "broker end of the tunnel"
-cat >"$wg_if.conf" <<WG
+# wg-quick reads its config from /etc/wireguard: Ubuntu's AppArmor
+# profile for it refuses other paths, even to root.
+sudo install -D -m 600 /dev/stdin "/etc/wireguard/$wg_if.conf" <<WG
 [Interface]
 Address = ${broker_addr}/32
 PrivateKey = $(cat broker.key)
@@ -120,7 +123,7 @@ AllowedIPs = ${agent_addr}/32
 Endpoint = 127.0.0.1:${wg_port}
 PersistentKeepalive = 5
 WG
-sudo wg-quick up "$work/$wg_if.conf"
+sudo wg-quick up "$wg_if"
 
 version_url="http://${agent_addr}:${cdp_port}/json/version"
 for i in $(seq 1 30); do

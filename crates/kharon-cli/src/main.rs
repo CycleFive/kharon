@@ -12,7 +12,9 @@
 //! from the terminal with echo disabled — never from argv, env,
 //! or a file (REQ-EXP-003); when stdin is not a terminal it is
 //! read from stdin instead (one line), which is what automation
-//! and tests use.
+//! and tests use. `kharon init` generates the kharon account's
+//! master password and prints it once to the terminal
+//! (REQ-DEP-007).
 //!
 //! Password hygiene in this short-lived CLI (#86, closing the
 //! PR #81 carry-overs): the password is read with `rustix::io::read`
@@ -83,6 +85,9 @@ enum Command {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
+    /// Generate the kharon account's master password (REQ-DEP-007)
+    /// and print it once to the terminal.
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -412,7 +417,7 @@ fn owner_command(command: &Command) -> ExitCode {
             )),
         ),
         Command::Panic { socket } => (socket, Zeroizing::new("{\"op\":\"panic\"}".to_owned())),
-        Command::Audit(_) => unreachable!(),
+        Command::Audit(_) | Command::Init => unreachable!(),
     };
     match owner_request(socket, &request) {
         Ok(reply) if reply["ok"] == serde_json::Value::Bool(true) => {
@@ -435,9 +440,96 @@ fn owner_command(command: &Command) -> ExitCode {
     }
 }
 
+/// Random bytes in a generated master password: 160 bits, above
+/// REQ-DEP-007's 128-bit floor.
+const MASTER_PASSWORD_BYTES: usize = 20;
+/// Characters per group in the printed password.
+const MASTER_PASSWORD_GROUP: usize = 4;
+/// Crockford's base32 alphabet, lowercase: no `i`, `l`, `o` or `u`,
+/// so the password survives being read aloud or copied by hand.
+const BASE32: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// A fresh master password: [`MASTER_PASSWORD_BYTES`] from the OS
+/// RNG, base32 (5 bits a character, so 32 characters with no
+/// padding), in hyphen-separated groups of four. Every buffer that
+/// holds it zeroizes on drop.
+fn generate_master_password() -> Result<Zeroizing<String>, String> {
+    let mut bytes = Zeroizing::new([0u8; MASTER_PASSWORD_BYTES]);
+    let mut filled = 0;
+    while filled < MASTER_PASSWORD_BYTES {
+        match rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty()) {
+            Ok(n) => filled += n,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(format!("OS RNG: {e}")),
+        }
+    }
+    let chars = MASTER_PASSWORD_BYTES * 8 / 5;
+    let mut out = Zeroizing::new(String::with_capacity(chars + chars / MASTER_PASSWORD_GROUP));
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut written = 0;
+    for &b in bytes.iter() {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            if written > 0 && written % MASTER_PASSWORD_GROUP == 0 {
+                out.push('-');
+            }
+            out.push(char::from(BASE32[((acc >> bits) & 31) as usize]));
+            written += 1;
+        }
+        acc &= (1 << bits) - 1;
+    }
+    Ok(out)
+}
+
+/// `kharon init`: print a new master password once, to the
+/// controlling terminal only. It never goes to stdout, stderr, a
+/// file or the daemon, so it cannot end up in a pipe, a log or a
+/// shell redirect; without a terminal the command refuses.
+fn init_command() -> ExitCode {
+    let mut tty = match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "kharon: init prints the password only to a terminal, and /dev/tty is \
+                 unavailable ({e}); run it in an interactive shell"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let password = match generate_master_password() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kharon: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut text = Zeroizing::new(String::with_capacity(1024));
+    text.push_str("\nMaster password for the kharon Bitwarden account (160 bits):\n\n    ");
+    text.push_str(password.as_str());
+    text.push_str(
+        "\n\n\
+         Use it when you create the kharon account, then store it in your own\n\
+         vault, outside the kharon organization. kharon does not keep it and\n\
+         this is the only time it is shown. Anyone holding the API-key file and\n\
+         a copy of the server's data is left with an offline attack on this\n\
+         password, which is why it is long and random (SPEC REQ-DEP-007).\n\n",
+    );
+    match tty.write_all(text.as_bytes()).and_then(|()| tty.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kharon: cannot write to the terminal: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Init => init_command(),
         Command::Unlock { .. }
         | Command::Lock { .. }
         | Command::Status { .. }
@@ -522,6 +614,47 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn req_dep_007_master_password_has_at_least_128_bits() {
+        let p = generate_master_password().unwrap();
+        let symbols: Vec<char> = p.chars().filter(|&c| c != '-').collect();
+        assert_eq!(symbols.len(), 32, "{}", p.as_str());
+        assert!(symbols.iter().all(|c| BASE32.contains(&(*c as u8))));
+        // Each symbol is one of 32 equally likely values.
+        assert!(symbols.len() * 5 >= 128);
+        let groups: Vec<&str> = p.split('-').collect();
+        assert_eq!(groups.len(), 8);
+        assert!(groups.iter().all(|g| g.len() == MASTER_PASSWORD_GROUP));
+    }
+
+    #[test]
+    fn req_dep_007_master_passwords_differ() {
+        let a = generate_master_password().unwrap();
+        let b = generate_master_password().unwrap();
+        assert_ne!(a.as_str(), b.as_str());
+    }
+
+    #[test]
+    fn req_dep_007_base32_uses_every_bit() {
+        // 20 bytes are exactly 32 base32 symbols: the encoder must
+        // consume all 160 bits with none left over or dropped. A
+        // stuck symbol position would show as one value across many
+        // draws.
+        let draws: Vec<Zeroizing<String>> = (0..64)
+            .map(|_| generate_master_password().unwrap())
+            .collect();
+        for pos in 0..39 {
+            let first = draws[0].as_bytes()[pos];
+            if first == b'-' {
+                continue;
+            }
+            assert!(
+                draws.iter().any(|d| d.as_bytes()[pos] != first),
+                "symbol {pos} never varies"
+            );
+        }
+    }
 
     /// A pipe double: each `read` returns at most the next queued
     /// chunk (split if the caller's buffer is smaller), `None`

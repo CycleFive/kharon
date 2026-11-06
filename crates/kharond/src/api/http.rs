@@ -16,8 +16,13 @@
 //! | `POST /v1/context` | bearer | empty or `{}` → `ContextResult` (the agent's `browserContextId`, #65) |
 //! | `POST /v1/grants` | bearer | `GrantRequest` → `GrantRequestBody` (`{grant_request_id, state}`, #20) |
 //! | `GET /v1/openapi.json` | none | the OpenAPI document |
-//! | `GET/POST /owner/approve/<token>`, `/owner/deny/<token>` | one-time token | ntfy approval (REQ-APR-004; #21): GET confirms, POST decides, used/expired → 410 |
 //! | `POST /mcp` | bearer | MCP over Streamable HTTP ([`super::mcp`]) |
+//!
+//! ntfy redeem (`GET`/`POST` `/owner/approve/<token>` and
+//! `/owner/deny/<token>`, REQ-APR-004) is served on the owner UI
+//! listener (loopback). [`serve_owner`] binds that surface on its
+//! own for tests. The agent router leaves those paths unrouted
+//! (REQ-DEP-006, #136).
 //!
 //! Order: route (404), method (405), bearer token (401), parameters
 //! (400), then [`Broker::dispatch`]. The fill routes take a JSON body
@@ -46,12 +51,13 @@ use zeroize::Zeroizing;
 use axum::body::to_bytes;
 use tokio::time::Instant;
 
+use super::approval::{ApprovalAction, TokenGone};
 use super::core::{
     AgentId, Broker, Operation, Request as ApiRequest, VaultView, parse_context_body, parse_request,
 };
 use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillOperation, parse_fill};
-use super::grant::parse_grant;
+use super::grant::{ApprovalPrompt, parse_grant};
 use super::mcp::{MAX_BODY_BYTES, is_json};
 use crate::lock::Clock;
 
@@ -105,6 +111,85 @@ where
         .await
 }
 
+/// Serve the ntfy redeem routes on `listener`.
+///
+/// This is the owner-listener surface (REQ-DEP-006, #136): `GET`/`POST`
+/// [`OWNER_APPROVE_PREFIX`] and [`OWNER_DENY_PREFIX`]. The daemon
+/// mounts the same handler on the owner UI listener; tests bind it
+/// here when they do not need the rest of the UI. The agent router
+/// ([`router`]) does not include it.
+pub async fn serve_owner<S, C>(
+    listener: TcpListener,
+    broker: Arc<Broker<S, C>>,
+) -> std::io::Result<()>
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    axum::serve(listener, owner_router(broker)).await
+}
+
+fn owner_router<S, C>(broker: Arc<Broker<S, C>>) -> Router
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    Router::new()
+        .fallback(handle_owner_redeem::<S, C>)
+        .with_state(broker)
+}
+
+async fn handle_owner_redeem<S, C>(
+    State(broker): State<Arc<Broker<S, C>>>,
+    req: Request,
+) -> Response
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    dispatch_owner_approval(broker, method, path).await
+}
+
+/// Broker calls the owner listener needs to render and redeem an
+/// ntfy one-time token (REQ-APR-004). [`Broker`] implements this.
+pub trait ApprovalRedeemer: Send + Sync + 'static {
+    /// Peek the token. Does not consume it and does not change
+    /// grant state.
+    fn prompt(&self, token: &str) -> Result<(ApprovalPrompt, ApprovalAction), TokenGone>;
+
+    /// Consume the token and decide the request.
+    fn redeem(&self, token: &str) -> Result<ApprovalAction, TokenGone>;
+}
+
+impl<S, C> ApprovalRedeemer for Broker<S, C>
+where
+    S: VaultView + 'static,
+    C: Clock + 'static,
+{
+    fn prompt(&self, token: &str) -> Result<(ApprovalPrompt, ApprovalAction), TokenGone> {
+        self.approval_token_prompt(token)
+    }
+
+    fn redeem(&self, token: &str) -> Result<ApprovalAction, TokenGone> {
+        self.redeem_approval_token(token)
+    }
+}
+
+/// Run the redeem response off the async worker. A panicked worker
+/// answers 410, the same as an unknown token: the caller learns
+/// nothing about the failure.
+pub(crate) async fn dispatch_owner_approval(
+    redeem: Arc<dyn ApprovalRedeemer>,
+    method: Method,
+    path: String,
+) -> Response {
+    tokio::task::spawn_blocking(move || owner_approval_response(redeem.as_ref(), &method, &path))
+        .await
+        .unwrap_or_else(|_| token_gone())
+}
+
 enum Route {
     Status,
     Items,
@@ -136,9 +221,6 @@ where
         }
         CONTEXT_PATH => return handle_context(state, req, received).await,
         GRANTS_PATH => return handle_grants(state, req, received).await,
-        path if path.starts_with(OWNER_APPROVE_PREFIX) || path.starts_with(OWNER_DENY_PREFIX) => {
-            return handle_owner_token(state, req).await;
-        }
         super::mcp::MCP_PATH => return super::mcp::handle(state, req).await,
         _ => return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute)),
     };
@@ -288,94 +370,77 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The ntfy one-time approval endpoints (REQ-APR-004, #21). No
-/// bearer <redacted>: the 256-bit token in the path *is* the credential,
-/// which is why it is single-use and lives 120 s. GET renders a
-/// confirm page and never mutates grant state; POST redeems the
-/// token and decides the request. A token presented to the wrong
-/// action's endpoint is treated as gone.
-async fn handle_owner_token<S, C>(state: Arc<AppState<S, C>>, req: Request) -> Response
-where
-    S: VaultView + 'static,
-    C: Clock + Send + 'static,
-{
-    use super::approval::ApprovalAction;
-    let path = req.uri().path().to_owned();
+/// The ntfy one-time approval endpoints (REQ-APR-004, #21), served on
+/// the owner listener. No bearer <redacted>: the 256-bit token in the path
+/// *is* the credential, which is why it is single-use and lives 120 s.
+/// GET renders a confirm page and never mutates grant state; POST
+/// redeems the token and decides the request. A token presented to
+/// the wrong action's endpoint is treated as gone.
+fn owner_approval_response(redeem: &dyn ApprovalRedeemer, method: &Method, path: &str) -> Response {
     let (expected, token) = if let Some(t) = path.strip_prefix(OWNER_APPROVE_PREFIX) {
-        (ApprovalAction::Approve, t.to_owned())
+        (ApprovalAction::Approve, t)
     } else if let Some(t) = path.strip_prefix(OWNER_DENY_PREFIX) {
-        (ApprovalAction::Deny, t.to_owned())
+        (ApprovalAction::Deny, t)
     } else {
         return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute));
     };
     if token.is_empty() || token.contains('/') {
         return token_gone();
     }
-    match *req.method() {
-        Method::GET => {
-            let broker = Arc::clone(&state.broker);
-            let seen = tokio::task::spawn_blocking(move || broker.approval_token_prompt(&token))
-                .await
-                .unwrap_or(Err(super::approval::TokenGone::Unknown));
-            match seen {
-                Ok((prompt, action)) if action == expected => {
-                    let verb = match action {
-                        ApprovalAction::Approve => "approve",
-                        ApprovalAction::Deny => "deny",
-                    };
-                    let body = format!(
-                        "<!doctype html><title>kharon — {verb} request</title>\
-                         <h1>{verb} this grant request?</h1>\
-                         <p>Agent: {agent}</p><p>Item: {item}</p>\
-                         <p>Action: {act}</p><p>Origin: {origin}</p>\
-                         <form method=\"post\" action=\"{path}\">\
-                         <button type=\"submit\">{verb}</button></form>",
-                        agent = html_escape(&prompt.agent_id),
-                        item = html_escape(&prompt.item_id),
-                        act = prompt.action.as_str(),
-                        origin = html_escape(&prompt.origin),
-                        path = html_escape(&path),
-                    );
-                    html_response(StatusCode::OK, body)
-                }
-                _ => token_gone(),
+    if method == Method::GET {
+        return match redeem.prompt(token) {
+            Ok((prompt, action)) if action == expected => {
+                let verb = match action {
+                    ApprovalAction::Approve => "approve",
+                    ApprovalAction::Deny => "deny",
+                };
+                let body = format!(
+                    "<!doctype html><title>kharon — {verb} request</title>\
+                     <h1>{verb} this grant request?</h1>\
+                     <p>Agent: {agent}</p><p>Item: {item}</p>\
+                     <p>Action: {act}</p><p>Origin: {origin}</p>\
+                     <form method=\"post\" action=\"{path}\">\
+                     <button type=\"submit\">{verb}</button></form>",
+                    agent = html_escape(&prompt.agent_id),
+                    item = html_escape(&prompt.item_id),
+                    act = prompt.action.as_str(),
+                    origin = html_escape(&prompt.origin),
+                    path = html_escape(path),
+                );
+                html_response(StatusCode::OK, body)
             }
-        }
-        Method::POST => {
-            let broker = Arc::clone(&state.broker);
-            let decided = tokio::task::spawn_blocking(move || {
-                let (_, action) = broker.approval_token_prompt(&token)?;
-                if action != expected {
-                    return Err(super::approval::TokenGone::Unknown);
-                }
-                broker.redeem_approval_token(&token)
-            })
-            .await
-            .unwrap_or(Err(super::approval::TokenGone::Unknown));
-            match decided {
-                Ok(action) => {
-                    let done = match action {
-                        ApprovalAction::Approve => "approved",
-                        ApprovalAction::Deny => "denied",
-                    };
-                    html_response(
-                        StatusCode::OK,
-                        format!("<!doctype html><title>kharon</title><p>Request {done}.</p>"),
-                    )
-                }
-                Err(_) => token_gone(),
-            }
-        }
-        _ => {
-            let mut resp = error(ApiError::new(
-                ErrorCode::MethodNotAllowed,
-                Detail::MethodNotAllowed,
-            ));
-            resp.headers_mut()
-                .insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
-            resp
-        }
+            _ => token_gone(),
+        };
     }
+    if method == Method::POST {
+        let decided = (|| {
+            let (_, action) = redeem.prompt(token)?;
+            if action != expected {
+                return Err(TokenGone::Unknown);
+            }
+            redeem.redeem(token)
+        })();
+        return match decided {
+            Ok(action) => {
+                let done = match action {
+                    ApprovalAction::Approve => "approved",
+                    ApprovalAction::Deny => "denied",
+                };
+                html_response(
+                    StatusCode::OK,
+                    format!("<!doctype html><title>kharon</title><p>Request {done}.</p>"),
+                )
+            }
+            Err(_) => token_gone(),
+        };
+    }
+    let mut resp = error(ApiError::new(
+        ErrorCode::MethodNotAllowed,
+        Detail::MethodNotAllowed,
+    ));
+    resp.headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
+    resp
 }
 
 /// `POST /v1/grants` (#20): same order as the fill routes — method,

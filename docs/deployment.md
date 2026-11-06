@@ -114,6 +114,41 @@ A full `ws://10.66.0.2:9222/devtools/browser/<id>` endpoint still
 works and is used as written, but it goes stale when Chromium
 restarts.
 
+### ntfy approve and deny (REQ-APR-004, REQ-DEP-006)
+
+`GET` and `POST` on `/owner/approve/<token>` and `/owner/deny/<token>`
+are served on the owner UI listener, `[owner_ui] listen` (loopback).
+Configure `[owner_ui]` or kharond has no HTTP listener for them. The
+agent API (`[api] listen`, the WireGuard address) leaves those paths
+unrouted.
+
+An ntfy `http` action is the POST the ntfy client sends when the owner
+taps it. The action URL's host is that owner listen address:
+
+```text
+http://127.0.0.1:8788/owner/approve/<token>
+http://127.0.0.1:8788/owner/deny/<token>
+```
+
+`8788` is whatever `[owner_ui] listen` uses. Loopback is reachable from
+the broker host: open the ntfy web app there, or forward the owner port
+to the device that taps the action (an SSH local forward to the broker
+host's owner port). Publish that port on the broker host's loopback
+when a forward needs it. The `wg` address is the agent API; the action
+URL uses the owner listen address instead.
+
+Inside Compose the process binds `127.0.0.1` in the container. A
+published host port does not reach a container loopback bind. Run
+kharond on the host network, or forward into the container's loopback,
+and keep the action URL on that owner address.
+
+The owner unix socket remains the CLI channel (`kharon unlock`,
+`kharon approve`). It does not speak this HTTP.
+
+Follow-up #128: the publisher that builds the ntfy message must emit
+absolute action URLs whose host is this owner listen address. The path
+shape (`/owner/approve/<token>`, `/owner/deny/<token>`) stays as it is.
+
 ## Agent host (REQ-DEP-005)
 
 The agent host needs four things, and nothing else from kharon

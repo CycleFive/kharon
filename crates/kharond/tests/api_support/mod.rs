@@ -343,6 +343,16 @@ pub async fn serve_http(broker: Arc<TestBroker>) -> std::net::SocketAddr {
     addr
 }
 
+/// The owner listener's ntfy redeem routes for `broker`, on an
+/// ephemeral loopback port (REQ-DEP-006, #136). The agent transport
+/// ([`serve_http`]) does not serve these paths.
+pub async fn serve_owner(broker: Arc<TestBroker>) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(kharond::api::http::serve_owner(listener, broker));
+    addr
+}
+
 /// A parsed HTTP/1.1 response.
 #[derive(Debug)]
 pub struct RawResponse {

@@ -1365,6 +1365,11 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// (`/owner/approve/<token>`, `/owner/deny/<token>`), or `None`
     /// when no live pair exists (REQ-APR-004, #21). Owner surfaces
     /// only: the paths carry bearer-grade tokens.
+    ///
+    /// Follow-up #128: the publisher joins these paths to the owner
+    /// listener (`[owner_ui] listen`, loopback). That listener is
+    /// where redeem is served (REQ-DEP-006, #136). The URL host is
+    /// that address.
     pub fn approval_token_paths(&self, request_id: &str) -> Option<(String, String)> {
         self.approval_tokens
             .lock()

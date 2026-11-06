@@ -32,7 +32,11 @@ docker compose exec kharon kharon status
 - No ports are published. The agent API listens on `10.66.0.1:8787`
   on the `wg` network, which stands in for the WireGuard interface to
   the agent host; kharond refuses a wildcard `[api] listen`
-  (REQ-DEP-006).
+  (REQ-DEP-006). ntfy approve/deny
+  (`/owner/approve/<token>`, `/owner/deny/<token>`) is on the owner
+  UI listen address once `[owner_ui]` is set. The action URL uses
+  that loopback address; see the
+  [deployment guide](../../docs/deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
 - `memlock` is unlimited so `require_mlock` holds, and core dumps are
   off. `cap_add: IPC_LOCK` has no effect for a non-root uid; the
   ulimit is what makes `mlock` succeed.

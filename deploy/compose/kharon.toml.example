@@ -23,6 +23,11 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 listen = "10.66.0.1:8787"
 
 # Owner web UI (REQ-APR-005). Loopback only; sign-in is a passkey.
+# ntfy http actions (REQ-APR-004) POST here, for example
+# http://127.0.0.1:8788/owner/approve/<token> (and /owner/deny/...).
+# That is the owner listen address. The WireGuard agent address in
+# [api] listen leaves those paths unrouted (REQ-DEP-006).
+# Follow-up #128: the publisher must emit this owner host.
 # Browse the origin below (localhost, not the listen IP). Enroll with
 # `kharon passkey-enroll` — that code is not a password.
 # [owner_ui]

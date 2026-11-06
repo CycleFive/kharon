@@ -15,7 +15,8 @@
 //!   REQ-APR-001/002/003/007; #20), behind `kharon_request_grant`,
 //!   `POST /v1/grants`, the fill grant gate and status's grants.
 //! - [`approval`]: one-time ntfy approval tokens (REQ-APR-004; #21),
-//!   redeemed over the `/owner/*` HTTP endpoints in [`http`].
+//!   redeemed on the owner listener (`/owner/approve|deny/<token>`
+//!   in [`http`], mounted by the owner UI).
 
 pub mod approval;
 pub mod core;

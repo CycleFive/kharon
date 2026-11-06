@@ -511,6 +511,10 @@ pub enum FakeAnswer {
     OriginMismatch,
     /// Never completes (the broker's deadline must cut it off).
     Stall,
+    /// The engine's answer when the page-side budget aborts the fill
+    /// (#118): `FillOutcome::Timeout` from a `kharon:deadline`
+    /// exception, returned before the broker's own deadline.
+    PageDeadline,
 }
 
 /// A [`FillBackend`] without a browser: agents `alpha` and `beta`
@@ -590,6 +594,7 @@ impl FillBackend for FakeFill {
                 FakeAnswer::Filled => FillOutcome::Filled { kinds },
                 FakeAnswer::OriginMismatch => FillOutcome::OriginMismatch,
                 FakeAnswer::Stall => std::future::pending().await,
+                FakeAnswer::PageDeadline => FillOutcome::Timeout,
             }
         })
     }

@@ -132,6 +132,32 @@ async fn req_api_009_default_deadline_is_10s_and_fails_closed() {
     assert_one_timeout_entry(&r, true);
 }
 
+/// #118: the page-side budget's abort reaches the broker as
+/// `FillOutcome::Timeout` (the engine's mapping of the in-page
+/// `kharon:deadline` exception) *before* the broker's own deadline.
+/// The outcome is the existing one — `timeout` reply, exactly one
+/// `fill_timeout` entry after the dispatch, plan zeroized — with no
+/// new status value.
+#[tokio::test(start_paused = true)]
+async fn req_api_009_page_deadline_maps_to_timeout() {
+    fixture_vault();
+    let r = harness(FakeAnswer::PageDeadline, None);
+    let received = Instant::now();
+    assert_eq!(fill(&r, received).await.unwrap(), TIMEOUT());
+    assert!(
+        received.elapsed() < Duration::from_secs(10),
+        "answered by the page budget, not the broker deadline"
+    );
+    assert_eq!(r.fake.seen().len(), 1, "the backend was reached once");
+    let wiped = r.wiped.lock().unwrap().clone();
+    assert_eq!(wiped.len(), 1);
+    assert!(
+        wiped.iter().all(String::is_empty),
+        "plan zeroized on the page-deadline outcome"
+    );
+    assert_one_timeout_entry(&r, true);
+}
+
 #[tokio::test(start_paused = true)]
 async fn req_api_009_configured_deadline_is_honoured() {
     fixture_vault();

@@ -1,7 +1,7 @@
 //! kharon owner CLI.
 //!
-//! The full surface (approve/deny, grants, revoke, panic, …) lands
-//! with the daemon milestones; this binary currently provides the
+//! The remaining surface (revoke, panic, …) lands with the daemon
+//! milestones; this binary currently provides the
 //! audit verifier, REQ-AUD-001/002's "owner or offline tool can
 //! check the log", and the owner unlock channel (issue #11, SPEC
 //! §8): `kharon unlock` / `kharon lock` / `kharon status` talk to
@@ -59,6 +59,41 @@ enum Command {
     },
     /// Print whether the broker is locked.
     Status {
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// List pending grant requests (REQ-APR-006).
+    Grants {
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Approve a pending grant request (REQ-APR-006; SPEC §5 CLI).
+    Approve {
+        /// The `gr_…` grant request id.
+        request_id: String,
+        /// Grant kind: `once` (default), `per-origin` or `standing`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Grant TTL in seconds (SPEC §5's `--ttl`; bounded per kind
+        /// by the daemon).
+        #[arg(long)]
+        ttl: Option<u64>,
+        /// Use cap for the grant.
+        #[arg(long)]
+        max_uses: Option<u64>,
+        /// Scope the grant to a collection instead of the item.
+        #[arg(long)]
+        scope_collection: Option<String>,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Deny a pending grant request (REQ-APR-006).
+    Deny {
+        /// The `gr_…` grant request id.
+        request_id: String,
         /// The daemon's owner socket.
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
@@ -347,6 +382,34 @@ fn owner_command(command: &Command) -> ExitCode {
         }
         Command::Lock { socket } => (socket, Zeroizing::new("{\"op\":\"lock\"}".to_owned())),
         Command::Status { socket } => (socket, Zeroizing::new("{\"op\":\"status\"}".to_owned())),
+        Command::Grants { socket } => (socket, Zeroizing::new("{\"op\":\"grants\"}".to_owned())),
+        Command::Approve {
+            request_id,
+            kind,
+            ttl,
+            max_uses,
+            scope_collection,
+            socket,
+        } => (
+            socket,
+            Zeroizing::new(
+                serde_json::json!({
+                    "op": "approve",
+                    "request_id": request_id,
+                    "kind": kind,
+                    "ttl_s": ttl,
+                    "max_uses": max_uses,
+                    "scope_collection": scope_collection,
+                })
+                .to_string(),
+            ),
+        ),
+        Command::Deny { request_id, socket } => (
+            socket,
+            Zeroizing::new(
+                serde_json::json!({ "op": "deny", "request_id": request_id }).to_string(),
+            ),
+        ),
         Command::Audit(_) => unreachable!(),
     };
     match owner_request(socket, &request) {
@@ -354,7 +417,27 @@ fn owner_command(command: &Command) -> ExitCode {
             match reply["locked"].as_bool() {
                 Some(true) => println!("locked"),
                 Some(false) => println!("unlocked"),
-                None => println!("ok"),
+                None => {
+                    if let Some(pending) = reply["pending"].as_array() {
+                        for p in pending {
+                            println!(
+                                "{} agent={} item={} action={} origin={}",
+                                p["request_id"].as_str().unwrap_or("?"),
+                                p["agent_id"].as_str().unwrap_or("?"),
+                                p["item_id"].as_str().unwrap_or("?"),
+                                p["action"].as_str().unwrap_or("?"),
+                                p["origin"].as_str().unwrap_or("?"),
+                            );
+                        }
+                        if pending.is_empty() {
+                            println!("no pending requests");
+                        }
+                    } else if let Some(gid) = reply["grant_id"].as_str() {
+                        println!("grant {gid}");
+                    } else {
+                        println!("ok");
+                    }
+                }
             }
             ExitCode::SUCCESS
         }
@@ -373,9 +456,12 @@ fn owner_command(command: &Command) -> ExitCode {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Unlock { .. } | Command::Lock { .. } | Command::Status { .. } => {
-            owner_command(&cli.command)
-        }
+        Command::Unlock { .. }
+        | Command::Lock { .. }
+        | Command::Status { .. }
+        | Command::Grants { .. }
+        | Command::Approve { .. }
+        | Command::Deny { .. } => owner_command(&cli.command),
         Command::Audit(AuditCommand::Verify { data, checkpoints }) => {
             let key_path = data.join("keys").join("audit_sign.pub");
             let key_bytes = match std::fs::read(&key_path) {

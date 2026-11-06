@@ -291,13 +291,23 @@ pub async fn serve<O: OwnerOps>(listener: UnixListener, ops: Arc<O>) {
     }
 }
 
+/// The owner socket's peer gate (REQ-APR-006): a connection is
+/// served only when its peer credentials were readable *and* the
+/// peer's uid is the daemon's own effective uid. Anything else —
+/// another uid, or credentials the kernel would not give us — is
+/// rejected (and audited by the caller as `owner_auth_fail` /
+/// `peer_uid`).
+pub fn peer_uid_accepted(peer_uid: Option<u32>, own_uid: u32) -> bool {
+    peer_uid == Some(own_uid)
+}
+
 async fn handle<O: OwnerOps>(mut stream: UnixStream, ops: Arc<O>) -> std::io::Result<()> {
     // Owner-only: the peer must be a process running as the same
     // effective uid as the daemon.
-    let peer_ok = stream
-        .peer_cred()
-        .map(|c| c.uid() == rustix::process::geteuid().as_raw())
-        .unwrap_or(false);
+    let peer_ok = peer_uid_accepted(
+        stream.peer_cred().ok().map(|c| c.uid()),
+        rustix::process::geteuid().as_raw(),
+    );
     if !peer_ok {
         // Rejected peers are audited (REQ-AUD-003), then dropped
         // without a reply, as before.
@@ -791,6 +801,15 @@ mod tests {
             scan_response_gated(false, &req),
             error_response("unknown_op")
         );
+    }
+
+    #[test]
+    fn req_apr_006_only_the_daemons_own_uid_is_accepted() {
+        assert!(peer_uid_accepted(Some(1000), 1000));
+        assert!(!peer_uid_accepted(Some(1001), 1000));
+        assert!(!peer_uid_accepted(Some(0), 1000));
+        // Unreadable credentials are a rejection, never a pass.
+        assert!(!peer_uid_accepted(None, 1000));
     }
 
     #[cfg(feature = "canary-scan")]

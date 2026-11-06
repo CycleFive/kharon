@@ -56,6 +56,7 @@ use tokio::time::Instant;
 use url::Url;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use super::approval::{ApprovalAction, ApprovalTokenStore, TokenGone};
 use super::error::{ApiError, Detail};
 use super::fill::{FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus};
 use super::grant::{
@@ -372,6 +373,9 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// broker's injected clock in tests, [`SystemClock`] in the
     /// daemon (whose lock controller runs on the same clock).
     grant_clock: Arc<dyn Clock>,
+    /// One-time ntfy approval tokens (REQ-APR-004, #21): a pair is
+    /// minted for every pending grant request when it is created.
+    approval_tokens: Mutex<ApprovalTokenStore>,
 }
 
 /// Called with every resolved [`FillPlan`] after its values were
@@ -499,6 +503,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             fill_sync: None,
             grants: Mutex::new(GrantStore::new(false)),
             grant_clock: Arc::new(SystemClock),
+            approval_tokens: Mutex::new(ApprovalTokenStore::new()),
         }
     }
 
@@ -946,6 +951,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             );
         if created {
             self.append(Self::grant_creation_entry(&greq))?;
+            if greq.state == RequestState::Pending {
+                self.mint_approval_tokens(&greq.id);
+            }
         }
         let status = match greq.state {
             RequestState::OriginMismatch => FillStatus::Engine(FillOutcome::OriginMismatch),
@@ -1037,6 +1045,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             );
         if created {
             self.append(Self::grant_creation_entry(&greq))?;
+            if greq.state == RequestState::Pending {
+                self.mint_approval_tokens(&greq.id);
+            }
         }
         Ok(Outcome::GrantRequest(GrantRequestBody::of(&greq)))
     }
@@ -1153,6 +1164,87 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             return Err(GrantError::AuditFailed);
         }
         Ok(req)
+    }
+
+    /// Mint the one-time approve/deny token pair for a freshly
+    /// created pending request (REQ-APR-004). The plaintext pair is
+    /// retrievable exactly while the tokens are live, via
+    /// [`Self::approval_token_paths`], for the owner surfaces that
+    /// render or send the ntfy action URLs.
+    fn mint_approval_tokens(&self, request_id: &str) {
+        let now = self.grant_now();
+        let mut store = self
+            .approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        store.mint(request_id, ApprovalAction::Approve, now);
+        store.mint(request_id, ApprovalAction::Deny, now);
+    }
+
+    /// The live ntfy action paths for `request_id`
+    /// (`/owner/approve/<token>`, `/owner/deny/<token>`), or `None`
+    /// when no live pair exists (REQ-APR-004, #21). Owner surfaces
+    /// only: the paths carry bearer-grade tokens.
+    pub fn approval_token_paths(&self, request_id: &str) -> Option<(String, String)> {
+        self.approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .paths_for(request_id, self.grant_now())
+    }
+
+    /// The approval prompt a token's GET confirm page renders
+    /// (REQ-APR-004): peeking never consumes the token and never
+    /// mutates grant state. The action the token carries is checked
+    /// against the endpoint it was presented on by the caller.
+    pub fn approval_token_prompt(
+        &self,
+        token: &str,
+    ) -> Result<(super::grant::ApprovalPrompt, ApprovalAction), TokenGone> {
+        let (request_id, action) = self
+            .approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peek(token, self.grant_now())?;
+        let req = self.grant_request(&request_id).ok_or(TokenGone::Unknown)?;
+        let prompt = req.prompt().ok_or(TokenGone::Used)?;
+        Ok((prompt, action))
+    }
+
+    /// Redeem a one-time approval token (REQ-APR-004): approve
+    /// issues a `once` grant on the ntfy channel (SPEC §5: ntfy
+    /// `http` actions approve `once` grants only; wider terms need
+    /// the CLI or the WebAuthn web UI), deny denies the request.
+    /// A token for a request that is no longer pending is `Used`
+    /// (410): it can never take effect.
+    pub fn redeem_approval_token(&self, token: &str) -> Result<ApprovalAction, TokenGone> {
+        // Peek first so a decided-elsewhere request does not burn
+        // the distinction between replay and expiry in the store;
+        // the redeem below is the single consumption point.
+        let (request_id, action) = self
+            .approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peek(token, self.grant_now())?;
+        let req = self.grant_request(&request_id).ok_or(TokenGone::Unknown)?;
+        if req.state != RequestState::Pending {
+            return Err(TokenGone::Used);
+        }
+        self.approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .redeem(token, self.grant_now())?;
+        let decided = match action {
+            ApprovalAction::Approve => self
+                .approve_grant_request(
+                    &request_id,
+                    &GrantTerms::once_item(req.item_id.clone()),
+                    Channel::Ntfy,
+                )
+                .map(|_| ()),
+            ApprovalAction::Deny => self.deny_grant_request(&request_id).map(|_| ()),
+        };
+        decided.map_err(|_| TokenGone::Used)?;
+        Ok(action)
     }
 
     /// Revoke a grant (REQ-REV-001's broker primitive; effective for

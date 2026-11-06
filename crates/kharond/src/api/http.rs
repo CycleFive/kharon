@@ -16,6 +16,7 @@
 //! | `POST /v1/context` | bearer | empty or `{}` → `ContextResult` (the agent's `browserContextId`, #65) |
 //! | `POST /v1/grants` | bearer | `GrantRequest` → `GrantRequestBody` (`{grant_request_id, state}`, #20) |
 //! | `GET /v1/openapi.json` | none | the OpenAPI document |
+//! | `GET/POST /owner/approve/<token>`, `/owner/deny/<token>` | one-time token | ntfy approval (REQ-APR-004; #21): GET confirms, POST decides, used/expired → 410 |
 //! | `POST /mcp` | bearer | MCP over Streamable HTTP ([`super::mcp`]) |
 //!
 //! Order: route (404), method (405), bearer token (401), parameters
@@ -135,6 +136,9 @@ where
         }
         CONTEXT_PATH => return handle_context(state, req, received).await,
         GRANTS_PATH => return handle_grants(state, req, received).await,
+        path if path.starts_with(OWNER_APPROVE_PREFIX) || path.starts_with(OWNER_DENY_PREFIX) => {
+            return handle_owner_token(state, req).await;
+        }
         super::mcp::MCP_PATH => return super::mcp::handle(state, req).await,
         _ => return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute)),
     };
@@ -251,6 +255,126 @@ where
     match state.broker.context(&agent, received).await {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
+    }
+}
+
+/// `/owner/approve/<token>` prefix (REQ-APR-004, #21).
+pub const OWNER_APPROVE_PREFIX: &str = "/owner/approve/";
+/// `/owner/deny/<token>` prefix (REQ-APR-004, #21).
+pub const OWNER_DENY_PREFIX: &str = "/owner/deny/";
+
+fn html_response(status: StatusCode, body: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .expect("invariant: static headers are valid")
+}
+
+/// 410 for a used, expired or unknown approval token (REQ-APR-004).
+fn token_gone() -> Response {
+    html_response(
+        StatusCode::GONE,
+        "<!doctype html><title>kharon</title><p>This approval link is no longer valid.</p>"
+            .to_owned(),
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The ntfy one-time approval endpoints (REQ-APR-004, #21). No
+/// bearer <redacted>: the 256-bit token in the path *is* the credential,
+/// which is why it is single-use and lives 120 s. GET renders a
+/// confirm page and never mutates grant state; POST redeems the
+/// token and decides the request. A token presented to the wrong
+/// action's endpoint is treated as gone.
+async fn handle_owner_token<S, C>(state: Arc<AppState<S, C>>, req: Request) -> Response
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    use super::approval::ApprovalAction;
+    let path = req.uri().path().to_owned();
+    let (expected, token) = if let Some(t) = path.strip_prefix(OWNER_APPROVE_PREFIX) {
+        (ApprovalAction::Approve, t.to_owned())
+    } else if let Some(t) = path.strip_prefix(OWNER_DENY_PREFIX) {
+        (ApprovalAction::Deny, t.to_owned())
+    } else {
+        return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute));
+    };
+    if token.is_empty() || token.contains('/') {
+        return token_gone();
+    }
+    match *req.method() {
+        Method::GET => {
+            let broker = Arc::clone(&state.broker);
+            let seen = tokio::task::spawn_blocking(move || broker.approval_token_prompt(&token))
+                .await
+                .unwrap_or(Err(super::approval::TokenGone::Unknown));
+            match seen {
+                Ok((prompt, action)) if action == expected => {
+                    let verb = match action {
+                        ApprovalAction::Approve => "approve",
+                        ApprovalAction::Deny => "deny",
+                    };
+                    let body = format!(
+                        "<!doctype html><title>kharon — {verb} request</title>\
+                         <h1>{verb} this grant request?</h1>\
+                         <p>Agent: {agent}</p><p>Item: {item}</p>\
+                         <p>Action: {act}</p><p>Origin: {origin}</p>\
+                         <form method=\"post\" action=\"{path}\">\
+                         <button type=\"submit\">{verb}</button></form>",
+                        agent = html_escape(&prompt.agent_id),
+                        item = html_escape(&prompt.item_id),
+                        act = prompt.action.as_str(),
+                        origin = html_escape(&prompt.origin),
+                        path = html_escape(&path),
+                    );
+                    html_response(StatusCode::OK, body)
+                }
+                _ => token_gone(),
+            }
+        }
+        Method::POST => {
+            let broker = Arc::clone(&state.broker);
+            let decided = tokio::task::spawn_blocking(move || {
+                let (_, action) = broker.approval_token_prompt(&token)?;
+                if action != expected {
+                    return Err(super::approval::TokenGone::Unknown);
+                }
+                broker.redeem_approval_token(&token)
+            })
+            .await
+            .unwrap_or(Err(super::approval::TokenGone::Unknown));
+            match decided {
+                Ok(action) => {
+                    let done = match action {
+                        ApprovalAction::Approve => "approved",
+                        ApprovalAction::Deny => "denied",
+                    };
+                    html_response(
+                        StatusCode::OK,
+                        format!("<!doctype html><title>kharon</title><p>Request {done}.</p>"),
+                    )
+                }
+                Err(_) => token_gone(),
+            }
+        }
+        _ => {
+            let mut resp = error(ApiError::new(
+                ErrorCode::MethodNotAllowed,
+                Detail::MethodNotAllowed,
+            ));
+            resp.headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
+            resp
+        }
     }
 }
 

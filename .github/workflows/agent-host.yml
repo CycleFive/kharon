@@ -1,9 +1,9 @@
 name: agent-host
 # Agent-host provisioning (issue #24): REQ-DEP-005's shell snippet,
-# deploy/agent-host/provision.sh, run in a fresh Debian VM under KVM,
-# with the runner as the broker at the other end of the WireGuard
-# tunnel. REQ-ARCH-001's docs check runs with the workspace tests in
-# ci.yml.
+# deploy/agent-host/provision.sh, run in a fresh Debian VM (KVM when
+# the runner offers it, TCG otherwise), with the runner as the broker
+# at the other end of the WireGuard tunnel. REQ-ARCH-001's docs check
+# runs with the workspace tests in ci.yml.
 on:
   workflow_dispatch:
   push: { branches: [master] }
@@ -15,7 +15,7 @@ permissions: { contents: read }
 jobs:
   req_dep_005_vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
@@ -27,13 +27,15 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils wireguard-tools
-      - name: Let the runner user open /dev/kvm
+      - name: Let the runner user open /dev/kvm, if the runner has it
         run: |
+          ls -l /dev/kvm || { echo "no /dev/kvm: the VM runs under TCG (slower)"; exit 0; }
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          test -w /dev/kvm
+          sudo udevadm settle
+          ls -l /dev/kvm
       - name: REQ-DEP-005 provision a Debian VM and check it
         run: deploy/agent-host/tests/req_dep_005_vm.sh
       - name: Keep the VM's console and provisioning log

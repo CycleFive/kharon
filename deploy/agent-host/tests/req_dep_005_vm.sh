@@ -2,7 +2,7 @@
 # REQ-DEP-005 (issue #24): run deploy/agent-host/provision.sh in a fresh
 # Debian VM and check the result, with this machine as the broker.
 #
-#  1. Boot the Debian cloud image (checksum-verified) under KVM, with
+#  1. Boot the Debian cloud image (checksum-verified) under QEMU, with
 #     SSH and the WireGuard UDP port forwarded to localhost.
 #  2. Make a broker WireGuard key here, run provision.sh in the VM with
 #     its public key, and bring up the broker end here.
@@ -14,9 +14,9 @@
 #  4. Here, through the tunnel: CDP answers, and chrome://prefs-internals
 #     shows the password manager and autofill off by managed policy.
 #
-# Needs: qemu-system-x86_64 with /dev/kvm, qemu-img, cloud-localds,
-# wireguard-tools, curl, ssh, node 22+, and sudo (for the broker's
-# wg-quick). CI: .github/workflows/agent-host.yml.
+# Needs: qemu-system-x86_64 (KVM if /dev/kvm is writable, else TCG),
+# qemu-img, cloud-localds, wireguard-tools, curl, ssh, node 22+, and
+# sudo (for the broker's wg-quick). CI: .github/workflows/agent-host.yml.
 
 set -euo pipefail
 
@@ -70,7 +70,13 @@ cloud-localds seed.img user-data
 
 log "boot"
 rm -f qemu.pid console.log
-qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 3072 \
+if [ -w /dev/kvm ]; then
+    accel=(-accel kvm -cpu host)
+else
+    echo "no writable /dev/kvm: falling back to TCG, which is much slower"
+    accel=(-accel tcg -cpu max)
+fi
+qemu-system-x86_64 "${accel[@]}" -smp 2 -m 3072 \
     -drive file=disk.qcow2,if=virtio \
     -drive file=seed.img,if=virtio,format=raw \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22,hostfwd=udp:127.0.0.1:${wg_port}-:${wg_port}" \
@@ -82,9 +88,9 @@ ssh_opts=(-i id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR -o ConnectTimeout=5)
 vm() { ssh "${ssh_opts[@]}" -p "$ssh_port" debian@127.0.0.1 "$@"; }
 
-for i in $(seq 1 90); do
+for i in $(seq 1 180); do
     if vm true 2>/dev/null; then break; fi
-    if [ "$i" -eq 90 ]; then
+    if [ "$i" -eq 180 ]; then
         tail -50 console.log
         echo "FAIL: the VM did not come up" >&2
         exit 1

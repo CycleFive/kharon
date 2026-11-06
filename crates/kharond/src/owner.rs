@@ -30,9 +30,16 @@
 //!   `{"ok":true,"grant_id":"g_…"}`. Term bounds are SPEC §5's,
 //!   enforced by the broker.
 //! - `{"op":"deny","request_id":"gr_…"}` — deny a pending request.
+//! - `{"op":"passkey_enroll"}` — mint a single-use enrollment code
+//!   for the owner web UI (REQ-APR-005). The reply is
+//!   `{"ok":true,"enroll_token":"<base64url>"}`. The code is not a
+//!   password and cannot sign in; it only authorizes registering a
+//!   passkey. It is zeroized with the reply buffer. Without an
+//!   owner UI configured the op is `unknown_op`.
 //!
-//!   The CLI/ntfy presentation of these ops is #16; this socket is
-//!   the broker-side seam it drives.
+//!   The CLI/ntfy presentation of the grant ops is #16; this socket
+//!   is the broker-side seam they drive. The web UI never accepts
+//!   the master password.
 //! - `{"op":"scan","needle":"…"}` or
 //!   `{"op":"scan","needle_hex":"…"}` — only in builds with the
 //!   non-default cargo feature `canary-scan` (enabled by the test
@@ -154,6 +161,14 @@ pub trait OwnerOps: Send + Sync + 'static {
     /// origin only, REQ-APR-007). Default: none.
     fn pending_grants(&self) -> impl Future<Output = Vec<crate::api::ApprovalPrompt>> + Send {
         async { Vec::new() }
+    }
+
+    /// Mint a one-time passkey enrollment code (REQ-APR-005).
+    /// Default: the owner UI is not attached (`unknown_op`).
+    fn passkey_enroll(
+        &self,
+    ) -> impl Future<Output = Result<Zeroizing<String>, OwnerFailure>> + Send {
+        async { Err(OwnerFailure::Unsupported) }
     }
 }
 
@@ -352,7 +367,7 @@ async fn handle<O: OwnerOps>(mut stream: UnixStream, ops: Arc<O>) -> std::io::Re
 
     let response = match parsed {
         Ok((req, password)) => dispatch(req, password, ops).await,
-        Err(()) => error_response("bad_request"),
+        Err(()) => Zeroizing::new(error_response("bad_request")),
     };
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
@@ -520,6 +535,17 @@ async fn dispatch<O: OwnerOps>(
     req: Request,
     password: Option<Zeroizing<String>>,
     ops: Arc<O>,
+) -> Zeroizing<String> {
+    // The reply moves into a zeroizing buffer (the enrollment code
+    // is the one secret a reply can carry). Moving the `String`
+    // does not copy its bytes.
+    Zeroizing::new(dispatch_line(req, password, ops).await)
+}
+
+async fn dispatch_line<O: OwnerOps>(
+    req: Request,
+    password: Option<Zeroizing<String>>,
+    ops: Arc<O>,
 ) -> String {
     match req.op.as_str() {
         "unlock" => {
@@ -604,6 +630,10 @@ async fn dispatch<O: OwnerOps>(
             }
         }
         "scan" => scan_response(req),
+        "passkey_enroll" => match ops.passkey_enroll().await {
+            Ok(token) => format!("{{\"ok\":true,\"enroll_token\":\"{}\"}}\n", token.as_str()),
+            Err(e) => error_response(e.code()),
+        },
         _ => error_response("unknown_op"),
     }
 }
@@ -769,7 +799,7 @@ mod tests {
             ..MockOps::default()
         });
         let reply = dispatch(req, password, Arc::clone(&ops)).await;
-        assert_eq!(reply, error_response("unlock_failed"));
+        assert_eq!(&*reply, &error_response("unlock_failed"));
         assert_eq!(*ops.auth_failed.lock().unwrap(), ["unlock_failed"]);
 
         let (req, password) = request(br#"{"op":"unlock","password":"x"}"#);
@@ -778,7 +808,7 @@ mod tests {
             ..MockOps::default()
         });
         let reply = dispatch(req, password, ops.clone()).await;
-        assert_eq!(reply, error_response("already_unlocked"));
+        assert_eq!(&*reply, &error_response("already_unlocked"));
         assert!(ops.auth_failed.lock().unwrap().is_empty());
     }
 

@@ -57,6 +57,7 @@ fn req_dep_003_spec_example_loads_with_defaults() {
     assert_eq!(cfg.policy, PolicyConfig::default());
     assert_eq!(cfg.audit, AuditConfig::default());
     assert!(cfg.memory.require_mlock);
+    assert!(cfg.owner_ui.is_none());
     assert!(cfg.warnings().is_empty());
 }
 
@@ -149,5 +150,43 @@ checkpoint_local_only = true
     assert_eq!(
         cfg.warnings(),
         vec![ConfigWarning::AuditCheckpointLocalOnly]
+    );
+}
+
+#[test]
+fn req_apr_005_owner_ui_is_loopback_and_origin_matches_rp_id() {
+    let ok = format!(
+        "{}\n[api]\nlisten = \"127.0.0.1:8787\"\n[owner_ui]\nlisten = \"127.0.0.1:8788\"\norigin = \"http://localhost:8788/\"\n",
+        spec_example()
+    );
+    let cfg = Config::from_toml_str(&ok).unwrap();
+    let ui = cfg.owner_ui.expect("owner ui");
+    assert_eq!(ui.rp_id, "localhost");
+    assert_eq!(ui.origin, "http://localhost:8788");
+    assert_eq!(ui.origin_for_bound_port(8788), "http://localhost:8788");
+
+    let wildcard = spec_example()
+        + "\n[owner_ui]\nlisten = \"0.0.0.0:8788\"\norigin = \"http://localhost:8788\"\n";
+    assert_eq!(
+        Config::from_toml_str(&wildcard).unwrap_err().code(),
+        "owner_ui_not_loopback"
+    );
+    let remote = spec_example()
+        + "\n[owner_ui]\nlisten = \"10.66.0.1:8788\"\norigin = \"http://localhost:8788\"\n";
+    assert_eq!(
+        Config::from_toml_str(&remote).unwrap_err().code(),
+        "owner_ui_not_loopback"
+    );
+    let mismatch = spec_example()
+        + "\n[owner_ui]\nlisten = \"127.0.0.1:8788\"\norigin = \"http://localhost:9\"\n";
+    assert_eq!(
+        Config::from_toml_str(&mismatch).unwrap_err().code(),
+        "owner_ui_origin_port"
+    );
+    let ip_origin = spec_example()
+        + "\n[owner_ui]\nlisten = \"127.0.0.1:8788\"\nrp_id = \"127.0.0.1\"\norigin = \"http://127.0.0.1:8788\"\n";
+    assert_eq!(
+        Config::from_toml_str(&ip_origin).unwrap_err().code(),
+        "owner_ui_rp_id"
     );
 }

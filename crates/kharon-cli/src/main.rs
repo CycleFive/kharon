@@ -5,7 +5,9 @@
 //! audit verifier, REQ-AUD-001/002's "owner or offline tool can
 //! check the log", and the owner unlock channel (issue #11, SPEC
 //! §8): `kharon unlock` / `kharon lock` / `kharon status` talk to
-//! the daemon's unix owner socket. The unlock password is read
+//! the daemon's unix owner socket. `kharon passkey-enroll` prints a
+//! one-time WebAuthn enrollment code (REQ-APR-005); it is not a
+//! password and does not sign in. The unlock password is read
 //! from the terminal with echo disabled — never from argv, env,
 //! or a file (REQ-EXP-003); when stdin is not a terminal it is
 //! read from stdin instead (one line), which is what automation
@@ -59,6 +61,14 @@ enum Command {
     },
     /// Print whether the broker is locked.
     Status {
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Print a one-time passkey enrollment code for the owner web UI.
+    /// The code authorizes registration only; signing in still
+    /// requires a passkey assertion.
+    PasskeyEnroll {
         /// The daemon's owner socket.
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
@@ -327,6 +337,35 @@ fn unlock_frame(password: &str) -> Zeroizing<String> {
     frame
 }
 
+/// Print the enrollment code once, to stdout only. Stderr is for
+/// refusals, which do not include the code.
+fn passkey_enroll(socket: &PathBuf) -> ExitCode {
+    let request = Zeroizing::new("{\"op\":\"passkey_enroll\"}".to_owned());
+    match owner_request(socket, &request) {
+        Ok(reply) if reply.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+            match reply.get("enroll_token").and_then(|v| v.as_str()) {
+                Some(token) if !token.is_empty() => {
+                    println!("{token}");
+                    ExitCode::SUCCESS
+                }
+                _ => {
+                    eprintln!("kharon: daemon reply had no enrollment code");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Ok(reply) => {
+            let code = reply["error"].as_str().unwrap_or("unknown");
+            eprintln!("kharon: daemon refused [{code}]");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("kharon: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// Run an owner command; print the outcome for the owner.
 fn owner_command(command: &Command) -> ExitCode {
     let (socket, request) = match command {
@@ -347,7 +386,7 @@ fn owner_command(command: &Command) -> ExitCode {
         }
         Command::Lock { socket } => (socket, Zeroizing::new("{\"op\":\"lock\"}".to_owned())),
         Command::Status { socket } => (socket, Zeroizing::new("{\"op\":\"status\"}".to_owned())),
-        Command::Audit(_) => unreachable!(),
+        Command::Audit(_) | Command::PasskeyEnroll { .. } => unreachable!(),
     };
     match owner_request(socket, &request) {
         Ok(reply) if reply["ok"] == serde_json::Value::Bool(true) => {
@@ -376,6 +415,7 @@ fn main() -> ExitCode {
         Command::Unlock { .. } | Command::Lock { .. } | Command::Status { .. } => {
             owner_command(&cli.command)
         }
+        Command::PasskeyEnroll { socket } => passkey_enroll(&socket),
         Command::Audit(AuditCommand::Verify { data, checkpoints }) => {
             let key_path = data.join("keys").join("audit_sign.pub");
             let key_bytes = match std::fs::read(&key_path) {

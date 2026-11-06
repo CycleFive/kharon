@@ -19,3 +19,11 @@ cdp = { endpoint = "ws://10.66.0.2:9222/devtools/browser/<id>", via = "wireguard
 [api]
 # The wg address only; wildcards are refused (REQ-DEP-006).
 listen = "10.66.0.1:8787"
+
+# Owner web UI (REQ-APR-005). Loopback only; sign-in is a passkey.
+# Browse the origin below (localhost, not the listen IP). Enroll with
+# `kharon passkey-enroll` — that code is not a password.
+# [owner_ui]
+# listen = "127.0.0.1:8788"
+# rp_id = "localhost"
+# origin = "http://localhost:8788"

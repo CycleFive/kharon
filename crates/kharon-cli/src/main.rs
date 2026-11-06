@@ -1,7 +1,9 @@
 //! kharon owner CLI.
 //!
-//! The remaining surface (revoke, panic, …) lands with the daemon
-//! milestones; this binary currently provides the
+//! Owner tool over the daemon's owner socket: unlock/lock/status,
+//! grants/approve/deny (REQ-APR-006), revoke/unsuspend/panic
+//! (REQ-REV-001/002, REQ-RL-002), plus `init`; this binary also
+//! provides the
 //! audit verifier, REQ-AUD-001/002's "owner or offline tool can
 //! check the log", and the owner unlock channel (issue #11, SPEC
 //! §8): `kharon unlock` / `kharon lock` / `kharon status` talk to
@@ -71,6 +73,17 @@ enum Command {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
+    /// Revoke a grant, or an agent until the daemon restarts (REQ-REV-001).
+    #[command(subcommand)]
+    Revoke(RevokeCommand),
+    /// Clear an agent's suspension (REQ-RL-002). Does not un-revoke.
+    Unsuspend {
+        /// Agent id.
+        agent_id: String,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
     /// Approve a pending grant request (REQ-APR-006; SPEC §5 CLI).
     Approve {
         /// The `gr_…` grant request id.
@@ -100,9 +113,38 @@ enum Command {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
+    /// Panic: lock, zeroize, revoke all grants, close CDP (REQ-REV-002).
+    Panic {
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
     /// Generate the kharon account's master password (REQ-DEP-007)
     /// and print it once to the terminal.
     Init,
+}
+
+#[derive(Subcommand)]
+enum RevokeCommand {
+    /// Revoke one grant by id.
+    Grant {
+        /// `g_…` grant id.
+        id: String,
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Revoke an agent's token and grants until the daemon restarts.
+    ///
+    /// The flag is in-memory for the life of the process. `kharon
+    /// unsuspend` does not clear it, and there is no un-revoke
+    /// command. The token hash stays in the token store, so
+    /// restarting the daemon lets the agent authenticate again.
+    Agent {
+        /// Agent id.
+        id: String,
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -415,6 +457,28 @@ fn owner_command(command: &Command) -> ExitCode {
                 serde_json::json!({ "op": "deny", "request_id": request_id }).to_string(),
             ),
         ),
+        Command::Revoke(RevokeCommand::Grant { id, socket }) => (
+            socket,
+            Zeroizing::new(format!(
+                "{{\"op\":\"revoke_grant\",\"grant_id\":{}}}",
+                serde_json::to_string(id).expect("string")
+            )),
+        ),
+        Command::Revoke(RevokeCommand::Agent { id, socket }) => (
+            socket,
+            Zeroizing::new(format!(
+                "{{\"op\":\"revoke_agent\",\"agent_id\":{}}}",
+                serde_json::to_string(id).expect("string")
+            )),
+        ),
+        Command::Unsuspend { agent_id, socket } => (
+            socket,
+            Zeroizing::new(format!(
+                "{{\"op\":\"unsuspend\",\"agent_id\":{}}}",
+                serde_json::to_string(agent_id).expect("string")
+            )),
+        ),
+        Command::Panic { socket } => (socket, Zeroizing::new("{\"op\":\"panic\"}".to_owned())),
         Command::Audit(_) | Command::Init => unreachable!(),
     };
     match owner_request(socket, &request) {
@@ -554,6 +618,9 @@ fn main() -> ExitCode {
         | Command::Grants { .. }
         | Command::Approve { .. }
         | Command::Deny { .. } => owner_command(&cli.command),
+        Command::Revoke(_) | Command::Unsuspend { .. } | Command::Panic { .. } => {
+            owner_command(&cli.command)
+        }
         Command::Audit(AuditCommand::Verify { data, checkpoints }) => {
             let key_path = data.join("keys").join("audit_sign.pub");
             let key_bytes = match std::fs::read(&key_path) {

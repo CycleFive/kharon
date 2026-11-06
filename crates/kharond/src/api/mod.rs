@@ -25,6 +25,8 @@ pub mod grant;
 pub mod http;
 pub mod mcp;
 pub mod meta;
+pub mod rate;
+pub mod rollback;
 pub mod surface;
 pub mod token;
 
@@ -46,4 +48,6 @@ pub use grant::{
     RequestState, parse_grant,
 };
 pub use meta::ItemMeta;
+pub use rate::{RateDenied, RateLimiter, RatePolicy};
+pub use rollback::{RollbackGuard, RollbackReason};
 pub use token::{ParamFloor, TokenStore};

@@ -120,6 +120,13 @@ struct RawPolicy {
     allow_default_context: bool,
     clock_skew_warn: Option<String>,
     clock_skew_refuse: Option<String>,
+    fills_per_minute: Option<u32>,
+    fills_per_day: Option<u32>,
+    list_per_minute: Option<u32>,
+    item_fills_per_window: Option<u32>,
+    item_fill_window: Option<String>,
+    max_pending_grants: Option<u32>,
+    origin_mismatch_suspend: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -490,6 +497,19 @@ fn validate_policy(p: RawPolicy) -> Result<PolicyConfig, ConfigError> {
             p.clock_skew_refuse,
             d.clock_skew_refuse,
         )?,
+        fills_per_minute: p.fills_per_minute.unwrap_or(d.fills_per_minute),
+        fills_per_day: p.fills_per_day.unwrap_or(d.fills_per_day),
+        list_per_minute: p.list_per_minute.unwrap_or(d.list_per_minute),
+        item_fills_per_window: p.item_fills_per_window.unwrap_or(d.item_fills_per_window),
+        item_fill_window: duration(
+            "policy.item_fill_window",
+            p.item_fill_window,
+            d.item_fill_window,
+        )?,
+        max_pending_grants: p.max_pending_grants.unwrap_or(d.max_pending_grants),
+        origin_mismatch_suspend: p
+            .origin_mismatch_suspend
+            .unwrap_or(d.origin_mismatch_suspend),
     };
     if policy.default_grant == GrantKind::Standing && !policy.allow_standing {
         return Err(ConfigError::StandingGrantsDisabled);

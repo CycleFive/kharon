@@ -96,6 +96,20 @@ pub const DEFAULT_FILL_DEADLINE: Duration = crate::cdp::fill::DEFAULT_FILL_DEADL
 pub const DEFAULT_CLOCK_SKEW_WARN: Duration = Duration::from_secs(30);
 /// REQ-API-007: clock skew above this refuses `fill_totp`.
 pub const DEFAULT_CLOCK_SKEW_REFUSE: Duration = Duration::from_secs(90);
+/// REQ-RL-001: fills per agent per minute.
+pub const DEFAULT_FILLS_PER_MINUTE: u32 = 10;
+/// REQ-RL-001: fills per agent per day.
+pub const DEFAULT_FILLS_PER_DAY: u32 = 100;
+/// REQ-RL-001: list/search per agent per minute.
+pub const DEFAULT_LIST_PER_MINUTE: u32 = 60;
+/// REQ-RL-002: fills of one item inside the item window.
+pub const DEFAULT_ITEM_FILLS_PER_WINDOW: u32 = 5;
+/// REQ-RL-002: per-item fill window.
+pub const DEFAULT_ITEM_FILL_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// REQ-RL-003: pending grant requests per agent.
+pub const DEFAULT_MAX_PENDING_GRANTS: u32 = 3;
+/// REQ-RL-002: consecutive origin_mismatch → suspend.
+pub const DEFAULT_ORIGIN_MISMATCH_SUSPEND: u32 = 5;
 
 /// Config keys that would hold a secret inline. The master password and
 /// export password are supplied only at unlock (SPEC §8, REQ-EXP-003);
@@ -600,6 +614,20 @@ pub struct PolicyConfig {
     pub clock_skew_warn: Duration,
     /// REQ-API-007 refuse threshold. Default 90s.
     pub clock_skew_refuse: Duration,
+    /// REQ-RL-001: fill + fill_totp per agent per minute. Default 10.
+    pub fills_per_minute: u32,
+    /// REQ-RL-001: fill + fill_totp per agent per day. Default 100.
+    pub fills_per_day: u32,
+    /// REQ-RL-001: list + search per agent per minute. Default 60.
+    pub list_per_minute: u32,
+    /// REQ-RL-002: fills of one item per window. Default 5.
+    pub item_fills_per_window: u32,
+    /// REQ-RL-002: per-item fill window. Default 10m.
+    pub item_fill_window: Duration,
+    /// REQ-RL-003: pending grant requests per agent. Default 3.
+    pub max_pending_grants: u32,
+    /// REQ-RL-002: consecutive origin_mismatch → suspend. Default 5.
+    pub origin_mismatch_suspend: u32,
 }
 
 impl Default for PolicyConfig {
@@ -615,6 +643,13 @@ impl Default for PolicyConfig {
             allow_default_context: false,
             clock_skew_warn: DEFAULT_CLOCK_SKEW_WARN,
             clock_skew_refuse: DEFAULT_CLOCK_SKEW_REFUSE,
+            fills_per_minute: DEFAULT_FILLS_PER_MINUTE,
+            fills_per_day: DEFAULT_FILLS_PER_DAY,
+            list_per_minute: DEFAULT_LIST_PER_MINUTE,
+            item_fills_per_window: DEFAULT_ITEM_FILLS_PER_WINDOW,
+            item_fill_window: DEFAULT_ITEM_FILL_WINDOW,
+            max_pending_grants: DEFAULT_MAX_PENDING_GRANTS,
+            origin_mismatch_suspend: DEFAULT_ORIGIN_MISMATCH_SUSPEND,
         }
     }
 }

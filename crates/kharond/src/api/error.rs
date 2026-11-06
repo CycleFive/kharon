@@ -32,6 +32,8 @@ pub enum ErrorCode {
     /// The audit write failed; the request was refused (REQ-AUD-003,
     /// HTTP 500).
     AuditFailed,
+    /// Per-agent rate limit or suspension (REQ-RL-*; HTTP 429).
+    RateLimited,
 }
 
 impl ErrorCode {
@@ -45,6 +47,7 @@ impl ErrorCode {
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::AuditFailed => "audit_failed",
+            Self::RateLimited => "rate_limited",
         }
     }
 
@@ -58,11 +61,12 @@ impl ErrorCode {
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
             Self::AuditFailed => 500,
+            Self::RateLimited => 429,
         }
     }
 
     /// Every code (for the REQ-API-006 tests and the OpenAPI enum).
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::Locked,
@@ -70,6 +74,7 @@ impl ErrorCode {
         Self::NotFound,
         Self::MethodNotAllowed,
         Self::AuditFailed,
+        Self::RateLimited,
     ];
 }
 
@@ -131,6 +136,8 @@ pub enum Detail {
     /// The grant request does not match `GrantRequest` (unknown,
     /// missing, duplicate or mistyped field; issue #20).
     InvalidGrantRequest,
+    /// Rate limited or agent suspended (REQ-RL-*).
+    RateLimited,
 }
 
 impl Detail {
@@ -163,11 +170,12 @@ impl Detail {
             Self::DuplicateFillField => "fields names a kind twice",
             Self::FrameIdUnsupported => "frame_id is not supported; use the frame's cdp_target_id",
             Self::InvalidGrantRequest => "grant request does not match the schema",
+            Self::RateLimited => "rate limited; retry later or ask the owner to unsuspend",
         }
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::MissingToken,
         Self::InvalidToken,
         Self::Locked,
@@ -194,6 +202,7 @@ impl Detail {
         Self::DuplicateFillField,
         Self::FrameIdUnsupported,
         Self::InvalidGrantRequest,
+        Self::RateLimited,
     ];
 }
 
@@ -220,6 +229,9 @@ impl ApiError {
     /// 423.
     pub const LOCKED: Self = Self::new(ErrorCode::Locked, Detail::Locked);
     /// 500, REQ-AUD-003 fail-closed.
+    pub const RATE_LIMITED: Self = Self::new(ErrorCode::RateLimited, Detail::RateLimited);
+
+    /// Audit write failed.
     pub const AUDIT_FAILED: Self = Self::new(ErrorCode::AuditFailed, Detail::AuditWriteFailed);
 
     /// 400 with `detail`.

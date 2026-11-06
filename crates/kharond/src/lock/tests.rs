@@ -469,6 +469,8 @@ fn issue_54_audit_entries_use_the_real_audit_vocabulary() {
             Some("unknown_crypto_version"),
         ),
         (LockReason::ScopeWidened, Event::ScopeWidened, None),
+        (LockReason::Panic, Event::Panic, None),
+        (LockReason::RollbackDetected, Event::RollbackDetected, None),
     ];
     for (reason, event, detail) in cases {
         let entry = reason.audit_entry();

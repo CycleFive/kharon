@@ -14,7 +14,10 @@
 //! - [`grant`]: the grant model and request lifecycle (SPEC §5,
 //!   REQ-APR-001/002/003/007; #20), behind `kharon_request_grant`,
 //!   `POST /v1/grants`, the fill grant gate and status's grants.
+//! - [`approval`]: one-time ntfy approval tokens (REQ-APR-004; #21),
+//!   redeemed over the `/owner/*` HTTP endpoints in [`http`].
 
+pub mod approval;
 pub mod core;
 pub mod error;
 pub mod fill;
@@ -22,12 +25,17 @@ pub mod grant;
 pub mod http;
 pub mod mcp;
 pub mod meta;
+pub mod rate;
+pub mod rollback;
 pub mod surface;
 pub mod token;
 
 pub use self::core::{
     AgentId, AuditSink, Broker, ContextResult, FillSync, Outcome, Request, StatusBody, SyncFetch,
     VaultView,
+};
+pub use approval::{
+    ApprovalAction, ApprovalTokenStore, TOKEN_TTL as APPROVAL_TOKEN_TTL, TokenGone,
 };
 pub use error::{ApiError, Detail, ErrorBody, ErrorCode};
 pub use fill::{
@@ -40,4 +48,6 @@ pub use grant::{
     RequestState, parse_grant,
 };
 pub use meta::ItemMeta;
+pub use rate::{RateDenied, RateLimiter, RatePolicy};
+pub use rollback::{RollbackGuard, RollbackReason};
 pub use token::{ParamFloor, TokenStore};

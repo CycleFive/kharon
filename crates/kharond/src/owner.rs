@@ -19,6 +19,14 @@
 //!   the future web UI) is the only way in.
 //! - `{"op":"lock"}` — lock now, destroying the session.
 //! - `{"op":"status"}` — `{"ok":true,"locked":<bool>}`.
+//! - `{"op":"revoke_grant","grant_id":"g_…"}` — REQ-REV-001.
+//! - `{"op":"revoke_agent","agent_id":"…"}` — REQ-REV-001 (token +
+//!   grants). In-memory until the daemon process exits; `unsuspend`
+//!   does not clear it, and there is no un-revoke op. The token hash
+//!   stays in the store, so a restart accepts the token again.
+//! - `{"op":"unsuspend","agent_id":"…"}` — REQ-RL-002 owner reset of
+//!   a suspension. Does not restore a revoked token.
+//! - `{"op":"panic"}` — REQ-REV-002.
 //! - `{"op":"grants"}` — `{"ok":true,"pending":[…]}`: the pending
 //!   grant requests (SPEC §5, #20), each as the approval prompt an
 //!   owner decides on — the request id, agent, item, action, and the
@@ -170,6 +178,35 @@ pub trait OwnerOps: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Zeroizing<String>, OwnerFailure>> + Send {
         async { Err(OwnerFailure::Unsupported) }
     }
+
+    /// Revoke one grant (REQ-REV-001). Default: unsupported.
+    fn revoke_grant(
+        &self,
+        grant_id: String,
+    ) -> impl Future<Output = Result<bool, OwnerFailure>> + Send {
+        let _ = grant_id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Revoke an agent (token + grants; REQ-REV-001). Default: unsupported.
+    fn revoke_agent(
+        &self,
+        agent_id: String,
+    ) -> impl Future<Output = Result<usize, OwnerFailure>> + Send {
+        let _ = agent_id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Clear suspension (REQ-RL-002). Default: unsupported.
+    fn unsuspend(&self, agent_id: String) -> impl Future<Output = Result<(), OwnerFailure>> + Send {
+        let _ = agent_id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Panic lock (REQ-REV-002). Default: unsupported.
+    fn panic_lock(&self) -> impl Future<Output = Result<(), OwnerFailure>> + Send {
+        async { Err(OwnerFailure::Unsupported) }
+    }
 }
 
 /// Owner-chosen approval terms from an `approve` request line.
@@ -260,6 +297,12 @@ struct Request {
     /// Grant ops: use-cap override.
     #[serde(default)]
     max_uses: Option<u64>,
+    /// Revoke / unsuspend: grant id.
+    #[serde(default)]
+    grant_id: Option<String>,
+    /// Revoke agent / unsuspend: agent id.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 /// The socket path for a daemon with this `data_dir`.
@@ -306,13 +349,23 @@ pub async fn serve<O: OwnerOps>(listener: UnixListener, ops: Arc<O>) {
     }
 }
 
+/// The owner socket's peer gate (REQ-APR-006): a connection is
+/// served only when its peer credentials were readable *and* the
+/// peer's uid is the daemon's own effective uid. Anything else —
+/// another uid, or credentials the kernel would not give us — is
+/// rejected (and audited by the caller as `owner_auth_fail` /
+/// `peer_uid`).
+pub fn peer_uid_accepted(peer_uid: Option<u32>, own_uid: u32) -> bool {
+    peer_uid == Some(own_uid)
+}
+
 async fn handle<O: OwnerOps>(mut stream: UnixStream, ops: Arc<O>) -> std::io::Result<()> {
     // Owner-only: the peer must be a process running as the same
     // effective uid as the daemon.
-    let peer_ok = stream
-        .peer_cred()
-        .map(|c| c.uid() == rustix::process::geteuid().as_raw())
-        .unwrap_or(false);
+    let peer_ok = peer_uid_accepted(
+        stream.peer_cred().ok().map(|c| c.uid()),
+        rustix::process::geteuid().as_raw(),
+    );
     if !peer_ok {
         // Rejected peers are audited (REQ-AUD-003), then dropped
         // without a reply, as before.
@@ -629,6 +682,43 @@ async fn dispatch_line<O: OwnerOps>(
                 Err(e) => error_response(e.code()),
             }
         }
+        "revoke_grant" => {
+            let Some(grant_id) = req.grant_id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.revoke_grant(grant_id).await {
+                Ok(true) => ok_response(None),
+                Ok(false) => error_response("not_found"),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "revoke_agent" => {
+            let Some(agent_id) = req.agent_id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.revoke_agent(agent_id).await {
+                Ok(n) => {
+                    let mut out =
+                        serde_json::json!({ "ok": true, "grants_revoked": n }).to_string();
+                    out.push('\n');
+                    out
+                }
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "unsuspend" => {
+            let Some(agent_id) = req.agent_id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.unsuspend(agent_id).await {
+                Ok(()) => ok_response(None),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "panic" => match ops.panic_lock().await {
+            Ok(()) => ok_response(Some(true)),
+            Err(e) => error_response(e.code()),
+        },
         "scan" => scan_response(req),
         "passkey_enroll" => match ops.passkey_enroll().await {
             Ok(token) => format!("{{\"ok\":true,\"enroll_token\":\"{}\"}}\n", token.as_str()),
@@ -821,6 +911,15 @@ mod tests {
             scan_response_gated(false, &req),
             error_response("unknown_op")
         );
+    }
+
+    #[test]
+    fn req_apr_006_only_the_daemons_own_uid_is_accepted() {
+        assert!(peer_uid_accepted(Some(1000), 1000));
+        assert!(!peer_uid_accepted(Some(1001), 1000));
+        assert!(!peer_uid_accepted(Some(0), 1000));
+        // Unreadable credentials are a rejection, never a pass.
+        assert!(!peer_uid_accepted(None, 1000));
     }
 
     #[cfg(feature = "canary-scan")]

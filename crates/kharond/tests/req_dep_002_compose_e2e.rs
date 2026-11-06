@@ -41,7 +41,10 @@
 //! 5. The agent (this test) asks for its browser context and fills.
 //!    The first fill is `pending_approval` (#20, REQ-APR-001); the
 //!    owner approves it (per-origin) through the owner socket and
-//!    the fill is retried — see `owner_approve`.
+//!    the fill is retried — see `owner_approve`. Both that call and
+//!    the retry spend a fill admission, so the harness `[policy]`
+//!    raises the fill budgets above the production defaults
+//!    (`FILL_ADMISSIONS`). The daemon defaults themselves stay.
 //!
 //! Ignored by default. Env: `KHARON_FIXTURE_BASE_URL`,
 //! `KHARON_FIXTURE_CA_CERT`, `KHARON_FIXTURE_API_KEY_JSON` (as for
@@ -92,6 +95,12 @@ const PAGE_HOST: &str = "canary.example.test";
 const PROFILE: &str = "/home/browser/profile";
 
 const FILLS: usize = 10;
+/// Admissions the shared setup spends on one agent and one item:
+/// [`FILLS`] successes, plus the first call's `pending_approval`
+/// (the retry is a second `admit_fill`, and a refusal still counts).
+/// Production defaults are 10/min and 5/item/10min, which stop this
+/// run at fill 4.
+const FILL_ADMISSIONS: u32 = FILLS as u32 + 1;
 
 const PAGE: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>kharon compose E2E login</title></head>
@@ -139,6 +148,41 @@ fn write_public(path: &Path, contents: &[u8]) {
     std::fs::write(path, contents).unwrap();
     // Read by the containers' own uids (bind mounts keep host modes).
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// Compose-harness daemon config. Fill budgets cover [`FILL_ADMISSIONS`];
+/// every other `[policy]` knob is omitted so it stays at the production
+/// default.
+fn kharond_toml(email: &str, org: &str, coll: &str, hash: &str, browser_ws: &str) -> String {
+    format!(
+        r#"mode = "sync"
+
+[bitwarden]
+server = "https://vaultwarden"
+email = "{email}"
+api_key_file = "/run/secrets/kharon_bw_api_key"
+organization_id = "{org}"
+collection_ids = ["{coll}"]
+ca_file = "/etc/kharon/vault-ca.pem"
+
+[agents.alpha]
+token_hash = "{hash}"
+cdp = {{ endpoint = "{browser_ws}", via = "wireguard" }}
+
+[policy]
+# Harness only: {FILL_ADMISSIONS} admissions of one item inside a minute
+# (ten fills, and the pending_approval retry). Production stays 10/min
+# and 5/item/10min.
+fills_per_minute = {FILL_ADMISSIONS}
+item_fills_per_window = {FILL_ADMISSIONS}
+
+[audit]
+checkpoint_local_only = true
+
+[api]
+listen = "{AGENT_API}"
+"#
+    )
 }
 
 // ------------------------------------------------------------ the run
@@ -656,28 +700,7 @@ async fn setup() -> Run {
     // agent API on the wg address, CDP to the agent host over wg.
     let (token, hash) = generate("alpha");
     let token = token.expose_secret().clone();
-    let toml = format!(
-        r#"mode = "sync"
-
-[bitwarden]
-server = "https://vaultwarden"
-email = "{email}"
-api_key_file = "/run/secrets/kharon_bw_api_key"
-organization_id = "{org}"
-collection_ids = ["{coll}"]
-ca_file = "/etc/kharon/vault-ca.pem"
-
-[agents.alpha]
-token_hash = "{hash}"
-cdp = {{ endpoint = "{browser_ws}", via = "wireguard" }}
-
-[audit]
-checkpoint_local_only = true
-
-[api]
-listen = "{AGENT_API}"
-"#
-    );
+    let toml = kharond_toml(&email, &org, &coll, &hash, &browser_ws);
     write_public(&run_dir.join("kharon.toml"), toml.as_bytes());
     compose(&["up", "-d", "--no-build", "kharon"]);
     wait_for_log(
@@ -889,6 +912,37 @@ listen = "{AGENT_API}"
 }
 
 // ------------------------------------------------------------ tests
+
+/// The harness config parses, covers the 10-fill path, and does not
+/// rewrite the other production policy defaults.
+#[test]
+fn compose_harness_fill_budget_covers_arch_004_and_leaves_other_defaults() {
+    let toml = kharond_toml(
+        "kharon@example.net",
+        "0f3c2a6e-1b2c-4d5e-8f90-a1b2c3d4e5f6",
+        "11111111-2222-3333-4444-555555555555",
+        "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$CANARYhashCANARYhash",
+        "ws://10.66.0.2:9222",
+    );
+    let cfg = kharond::config::Config::from_toml_str(&toml).unwrap();
+    let production = kharond::config::PolicyConfig::default();
+    assert!(FILL_ADMISSIONS > production.fills_per_minute);
+    assert!(FILL_ADMISSIONS > production.item_fills_per_window);
+    assert_eq!(cfg.policy.fills_per_minute, FILL_ADMISSIONS);
+    assert_eq!(cfg.policy.item_fills_per_window, FILL_ADMISSIONS);
+    assert_eq!(cfg.policy.fills_per_day, production.fills_per_day);
+    assert_eq!(cfg.policy.list_per_minute, production.list_per_minute);
+    assert_eq!(cfg.policy.item_fill_window, production.item_fill_window);
+    assert_eq!(cfg.policy.max_pending_grants, production.max_pending_grants);
+    assert_eq!(
+        cfg.policy.origin_mismatch_suspend,
+        production.origin_mismatch_suspend
+    );
+    assert_eq!(cfg.policy.idle_lock, production.idle_lock);
+    assert_eq!(cfg.policy.fill_deadline, production.fill_deadline);
+    assert_eq!(cfg.policy.default_grant, production.default_grant);
+    assert!(!cfg.policy.allow_standing);
+}
 
 #[test]
 #[ignore = "needs the compose E2E stack (image.yml)"]

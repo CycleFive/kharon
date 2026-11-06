@@ -83,6 +83,7 @@ pub struct ItemUri {
 
 /// One in-scope login item. Metadata is plaintext; secrets are still
 /// ciphertext. `Debug` prints the id only.
+#[derive(Clone)]
 pub struct Item {
     id: String,
     name: String,
@@ -116,7 +117,7 @@ impl Item {
     /// text under the export session's per-unlock key, so an `Item`
     /// never holds a plaintext secret in either mode.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         id: String,
         name: String,
         username: Option<String>,
@@ -159,6 +160,27 @@ impl Item {
     /// Server `revisionDate` (RFC 3339), for grant pinning (REQ-REV-004).
     pub fn revision(&self) -> Option<&str> {
         self.revision.as_deref()
+    }
+    /// Replace the server revision (tests and sync-side grant
+    /// invalidation; REQ-REV-003/004).
+    pub fn set_revision(&mut self, revision: Option<String>) {
+        self.revision = revision;
+    }
+
+    /// Clone this item with a different `revisionDate` (REQ-REV-004
+    /// tests): secrets and metadata are preserved.
+    pub fn with_revision(&self, revision: Option<String>) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            username: self.username.clone(),
+            uris: self.uris.clone(),
+            revision,
+            collection_ids: self.collection_ids.clone(),
+            protected_cipher_key: self.protected_cipher_key.clone(),
+            protected_password: self.protected_password.clone(),
+            protected_totp: self.protected_totp.clone(),
+        }
     }
     /// The protected (EncString) password text, for the session that
     /// owns the key for it (the export loader's wrap key). Ciphertext,
@@ -209,7 +231,7 @@ pub struct SyncReport {
 }
 
 /// The scoped item set produced by one sync.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Vault {
     items: BTreeMap<String, Item>,
     report: SyncReport,
@@ -218,7 +240,7 @@ pub struct Vault {
 impl Vault {
     /// Build a vault from items constructed outside the sync path
     /// (the export loader, issue #12), with the loader's own report.
-    pub(crate) fn with_report(items: Vec<Item>, report: SyncReport) -> Self {
+    pub fn with_report(items: Vec<Item>, report: SyncReport) -> Self {
         let items = items.into_iter().map(|i| (i.id.clone(), i)).collect();
         Self { items, report }
     }
@@ -242,6 +264,12 @@ impl Vault {
         self.items
             .get(&norm_id(item_id))
             .ok_or(SyncError::ItemNotFound)
+    }
+
+    /// Mutable lookup (tests adjusting revisionDate; sync paths that
+    /// rewrite an already-built vault).
+    pub fn get_mut(&mut self, item_id: &str) -> Option<&mut Item> {
+        self.items.get_mut(&norm_id(item_id))
     }
 
     pub fn report(&self) -> &SyncReport {

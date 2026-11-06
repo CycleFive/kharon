@@ -56,6 +56,7 @@ use tokio::time::Instant;
 use url::Url;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use super::approval::{ApprovalAction, ApprovalTokenStore, TokenGone};
 use super::error::{ApiError, Detail};
 use super::fill::{FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus};
 use super::grant::{
@@ -63,10 +64,12 @@ use super::grant::{
     GrantRequestBody, GrantScope, GrantStore, GrantTerms, GrantView, RequestState,
 };
 use super::meta::{ItemMeta, matches_origin, matches_query};
+use super::rate::{RateDenied, RateLimiter, RatePolicy};
+use super::rollback::RollbackGuard;
 use super::token::TokenStore;
 use crate::audit::{AuditLog, Entry, Event};
 use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin};
-use crate::lock::{AuditError, Clock, LockController, LockEvent, SystemClock};
+use crate::lock::{AuditError, Clock, LockController, LockEvent, LockReason, SystemClock};
 use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::wire::SyncResponse;
 use crate::sync::{LiveSync, SecretField, SyncError, SyncOutcome, Vault};
@@ -372,6 +375,15 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// broker's injected clock in tests, [`SystemClock`] in the
     /// daemon (whose lock controller runs on the same clock).
     grant_clock: Arc<dyn Clock>,
+    /// One-time ntfy approval tokens (REQ-APR-004, #21): a pair is
+    /// minted for every pending grant request when it is created.
+    approval_tokens: Mutex<ApprovalTokenStore>,
+    /// Rate limits, suspension, and agent revocation (REQ-RL-*,
+    /// REQ-REV-001). Separate from the lock controller so owner
+    /// revoke/panic never needs the session.
+    rates: Mutex<RateLimiter>,
+    /// Sync rollback high-water marks since unlock (REQ-REV-004).
+    rollback: Mutex<RollbackGuard>,
 }
 
 /// Called with every resolved [`FillPlan`] after its values were
@@ -499,6 +511,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             fill_sync: None,
             grants: Mutex::new(GrantStore::new(false)),
             grant_clock: Arc::new(SystemClock),
+            approval_tokens: Mutex::new(ApprovalTokenStore::new()),
+            rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
+            rollback: Mutex::new(RollbackGuard::new()),
         }
     }
 
@@ -517,6 +532,20 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .unwrap_or_else(|p| p.into_inner())
             .set_allow_standing(policy.allow_standing);
         self
+    }
+
+    /// Apply `[policy]` rate-limit / suspension thresholds (REQ-RL-*).
+    pub fn with_rate_policy(mut self, policy: RatePolicy) -> Self {
+        self.rates
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_policy(policy);
+        self
+    }
+
+    /// The rate / suspension gate (tests seed and inspect).
+    pub fn rate_limiter(&self) -> &Mutex<RateLimiter> {
+        &self.rates
     }
 
     /// The grant store (owner operations below; tests seed and
@@ -621,13 +650,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
 
     /// Route the lock controller's transitions into the audit log
     /// (REQ-AUD-003): `Unlocked` → `unlock`, locks → `lock` /
-    /// `key_rotated` / `scope_widened` (via
-    /// [`LockEvent::audit_entry`]). The daemon calls this at
-    /// startup; until it is called, transitions are unaudited (the
-    /// state machine's unit tests wire their own sink instead).
-    /// Because the controller enforces REQ-AUD-003 fail-closed on
-    /// the `Unlocked` entry, an audit failure rolls the unlock
-    /// back — exactly as if the sink had been wired by hand.
+    /// `key_rotated` / `scope_widened` / `panic` /
+    /// `rollback_detected` (via [`LockEvent::audit_entry`]). The
+    /// daemon calls this at startup; until it is called, transitions
+    /// are unaudited (the state machine's unit tests wire their own
+    /// sink instead). Panic and rollback have no separate broker
+    /// append — this sink is their only entry, so a second append
+    /// would double-write (REQ-AUD-003). Because the controller
+    /// enforces REQ-AUD-003 fail-closed on the `Unlocked` entry, an
+    /// audit failure rolls the unlock back — exactly as if the sink
+    /// had been wired by hand.
     pub fn wire_lock_audit(&self) {
         let audit = Arc::clone(&self.audit);
         let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -646,10 +678,19 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// Verify a bearer token (REQ-API-003). One Argon2id evaluation:
     /// async transports call this from a blocking thread.
     pub fn authenticate(&self, token: &str) -> Result<AgentId, ApiError> {
-        self.tokens
+        let id = self
+            .tokens
             .authenticate(token)
-            .map(AgentId)
-            .map_err(|_| ApiError::INVALID_TOKEN)
+            .map_err(|_| ApiError::INVALID_TOKEN)?;
+        if self
+            .rates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_revoked(&id)
+        {
+            return Err(ApiError::INVALID_TOKEN);
+        }
+        Ok(AgentId(id))
     }
 
     /// Run `req` for `agent`.
@@ -695,6 +736,26 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         q: Option<String>,
         origin: Option<String>,
     ) -> Result<Outcome, ApiError> {
+        // REQ-RL-001 list/search bucket (and suspension).
+        let now = self.grant_now();
+        if let Err(denied) = self
+            .rates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admit_list(agent.as_str(), now)
+        {
+            let detail = match denied {
+                RateDenied::Suspended => "agent_suspended",
+                RateDenied::Limited => "list_rate_limited",
+            };
+            self.append(
+                Entry::new(Event::RateLimit)
+                    .agent_id(agent.0.clone())
+                    .result("rate_limited")
+                    .detail_code(detail),
+            )?;
+            return Err(ApiError::RATE_LIMITED);
+        }
         let result = {
             let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
             // The gate (`require_unlocked` is the only way to get
@@ -796,6 +857,41 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // before this fill's own grant check runs.
         self.expire_grant_requests()
             .map_err(|_| ApiError::AUDIT_FAILED)?;
+        // REQ-MEM-007: lock dominates every other fill refusal,
+        // including rate limits — check it before spending a bucket.
+        {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            lock.poll();
+            if lock.is_locked() {
+                self.append(base(event).result("locked"))?;
+                return Err(ApiError::LOCKED);
+            }
+        }
+        // REQ-RL-001/002: fill bucket + per-item window + suspension.
+        // Spent up front so a refused fill still counts (anti-hammer).
+        {
+            let now = self.grant_now();
+            let admit = self
+                .rates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .admit_fill(agent.as_str(), &req.item_id, now);
+            if let Err(denied) = admit {
+                let detail = match denied {
+                    RateDenied::Suspended => "agent_suspended",
+                    RateDenied::Limited => "fill_rate_limited",
+                };
+                self.append(base(event).result("rate_limited").detail_code(detail))?;
+                self.append(
+                    Entry::new(Event::RateLimit)
+                        .agent_id(agent.0.clone())
+                        .item_id(req.item_id.clone())
+                        .result("rate_limited")
+                        .detail_code(detail),
+                )?;
+                return Ok(Outcome::Fill(FillStatus::RateLimited.result()));
+            }
+        }
         let resolved = match self.resync_if_stale(deadline).await {
             Ok(()) => self.resolve_fill(agent, &req),
             Err(u) => Err(u),
@@ -873,6 +969,30 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             None => entry,
         };
         self.append(entry)?;
+        // REQ-RL-002: consecutive origin_mismatch → suspend.
+        match &status {
+            FillStatus::Engine(FillOutcome::OriginMismatch) => {
+                let newly = self
+                    .rates
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_origin_mismatch(agent.as_str());
+                if newly {
+                    let _ = self.append(
+                        Entry::new(Event::RateLimit)
+                            .agent_id(agent.0.clone())
+                            .result("suspended")
+                            .detail_code("origin_mismatch_streak"),
+                    );
+                }
+            }
+            _ => {
+                self.rates
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_non_mismatch(agent.as_str());
+            }
+        }
         let mut result = status.result();
         result.grant_request_id = grant_request_id;
         Ok(Outcome::Fill(result))
@@ -932,6 +1052,37 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let Some(observed) = observed else {
             return Ok((FillStatus::Engine(FillOutcome::TargetNotOwned), None, None));
         };
+        // REQ-RL-003: ≤ max pending per agent; a 4th distinct request
+        // is rate_limited with no notification (no grant_request
+        // entry, no prompt). Deduped retries of an existing pending
+        // triple still succeed.
+        {
+            let store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+            let max = self
+                .rates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .max_pending_grants() as usize;
+            let claim_ok = crate::api::grant::serialized_origin(&req.expected_origin)
+                == crate::api::grant::serialized_origin(&observed);
+            let deduped = claim_ok
+                && store.pending_requests().iter().any(|r| {
+                    r.agent_id == agent.as_str()
+                        && r.item_id == req.item_id
+                        && r.action == grant_action(req.operation)
+                });
+            if claim_ok && !deduped && store.pending_count(agent.as_str()) >= max {
+                drop(store);
+                let _ = self.append(
+                    Entry::new(Event::RateLimit)
+                        .agent_id(agent.0.clone())
+                        .item_id(req.item_id.clone())
+                        .result("rate_limited")
+                        .detail_code("pending_grant_cap"),
+                );
+                return Ok((FillStatus::RateLimited, None, Some(observed)));
+            }
+        }
         let (greq, created) = self
             .grants
             .lock()
@@ -946,6 +1097,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             );
         if created {
             self.append(Self::grant_creation_entry(&greq))?;
+            if greq.state == RequestState::Pending {
+                self.mint_approval_tokens(&greq.id);
+            }
         }
         let status = match greq.state {
             RequestState::OriginMismatch => FillStatus::Engine(FillOutcome::OriginMismatch),
@@ -1037,6 +1191,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             );
         if created {
             self.append(Self::grant_creation_entry(&greq))?;
+            if greq.state == RequestState::Pending {
+                self.mint_approval_tokens(&greq.id);
+            }
         }
         Ok(Outcome::GrantRequest(GrantRequestBody::of(&greq)))
     }
@@ -1109,6 +1266,27 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .approve(request_id, terms, channel, now)?;
+        // REQ-REV-004: pin the item revision at issuance.
+        if let GrantScope::Item(ref item_id) = grant.scope {
+            let rev = {
+                let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+                lock.require_unlocked()
+                    .ok()
+                    .and_then(|s| s.vault().get(item_id).ok())
+                    .and_then(|i| i.revision().map(str::to_owned))
+            };
+            self.grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pin_revision(&grant.id, rev);
+        }
+        let grant = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .grant(&grant.id)
+            .cloned()
+            .unwrap_or(grant);
         let entry = Entry::new(Event::GrantIssue)
             .agent_id(grant.agent_id.clone())
             .grant_id(grant.id.clone())
@@ -1155,6 +1333,87 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         Ok(req)
     }
 
+    /// Mint the one-time approve/deny token pair for a freshly
+    /// created pending request (REQ-APR-004). The plaintext pair is
+    /// retrievable exactly while the tokens are live, via
+    /// [`Self::approval_token_paths`], for the owner surfaces that
+    /// render or send the ntfy action URLs.
+    fn mint_approval_tokens(&self, request_id: &str) {
+        let now = self.grant_now();
+        let mut store = self
+            .approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        store.mint(request_id, ApprovalAction::Approve, now);
+        store.mint(request_id, ApprovalAction::Deny, now);
+    }
+
+    /// The live ntfy action paths for `request_id`
+    /// (`/owner/approve/<token>`, `/owner/deny/<token>`), or `None`
+    /// when no live pair exists (REQ-APR-004, #21). Owner surfaces
+    /// only: the paths carry bearer-grade tokens.
+    pub fn approval_token_paths(&self, request_id: &str) -> Option<(String, String)> {
+        self.approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .paths_for(request_id, self.grant_now())
+    }
+
+    /// The approval prompt a token's GET confirm page renders
+    /// (REQ-APR-004): peeking never consumes the token and never
+    /// mutates grant state. The action the token carries is checked
+    /// against the endpoint it was presented on by the caller.
+    pub fn approval_token_prompt(
+        &self,
+        token: &str,
+    ) -> Result<(super::grant::ApprovalPrompt, ApprovalAction), TokenGone> {
+        let (request_id, action) = self
+            .approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peek(token, self.grant_now())?;
+        let req = self.grant_request(&request_id).ok_or(TokenGone::Unknown)?;
+        let prompt = req.prompt().ok_or(TokenGone::Used)?;
+        Ok((prompt, action))
+    }
+
+    /// Redeem a one-time approval token (REQ-APR-004): approve
+    /// issues a `once` grant on the ntfy channel (SPEC §5: ntfy
+    /// `http` actions approve `once` grants only; wider terms need
+    /// the CLI or the WebAuthn web UI), deny denies the request.
+    /// A token for a request that is no longer pending is `Used`
+    /// (410): it can never take effect.
+    pub fn redeem_approval_token(&self, token: &str) -> Result<ApprovalAction, TokenGone> {
+        // Peek first so a decided-elsewhere request does not burn
+        // the distinction between replay and expiry in the store;
+        // the redeem below is the single consumption point.
+        let (request_id, action) = self
+            .approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peek(token, self.grant_now())?;
+        let req = self.grant_request(&request_id).ok_or(TokenGone::Unknown)?;
+        if req.state != RequestState::Pending {
+            return Err(TokenGone::Used);
+        }
+        self.approval_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .redeem(token, self.grant_now())?;
+        let decided = match action {
+            ApprovalAction::Approve => self
+                .approve_grant_request(
+                    &request_id,
+                    &GrantTerms::once_item(req.item_id.clone()),
+                    Channel::Ntfy,
+                )
+                .map(|_| ()),
+            ApprovalAction::Deny => self.deny_grant_request(&request_id).map(|_| ()),
+        };
+        decided.map_err(|_| TokenGone::Used)?;
+        Ok(action)
+    }
+
     /// Revoke a grant (REQ-REV-001's broker primitive; effective for
     /// the next fill). Audited (`grant_revoke`); an audit failure
     /// restores the grant. `false` when no such grant exists.
@@ -1188,6 +1447,184 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             return Err(GrantError::AuditFailed);
         }
         Ok(true)
+    }
+
+    /// Revoke an agent: drop its grants/requests and refuse its
+    /// token until the daemon process exits (REQ-REV-001). The flag
+    /// is in-memory; [`Self::unsuspend_agent`] does not clear it,
+    /// and there is no un-revoke op. The token hash stays in the
+    /// store, so a restart accepts the token again. Audited as
+    /// `token_revoke` + per-grant `grant_revoke`.
+    pub fn revoke_agent(&self, agent_id: &str) -> Result<usize, GrantError> {
+        let removed = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revoke_agent(agent_id);
+        self.rates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revoke_agent(agent_id);
+        for grant in &removed {
+            let entry = Entry::new(Event::GrantRevoke)
+                .agent_id(grant.agent_id.clone())
+                .grant_id(grant.id.clone())
+                .result("revoked")
+                .detail_code("agent_revoked");
+            let entry = match grant_item_id(grant) {
+                Some(id) => entry.item_id(id),
+                None => entry,
+            };
+            if self.append(entry).is_err() {
+                // Best-effort restore of this one grant; the agent
+                // stays revoked (fail closed on the token).
+                self.grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .restore_grant(grant.clone());
+                return Err(GrantError::AuditFailed);
+            }
+        }
+        let entry = Entry::new(Event::TokenRevoke)
+            .agent_id(agent_id.to_owned())
+            .result("revoked");
+        self.append(entry).map_err(|_| GrantError::AuditFailed)?;
+        Ok(removed.len())
+    }
+
+    /// Clear an agent's suspension (REQ-RL-002 owner reset). Does
+    /// not restore a revoked token; revocation lasts until the
+    /// daemon process exits.
+    pub fn unsuspend_agent(&self, agent_id: &str) -> Result<(), GrantError> {
+        self.rates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unsuspend(agent_id);
+        self.append(
+            Entry::new(Event::RateLimit)
+                .agent_id(agent_id.to_owned())
+                .result("unsuspended")
+                .detail_code("owner_reset"),
+        )
+        .map_err(|_| GrantError::AuditFailed)
+    }
+
+    /// `kharon panic` (REQ-REV-002): revoke every grant, then lock
+    /// (zeroize + CDP close via the lock hook). The single `panic`
+    /// audit entry is that lock ([`LockReason::Panic`] through
+    /// [`Self::wire_lock_audit`]); appending it here as well would
+    /// record the transition twice (REQ-AUD-003). Notify is
+    /// best-effort via the audit/ntfy checkpoint path; a dedicated
+    /// ntfy push is not yet wired (#16).
+    pub fn panic_lock(&self) -> Result<(), GrantError> {
+        let removed = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revoke_all();
+        for grant in &removed {
+            let entry = Entry::new(Event::GrantRevoke)
+                .agent_id(grant.agent_id.clone())
+                .grant_id(grant.id.clone())
+                .result("revoked")
+                .detail_code("panic");
+            let entry = match grant_item_id(grant) {
+                Some(id) => entry.item_id(id),
+                None => entry,
+            };
+            let _ = self.append(entry);
+        }
+        self.rollback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reset();
+        self.lock_audited(LockReason::Panic);
+        Ok(())
+    }
+
+    /// Lock for `reason`. [`LockReason::Panic`] and
+    /// [`LockReason::RollbackDetected`] have no other audit entry:
+    /// the lock sink writes [`LockReason::audit_entry`] when this
+    /// call actually transitions to locked. If the broker is already
+    /// locked the sink does not run, so that same entry is appended
+    /// here — exactly one of the two paths, never both (REQ-AUD-003).
+    fn lock_audited(&self, reason: LockReason) {
+        let transitioned = {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            lock.lock(reason)
+        };
+        if !transitioned && matches!(reason, LockReason::Panic | LockReason::RollbackDetected) {
+            let _ = self.append(reason.audit_entry());
+        }
+    }
+
+    /// Observe a freshly applied vault for rollback (REQ-REV-004).
+    /// On `Err`, the caller must lock with [`LockReason::RollbackDetected`]
+    /// (and may already hold the controller — this method never takes
+    /// the lock). That lock is the single `rollback_detected` audit
+    /// entry; this method does not append one, or a wired lock sink
+    /// would record a second (REQ-AUD-003). Resets the high-water
+    /// marks after a detected rollback so the next unlock starts clean.
+    pub fn detect_rollback(
+        &self,
+        vault: &Vault,
+    ) -> Result<(), crate::api::rollback::RollbackReason> {
+        let result = self
+            .rollback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observe(vault);
+        if result.is_err() {
+            self.rollback
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .reset();
+        }
+        result
+    }
+
+    /// Invalidate per-item grants whose item is gone or whose pinned
+    /// revision no longer matches (REQ-REV-003). Audited per grant.
+    pub fn invalidate_grants_for_vault(&self, vault: &Vault) -> Result<usize, GrantError> {
+        let removed = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .invalidate_for_vault(vault);
+        for grant in &removed {
+            let entry = Entry::new(Event::GrantRevoke)
+                .agent_id(grant.agent_id.clone())
+                .grant_id(grant.id.clone())
+                .result("revoked")
+                .detail_code("item_revised_or_removed");
+            let entry = match grant_item_id(grant) {
+                Some(id) => entry.item_id(id),
+                None => entry,
+            };
+            self.append(entry).map_err(|_| GrantError::AuditFailed)?;
+        }
+        Ok(removed.len())
+    }
+
+    /// Convenience for callers that do not already hold the lock
+    /// controller: detect rollback (locking if needed) then invalidate
+    /// grants. Returns whether a rollback forced a lock. The single
+    /// `rollback_detected` entry is that lock's, not a second append.
+    pub fn observe_vault_after_sync(&self, vault: &Vault) -> Result<bool, GrantError> {
+        if self.detect_rollback(vault).is_err() {
+            self.lock_audited(LockReason::RollbackDetected);
+            return Ok(true);
+        }
+        self.invalidate_grants_for_vault(vault)?;
+        Ok(false)
+    }
+
+    /// Reset rollback marks on unlock (fresh high-water).
+    pub fn reset_rollback_guard(&self) {
+        self.rollback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reset();
     }
 
     /// A grant request by id (owner surfaces, tests).
@@ -1436,6 +1873,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             let mut store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
             match &req.grant_id {
                 Some(gid) => {
+                    let rev = item.revision();
                     let ok = store.grant(gid).is_some_and(|g| {
                         g.matches(
                             agent.as_str(),
@@ -1444,7 +1882,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                             &req.expected_origin,
                             action,
                             now,
-                        )
+                        ) && g.revision_matches(rev)
                     }) && store.consume(gid, now);
                     if !ok {
                         return refuse(FillStatus::GrantDenied);
@@ -1452,25 +1890,46 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     gid.clone()
                 }
                 None => {
+                    let rev = item.revision();
                     let found = store
-                        .matching_grant(
-                            agent.as_str(),
-                            &req.item_id,
-                            item.collection_ids(),
-                            &req.expected_origin,
-                            action,
-                            now,
-                        )
-                        .map(|g| g.id.clone());
+                        .grants_for(agent.as_str(), now)
+                        .into_iter()
+                        .find(|g| {
+                            g.matches(
+                                agent.as_str(),
+                                &req.item_id,
+                                item.collection_ids(),
+                                &req.expected_origin,
+                                action,
+                                now,
+                            ) && g.revision_matches(rev)
+                        })
+                        .map(|g| g.id);
                     match found {
                         Some(gid) => {
-                            // Live under this same lock hold, by
-                            // `matching_grant`'s check.
                             let consumed = store.consume(&gid, now);
                             debug_assert!(consumed);
                             gid
                         }
-                        None => return Err(Unresolved::NeedsApproval),
+                        None => {
+                            // A live grant that fails only on revision
+                            // is denied (re-approval), not a fresh
+                            // request (REQ-REV-004).
+                            let revision_miss = store
+                                .matching_grant(
+                                    agent.as_str(),
+                                    &req.item_id,
+                                    item.collection_ids(),
+                                    &req.expected_origin,
+                                    action,
+                                    now,
+                                )
+                                .is_some_and(|g| !g.revision_matches(rev));
+                            if revision_miss {
+                                return refuse(FillStatus::GrantDenied);
+                            }
+                            return Err(Unresolved::NeedsApproval);
+                        }
                     }
                 }
             }

@@ -324,6 +324,7 @@ impl OwnerOps for DaemonOwner {
                 })
                 .await
                 .map_err(|_| OwnerFailure::UnlockFailed)??;
+                self.broker.reset_rollback_guard();
                 self.start_live_sync(bw);
                 Ok(())
             }
@@ -429,6 +430,36 @@ impl OwnerOps for DaemonOwner {
             Some(ui) => Ok(ui.mint_enroll_token()),
             None => Err(OwnerFailure::Unsupported),
         }
+    }
+
+    async fn revoke_grant(&self, grant_id: String) -> Result<bool, OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.revoke_grant(&grant_id).map_err(map_grant_error))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+    }
+
+    async fn revoke_agent(&self, agent_id: String) -> Result<usize, OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.revoke_agent(&agent_id).map_err(map_grant_error))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+    }
+
+    async fn unsuspend(&self, agent_id: String) -> Result<(), OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || {
+            broker.unsuspend_agent(&agent_id).map_err(map_grant_error)
+        })
+        .await
+        .map_err(|_| OwnerFailure::AuditFailed)?
+    }
+
+    async fn panic_lock(&self) -> Result<(), OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.panic_lock().map_err(map_grant_error))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
     }
 }
 
@@ -625,6 +656,7 @@ pub async fn start(
         // SPEC §5 (#20): standing grants only when `[policy]
         // allow_standing` says so.
         .with_grant_policy(crate::api::GrantPolicy::from(&cfg.policy))
+        .with_rate_policy(crate::api::rate::RatePolicy::from(&cfg.policy))
         // REQ-API-009 `fill_deadline` and the fill origin policy.
         .with_fill_policy(FillPolicy::from(&cfg.policy))
         // REQ-API-008: each agent's configured CDP endpoint,
@@ -929,16 +961,40 @@ async fn live_sync(
         }
         let step = match client.sync().await {
             Ok(sync) => {
-                with_generation(&broker, generation, move |lock| {
+                let broker_sync = Arc::clone(&broker);
+                tokio::task::spawn_blocking(move || {
+                    let mut lock = broker_sync
+                        .lock_controller()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    lock.poll();
+                    if lock.unlocked_at() != Some(generation) {
+                        return LiveStep::Stop;
+                    }
                     let outcome = lock.with_session_mut(|session| match session {
                         DaemonSession::Sync(live) => live.apply(&sync),
-                        // Not reachable: this task only runs for
-                        // sync-mode unlocks.
                         DaemonSession::Export(_) => Ok(SyncOutcome::Synced),
                     });
                     match outcome {
                         Err(_locked) => LiveStep::Stop,
-                        Ok(Ok(SyncOutcome::Synced)) => LiveStep::Continue,
+                        Ok(Ok(SyncOutcome::Synced)) => {
+                            // REQ-REV-003/004 under the same lock hold.
+                            let vault = match lock.require_unlocked() {
+                                Ok(s) => s.vault().clone(),
+                                Err(_) => return LiveStep::Stop,
+                            };
+                            if broker_sync.detect_rollback(&vault).is_err() {
+                                // The session is unlocked here, so this
+                                // lock transitions and the sink
+                                // (`wire_lock_audit`) writes the one
+                                // `rollback_detected` entry.
+                                // `detect_rollback` does not append one.
+                                lock.lock(crate::lock::LockReason::RollbackDetected);
+                                return LiveStep::Stop;
+                            }
+                            let _ = broker_sync.invalidate_grants_for_vault(&vault);
+                            LiveStep::Continue
+                        }
                         Ok(Ok(SyncOutcome::Lock(reason))) => {
                             lock.on_sync_lock(&reason);
                             LiveStep::Stop
@@ -947,6 +1003,7 @@ async fn live_sync(
                     }
                 })
                 .await
+                .unwrap_or(LiveStep::Stop)
             }
             Err(e) => {
                 // The session may have gone while the request ran.

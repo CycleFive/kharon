@@ -22,11 +22,14 @@
 //! requesting agent's browser context, or the default context when
 //! `allow_default` is set.
 //!
-//! This module is the engine only: it has no deadline and writes no
-//! audit entry. The daemon's one fill path, `fill` and `fill_totp`
-//! alike, is [`crate::api::Broker::fill`], which owns the REQ-API-009
-//! deadline and the REQ-AUD-003† dispatch / outcome audit pair around
-//! [`FillEngine::fill`] (#73, #77, #88).
+//! This module is the fill engine. It writes no audit entry — the
+//! daemon's one fill path, `fill` and `fill_totp` alike, is
+//! [`crate::api::Broker::fill`], which owns the REQ-AUD-003† dispatch /
+//! outcome audit pair around [`FillEngine::fill`] (#73, #77, #88).
+//! REQ-API-009's end-to-end deadline is still owned by the broker, but
+//! the engine converts the remainder into a page-side relative budget
+//! at dispatch (`FillPlan.deadline` / [`page_budget`], #118) so a
+//! single in-page step can abort ahead of the broker's cut-off.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -161,8 +164,11 @@ pub enum FillOutcome {
     /// (no further broker-side CDP writes) and zeroizing the plan, and
     /// also returned by [`FillEngine::fill`] itself when the page-side
     /// budget (#118) ends the fill: the in-page call threw
-    /// `kharon:deadline`, or the remainder at dispatch was already at
-    /// or under the return margin so the call was never sent. Not a
+    /// `kharon:deadline`, or the remainder at dispatch was already
+    /// zero so the call was never sent (`PageBudget::Exhausted`). Under
+    /// the half-cap margin (`margin = min(250ms, remaining/2)`) a
+    /// positive remainder always yields a usable budget of at least
+    /// 1 ms — only a zero remainder refuses dispatch here. Not a
     /// guarantee that nothing happened in the page: an in-page fill
     /// call dispatched before expiry may still complete a step already
     /// running (see [`FillEngine::fill`], #46).
@@ -280,12 +286,14 @@ impl FillEngine {
 
     /// Run one fill attempt (SPEC §6 steps 1–4) and classify it.
     ///
-    /// The engine has no deadline and writes no audit entry. The
-    /// daemon's only fill path, `fill` and `fill_totp` alike, is
-    /// [`crate::api::Broker::fill`] (through its
-    /// [`crate::api::FillBackend`]), which owns the REQ-API-009 deadline
-    /// and the REQ-AUD-003† `fill_dispatch` / outcome pair; on expiry it
-    /// drops this future, zeroizes the plan and appends `fill_timeout`.
+    /// The engine writes no audit entry. The daemon's only fill path,
+    /// `fill` and `fill_totp` alike, is [`crate::api::Broker::fill`]
+    /// (through its [`crate::api::FillBackend`]), which owns the
+    /// REQ-AUD-003† `fill_dispatch` / outcome pair and the REQ-API-009
+    /// end-to-end deadline; on expiry it drops this future, zeroizes
+    /// the plan and appends `fill_timeout`. At dispatch the engine
+    /// still converts the deadline remainder into a page-side budget
+    /// (`FillPlan.deadline` / [`page_budget`], #118).
     ///
     /// # Cancellation: what "fails closed" does *not* cover (#46)
     ///
@@ -500,10 +508,11 @@ impl FillEngine {
 
         // #118: convert what is left of the REQ-API-009 deadline into
         // the page-side relative budget at the last moment, so the
-        // setup above is charged against it. A remainder at or under
-        // the return margin is refused here, before the call is sent
-        // (the broker maps this to the same `timeout` outcome as an
-        // expiry it observed itself).
+        // setup above is charged against it. Only a zero remainder is
+        // refused here (`PageBudget::Exhausted`); under the half-cap
+        // margin a positive remainder always yields ≥1 ms. The broker
+        // maps Exhausted to the same `timeout` outcome as an expiry it
+        // observed itself.
         let budget_ms = match page_budget(deadline, Instant::now()) {
             PageBudget::Exhausted => return FillOutcome::Timeout,
             PageBudget::Budget(ms) => ms,

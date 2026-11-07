@@ -310,6 +310,7 @@ Agent token provisioning is out of band (REQ-API-003, #129). `kharon token mint 
 | REQ-RL-001 | Per-agent token bucket (`fill` and `fill_totp` share it): fills 10/min and 100/day, list/search 60/min (configurable). | Load test: the 11th fill in 60 s → `rate_limited`. |
 | REQ-RL-002 | Per-item: 5 fills (password or TOTP) per 10 min. Per-agent: 5 consecutive `origin_mismatch` → agent suspended until owner reset. | Tests for both thresholds. Suspension audited. |
 | REQ-RL-003 | Pending grant requests ≤ 3 per agent (anti-approval-fatigue). | The 4th request → `rate_limited` without notification. |
+| REQ-RL-004 | A fill backed by a live grant already issued for it is not refused by REQ-RL-001's per-agent fill bucket. It still draws a token when one is left, so it counts. "Backed" means the grant would admit this fill at the grant gate (agent, item or collection, origin, action, TTL, uses, revision; REQ-APR-002). Refused attempts keep counting toward REQ-RL-001, so probing stays limited, but the owner's approval outranks the agent's earlier noise and an approved grant cannot be stranded. REQ-RL-002 (the per-item window and the `origin_mismatch` suspension) applies unchanged, and the grant's TTL and `max_uses` (REQ-APR-008) bound it. (#152, Lothrop decision 2026-11-07.) | Tests: an agent at its fill limit with a live grant for the item → the fill proceeds and draws no token past the limit; the same agent without a grant → `rate_limited`. A grant-backed fill is still refused by the per-item window and while the agent is suspended. |
 | REQ-REV-001 | `kharon revoke grant <id>`, `revoke agent <id>` (token + grants), effective for the next request. | Revoke then fill within 10 ms → denied. |
 | REQ-REV-002 | `kharon panic`: lock, zeroize keys, revoke all grants, close CDP sessions, notify. Also via ntfy action and web UI. | After panic, the heap scan shows no key canary. `status.locked=true`. Fill → `locked`. |
 | REQ-REV-004 | Rollback detection: keep a per-item high-water `revisionDate` and an item-set hash in memory since unlock. A sync that regresses either → lock + audit `rollback_detected`. Grants pin the item revision at issuance; a fill against a different revision → `denied` (re-approval). Closes OQ-7 for v1. | Fixture serves an older cipher → lock. Changing an item revision after grant → fill denied. |
@@ -434,7 +435,7 @@ M0 skeleton · M1 vault read path · M2 fill path · M3 policy and approvals · 
 | 15 | Grant model and request lifecycle | REQ-APR-001, 002, 003, 007, 008 | 9, 8 |
 | 16 | Approval channels: CLI socket, ntfy one-time actions | REQ-APR-004, 006 | 15 |
 | 17 | Owner web UI with WebAuthn (approvals, grants, audit tail, unlock) | REQ-APR-005 | 15, 7 |
-| 18 | Rate limits, suspension, revocation, panic | REQ-RL-001..003, REQ-REV-001..004, REQ-MEM-007 | 13, 15 |
+| 18 | Rate limits, suspension, revocation, panic | REQ-RL-001..004, REQ-REV-001..004, REQ-MEM-007 | 13, 15 |
 | 19 | Docker image, compose, agent-host guide, canary E2E suite | REQ-DEP-001, 002, 005, 006, 007, 008, REQ-ARCH-001, 004, REQ-GOAL-002 | 13, 16 |
 | 20 | Official Bitwarden compat run plus `COMPAT.md` | REQ-DEP-004 | 5 |
 | 21 | Export mode loader | REQ-EXP-001..005 | 4, 7 |

@@ -17,7 +17,9 @@ use crate::{AUTH_OK, AUTH_PROTOCOL, AUTH_UNAUTHORIZED, ClientError};
 /// `server_name` is the TLS name (a DNS name or an IP literal). `broker`
 /// is the address actually dialed, which may be the proxy's target
 /// resolved by the caller. `proxy`, when set, is an HTTP CONNECT proxy
-/// with no userinfo.
+/// with no userinfo. `proxy_creds`, when set with `proxy`, is the raw
+/// `user:password` line sent only as `Proxy-Authorization` on that
+/// CONNECT. It is not sent to the broker.
 #[derive(Clone)]
 pub struct AgentParams {
     pub broker: SocketAddr,
@@ -27,6 +29,7 @@ pub struct AgentParams {
     pub token: Zeroizing<String>,
     pub cdp: SocketAddr,
     pub proxy: Option<SocketAddr>,
+    pub proxy_creds: Option<Zeroizing<Vec<u8>>>,
 }
 
 /// Dial the broker once and relay until the session ends.
@@ -40,7 +43,15 @@ pub async fn run_agent_once(params: &AgentParams) -> Result<(), ClientError> {
         return Err(ClientError::CdpNotLoopback);
     }
     let tcp = match params.proxy {
-        Some(proxy) => connect_http_proxy(proxy, &params.server_name, params.broker.port()).await?,
+        Some(proxy) => {
+            connect_http_proxy(
+                proxy,
+                &params.server_name,
+                params.broker.port(),
+                params.proxy_creds.as_deref().map(Vec::as_slice),
+            )
+            .await?
+        }
         None => TcpStream::connect(params.broker)
             .await
             .map_err(|_| ClientError::Transport { context: "tcp" })?,

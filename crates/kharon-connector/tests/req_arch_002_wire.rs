@@ -69,6 +69,7 @@ fn params(broker: SocketAddr, pin: [u8; 32], token: &str, cdp: SocketAddr) -> Ag
         token: Zeroizing::new(token.into()),
         cdp,
         proxy: None,
+        proxy_creds: None,
     }
 }
 
@@ -228,6 +229,7 @@ async fn req_arch_002_http_connect_proxy_reaches_the_broker() {
     let (broker, pin, sessions) = token_broker("kh_tunnel_assistant_ok").await;
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let (mut inbound, _) = proxy.accept().await.unwrap();
         let mut buf = Vec::new();
@@ -237,6 +239,7 @@ async fn req_arch_002_http_connect_proxy_reaches_the_broker() {
             buf.push(byte[0]);
         }
         let head = String::from_utf8(buf).unwrap();
+        let _ = tx.send(head.clone());
         let target = head
             .split("\r\n")
             .next()
@@ -258,6 +261,15 @@ async fn req_arch_002_http_connect_proxy_reaches_the_broker() {
     let agent = tokio::spawn(async move {
         let _ = run_agent_once(&p).await;
     });
+    let head = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let port = broker.port();
+    let expected = format!(
+        "CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    assert_eq!(head, expected);
     let session = wait_sessions(&sessions, 1).await;
     let mut io = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
         .await
@@ -272,4 +284,118 @@ async fn req_arch_002_http_connect_proxy_reaches_the_broker() {
     assert_eq!(&buf, b"via-proxy");
     session.shutdown();
     let _ = agent.await;
+}
+
+/// RFC 7617 §2 vector. The proxy accepts only this header.
+const PROXY_BASIC: &str = "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==";
+
+#[tokio::test]
+async fn req_arch_002_http_connect_proxy_basic_auth_reaches_the_broker() {
+    let (cdp, _) = counting_listener().await;
+    let (broker, pin, sessions) = token_broker("kh_tunnel_assistant_ok").await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            inbound.read_exact(&mut byte).await.unwrap();
+            buf.push(byte[0]);
+        }
+        let head = String::from_utf8(buf).unwrap();
+        let ok = head.contains(PROXY_BASIC) && !head.contains("open sesame");
+        let _ = tx.send(head.clone());
+        if !ok {
+            let _ = inbound
+                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .await;
+            return;
+        }
+        let target = head
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .split(' ')
+            .nth(1)
+            .unwrap()
+            .parse::<SocketAddr>()
+            .unwrap();
+        let mut outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+        inbound
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    });
+    let mut p = params(broker, pin, "kh_tunnel_assistant_ok", cdp);
+    p.proxy = Some(proxy_addr);
+    p.proxy_creds = Some(Zeroizing::new(b"Aladdin:open sesame".to_vec()));
+    let agent = tokio::spawn(async move {
+        let _ = run_agent_once(&p).await;
+    });
+    let head = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(head.contains(PROXY_BASIC), "{head}");
+    assert!(!head.contains("open sesame"));
+    assert!(!head.contains("Aladdin"));
+    let session = wait_sessions(&sessions, 1).await;
+    let mut io = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+        .await
+        .unwrap()
+        .unwrap();
+    io.write_all(b"authed").await.unwrap();
+    let mut buf = [0u8; 6];
+    tokio::time::timeout(Duration::from_secs(5), io.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"authed");
+    session.shutdown();
+    let _ = agent.await;
+}
+
+#[tokio::test]
+async fn req_arch_002_proxy_407_does_not_dial_cdp() {
+    let (cdp, hits) = counting_listener().await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            if inbound.read(&mut byte).await.unwrap() == 0 {
+                return;
+            }
+            buf.push(byte[0]);
+        }
+        let _ = inbound
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+Proxy-Authenticate: Basic realm=\"Aladdin\"\r\n\
+\r\n\
+open sesame",
+            )
+            .await;
+    });
+    let mut p = params(
+        "127.0.0.1:9".parse().unwrap(),
+        [7u8; 32],
+        "kh_tunnel_assistant_ok",
+        cdp,
+    );
+    p.proxy = Some(proxy_addr);
+    p.proxy_creds = Some(Zeroizing::new(b"Aladdin:open sesame".to_vec()));
+    let err = run_agent_once(&p).await.unwrap_err();
+    assert_eq!(err, ClientError::ProxyAuth);
+    assert_eq!(err.to_string(), "proxy authentication was refused");
+    let shown = format!("{err:?} {err}");
+    assert!(!shown.contains("open sesame"));
+    assert!(!shown.contains("Aladdin"));
+    assert!(!shown.contains("QWxhZGRpbjpvcGVuIHNlc2FtZQ=="));
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
 }

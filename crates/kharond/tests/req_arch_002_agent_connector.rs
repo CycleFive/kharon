@@ -207,6 +207,7 @@ fn agent_params(rig: &Rig, pin: [u8; 32]) -> AgentParams {
         token: Zeroizing::new(rig.token.clone()),
         cdp: rig.cdp,
         proxy: None,
+        proxy_creds: None,
     }
 }
 

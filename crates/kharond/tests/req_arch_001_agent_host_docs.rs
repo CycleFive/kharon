@@ -259,6 +259,7 @@ const CONNECTOR_INSTALL: &[&str] = &[
     "/etc/kharon-connector",
     "/usr/local/bin/kharon-agent-connector",
     "/etc/kharon-connector/token",
+    "/etc/kharon-connector/proxy-creds",
 ];
 /// After connector names are stripped, path (B) code must not name these.
 const CONNECTOR_FORBIDDEN: &[&str] = &[
@@ -402,6 +403,24 @@ fn req_arch_001_connector_script_installs_only_chromium_and_tunnel_config() {
     let guide = repo_file("docs/deployment.md");
     let guide_problems = connector_guide_problems(&guide, &script);
     assert!(guide_problems.is_empty(), "{guide_problems:#?}");
+}
+
+#[test]
+fn req_dep_005_proxy_credential_is_a_file_and_userinfo_stays_refused() {
+    let script = repo_file("deploy/agent-host/provision-connector.sh");
+    assert!(
+        script.contains("PROXY must not carry userinfo"),
+        "userinfo rejection was removed"
+    );
+    assert!(script.contains("PROXY_CREDS_FILE"));
+    assert!(script.contains("/etc/kharon-connector/proxy-creds"));
+    assert!(script.contains("proxy_creds_file"));
+    let guide = repo_file("docs/deployment.md");
+    let section = agent_host_section(&guide).unwrap();
+    assert!(section.contains("PROXY_CREDS_FILE"));
+    assert!(section.contains("proxy-creds"));
+    assert!(section.contains("userinfo"));
+    assert!(section.contains("Proxy-Authorization"));
 }
 
 #[test]

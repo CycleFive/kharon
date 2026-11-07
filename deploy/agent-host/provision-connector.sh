@@ -8,8 +8,10 @@
 #
 # Chromium matches path (A): user `browser`, profile mode 0700, CDP on
 # 127.0.0.1, ptrace_scope=1, password manager off. The connector is a
-# separate user. It holds a tunnel credential and dials the broker; it
-# does not hold an agent API token or any vault material.
+# separate user. It holds a tunnel credential and, when configured, the
+# egress proxy's password. It dials the broker; it does not hold an
+# agent API token or any vault material. The proxy password is sent
+# only to that proxy.
 #
 # Inputs (environment):
 #   CONNECTOR_BIN       required: path to the kharon-agent-connector binary
@@ -19,6 +21,12 @@
 #   TUNNEL_TOKEN_FILE   required: file whose contents are the tunnel credential
 #   CDP_PORT            optional, default 9222
 #   PROXY               optional http://host:port with no userinfo
+#   PROXY_CREDS_FILE    optional file of one line `user:password`
+#                       (a trailing newline is ignored). Requires PROXY.
+#                       Installed mode 0400 for the connector user at
+#                       /etc/kharon-connector/proxy-creds. The connector
+#                       sends it only as Proxy-Authorization on CONNECT.
+#                       A re-run that omits this variable removes that file.
 #
 # Re-running is safe: units and config are rewritten. The token file is
 # replaced from TUNNEL_TOKEN_FILE.
@@ -32,6 +40,7 @@ set -euo pipefail
 : "${TUNNEL_TOKEN_FILE:?set TUNNEL_TOKEN_FILE to the tunnel credential file}"
 CDP_PORT="${CDP_PORT:-9222}"
 PROXY="${PROXY:-}"
+PROXY_CREDS_FILE="${PROXY_CREDS_FILE:-}"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "provision-connector.sh: run as root" >&2
@@ -82,6 +91,14 @@ if [ -n "$PROXY" ]; then
             exit 1
             ;;
     esac
+fi
+if [ -n "$PROXY_CREDS_FILE" ] && [ -z "$PROXY" ]; then
+    echo "provision-connector.sh: PROXY_CREDS_FILE requires PROXY" >&2
+    exit 1
+fi
+if [ -n "$PROXY_CREDS_FILE" ] && [ ! -f "$PROXY_CREDS_FILE" ]; then
+    echo "provision-connector.sh: PROXY_CREDS_FILE is not a file" >&2
+    exit 1
 fi
 
 put_file() {
@@ -150,6 +167,11 @@ UNIT
 
 install -m 0755 -o root -g root "$CONNECTOR_BIN" /usr/local/bin/kharon-agent-connector
 install -m 0400 -o connector -g connector "$TUNNEL_TOKEN_FILE" /etc/kharon-connector/token
+if [ -n "$PROXY_CREDS_FILE" ]; then
+    install -m 0400 -o connector -g connector "$PROXY_CREDS_FILE" /etc/kharon-connector/proxy-creds
+else
+    rm -f /etc/kharon-connector/proxy-creds
+fi
 
 {
     printf 'broker = "%s"\n' "$BROKER_ADDR"
@@ -159,6 +181,9 @@ install -m 0400 -o connector -g connector "$TUNNEL_TOKEN_FILE" /etc/kharon-conne
     printf 'cdp = "127.0.0.1:%s"\n' "$CDP_PORT"
     if [ -n "$PROXY" ]; then
         printf 'proxy = "%s"\n' "$PROXY"
+    fi
+    if [ -n "$PROXY_CREDS_FILE" ]; then
+        printf 'proxy_creds_file = "/etc/kharon-connector/proxy-creds"\n'
     fi
 } | put_file /etc/kharon-connector/connector.toml 0644
 

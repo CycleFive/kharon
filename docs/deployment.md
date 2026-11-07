@@ -414,7 +414,12 @@ It:
 
 `CDP_PORT` defaults to `9222`. `PROXY=http://proxy-host:3128` is an
 optional HTTP CONNECT proxy with no userinfo; the connector refuses a
-proxy URL that embeds a password. Re-running the script is safe.
+proxy URL that embeds a password. When the proxy itself needs a
+credential, set `PROXY_CREDS_FILE` to a file (mode `0400`/`0600`) holding
+one `user:password` line — the script installs it at
+`/etc/kharon-connector/proxy-creds` and the connector sends
+`Proxy-Authorization: Basic` on CONNECT. Do not put the password in the
+`PROXY` URL. Re-running the script is safe.
 
 The tunnel credential is the only kharon secret on this host, and
 only the `connector` user can read it. It is not the agent API token.

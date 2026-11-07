@@ -259,6 +259,7 @@ const CONNECTOR_INSTALL: &[&str] = &[
     "/etc/kharon-connector",
     "/usr/local/bin/kharon-agent-connector",
     "/etc/kharon-connector/token",
+    "/etc/kharon-connector/proxy-creds",
 ];
 /// After connector names are stripped, path (B) code must not name these.
 const CONNECTOR_FORBIDDEN: &[&str] = &[

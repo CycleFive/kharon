@@ -19,9 +19,13 @@
 #   TUNNEL_TOKEN_FILE   required: file whose contents are the tunnel credential
 #   CDP_PORT            optional, default 9222
 #   PROXY               optional http://host:port with no userinfo
+#   PROXY_CREDS_FILE    optional: file holding one user:password line for
+#                       Proxy-Authorization on CONNECT (requires PROXY).
+#                       Installed mode 0400 like the tunnel token; never
+#                       put credentials in the PROXY URL.
 #
 # Re-running is safe: units and config are rewritten. The token file is
-# replaced from TUNNEL_TOKEN_FILE.
+# replaced from TUNNEL_TOKEN_FILE. PROXY_CREDS_FILE is replaced the same way.
 
 set -euo pipefail
 
@@ -32,6 +36,7 @@ set -euo pipefail
 : "${TUNNEL_TOKEN_FILE:?set TUNNEL_TOKEN_FILE to the tunnel credential file}"
 CDP_PORT="${CDP_PORT:-9222}"
 PROXY="${PROXY:-}"
+PROXY_CREDS_FILE="${PROXY_CREDS_FILE:-}"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "provision-connector.sh: run as root" >&2
@@ -72,7 +77,7 @@ fi
 if [ -n "$PROXY" ]; then
     case "$PROXY" in
         http://*@*|http://*:*@*)
-            echo "provision-connector.sh: PROXY must not carry userinfo" >&2
+            echo "provision-connector.sh: PROXY must not carry userinfo (use PROXY_CREDS_FILE)" >&2
             exit 1
             ;;
         http://*)
@@ -82,6 +87,16 @@ if [ -n "$PROXY" ]; then
             exit 1
             ;;
     esac
+fi
+if [ -n "$PROXY_CREDS_FILE" ]; then
+    if [ -z "$PROXY" ]; then
+        echo "provision-connector.sh: PROXY_CREDS_FILE requires PROXY" >&2
+        exit 1
+    fi
+    if [ ! -f "$PROXY_CREDS_FILE" ]; then
+        echo "provision-connector.sh: PROXY_CREDS_FILE is not a file" >&2
+        exit 1
+    fi
 fi
 
 put_file() {
@@ -150,6 +165,9 @@ UNIT
 
 install -m 0755 -o root -g root "$CONNECTOR_BIN" /usr/local/bin/kharon-agent-connector
 install -m 0400 -o connector -g connector "$TUNNEL_TOKEN_FILE" /etc/kharon-connector/token
+if [ -n "$PROXY_CREDS_FILE" ]; then
+    install -m 0400 -o connector -g connector "$PROXY_CREDS_FILE" /etc/kharon-connector/proxy-creds
+fi
 
 {
     printf 'broker = "%s"\n' "$BROKER_ADDR"
@@ -159,6 +177,9 @@ install -m 0400 -o connector -g connector "$TUNNEL_TOKEN_FILE" /etc/kharon-conne
     printf 'cdp = "127.0.0.1:%s"\n' "$CDP_PORT"
     if [ -n "$PROXY" ]; then
         printf 'proxy = "%s"\n' "$PROXY"
+    fi
+    if [ -n "$PROXY_CREDS_FILE" ]; then
+        printf 'proxy_creds_file = "/etc/kharon-connector/proxy-creds"\n'
     fi
 } | put_file /etc/kharon-connector/connector.toml 0644
 

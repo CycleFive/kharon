@@ -69,6 +69,7 @@ fn params(broker: SocketAddr, pin: [u8; 32], token: &str, cdp: SocketAddr) -> Ag
         token: Zeroizing::new(token.into()),
         cdp,
         proxy: None,
+        proxy_auth: None,
     }
 }
 
@@ -270,6 +271,139 @@ async fn req_arch_002_http_connect_proxy_reaches_the_broker() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf, b"via-proxy");
+    session.shutdown();
+    let _ = agent.await;
+}
+
+#[tokio::test]
+async fn req_dep_005_http_connect_proxy_auth_accepted() {
+    // base64("pilot:s3cret") — fixed so the test does not depend on base64ct.
+    const EXPECTED: &str = "Proxy-Authorization: Basic cGlsb3Q6czNjcmV0";
+
+    let (cdp, _) = counting_listener().await;
+    let (broker, pin, sessions) = token_broker("kh_tunnel_assistant_ok").await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            inbound.read_exact(&mut byte).await.unwrap();
+            buf.push(byte[0]);
+        }
+        let head = String::from_utf8(buf).unwrap();
+        assert!(
+            head.lines().any(|l| l == EXPECTED),
+            "missing or wrong Proxy-Authorization: {head}"
+        );
+        let target = head
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .split(' ')
+            .nth(1)
+            .unwrap()
+            .parse::<SocketAddr>()
+            .unwrap();
+        let mut outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+        inbound
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    });
+    let mut p = params(broker, pin, "kh_tunnel_assistant_ok", cdp);
+    p.proxy = Some(proxy_addr);
+    p.proxy_auth = Some(Zeroizing::new(b"pilot:s3cret".to_vec()));
+    let agent = tokio::spawn(async move {
+        let _ = run_agent_once(&p).await;
+    });
+    let session = wait_sessions(&sessions, 1).await;
+    let mut io = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+        .await
+        .unwrap()
+        .unwrap();
+    io.write_all(b"via-auth").await.unwrap();
+    let mut buf = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(5), io.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"via-auth");
+    session.shutdown();
+    let _ = agent.await;
+}
+
+#[tokio::test]
+async fn req_dep_005_http_connect_proxy_407_is_proxy_auth() {
+    let (cdp, hits) = counting_listener().await;
+    let (broker, pin, _sessions) = token_broker("kh_tunnel_assistant_ok").await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            inbound.read_exact(&mut byte).await.unwrap();
+            buf.push(byte[0]);
+        }
+        inbound
+            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let mut p = params(broker, pin, "kh_tunnel_assistant_ok", cdp);
+    p.proxy = Some(proxy_addr);
+    p.proxy_auth = Some(Zeroizing::new(b"pilot:wrong".to_vec()));
+    let err = run_agent_once(&p).await.unwrap_err();
+    assert_eq!(err, ClientError::ProxyAuth);
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "CDP must not dial on 407");
+}
+
+#[tokio::test]
+async fn req_dep_005_http_connect_proxy_no_auth_header_when_unset() {
+    let (cdp, _) = counting_listener().await;
+    let (broker, pin, sessions) = token_broker("kh_tunnel_assistant_ok").await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            inbound.read_exact(&mut byte).await.unwrap();
+            buf.push(byte[0]);
+        }
+        let head = String::from_utf8(buf).unwrap();
+        assert!(
+            !head.to_ascii_lowercase().contains("proxy-authorization"),
+            "no-auth path must omit Proxy-Authorization: {head}"
+        );
+        let target = head
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .split(' ')
+            .nth(1)
+            .unwrap()
+            .parse::<SocketAddr>()
+            .unwrap();
+        let mut outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+        inbound
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    });
+    let mut p = params(broker, pin, "kh_tunnel_assistant_ok", cdp);
+    p.proxy = Some(proxy_addr);
+    // proxy_auth stays None — byte-identical to the pre-#145 request shape.
+    let agent = tokio::spawn(async move {
+        let _ = run_agent_once(&p).await;
+    });
+    let session = wait_sessions(&sessions, 1).await;
     session.shutdown();
     let _ = agent.await;
 }

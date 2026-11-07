@@ -1,35 +1,56 @@
 //! HTTP/1.1 `CONNECT` in front of the broker TLS handshake.
 //!
-//! v1 has no proxy authentication. A proxy URL with userinfo is refused
-//! by the agent binary so a password is not placed on the command line
-//! or in the config the process would otherwise log. Add auth only with
-//! a story for where the secret lives (a file, like the tunnel token).
+//! Proxy authentication is optional and file-backed: the agent binary
+//! still refuses a proxy URL with userinfo so a password is never on
+//! the command line or in a logged config value. When a credential is
+//! supplied, the CONNECT request carries `Proxy-Authorization: Basic`
+//! built from that credential; a `407` is reported as
+//! [`ClientError::ProxyAuth`] without echoing the credential or the
+//! response body.
 
 use std::net::SocketAddr;
 
+use base64ct::{Base64, Encoding};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::ClientError;
 
 /// Dial `proxy` and ask it to connect to `target_host:target_port`.
+///
+/// `basic_userinfo`, when set, is the raw `user:password` bytes used to
+/// build a Basic `Proxy-Authorization` header. It is never logged.
 /// The returned stream is ready for the TLS handshake to that target.
 pub async fn connect_http_proxy(
     proxy: SocketAddr,
     target_host: &str,
     target_port: u16,
+    basic_userinfo: Option<&[u8]>,
 ) -> Result<TcpStream, ClientError> {
     if target_host.is_empty() || target_host.len() > 253 || target_host.contains([' ', '\r', '\n'])
     {
         return Err(ClientError::Protocol);
     }
+    if let Some(cred) = basic_userinfo {
+        // Reject CR/LF so a malicious file cannot inject headers.
+        if cred.is_empty() || cred.iter().any(|b| *b == b'\r' || *b == b'\n') {
+            return Err(ClientError::Protocol);
+        }
+    }
     let mut stream = TcpStream::connect(proxy)
         .await
         .map_err(|_| ClientError::Transport { context: "proxy" })?;
     let _ = stream.set_nodelay(true);
-    let req = format!(
-        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    let mut req = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: keep-alive\r\n"
     );
+    if let Some(cred) = basic_userinfo {
+        let b64 = Base64::encode_string(cred);
+        req.push_str("Proxy-Authorization: Basic ");
+        req.push_str(&b64);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
     stream
         .write_all(req.as_bytes())
         .await
@@ -42,7 +63,13 @@ pub async fn connect_http_proxy(
     let mut parts = status.split(' ');
     let version = parts.next().unwrap_or("");
     let code = parts.next().unwrap_or("");
-    if !version.starts_with("HTTP/1.") || code != "200" {
+    if !version.starts_with("HTTP/1.") {
+        return Err(ClientError::Transport { context: "proxy" });
+    }
+    if code == "407" {
+        return Err(ClientError::ProxyAuth);
+    }
+    if code != "200" {
         return Err(ClientError::Transport { context: "proxy" });
     }
     Ok(stream)

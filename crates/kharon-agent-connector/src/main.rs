@@ -36,6 +36,8 @@ struct RawConfig {
     cdp: String,
     #[serde(default)]
     proxy: Option<String>,
+    #[serde(default)]
+    proxy_creds_file: Option<PathBuf>,
 }
 
 struct Config {
@@ -46,6 +48,7 @@ struct Config {
     token: Zeroizing<String>,
     cdp: SocketAddr,
     proxy: Option<(String, u16)>,
+    proxy_auth: Option<Zeroizing<Vec<u8>>>,
 }
 
 fn main() -> ExitCode {
@@ -120,6 +123,15 @@ fn load(path: &Path) -> Result<Config, String> {
         None => None,
         Some(p) => Some(parse_proxy(&p)?),
     };
+    let proxy_auth = match raw.proxy_creds_file {
+        None => None,
+        Some(ref p) => {
+            if proxy.is_none() {
+                return Err("proxy_creds_file requires proxy".to_owned());
+            }
+            Some(read_proxy_creds(p)?)
+        }
+    };
     let token = read_token(&raw.token_file)?;
     Ok(Config {
         broker_host: broker_host.to_owned(),
@@ -129,6 +141,7 @@ fn load(path: &Path) -> Result<Config, String> {
         token,
         cdp,
         proxy,
+        proxy_auth,
     })
 }
 
@@ -157,6 +170,41 @@ fn read_token(path: &Path) -> Result<Zeroizing<String>, String> {
         );
     }
     Ok(Zeroizing::new(token))
+}
+
+fn read_proxy_creds(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    let meta = std::fs::metadata(path).map_err(|_| "cannot read proxy creds file".to_owned())?;
+    if !meta.is_file() {
+        return Err("proxy creds file is not a regular file".to_owned());
+    }
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o777
+    };
+    if mode & 0o077 != 0 {
+        return Err("proxy creds file must be mode 0400 or 0600".to_owned());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "cannot read proxy creds file".to_owned())?;
+    // One line: user:password. Trim a single trailing newline only; do not
+    // log or echo the contents. Reject CR/LF inside so CONNECT headers stay
+    // single-line.
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    let cred = &bytes[..end];
+    if cred.is_empty() || !cred.contains(&b':') || cred.iter().any(|b| *b == b'\r' || *b == b'\n') {
+        return Err("proxy creds file must hold one user:password line".to_owned());
+    }
+    // user must be non-empty (password may be empty).
+    let colon = cred.iter().position(|b| *b == b':').unwrap();
+    if colon == 0 {
+        return Err("proxy creds file must hold one user:password line".to_owned());
+    }
+    Ok(Zeroizing::new(cred.to_vec()))
 }
 
 fn parse_pin(hex_pin: &str) -> Result<kharon_connector::CertSha256, String> {
@@ -226,6 +274,7 @@ async fn resolve(cfg: &Config) -> Result<AgentParams, String> {
         token: cfg.token.clone(),
         cdp: cfg.cdp,
         proxy,
+        proxy_auth: cfg.proxy_auth.clone(),
     })
 }
 
@@ -251,6 +300,14 @@ async fn run_until_signal(params: AgentParams) {
                     Err(ClientError::Unauthorized) => {
                         eprintln!(
                             "kharon-agent-connector: tunnel credentials refused; retrying in 60s"
+                        );
+                        if sleep_or_shutdown(Duration::from_secs(60)).await {
+                            return;
+                        }
+                    }
+                    Err(ClientError::ProxyAuth) => {
+                        eprintln!(
+                            "kharon-agent-connector: proxy authentication refused; retrying in 60s"
                         );
                         if sleep_or_shutdown(Duration::from_secs(60)).await {
                             return;

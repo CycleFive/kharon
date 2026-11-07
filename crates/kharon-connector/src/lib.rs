@@ -71,6 +71,10 @@ pub enum ClientError {
     /// The broker refused the tunnel credential (REQ-ARCH-002).
     #[error("tunnel credentials were refused")]
     Unauthorized,
+    /// The HTTP CONNECT proxy returned 407 (REQ-DEP-005 path B).
+    /// Display text never includes the credential or the response body.
+    #[error("proxy authentication was refused")]
+    ProxyAuth,
     /// The peer did not speak version 1.
     #[error("connector protocol error")]
     Protocol,

@@ -570,6 +570,27 @@ pub enum StartupError {
         /// `std::io::ErrorKind` rendering. No file contents.
         kind: String,
     },
+    /// A configured TLS certificate or key could not be loaded.
+    #[error("tls material: {reason}")]
+    TlsMaterial {
+        /// Fixed-text reason.
+        reason: &'static str,
+    },
+    /// The connector listen address could not be bound.
+    #[error("cannot bind agent connector on {addr}: {kind}")]
+    ConnectorBind {
+        /// Configured address.
+        addr: SocketAddr,
+        /// `std::io::ErrorKind` rendering.
+        kind: String,
+    },
+}
+
+/// Path B accept task plus the hub the CDP backend dials through.
+struct ConnectorRuntime {
+    task: tokio::task::JoinHandle<()>,
+    addr: SocketAddr,
+    hub: Arc<crate::connector::Hub>,
 }
 
 impl StartupError {
@@ -590,6 +611,8 @@ impl StartupError {
             Self::Bind { .. } => "bind",
             Self::OwnerUiBind { .. } => "owner_ui_bind",
             Self::OwnerUiStore { .. } => "owner_ui_store",
+            Self::TlsMaterial { .. } => "tls_material",
+            Self::ConnectorBind { .. } => "connector_bind",
         }
     }
 
@@ -607,7 +630,10 @@ impl StartupError {
             | Self::Audit(_)
             | Self::OwnerBind { .. }
             | Self::OwnerUiStore { .. } => EX_CANTCREAT,
-            Self::Bind { .. } | Self::OwnerUiBind { .. } => EX_UNAVAILABLE,
+            Self::Bind { .. } | Self::OwnerUiBind { .. } | Self::ConnectorBind { .. } => {
+                EX_UNAVAILABLE
+            }
+            Self::TlsMaterial { .. } => EX_CONFIG,
         }
     }
 }
@@ -615,7 +641,7 @@ impl StartupError {
 /// The config checks [`start`] adds on top of the loader, without
 /// side effects: what `kharond --check` runs after `load_for_startup`.
 pub fn check(cfg: &Config) -> Result<SocketAddr, StartupError> {
-    let api = cfg.api.ok_or(StartupError::ApiListenMissing)?;
+    let api = cfg.api.as_ref().ok_or(StartupError::ApiListenMissing)?;
     // REQ-AUD-002 (#127): off-host checkpoints are served by the ntfy
     // sink; the loader already guarantees the channel exists in this
     // mode, and `--check` must not read the token file or touch the
@@ -630,6 +656,10 @@ pub fn check(cfg: &Config) -> Result<SocketAddr, StartupError> {
 /// An assembled daemon: locked broker plus bound listener.
 pub struct Daemon {
     listener: TcpListener,
+    /// Set when the agent API speaks TLS (path B, and path A if configured).
+    api_tls: Option<Arc<rustls::ServerConfig>>,
+    /// Path B accept loop, if any agent uses `via = agent_connector`.
+    connector: Option<ConnectorRuntime>,
     broker: Arc<DaemonBroker>,
     clock: Option<SyncClient>,
     owner_listener: UnixListener,
@@ -708,6 +738,15 @@ pub async fn start(
         SystemClock,
         hardening,
     );
+    let connector = bind_connector(cfg).await?;
+    let api_tls = match cfg.api.as_ref().and_then(|api| api.tls.as_ref()) {
+        Some(material) => Some(load_tls_material(material)?),
+        None => None,
+    };
+    let mut cdp_backend = ConnectingCdpBackend::from_agents(&cfg.agents);
+    if let Some(rt) = &connector {
+        cdp_backend = cdp_backend.with_connector(Arc::clone(&rt.hub));
+    }
     let broker = Broker::new(tokens, lock, Box::new(audit), cfg.policy.origin_config())
         .with_clock_skew_policy(SkewPolicy::from(&cfg.policy))
         // SPEC §5 (#20): standing grants only when `[policy]
@@ -720,8 +759,9 @@ pub async fn start(
         // connected (and its browser context created, REQ-ARCH-005)
         // on its first fill or `kharon_context` call, after that
         // call's `fill_dispatch`/`context_open` entry and inside the
-        // deadline. Startup does not need the browser.
-        .with_fill_backend(Box::new(ConnectingCdpBackend::from_agents(&cfg.agents)));
+        // deadline. Startup does not need the browser. Path B attaches
+        // the connector hub below, once the listener exists.
+        .with_fill_backend(Box::new(cdp_backend));
     // REQ-APR-004 send half (#128): publish approval prompts to the
     // configured ntfy topic, with action URLs on the owner listener.
     // Needs both halves: no `[approval].ntfy` → no channel; no
@@ -782,6 +822,8 @@ pub async fn start(
         })?;
     Ok(Daemon {
         listener,
+        api_tls,
+        connector,
         broker,
         clock,
         owner_listener,
@@ -791,6 +833,44 @@ pub async fn start(
         owner_ui_addr,
         owner_ui_origin,
     })
+}
+
+fn load_tls_material(
+    material: &crate::config::TlsMaterial,
+) -> Result<Arc<rustls::ServerConfig>, StartupError> {
+    crate::config::load_tls(material).map_err(|e| StartupError::TlsMaterial {
+        reason: match e {
+            crate::config::ConfigError::TlsMaterial { reason } => reason,
+            _ => "unreadable certificate",
+        },
+    })
+}
+
+async fn bind_connector(cfg: &Config) -> Result<Option<ConnectorRuntime>, StartupError> {
+    let Some(connector) = &cfg.connector else {
+        return Ok(None);
+    };
+    let tls = load_tls_material(&connector.tls)?;
+    let listener =
+        TcpListener::bind(connector.listen)
+            .await
+            .map_err(|e| StartupError::ConnectorBind {
+                addr: connector.listen,
+                kind: e.kind().to_string(),
+            })?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| StartupError::ConnectorBind {
+            addr: connector.listen,
+            kind: e.kind().to_string(),
+        })?;
+    let tokens = TokenStore::from_connector_agents(&cfg.agents)?;
+    let hub = Arc::new(crate::connector::Hub::new(tokens));
+    let accept_hub = Arc::clone(&hub);
+    let task = tokio::spawn(async move {
+        crate::connector::accept(listener, tls, accept_hub).await;
+    });
+    Ok(Some(ConnectorRuntime { task, addr, hub }))
 }
 
 /// Bind `[owner_ui]` when it is configured. The origin uses the
@@ -883,6 +963,16 @@ impl Daemon {
         self.listener.local_addr()
     }
 
+    /// Whether the agent API listener speaks TLS.
+    pub fn agent_api_tls(&self) -> bool {
+        self.api_tls.is_some()
+    }
+
+    /// The connector listen address, when path B is configured.
+    pub fn connector_addr(&self) -> Option<SocketAddr> {
+        self.connector.as_ref().map(|rt| rt.addr)
+    }
+
     /// The owner socket path (`kharon unlock` / `lock` connect here).
     pub fn owner_socket(&self) -> &std::path::Path {
         &self.owner_path
@@ -929,7 +1019,16 @@ impl Daemon {
             })
         });
         let shutdown_broker = Arc::clone(&self.broker);
-        let served = http::serve_with_shutdown(self.listener, self.broker, shutdown).await;
+        let connector_task = self.connector.as_ref().map(|rt| rt.task.abort_handle());
+        let served = match self.api_tls {
+            Some(tls) => {
+                http::serve_tls_with_shutdown(self.listener, tls, self.broker, shutdown).await
+            }
+            None => http::serve_with_shutdown(self.listener, self.broker, shutdown).await,
+        };
+        if let Some(task) = connector_task {
+            task.abort();
+        }
         checkpoint_timer.abort();
         owner.abort();
         if let Some(task) = owner_ui {

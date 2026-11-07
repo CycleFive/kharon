@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/kharon-bwcrypto", "crates/kharond", "crates/kharon-cli"]
+members = [
+    "crates/kharon-bwcrypto",
+    "crates/kharond",
+    "crates/kharon-cli",
+    "crates/kharon-connector",
+    "crates/kharon-agent-connector",
+]
 
 [workspace.package]
 version = "0.0.0"

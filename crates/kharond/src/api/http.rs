@@ -111,6 +111,69 @@ where
         .await
 }
 
+/// Path B agent API (REQ-DEP-006): the same router over TLS. Plain HTTP
+/// bytes on this listener fail the handshake and are not dispatched.
+pub async fn serve_tls_with_shutdown<S, C, F>(
+    listener: TcpListener,
+    tls: Arc<rustls::ServerConfig>,
+    broker: Arc<Broker<S, C>>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(TlsListener::new(listener, tls), router(broker))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+/// TCP listener that completes a TLS handshake before axum sees the stream.
+struct TlsListener {
+    tcp: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl TlsListener {
+    fn new(tcp: TcpListener, tls: Arc<rustls::ServerConfig>) -> Self {
+        Self {
+            tcp,
+            acceptor: tokio_rustls::TlsAcceptor::from(tls),
+        }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (sock, addr) = match self.tcp.accept().await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    continue;
+                }
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.acceptor.accept(sock),
+            )
+            .await
+            {
+                Ok(Ok(tls)) => return (tls, addr),
+                _ => continue,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.tcp.local_addr()
+    }
+}
+
 /// Serve the ntfy redeem routes on `listener`.
 ///
 /// This is the owner-listener surface (REQ-DEP-006, #136): `GET`/`POST`

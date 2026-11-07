@@ -125,6 +125,9 @@ pub(crate) enum MaybeTls {
     // Boxed: the TLS variant is ~1.1 KB and this enum crosses every
     // websocket poll.
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// Path B: bytes for this CDP connection ride the agent-held TLS
+    /// session (`via = agent_connector`). Boxed like the TLS variant.
+    Connector(Box<kharon_connector::MuxIo>),
 }
 
 impl tokio::io::AsyncRead for MaybeTls {
@@ -136,6 +139,7 @@ impl tokio::io::AsyncRead for MaybeTls {
         match self.get_mut() {
             Self::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             Self::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::Connector(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -149,6 +153,7 @@ impl tokio::io::AsyncWrite for MaybeTls {
         match self.get_mut() {
             Self::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             Self::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::Connector(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -159,6 +164,7 @@ impl tokio::io::AsyncWrite for MaybeTls {
         match self.get_mut() {
             Self::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
             Self::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::Connector(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -169,6 +175,7 @@ impl tokio::io::AsyncWrite for MaybeTls {
         match self.get_mut() {
             Self::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             Self::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::Connector(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 
@@ -180,6 +187,7 @@ impl tokio::io::AsyncWrite for MaybeTls {
         match self.get_mut() {
             Self::Plain(s) => std::pin::Pin::new(s).poll_write_vectored(cx, bufs),
             Self::Tls(s) => std::pin::Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Connector(s) => std::pin::Pin::new(s).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -187,15 +195,49 @@ impl tokio::io::AsyncWrite for MaybeTls {
         match self {
             Self::Plain(s) => s.is_write_vectored(),
             Self::Tls(s) => s.is_write_vectored(),
+            Self::Connector(s) => s.is_write_vectored(),
         }
     }
 }
 
-/// Open the transport to `endpoint`'s host and port: plain TCP for
-/// `ws://`, pinned TLS for `wss://` (REQ-ARCH-002). Shared by the
-/// WebSocket connect and the `/json/version` lookup
-/// ([`super::discover`]), so both go the same way.
-pub(super) async fn open_stream(endpoint: &CdpEndpoint) -> Result<MaybeTls, CdpError> {
+/// How [`CdpClient::connect_via`] obtains the byte stream.
+///
+/// [`CdpDial::Tcp`] is every transport the broker dials itself
+/// (`direct`, `wireguard`, `ssh`, `mtls`). [`CdpDial::Connector`] is
+/// path B: the stream is a mux channel on the agent-held TLS session.
+#[derive(Clone)]
+pub enum CdpDial {
+    /// Dial `endpoint`'s host and port.
+    Tcp,
+    /// Open a stream on the accepted connector for `agent_id`.
+    Connector {
+        /// Live connector sessions.
+        hub: std::sync::Arc<crate::connector::Hub>,
+        /// `[agents.<id>]` this CDP endpoint belongs to.
+        agent_id: String,
+    },
+}
+
+/// Open the transport to `endpoint`: plain TCP for `ws://`, pinned TLS
+/// for `wss://`, or a connector stream when `via = agent_connector`
+/// (REQ-ARCH-002). Shared by the WebSocket connect and the
+/// `/json/version` lookup ([`super::discover`]), so both go the same way.
+pub(super) async fn open_stream(
+    endpoint: &CdpEndpoint,
+    dial: &CdpDial,
+) -> Result<MaybeTls, CdpError> {
+    if endpoint.tunnel == super::endpoint::Tunnel::AgentConnector {
+        let CdpDial::Connector { hub, agent_id } = dial else {
+            return Err(CdpError::Connect(
+                "agent_connector endpoint requires the connector hub".into(),
+            ));
+        };
+        let io = hub
+            .open_stream(agent_id)
+            .await
+            .map_err(|e| CdpError::Connect(e.to_string()))?;
+        return Ok(MaybeTls::Connector(Box::new(io)));
+    }
     let host = endpoint
         .url
         .host_str()
@@ -308,12 +350,18 @@ impl CdpClient {
     /// port with that path (issue #113). Every connect resolves again,
     /// so a reconnect after a Chromium restart finds the new `<id>`.
     pub async fn connect(endpoint: &CdpEndpoint) -> Result<Self, CdpError> {
+        Self::connect_via(endpoint, &CdpDial::Tcp).await
+    }
+
+    /// [`connect`](Self::connect) with an explicit dial. Path B passes
+    /// [`CdpDial::Connector`]; every other `via` passes [`CdpDial::Tcp`].
+    pub async fn connect_via(endpoint: &CdpEndpoint, dial: &CdpDial) -> Result<Self, CdpError> {
         let url = if endpoint.discovers() {
-            super::discover::browser_url(endpoint).await?
+            super::discover::browser_url_via(endpoint, dial).await?
         } else {
             endpoint.url.clone()
         };
-        let stream = open_stream(endpoint).await?;
+        let stream = open_stream(endpoint, dial).await?;
 
         let request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
             .uri(url.as_str())

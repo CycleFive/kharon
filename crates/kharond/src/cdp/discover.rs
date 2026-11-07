@@ -38,7 +38,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use url::{Host, Url};
 
-use super::client::{CdpError, open_stream};
+use super::client::{CdpDial, CdpError, open_stream};
 use super::endpoint::CdpEndpoint;
 
 /// Upper bound on the whole `/json/version` response (head and body).
@@ -55,7 +55,15 @@ const BROWSER_PATH_PREFIX: &str = "/devtools/browser/";
 /// No timeout of its own: callers bound the whole connect (the daemon's
 /// connect budget, `DEFAULT_CONNECT_TIMEOUT`).
 pub async fn browser_url(endpoint: &CdpEndpoint) -> Result<Url, CdpError> {
-    let mut stream = open_stream(endpoint).await?;
+    browser_url_via(endpoint, &CdpDial::Tcp).await
+}
+
+/// [`browser_url`] over `dial` (path B passes the connector hub).
+pub(crate) async fn browser_url_via(
+    endpoint: &CdpEndpoint,
+    dial: &CdpDial,
+) -> Result<Url, CdpError> {
+    let mut stream = open_stream(endpoint, dial).await?;
     let request = format!(
         "GET /json/version HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
         host_header(&endpoint.url, true)

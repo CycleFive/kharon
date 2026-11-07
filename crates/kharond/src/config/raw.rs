@@ -10,8 +10,9 @@ use url::Url;
 
 use super::{
     AgentConfig, ApiConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config, ConfigError,
-    DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind, MemoryConfig, NtfyConfig,
-    OwnerUiConfig, PolicyConfig, Redacted, Source, parse_duration, tunnel_from_config,
+    ConnectorConfig, DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind,
+    MemoryConfig, NtfyConfig, OwnerUiConfig, PolicyConfig, Redacted, Source, TlsMaterial,
+    parse_duration, tunnel_from_config,
 };
 use crate::api::token::{HashProblem, ParamFloor, check_token_hash};
 use crate::cdp::{CdpEndpoint, CertSha256};
@@ -53,6 +54,7 @@ struct RawConfig {
     #[serde(default)]
     memory: RawMemory,
     api: Option<RawApi>,
+    connector: Option<RawConnector>,
     data_dir: Option<PathBuf>,
     owner_ui: Option<RawOwnerUi>,
 }
@@ -61,6 +63,18 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawApi {
     listen: String,
+    #[serde(default)]
+    tls_cert_file: Option<PathBuf>,
+    #[serde(default)]
+    tls_key_file: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConnector {
+    listen: String,
+    tls_cert_file: PathBuf,
+    tls_key_file: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +110,8 @@ struct RawExport {
 #[serde(deny_unknown_fields)]
 struct RawAgent {
     token_hash: String,
+    #[serde(default)]
+    connector_token_hash: Option<String>,
     cdp: RawCdp,
 }
 
@@ -305,7 +321,35 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         return Err(ConfigError::AuditNoOffHostSink);
     }
 
-    let api = raw.api.map(validate_api).transpose()?;
+    let path_b = agents
+        .values()
+        .any(|a| a.cdp.tunnel == crate::cdp::Tunnel::AgentConnector);
+    for (id, agent) in &agents {
+        match (
+            agent.cdp.tunnel == crate::cdp::Tunnel::AgentConnector,
+            agent.connector_token_hash.is_some(),
+        ) {
+            (true, false) => {
+                return Err(ConfigError::ConnectorTokenMissing { agent: id.clone() });
+            }
+            (false, true) => {
+                return Err(ConfigError::ConnectorTokenUnexpected { agent: id.clone() });
+            }
+            _ => {}
+        }
+    }
+    let connector = raw.connector.map(validate_connector).transpose()?;
+    match (path_b, connector.is_some()) {
+        (true, false) => return Err(ConfigError::ConnectorMissing),
+        (false, true) => return Err(ConfigError::ConnectorUnexpected),
+        _ => {}
+    }
+    let api = raw.api.map(|a| validate_api(a, path_b)).transpose()?;
+    if let (Some(api), Some(connector)) = (&api, &connector)
+        && api.listen == connector.listen
+    {
+        return Err(ConfigError::ConnectorListenConflict);
+    }
     let owner_ui = raw.owner_ui.map(validate_owner_ui).transpose()?;
     let data_dir = raw
         .data_dir
@@ -324,6 +368,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             require_mlock: raw.memory.require_mlock,
         },
         api,
+        connector,
         data_dir,
         owner_ui,
     })
@@ -333,13 +378,56 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
 /// Hostnames are refused (no DNS at startup, and a name could resolve
 /// to a wildcard); `0.0.0.0`, `::` and `::ffff:0.0.0.0` are refused as
 /// wildcards.
-fn validate_api(raw: RawApi) -> Result<ApiConfig, ConfigError> {
+fn validate_api(raw: RawApi, path_b: bool) -> Result<ApiConfig, ConfigError> {
     let listen: SocketAddr = raw
         .listen
         .parse()
         .map_err(|_| ConfigError::ApiListenInvalid)?;
-    check_listen_ip(listen.ip())?;
-    Ok(ApiConfig { listen })
+    check_listen_ip(listen.ip()).map_err(|problem| match problem {
+        ListenProblem::Wildcard => ConfigError::ApiWildcardBind,
+        ListenProblem::NotUnicast => ConfigError::ApiListenNotUnicast,
+    })?;
+    let tls = optional_tls("api", raw.tls_cert_file, raw.tls_key_file)?;
+    if path_b && !listen.ip().is_loopback() && tls.is_none() {
+        return Err(ConfigError::ApiPlainHttpNonLoopback);
+    }
+    Ok(ApiConfig { listen, tls })
+}
+
+fn validate_connector(raw: RawConnector) -> Result<ConnectorConfig, ConfigError> {
+    let listen: SocketAddr = raw
+        .listen
+        .parse()
+        .map_err(|_| ConfigError::ConnectorListenInvalid)?;
+    check_listen_ip(listen.ip()).map_err(|problem| match problem {
+        ListenProblem::Wildcard => ConfigError::ConnectorWildcardBind,
+        ListenProblem::NotUnicast => ConfigError::ConnectorListenNotUnicast,
+    })?;
+    let tls = TlsMaterial {
+        cert_file: raw.tls_cert_file,
+        key_file: raw.tls_key_file,
+    };
+    Ok(ConnectorConfig { listen, tls })
+}
+
+fn optional_tls(
+    which: &'static str,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> Result<Option<TlsMaterial>, ConfigError> {
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(cert_file), Some(key_file)) => Ok(Some(TlsMaterial {
+            cert_file,
+            key_file,
+        })),
+        _ => Err(ConfigError::TlsMaterialIncomplete { which }),
+    }
+}
+
+enum ListenProblem {
+    Wildcard,
+    NotUnicast,
 }
 
 /// REQ-APR-005 / REQ-DEP-006: the owner UI binds loopback only, and
@@ -422,18 +510,18 @@ fn serialize_origin(scheme: &str, host: &str, port: u16) -> String {
     }
 }
 
-fn check_listen_ip(ip: IpAddr) -> Result<(), ConfigError> {
+fn check_listen_ip(ip: IpAddr) -> Result<(), ListenProblem> {
     let ip = match ip {
         // `::ffff:a.b.c.d` binds as the v4 address on a dual-stack socket.
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
     };
     if ip.is_unspecified() {
-        return Err(ConfigError::ApiWildcardBind);
+        return Err(ListenProblem::Wildcard);
     }
     let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
     if ip.is_multicast() || broadcast {
-        return Err(ConfigError::ApiListenNotUnicast);
+        return Err(ListenProblem::NotUnicast);
     }
     Ok(())
 }
@@ -534,6 +622,25 @@ fn validate_agent(id: &str, a: RawAgent) -> Result<AgentConfig, ConfigError> {
         .as_deref()
         .map(|h| parse_pin(id, h))
         .transpose()?;
+    let connector_token_hash = match a.connector_token_hash {
+        None => None,
+        Some(hash) => {
+            match check_token_hash(&hash, &ParamFloor::PRODUCTION) {
+                Ok(()) => {}
+                Err(HashProblem::Invalid) => {
+                    return Err(ConfigError::ConnectorTokenHashNotArgon2id {
+                        agent: id.to_owned(),
+                    });
+                }
+                Err(HashProblem::WeakParams) => {
+                    return Err(ConfigError::ConnectorTokenHashWeak {
+                        agent: id.to_owned(),
+                    });
+                }
+            }
+            Some(Redacted::new(hash))
+        }
+    };
     let cdp =
         CdpEndpoint::validate(&a.cdp.endpoint, via, pin).map_err(|source| ConfigError::Cdp {
             agent: id.to_owned(),
@@ -541,6 +648,7 @@ fn validate_agent(id: &str, a: RawAgent) -> Result<AgentConfig, ConfigError> {
         })?;
     Ok(AgentConfig {
         token_hash: Redacted::new(a.token_hash),
+        connector_token_hash,
         cdp,
     })
 }

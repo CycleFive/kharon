@@ -140,6 +140,12 @@ enum Command {
     /// is not contacted, and no `token_create` audit entry is written.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Mint a path-B tunnel credential (`connector_token_hash`).
+    ///
+    /// Shown once, on the terminal only. This is not an agent API token:
+    /// the connector must not be given a token that can call `fill`.
+    #[command(subcommand)]
+    Tunnel(TunnelCommand),
 }
 
 /// `kharon token` — out-of-band agent token provisioning (REQ-API-003).
@@ -149,6 +155,19 @@ enum TokenCommand {
     ///
     /// The token is shown once, on the terminal only. The Argon2id PHC
     /// string (the `[agents.<id>]` `token_hash`) is printed on stdout.
+    Mint {
+        /// Agent id: `[a-z0-9-]{1,64}`, the `[agents.<id>]` table name.
+        agent_id: String,
+    },
+}
+
+/// `kharon tunnel` — out-of-band connector credential (path B).
+#[derive(Subcommand)]
+enum TunnelCommand {
+    /// Mint a tunnel credential for one agent.
+    ///
+    /// The credential is shown once, on the terminal only. The Argon2id
+    /// PHC string (`connector_token_hash`) is printed on stdout.
     Mint {
         /// Agent id: `[a-z0-9-]{1,64}`, the `[agents.<id>]` table name.
         agent_id: String,
@@ -539,7 +558,11 @@ fn owner_command(command: &Command) -> ExitCode {
             )),
         ),
         Command::Panic { socket } => (socket, Zeroizing::new("{\"op\":\"panic\"}".to_owned())),
-        Command::Audit(_) | Command::Init | Command::Token(_) | Command::PasskeyEnroll { .. } => {
+        Command::Audit(_)
+        | Command::Init
+        | Command::Token(_)
+        | Command::Tunnel(_)
+        | Command::PasskeyEnroll { .. } => {
             unreachable!()
         }
     };
@@ -634,7 +657,20 @@ fn generate_master_password() -> Result<Zeroizing<String>, String> {
 /// stderr, a file or the daemon. Without a terminal the command
 /// refuses and mints nothing. Provisioning is out of band (SPEC §7):
 /// this does not append `token_create`.
+fn mint_tunnel_command(agent_id: &str) -> ExitCode {
+    mint_secret(agent_id, MintKind::Tunnel)
+}
+
 fn mint_token_command(agent_id: &str) -> ExitCode {
+    mint_secret(agent_id, MintKind::Agent)
+}
+
+enum MintKind {
+    Agent,
+    Tunnel,
+}
+
+fn mint_secret(agent_id: &str, kind: MintKind) -> ExitCode {
     if !kharond::api::token::valid_agent_id(agent_id) {
         eprintln!("kharon: agent id must match [a-z0-9-]{{1,64}} (the [agents.<id>] table name)");
         return ExitCode::from(2);
@@ -649,24 +685,42 @@ fn mint_token_command(agent_id: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (token, hash) = kharond::api::token::generate(agent_id);
+    let (token, hash) = match kind {
+        MintKind::Agent => kharond::api::token::generate(agent_id),
+        MintKind::Tunnel => kharond::api::token::generate_tunnel(agent_id),
+    };
     let secret = token.expose_secret();
-    let mut text = Zeroizing::new(String::with_capacity(secret.len() + 640));
-    text.push_str("\nAgent token for `");
-    text.push_str(agent_id);
-    text.push_str("` (shown once; store it outside kharon):\n\n    ");
-    text.push_str(secret);
-    text.push_str(
-        "\n\n\
-         token_hash for [agents.",
-    );
-    text.push_str(agent_id);
-    text.push_str(
-        "] is the next line of stdout (one Argon2id PHC line). Paste that\n\
-         line into the config and never put this token there. kharon does\n\
-         not keep the token, the daemon is not contacted, and this mint is not\n\
-         an audit event (SPEC §7).\n\n",
-    );
+    let mut text = Zeroizing::new(String::with_capacity(secret.len() + 800));
+    match kind {
+        MintKind::Agent => {
+            text.push_str("\nAgent token for `");
+            text.push_str(agent_id);
+            text.push_str("` (shown once; store it outside kharon):\n\n    ");
+            text.push_str(secret);
+            text.push_str("\n\ntoken_hash for [agents.");
+            text.push_str(agent_id);
+            text.push_str(
+                "] is the next line of stdout (one Argon2id PHC line). Paste that\n\
+                 line into the config and never put this token there. kharon does\n\
+                 not keep the token, the daemon is not contacted, and this mint is not\n\
+                 an audit event (SPEC §7).\n\n",
+            );
+        }
+        MintKind::Tunnel => {
+            text.push_str("\nTunnel credential for `");
+            text.push_str(agent_id);
+            text.push_str("` (shown once; this is not an agent API token):\n\n    ");
+            text.push_str(secret);
+            text.push_str("\n\nconnector_token_hash for [agents.");
+            text.push_str(agent_id);
+            text.push_str(
+                "] is the next line of stdout (one Argon2id PHC line). Paste that\n\
+                 line into the broker config. Put the credential only in the connector's\n\
+                 token file on the agent host. It cannot call fill. kharon does not keep\n\
+                 it, the daemon is not contacted, and this mint is not an audit event.\n\n",
+            );
+        }
+    }
     if let Err(e) = tty.write_all(text.as_bytes()).and_then(|()| tty.flush()) {
         eprintln!("kharon: cannot write to the terminal: {e}");
         return ExitCode::from(2);
@@ -735,6 +789,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Init => init_command(),
         Command::Token(TokenCommand::Mint { agent_id }) => mint_token_command(&agent_id),
+        Command::Tunnel(TunnelCommand::Mint { agent_id }) => mint_tunnel_command(&agent_id),
         Command::Unlock { .. }
         | Command::Lock { .. }
         | Command::Status { .. }

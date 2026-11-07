@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Agent-host provisioning for kharon (SPEC §3.3 option (a), REQ-DEP-005).
+# Agent-host provisioning for path (A), WireGuard (SPEC §3.3, REQ-DEP-005).
+# Egress-shaped hosts use provision-connector.sh (path B) instead.
 #
 # Run as root on a fresh Debian 12 or 13 agent host. It sets up only
 # Chromium and the tunnel the broker uses to reach it (REQ-ARCH-001):

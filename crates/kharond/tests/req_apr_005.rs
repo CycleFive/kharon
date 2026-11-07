@@ -817,6 +817,19 @@ impl Cdp {
     }
 
     async fn call(&mut self, session: Option<&str>, method: &str, params: Json) -> Json {
+        match self.try_call(session, method, params).await {
+            Ok(result) => result,
+            Err(error) => panic!("{method}: {error}"),
+        }
+    }
+
+    /// One CDP round trip. `Err` carries the reply's `error` object.
+    async fn try_call(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Json,
+    ) -> Result<Json, Json> {
         self.next += 1;
         let id = self.next;
         let mut msg = json!({"id": id, "method": method, "params": params});
@@ -833,8 +846,10 @@ impl Cdp {
             let Message::Text(text) = frame else { continue };
             let v: Json = serde_json::from_str(&text).unwrap();
             if v["id"] == json!(id) {
-                assert!(v.get("error").is_none(), "{method}: {v}");
-                return v["result"].clone();
+                return match v.get("error") {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(v["result"].clone()),
+                };
             }
         }
     }
@@ -855,11 +870,12 @@ impl Cdp {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state = self
-                .eval(
+                .eval_navigating(
                     &session,
                     "JSON.stringify([location.href, document.readyState, window.isSecureContext])",
                 )
-                .await;
+                .await
+                .unwrap_or(Json::Null);
             let state: Json = serde_json::from_str(state.as_str().unwrap_or("[]")).unwrap();
             if state[1] == json!("complete") && state[0] == json!(url) {
                 assert_eq!(state[2], json!(true), "owner UI must be a secure context");
@@ -872,18 +888,47 @@ impl Cdp {
     }
 
     async fn eval(&mut self, session: &str, expression: &str) -> Json {
+        match self.try_eval(session, expression).await {
+            Ok(value) => value,
+            Err(error) => panic!("Runtime.evaluate: {error}"),
+        }
+    }
+
+    /// `Runtime.evaluate` on a page that may be navigating (#167).
+    /// `None` when a navigation took the execution context away, so a
+    /// poll loop tries again on the next tick. Any other error still
+    /// fails the test.
+    async fn eval_navigating(&mut self, session: &str, expression: &str) -> Option<Json> {
+        match self.try_eval(session, expression).await {
+            Ok(value) => Some(value),
+            Err(error) if is_navigation_race(&error) => None,
+            Err(error) => panic!("Runtime.evaluate: {error}"),
+        }
+    }
+
+    async fn try_eval(&mut self, session: &str, expression: &str) -> Result<Json, Json> {
         let r = self
-            .call(
+            .try_call(
                 Some(session),
                 "Runtime.evaluate",
                 json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
             )
-            .await;
+            .await?;
         if let Some(ex) = r.get("exceptionDetails") {
             panic!("eval failed: {ex} for {expression}");
         }
-        r["result"]["value"].clone()
+        Ok(r["result"]["value"].clone())
     }
+}
+
+/// A CDP error that only means "the page navigated under this call":
+/// the messages the fill engine maps to `navigated` (`cdp/fill.rs`).
+fn is_navigation_race(error: &Json) -> bool {
+    let message = error["message"].as_str().unwrap_or("");
+    message.contains("Cannot find context")
+        || message.contains("context was destroyed")
+        || message.contains("Inspected target navigated")
+        || message.contains("No execution context")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -948,16 +993,19 @@ async fn req_apr_005_chromium_virtual_authenticator() {
     // Same target, so the virtual authenticator (and its new
     // credential) is still attached. The login page's button is
     // `kharonSignIn`.
-    cdp.eval(&session, &format!("location.assign({origin:?})"))
+    // The navigation can take the context away before the reply.
+    let _ = cdp
+        .eval_navigating(&session, &format!("location.assign({origin:?})"))
         .await;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let ready = cdp
-            .eval(
+            .eval_navigating(
                 &session,
                 "JSON.stringify([location.pathname, typeof window.kharonSignIn])",
             )
-            .await;
+            .await
+            .unwrap_or(Json::Null);
         let ready: Json = serde_json::from_str(ready.as_str().unwrap_or("[]")).unwrap();
         if ready[0] == json!("/") && ready[1] == json!("function") {
             break;

@@ -301,6 +301,19 @@ impl Cdp {
     }
 
     async fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Value {
+        match self.try_call(session, method, params).await {
+            Ok(result) => result,
+            Err(error) => panic!("{method}: {error}"),
+        }
+    }
+
+    /// One CDP round trip. `Err` carries the reply's `error` object.
+    async fn try_call(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Value> {
         self.next += 1;
         let id = self.next;
         let mut msg = json!({"id": id, "method": method, "params": params});
@@ -319,21 +332,42 @@ impl Cdp {
             };
             let v: Value = serde_json::from_str(&text).unwrap();
             if v["id"] == json!(id) {
-                assert!(v.get("error").is_none(), "{method}: {v}");
-                return v["result"].clone();
+                return match v.get("error") {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(v["result"].clone()),
+                };
             }
         }
     }
 
     async fn eval(&mut self, session: &str, expression: &str) -> Value {
+        match self.try_eval(session, expression).await {
+            Ok(value) => value,
+            Err(error) => panic!("Runtime.evaluate: {error}"),
+        }
+    }
+
+    /// `Runtime.evaluate` on a page that may be navigating (#167).
+    /// `None` when a navigation took the execution context away, so a
+    /// poll loop tries again on the next tick. Any other error still
+    /// fails the test.
+    async fn eval_navigating(&mut self, session: &str, expression: &str) -> Option<Value> {
+        match self.try_eval(session, expression).await {
+            Ok(value) => Some(value),
+            Err(error) if is_navigation_race(&error) => None,
+            Err(error) => panic!("Runtime.evaluate: {error}"),
+        }
+    }
+
+    async fn try_eval(&mut self, session: &str, expression: &str) -> Result<Value, Value> {
         let r = self
-            .call(
+            .try_call(
                 Some(session),
                 "Runtime.evaluate",
                 json!({"expression": expression, "returnByValue": true}),
             )
-            .await;
-        r["result"]["value"].clone()
+            .await?;
+        Ok(r["result"]["value"].clone())
     }
 
     /// Open `url` in a new tab in `context`; returns (target, session)
@@ -358,12 +392,13 @@ impl Cdp {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let state = self
-                .eval(
+                .eval_navigating(
                     &session,
                     "JSON.stringify([location.href, document.readyState, window.isSecureContext, \
                      (document.body ? document.body.innerText : '').slice(0, 200)])",
                 )
-                .await;
+                .await
+                .unwrap_or(Value::Null);
             let state: Value = serde_json::from_str(state.as_str().unwrap_or("[]")).unwrap();
             if state[0] == json!(url) && state[1] == json!("complete") {
                 assert_eq!(state[2], json!(true), "test page must be a secure context");
@@ -374,6 +409,16 @@ impl Cdp {
         }
         (target, session)
     }
+}
+
+/// A CDP error that only means "the page navigated under this call":
+/// the messages the fill engine maps to `navigated` (`cdp/fill.rs`).
+fn is_navigation_race(error: &Value) -> bool {
+    let message = error["message"].as_str().unwrap_or("");
+    message.contains("Cannot find context")
+        || message.contains("context was destroyed")
+        || message.contains("Inspected target navigated")
+        || message.contains("No execution context")
 }
 
 // ------------------------------------------------------------ daemon

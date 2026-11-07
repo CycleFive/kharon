@@ -240,7 +240,7 @@ Frame note (#135): `target.frame_id` is reserved. A request that sets it is refu
 
 ## 5. Approval flow
 
-Grant = `{id, agent_id, item_id|*collection, origin (eTLD+1 or host), actions ⊆ {fill, totp}, expires_at, max_uses, uses, created_by_channel}`. `uses` counts fills that sent field values to the browser (REQ-APR-008). A fill without a matching live grant creates a `GrantRequest` and returns `pending_approval`. The agent may poll `kharon_status`, or call with `wait_s ≤ 60`. Requests time out after 120 s and are denied by default.
+Grant = `{id, agent_id, item_id|*collection, origin (eTLD+1 or host), actions ⊆ {fill, totp}, expires_at, max_uses, uses, created_by_channel}`. `uses` counts fills that sent field values to the browser (REQ-APR-008). A fill without a matching live grant creates a `GrantRequest` and returns `pending_approval`. The agent polls `kharon_status` and retries the fill. There is no `wait_s` long-poll: a fill held open for approval would collide with REQ-API-009's `fill_deadline` (#135). Requests time out after 120 s and are denied by default.
 
 | Grant type | Default TTL | Use |
 |---|---|---|
@@ -286,7 +286,7 @@ Redirect-race defense. The check and the write happen in one renderer task:
 3. If the document navigates, the isolated world context is destroyed and the call fails (`navigated`). It cannot land in the new document.
 4. After the call: check that `loaderId` is unchanged. If it changed and the call did not itself dispatch submit (`submit: false`, or a failure that returns before this check), attempt a clear in the old context (best effort) and report `navigated`. If the call reported success and itself dispatched submit (`submit: true`), a loader change is that submit's own navigation: report `filled` with `fields_filled` (REQ-API-008).
 
-The fallback path, `Input.insertText` for sites that ignore programmatic value sets, is gated by a pre-check plus a post-check of `loaderId` and origin. It is weaker: there is a race window between focus and insert. It is off by default (OQ-9).
+A fallback path, `Input.insertText` for sites that ignore programmatic value sets, would be gated by a pre-check plus a post-check of `loaderId` and origin. It is weaker: there is a race window between focus and insert. It is not implemented in v1 (OQ-9, #135).
 
 | ID | Requirement | AC |
 |---|---|---|
@@ -299,9 +299,11 @@ The fallback path, `Input.insertText` for sites that ignore programmatic value s
 ## 7. Audit, rate limits, revocation
 
 Audit: append-only JSONL at `/data/audit/audit.jsonl`, opened `O_APPEND`, with `chattr +a` recommended. Entry:
-`{seq, ts, prev_hash, event, agent_id, item_id, item_name_hash, origin, grant_id, channel, result, detail_code}` (fill entries also carry `request_id`, `fill_dispatch` a `field_count`, and fill outcome entries a `live_origin`; REQ-AUD-003†), with `hash = SHA-256(prev_hash ‖ JCS(entry without hash))` (RFC 8785 canonical JSON). Every N=100 entries or 10 min, a checkpoint `{seq, hash}` is signed with the broker's Ed25519 audit key and pushed off-host (ntfy or remote syslog) by default. Local-only checkpoints require `audit_checkpoint_local_only=true`, which is logged as a startup warning. Events: unlock, lock, sync, list, search, fill_*, context_open, context, grant_request, grant_issue, grant_revoke, token_create/revoke, owner_auth_fail, rate_limit, panic.
+`{seq, ts, prev_hash, event, agent_id, item_id, item_name_hash, origin, grant_id, channel, result, detail_code}` (fill entries also carry `request_id`, `fill_dispatch` a `field_count`, and fill outcome entries a `live_origin`; REQ-AUD-003†), with `hash = SHA-256(prev_hash ‖ JCS(entry without hash))` (RFC 8785 canonical JSON). Every N=100 entries or 10 min, a checkpoint `{seq, hash}` is signed with the broker's Ed25519 audit key and pushed off-host (ntfy or remote syslog) by default. Local-only checkpoints require `audit_checkpoint_local_only=true`, which is logged as a startup warning. Events: unlock, lock, list, search, fill_*, context_open, context, grant_request, grant_issue, grant_revoke, token_create/revoke, owner_auth_fail, rate_limit, panic.
 
-Agent token provisioning is out of band (REQ-API-003, #129). `kharon token mint <id>` prints the token once and the Argon2id PHC string the operator stores as `[agents.<id>] token_hash`. The daemon never sees the plaintext and does not append `token_create` for that mint. `token_revoke` is still appended when `kharon revoke agent` runs (REQ-REV-001). `token_create` stays a recognized event name so a later in-daemon rotation can emit it; v1 does not.
+Agent token provisioning is out of band (REQ-API-003, #129). `kharon token mint <id>` prints the token once and the Argon2id PHC string the operator stores as `[agents.<id>] token_hash`. The daemon never sees the plaintext and does not append `token_create` for that mint. `token_revoke` is still appended when `kharon revoke agent` runs (REQ-REV-001). `token_create` stays a recognized event name so a later in-daemon rotation can emit it; v1 does not. `sync` is likewise a recognized name that v1 does not emit (#135): a sync shows in the log through its effects, such as REQ-REV-003's `grant_revoke` entries.
+
+Revoke-first (#135): when a sync invalidates grants (REQ-REV-003), they are removed from memory before their `grant_revoke` entries are appended. If an append fails, the grant stays removed, because an audit failure must never undo a revocation; the failure is logged as an error so the gap in the log is explained. That is REQ-AUD-003's fail-closed rule applied to a restriction: the closed state is the grant removed, not restored.
 
 | ID | Requirement | AC |
 |---|---|---|
@@ -401,12 +403,12 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 | OQ-1 | Resolved: name is `kharon`. |
 | OQ-2 | Resolved (#3): the `bitwarden/sdk-internal` crates (`bitwarden-crypto`, `bitwarden-vault`, workspace version 4.0.0) each declare `license = "GPL-3.0-only OR LicenseRef-Bitwarden-SDK"` in their Cargo.toml. Neither branch preserves kharon's dual MIT OR Apache-2.0 (OQ-13) for a linked dependency: GPL-3.0-only is copyleft, and LicenseRef-Bitwarden-SDK is Bitwarden's proprietary SDK license, not a permissive grant. So the SDK is not usable as a dependency or a linked test oracle. Own impl stands; sdk-internal remains a behavioral reference, and test vectors come from the official `bw` CLI run as a separate program. |
 | OQ-3 | Resolved: a recommended harness policy in the deployment guide (no `evaluate` or value reads), not a kharon feature. |
-| OQ-4 | Is the masked username in metadata acceptable, or is it itself sensitive (account enumeration)? Default masked. Config to hide. |
+| OQ-4 | Is the masked username in metadata acceptable, or is it itself sensitive (account enumeration)? Always masked; v1 has no switch to hide it (#135). |
 | OQ-5 | Resolved: a dedicated `kharon` org. The owner adds or moves items there via the web vault, and live sync picks them up (REQ-CRY-008/009). |
 | OQ-6 | Passkey (FIDO2 credential in vault) assertion via CDP WebAuthn virtual authenticator: feasible for v2? |
 | OQ-7 | Resolved for v1: revision pinning plus high-water mark (REQ-REV-004). Cryptographic binding remains out of scope. |
 | OQ-8 | Account crypto v2 (type 7 EncStrings, COSE keys): timeline on cloud and Vaultwarden support. |
-| OQ-9 | Fallback stays off. The M2 fixture suite includes 2–3 realistic controlled-input pages (React, Vue, and a trusted-event-only page) to measure need. |
+| OQ-9 | The `Input.insertText` fallback is not implemented in v1 (#135). If it is built later, 2–3 realistic controlled-input fixture pages (React, Vue, and a trusted-event-only page) come with it, to measure the need first. |
 | OQ-10 | Resolved: `mlockall` for v1. No custom arena. `MADV_DONTDUMP` is not applied (amended in #134): it only removes regions from a core dump, and `prctl(PR_SET_DUMPABLE,0)` stops the kernel from writing one at all, before any `core_pattern` handler or `RLIMIT_CORE` is consulted. Verified 2026-11-07 on a systemd-coredump host (piped `core_pattern`, `fs.suid_dumpable=2`): an aborting non-dumpable process with `RLIMIT_CORE` unlimited was not dumped, and a dumpable one was. This holds because kharond is hardened at startup, before any key exists (REQ-MEM-001), and never changes credentials (a credential change is what resets `dumpable`). It is also what makes `panic = "abort"` safe: an abort leaves no core. To keep the second condition falsifiable, unlock reads `PR_GET_DUMPABLE` right before deriving keys and refuses (`process_dumpable`, no derivation) if the process has become dumpable again. |
 | OQ-11 | Official cloud: new-device verification / captcha on API-key login, `Bitwarden-Client-Version` minimums. |
 | OQ-12 | Resolved: per-agent browser contexts are v1 (REQ-ARCH-005). |

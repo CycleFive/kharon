@@ -1054,7 +1054,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         self.append(entry)?;
         // REQ-RL-002: consecutive origin_mismatch → suspend.
         match &status {
-            FillStatus::Engine(FillOutcome::OriginMismatch) => {
+            // An iframe refused by the allowlist (#180) counts too: it is
+            // the same refusal with a more specific detail code.
+            FillStatus::Engine(FillOutcome::OriginMismatch | FillOutcome::IframeNotAllowlisted) => {
                 let newly = self
                     .rates
                     .lock()

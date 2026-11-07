@@ -1,4 +1,4 @@
-//! #133: two browser-level ACs against a real Chromium, with no live
+//! #133: browser-level ACs against a real Chromium, with no live
 //! fixture. kharond runs in export mode (the bundled export, whose
 //! `Example Login` item is for `example.com`). Its agent `alpha` drives
 //! a headless Chromium, and the test serves a login page for
@@ -21,6 +21,14 @@
 //!   approves the request. The fill is still `origin_mismatch`, audited
 //!   with `detail_code: insecure_context` and the live `http` origin,
 //!   and the page's fields stay empty.
+//! - **REQ-ORG-004.** A relying party on another site
+//!   (`rp.example.org`) frames the item's login page. Site isolation
+//!   makes that frame an `iframe` target of its own, which the agent
+//!   fills by its target id. By default the fill is `origin_mismatch`
+//!   and the frame's fields stay empty. With
+//!   `allow_cross_origin_iframe_hosts = ["example.com"]` the same fill
+//!   is `filled`, even though the top-level page matches none of the
+//!   item's URIs: the allowlist admits the frame on its own origin.
 //!
 //! Skips when no Chromium binary is found (as `req_apr_005` does);
 //! `KHARON_CHROMIUM` names one, and `KHARON_REQUIRE_CHROMIUM=1` turns
@@ -60,6 +68,9 @@ const EXPORT_PASSWORD: &str = "kharon export fixture password 9";
 const ITEM_NAME: &str = "Example Login";
 const ITEM_USERNAME: &str = "fixture@example.net";
 const HOST: &str = "example.com";
+/// A relying party on another site (eTLD+1 `example.org`) that frames
+/// the item's login page (REQ-ORG-004).
+const RP_HOST: &str = "rp.example.org";
 /// The item's secrets (`tests/fixtures/gen/gen_export_fixture.py`):
 /// password, hidden custom field, TOTP seed.
 const SECRETS: [&str; 3] = [
@@ -84,6 +95,20 @@ const PAGE: &str = r#"<!doctype html>
     e.preventDefault();
     window.__submits += 1;
   });
+</script>
+</body></html>
+"#;
+
+/// The relying party's page: it frames [`PAGE`] from [`HOST`] on the same
+/// port. Chromium's site isolation puts that cross-site frame in its own
+/// process, so it is an `iframe` CDP target of its own.
+const RP_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>kharon #133 relying party</title></head>
+<body>
+<script>
+  const f = document.createElement("iframe");
+  f.src = "https://example.com:" + location.port + "/login";
+  document.body.appendChild(f);
 </script>
 </body></html>
 "#;
@@ -148,7 +173,8 @@ struct OwnerReply {
 
 // ------------------------------------------------------------ test pages
 
-/// Answer every request on `s` with [`PAGE`] (404 for the favicon).
+/// Answer every request on `s`: [`RP_PAGE`] under `/rp`, otherwise
+/// [`PAGE`] (404 for the favicon).
 async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut s: S) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
@@ -165,6 +191,8 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut s: S) {
         .to_owned();
     let (status, body) = if path == "/favicon.ico" {
         ("404 Not Found", "")
+    } else if path.starts_with("/rp") {
+        ("200 OK", RP_PAGE)
     } else {
         ("200 OK", PAGE)
     };
@@ -177,10 +205,10 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut s: S) {
 }
 
 /// [`PAGE`] over HTTPS on an ephemeral loopback port, with a throwaway
-/// certificate for [`HOST`]. Returns the port and the certificate's
+/// certificate for [`HOST`] and [`RP_HOST`]. Returns the port and the certificate's
 /// SPKI SHA-256 (base64), which is all Chromium is told to trust.
 async fn serve_https() -> (u16, String) {
-    let ck = rcgen::generate_simple_self_signed(vec![HOST.to_owned()]).unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec![HOST.to_owned(), RP_HOST.to_owned()]).unwrap();
     let spki = Base64::encode_string(&Sha256::digest(ck.key_pair.public_key_der()));
     let cert = ck.cert.der().clone();
     let key = rustls_pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
@@ -284,7 +312,9 @@ fn launch_chromium(bin: &Path, spki: Option<&str>) -> Chromium {
         "--remote-debugging-port=0",
     ])
     .arg(format!("--user-data-dir={}", profile.path().display()))
-    .arg(format!("--host-resolver-rules=MAP {HOST} 127.0.0.1"));
+    .arg(format!(
+        "--host-resolver-rules=MAP {HOST} 127.0.0.1,MAP {RP_HOST} 127.0.0.1"
+    ));
     if let Some(spki) = spki {
         // Trusts exactly the test page's key (needs --user-data-dir).
         cmd.arg(format!("--ignore-certificate-errors-spki-list={spki}"));
@@ -397,8 +427,7 @@ impl Cdp {
     }
 
     /// Open `url` in a new tab in `context`. Returns (target, session)
-    /// once the page has loaded. A `Runtime.evaluate` that a navigation
-    /// overtakes (#167) just means "not loaded yet".
+    /// once the page has loaded.
     async fn open(&mut self, context: &str, url: &str) -> (String, String) {
         let r = self
             .call(
@@ -408,6 +437,36 @@ impl Cdp {
             )
             .await;
         let target = r["targetId"].as_str().unwrap().to_owned();
+        let session = self.attach_loaded(&target, url).await;
+        (target, session)
+    }
+
+    /// The out-of-process `iframe` target showing `url`, once it exists.
+    async fn iframe_target(&mut self, url: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let r = self.call(None, "Target.getTargets", json!({})).await;
+            let found = r["targetInfos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["type"] == "iframe" && t["url"] == json!(url))
+                .map(|t| t["targetId"].as_str().unwrap().to_owned());
+            if let Some(target) = found {
+                return target;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no out-of-process iframe target for {url}: {r}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Attach to `target` and wait until it has loaded `url`. A
+    /// `Runtime.evaluate` that a navigation overtakes (#167) just means
+    /// "not loaded yet".
+    async fn attach_loaded(&mut self, target: &str, url: &str) -> String {
         let r = self
             .call(
                 None,
@@ -431,12 +490,11 @@ impl Cdp {
             };
             let state: Value = serde_json::from_str(state.as_str().unwrap_or("[]")).unwrap();
             if state[0] == json!(url) && state[1] == json!("complete") {
-                break;
+                return session;
             }
             assert!(Instant::now() < deadline, "{url} never loaded: {state}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        (target, session)
     }
 
     /// The page's two fields, read from its main world.
@@ -553,7 +611,8 @@ struct Running {
 }
 
 impl Running {
-    async fn start(chromium: &Chromium) -> Self {
+    /// `policy` is extra `[policy]` TOML (empty for the defaults).
+    async fn start(chromium: &Chromium, policy: &str) -> Self {
         let (token, hash) = generate("alpha");
         let token = token.expose_secret().clone();
         let data = tempfile::tempdir().unwrap();
@@ -576,6 +635,9 @@ require_mlock = false
 
 [api]
 listen = "127.0.0.1:0"
+
+[policy]
+{policy}
 "#,
             data = data.path().display(),
             cdp = chromium.ws,
@@ -701,7 +763,7 @@ async fn req_arch_003_second_cdp_client_receives_no_secret_during_a_fill() {
     };
     let (port, spki) = serve_https().await;
     let chromium = launch_chromium(&bin, Some(&spki));
-    let run = Running::start(&chromium).await;
+    let run = Running::start(&chromium, "").await;
 
     let url = format!("https://{HOST}:{port}/login");
     let origin = format!("https://{HOST}:{port}");
@@ -775,7 +837,7 @@ async fn req_org_005_http_page_with_an_https_item_is_refused() {
     };
     let port = serve_http().await;
     let chromium = launch_chromium(&bin, None);
-    let run = Running::start(&chromium).await;
+    let run = Running::start(&chromium, "").await;
 
     // Same host and path as the item's `https` URI, over plain HTTP.
     let url = format!("http://{HOST}:{port}/login");
@@ -819,4 +881,83 @@ async fn req_org_005_http_page_with_an_https_item_is_refused() {
     drop(cdp);
     run.shutdown().await;
     drop(chromium);
+}
+
+/// REQ-ORG-004: the item's login form framed by a relying party on
+/// another site. The agent fills the frame's own target. The grant gate
+/// runs first, so the owner approves each request.
+async fn req_org_004(test: &str, allowlisted: bool) {
+    let Some(bin) = chromium_or_skip(test) else {
+        return;
+    };
+    let (port, spki) = serve_https().await;
+    let chromium = launch_chromium(&bin, Some(&spki));
+    let policy = if allowlisted {
+        format!("allow_cross_origin_iframe_hosts = [\"{HOST}\"]")
+    } else {
+        String::new()
+    };
+    let run = Running::start(&chromium, &policy).await;
+
+    let rp = format!("https://{RP_HOST}:{port}/rp");
+    let login = format!("https://{HOST}:{port}/login");
+    let origin = format!("https://{HOST}:{port}");
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (_top, _top_session) = cdp.open(&run.context, &rp).await;
+    let frame = cdp.iframe_target(&login).await;
+    let session = cdp.attach_loaded(&frame, &login).await;
+
+    let first = run.fill(&frame, &origin).await;
+    assert_eq!(first.status, "pending_approval", "{first:?}");
+    run.approve_once(first.grant_request_id.as_deref().unwrap())
+        .await;
+    let outcome = run.fill(&frame, &origin).await;
+    let (username, password) = cdp.fields(&session).await;
+    if allowlisted {
+        // The allowlisted IdP frame is filled. Note that the top-level
+        // page (`example.org`) matches no URI of the item: the
+        // allowlist admits the frame on its own origin.
+        assert_eq!(outcome.status, "filled", "{outcome:?}");
+        assert_eq!(outcome.fields_filled, ["username", "password"]);
+        assert_eq!(username, ITEM_USERNAME);
+        assert!(
+            password == SECRETS[0],
+            "the frame's password field does not hold the item's password"
+        );
+    } else {
+        assert_eq!(outcome.status, "origin_mismatch", "{outcome:?}");
+        assert!(outcome.fields_filled.is_empty(), "{outcome:?}");
+        // Audited as a refusal on the frame's own live origin.
+        let audit = run.audit();
+        let last = audit
+            .iter()
+            .rev()
+            .find(|e| matches!(e.event, Event::Fill))
+            .unwrap();
+        assert_eq!(last.result.as_deref(), Some("origin_mismatch"));
+        assert_eq!(last.live_origin.as_deref(), Some(origin.as_str()));
+        assert_eq!(
+            (username, password),
+            (String::new(), String::new()),
+            "a refused frame's fields must stay empty"
+        );
+    }
+
+    drop(cdp);
+    run.shutdown().await;
+    drop(chromium);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_org_004_cross_site_iframe_fill_is_refused_by_default() {
+    req_org_004(
+        "req_org_004_cross_site_iframe_fill_is_refused_by_default",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_org_004_allowlisted_iframe_host_is_filled() {
+    req_org_004("req_org_004_allowlisted_iframe_host_is_filled", true).await;
 }

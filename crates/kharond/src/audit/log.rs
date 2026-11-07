@@ -321,6 +321,29 @@ fn open_append(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
+/// Test-only: [`AuditLog::open`], waiting out a transient `Locked`
+/// (#162). A test that drops a log and reopens it can see `Locked` when
+/// another test thread in the same binary forks a child in between (the
+/// `node` harnesses in `cdp::page_js`): the child shares the open file
+/// description, and so the `flock`, until it execs. Any other error, or
+/// `Locked` that lasts 5 s, is returned as is.
+#[cfg(test)]
+pub(crate) fn open_retrying(
+    dir: &Path,
+    config: AuditConfig,
+    sink: impl Fn() -> Box<dyn CheckpointSink>,
+) -> Result<AuditLog, OpenError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match AuditLog::open(dir, config.clone(), sink()) {
+            Err(OpenError::Locked) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,11 +468,9 @@ mod tests {
                 .unwrap();
             f.write_all(b"{\"seq\":6,\"ts\":\"").unwrap();
         }
-        let log = AuditLog::open(
-            dir.path(),
-            AuditConfig::default(),
-            Box::new(NullCheckpointSink),
-        )
+        let log = open_retrying(dir.path(), AuditConfig::default(), || {
+            Box::new(NullCheckpointSink)
+        })
         .expect("open must recover a torn tail");
         assert_eq!(log.head_seq(), 6, "5 entries + the recovery record");
         drop(log);
@@ -573,11 +594,9 @@ mod tests {
             .unwrap();
             log.keys().hash_name("github.com")
         };
-        let log2 = AuditLog::open(
-            dir.path(),
-            AuditConfig::default(),
-            Box::new(NullCheckpointSink),
-        )
+        let log2 = open_retrying(dir.path(), AuditConfig::default(), || {
+            Box::new(NullCheckpointSink)
+        })
         .unwrap();
         assert_eq!(h1, log2.keys().hash_name("github.com"));
 
@@ -619,6 +638,43 @@ mod tests {
         assert!(err.to_string().contains("definitely_not_an_event"), "{err}");
     }
 
+    /// #162: a reopen right after a drop can find the `flock` held by a
+    /// forked child (another test thread's `node` spawn) until it execs.
+    /// A second descriptor holding the lock stands in for that child.
+    #[test]
+    fn open_retrying_waits_out_a_briefly_held_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(
+            AuditLog::open(
+                dir.path(),
+                AuditConfig::default(),
+                Box::new(NullCheckpointSink),
+            )
+            .unwrap(),
+        );
+        let holder = File::open(dir.path().join("audit.jsonl")).unwrap();
+        holder.lock_exclusive().unwrap();
+        let plain = AuditLog::open(
+            dir.path(),
+            AuditConfig::default(),
+            Box::new(NullCheckpointSink),
+        );
+        assert!(
+            matches!(plain, Err(OpenError::Locked)),
+            "a held lock refuses a plain open"
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(holder);
+        });
+        let log = open_retrying(dir.path(), AuditConfig::default(), || {
+            Box::new(NullCheckpointSink)
+        })
+        .expect("opens once the holder lets go");
+        release.join().unwrap();
+        assert_eq!(log.head_seq(), 0, "the same empty log, reopened");
+    }
+
     #[test]
     fn keys_pub_self_heals_to_match_signing_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -631,11 +687,9 @@ mod tests {
         let pub_path = dir.path().join("keys").join("audit_sign.pub");
         std::fs::write(&pub_path, [0xAAu8; 32]).unwrap();
         drop(_log);
-        let log = AuditLog::open(
-            dir.path(),
-            AuditConfig::default(),
-            Box::new(NullCheckpointSink),
-        )
+        let log = open_retrying(dir.path(), AuditConfig::default(), || {
+            Box::new(NullCheckpointSink)
+        })
         .unwrap();
         let on_disk = std::fs::read(&pub_path).unwrap();
         assert_eq!(on_disk, log.keys().verifying_key().to_bytes());
@@ -658,11 +712,9 @@ mod tests {
         )
         .unwrap();
         drop(_log);
-        let _log2 = AuditLog::open(
-            dir.path(),
-            AuditConfig::default(),
-            Box::new(NullCheckpointSink),
-        )
+        let _log2 = open_retrying(dir.path(), AuditConfig::default(), || {
+            Box::new(NullCheckpointSink)
+        })
         .unwrap();
     }
 

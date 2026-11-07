@@ -38,6 +38,7 @@ pub(crate) mod checkpoint;
 mod entry;
 mod keys;
 mod log;
+mod requests;
 mod verify;
 
 pub use checkpoint::{
@@ -49,4 +50,5 @@ pub use log::{
     AppendError, AuditConfig, AuditLog, DEFAULT_CHECKPOINT_EVERY, DEFAULT_CHECKPOINT_PERIOD,
     OpenError,
 };
+pub use requests::{UnresolvedRequest, unresolved_grant_requests};
 pub use verify::{VerifyError, VerifyOutcome, verify};

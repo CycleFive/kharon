@@ -523,7 +523,12 @@ impl CdpClient {
         // send error, or drop (issue #76).
         let _entry = PendingEntry::insert(&self.pending, id, tx);
 
-        let mut message = json!({ "id": id, "method": method, "params": params });
+        // REQ-CRY-006 (#184): `params` is MOVED into the frame, never
+        // passed through `json!`. The macro serializes an expression
+        // (`to_value(&params)`), which would leave the caller's tree —
+        // a fill's field values — to drop unwiped while only the copy
+        // in `message` is zeroized below.
+        let mut message = frame(id, method, params);
         if let Some(session_id) = session_id {
             message["sessionId"] = Value::String(session_id.to_string());
         }
@@ -691,6 +696,18 @@ impl CdpSession {
     }
 }
 
+/// A request frame `{"id", "method", "params"}` that takes `params`
+/// over without copying it (REQ-CRY-006, #184): the frame's `params`
+/// is the caller's tree itself, so wiping the frame wipes the only
+/// copy.
+fn frame(id: u64, method: &str, params: Value) -> Value {
+    let mut frame = serde_json::Map::with_capacity(3);
+    frame.insert("id".to_owned(), Value::from(id));
+    frame.insert("method".to_owned(), Value::String(method.to_owned()));
+    frame.insert("params".to_owned(), params);
+    Value::Object(frame)
+}
+
 /// Serialize `message` into a buffer allocated once, at its exact size
 /// (REQ-CRY-006). `serde_json::to_string` grows its buffer as it
 /// writes, and each growth frees a partial copy of the frame, field
@@ -775,6 +792,28 @@ mod tests {
                 },
             })
         );
+    }
+
+    /// #184: the frame takes the caller's `params` over. Building it
+    /// with `json!({ "params": params })` serialized a second copy and
+    /// dropped the caller's tree, field values included, unwiped. The
+    /// value's heap buffer must be the very one the caller built.
+    #[test]
+    fn req_cry_006_frame_moves_params_without_copying_them() {
+        let params = json!({"arguments": [{"value": [{"value": "CANARY-PARAMS"}]}]});
+        let before = params["arguments"][0]["value"][0]["value"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let message = frame(9, "Runtime.callFunctionOn", params);
+        let after = message["params"]["arguments"][0]["value"][0]["value"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        assert_eq!(before, after, "the frame copied the params");
+        assert_eq!(message["id"], 9);
+        assert_eq!(message["method"], "Runtime.callFunctionOn");
+        assert_eq!(message.as_object().unwrap().len(), 3);
     }
     use futures_util::StreamExt;
     use std::collections::HashMap as StdMap;

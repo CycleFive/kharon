@@ -240,6 +240,9 @@ pub enum LockEvent {
     Unlocked,
     /// Unlock was refused before any key derivation ran.
     UnlockRefusedMlock,
+    /// Unlock was refused before any key derivation ran: the process
+    /// is dumpable again (#134, OQ-10).
+    UnlockRefusedDumpable,
     /// `require_mlock = false` and the best-effort `mlockall` still
     /// failed: the unlock proceeds, but the session's pages are
     /// swappable and the operator should know.
@@ -263,7 +266,9 @@ impl LockEvent {
         match self {
             Self::Unlocked => Some(Entry::new(Event::Unlock)),
             Self::Locked { reason } => Some(reason.audit_entry()),
-            Self::UnlockRefusedMlock | Self::MlockBestEffortFailed => None,
+            Self::UnlockRefusedMlock
+            | Self::UnlockRefusedDumpable
+            | Self::MlockBestEffortFailed => None,
         }
     }
 }
@@ -279,6 +284,11 @@ pub enum UnlockError<E> {
     /// not called.
     #[error("already unlocked")]
     AlreadyUnlocked,
+    /// The process is dumpable again, so a core dump could hold the
+    /// keys this unlock would derive (#134, SPEC OQ-10). No key
+    /// derivation ran.
+    #[error("process is dumpable; refusing to derive keys (OQ-10)")]
+    Dumpable,
     /// The derivation closure failed (wrong password, sync error,
     /// crypto error, …). The broker stays locked.
     #[error("unlock derivation failed: {0}")]
@@ -438,6 +448,14 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
                 // Best-effort mlock failed: proceed, but say so.
                 let _ = self.emit(LockEvent::MlockBestEffortFailed);
             }
+        }
+        // OQ-10 (#134): no core dump can hold keys only while the
+        // process is non-dumpable. kharond is hardened at startup, and
+        // a credential change since then would have reset it, so check
+        // right before the keys exist.
+        if !self.hardening.is_non_dumpable() {
+            let _ = self.emit(LockEvent::UnlockRefusedDumpable);
+            return Err(UnlockError::Dumpable);
         }
         let session = derive().map_err(UnlockError::DeriveFailed)?;
         let now = self.clock.now();

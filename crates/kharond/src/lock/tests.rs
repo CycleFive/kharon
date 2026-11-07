@@ -229,6 +229,35 @@ fn req_mem_events_are_emitted_in_order() {
     assert_eq!(*events.lock().unwrap(), [LockEvent::UnlockRefusedMlock]);
 }
 
+/// #134 / SPEC OQ-10: `MADV_DONTDUMP` is not applied because a
+/// non-dumpable process is never dumped. That only holds while the
+/// process stays non-dumpable, so unlock refuses to derive keys in a
+/// process that has become dumpable again (as a credential change
+/// would make it), and says so to the operator.
+#[test]
+fn req_mem_001_unlock_refused_when_dumpable_and_derivation_never_runs() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let log = events.clone();
+    let mut c = controller(ManualClock::new(), StaticHardening::all_ok().dumpable());
+    c.set_event_sink(Box::new(move |e| {
+        log.lock().unwrap().push(e);
+        Ok(())
+    }));
+    let derived = Arc::new(Mutex::new(false));
+    let flag = derived.clone();
+    let err = c
+        .unlock(move || {
+            *flag.lock().unwrap() = true;
+            Ok::<_, std::io::Error>(CanarySession::new())
+        })
+        .unwrap_err();
+    assert!(matches!(err, UnlockError::Dumpable), "{err:?}");
+    assert!(!*derived.lock().unwrap(), "no key derivation may run");
+    assert!(c.is_locked());
+    assert_eq!(*events.lock().unwrap(), [LockEvent::UnlockRefusedDumpable]);
+    assert!(LockEvent::UnlockRefusedDumpable.audit_entry().is_none());
+}
+
 #[test]
 fn req_mem_unlock_twice_and_failed_derivation_stay_consistent() {
     let mut c = controller(ManualClock::new(), StaticHardening::all_ok());

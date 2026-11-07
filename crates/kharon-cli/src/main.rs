@@ -784,7 +784,30 @@ fn init_command() -> ExitCode {
     }
 }
 
+/// SPEC §8 / #134: make this process non-dumpable with core limit 0,
+/// as kharond does at startup (REQ-MEM-001). `kharon` holds the master
+/// password (`init`, `unlock`) and fresh tokens (`token mint`, `tunnel
+/// mint`), and the release build aborts on panic: without this, an
+/// abort could leave a core dump with those secrets in it. A
+/// non-dumpable process gets no dump at all, whatever the host's
+/// `core_pattern`, and same-uid processes cannot ptrace it.
+fn harden_process() -> rustix::io::Result<()> {
+    use rustix::process::{DumpableBehavior, Resource, Rlimit, set_dumpable_behavior, setrlimit};
+    set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )
+}
+
 fn main() -> ExitCode {
+    if let Err(e) = harden_process() {
+        eprintln!("kharon: cannot make the process non-dumpable: {e}");
+        return ExitCode::from(2);
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Init => init_command(),

@@ -242,6 +242,7 @@ impl DaemonOwner {
         match e {
             UnlockError::AlreadyUnlocked => OwnerFailure::AlreadyUnlocked,
             UnlockError::MlockUnavailable => OwnerFailure::MlockUnavailable,
+            UnlockError::Dumpable => OwnerFailure::ProcessDumpable,
             UnlockError::Audit(_) => OwnerFailure::AuditFailed,
             UnlockError::DeriveFailed(_) => OwnerFailure::UnlockFailed,
         }
@@ -297,6 +298,7 @@ impl OwnerOps for DaemonOwner {
                     .map_err(|e| match e {
                         UnlockError::AlreadyUnlocked => OwnerFailure::AlreadyUnlocked,
                         UnlockError::MlockUnavailable => OwnerFailure::MlockUnavailable,
+                        UnlockError::Dumpable => OwnerFailure::ProcessDumpable,
                         UnlockError::Audit(_) => OwnerFailure::AuditFailed,
                         UnlockError::DeriveFailed(ExportUnlockError::Audit) => {
                             OwnerFailure::AuditFailed

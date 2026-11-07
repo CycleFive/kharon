@@ -330,7 +330,7 @@ kharon (REQ-ARCH-001):
 
 | What | Why |
 |---|---|
-| Chromium runs as its own OS user, `browser`, with its profile in `/var/lib/browser` (mode 0700) | The agent runs as a different user, so it cannot read the profile directory. |
+| Chromium runs as its own OS user, `browser`, with its profile in `/var/lib/browser` (mode 0700) | The agent runs as a different, non-root user, so it cannot read the profile directory (see [Running the agent](#running-the-agent)). |
 | `kernel.yama.ptrace_scope = 1` | The agent's user cannot attach to Chromium or read `/proc/<pid>/mem`, where filled values live briefly. |
 | Password manager, leak check, autofill and sync off by managed policy | Chromium never stores a filled password (REQ-ARCH-004). |
 | CDP on `127.0.0.1:9222`, exposed to the broker only through WireGuard | The agent uses CDP on loopback as before. The broker reaches it at `10.66.0.2:9222`, and nothing else can. |
@@ -449,6 +449,25 @@ against a CDP stub (`req_arch_002_agent_connector`).
 Run the agent as its own user, not `browser` and not in the
 `browser` group, and have it connect to CDP on loopback, for example
 with Playwright's `chromium.connectOverCDP("http://127.0.0.1:9222")`.
+
+That user must not be root, and on path (B) must not be `connector`
+either. Every boundary in the table above is a Unix permission, and
+root is exempt from all of them. A root agent:
+
+- reads Chromium's profile in `/var/lib/browser`;
+- reads the tunnel credential in `/etc/kharon-connector/token` (path
+  (B)) and the WireGuard key in `/etc/wireguard/wg0.key` (path (A));
+- attaches to Chromium and reads `/proc/<pid>/mem`, where filled
+  values live briefly, because `kernel.yama.ptrace_scope = 1` does
+  not restrict root.
+
+kharon cannot check this: the provision scripts run as root and do
+not know which uid the agent will use. A host that only offers a root
+agent, as some hosted agent runtimes do, still gets the transport,
+the approval flow and the audit log, but not this isolation (G1).
+The #121 live pilot ran that way: a root agent, with Chromium on
+`--no-sandbox` under an AppArmor user-namespace restriction. It
+proves path (B)'s transport, auth and fill, not isolation.
 
 For a visible browser instead of a headless one, change
 `browser.service`'s `ExecStart`: drop `--headless=new` and give it a

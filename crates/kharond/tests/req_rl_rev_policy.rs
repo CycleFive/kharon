@@ -13,7 +13,7 @@ use std::time::Duration;
 use api_support::{
     CHEAP_FLOOR, FakeAnswer, FakeFill, ITEM_A, RecordingAudit, TestSession, cheap_argon,
 };
-use kharond::api::grant::{Channel, GrantAction, GrantScope, GrantTerms};
+use kharond::api::grant::{Channel, GrantAction, GrantError, GrantScope, GrantTerms};
 use kharond::api::rate::RatePolicy;
 use kharond::api::token::{TokenStore, generate_with};
 use kharond::api::{Broker, FillOperation, Outcome, VaultView, parse_fill};
@@ -571,6 +571,104 @@ async fn req_rev_003_item_removal_invalidates_per_item_grants() {
             .iter()
             .any(|e| e.event == Event::GrantRevoke
                 && e.detail_code.as_deref() == Some("item_revised_or_removed"))
+    );
+}
+
+#[tokio::test]
+async fn req_rev_003_revoke_first_a_failed_grant_revoke_append_keeps_the_grant_gone() {
+    // SPEC §7 revoke-first (#135): the sync removes the grant before its
+    // `grant_revoke` entry is appended, and a failed append never
+    // restores it. The daemon logs the error instead of discarding it.
+    let (_alpha, ha) = generate_with(&cheap_argon(), "alpha");
+    let tokens = TokenStore::with_floor([("alpha", ha.as_str())], &CHEAP_FLOOR).unwrap();
+    let clock = Arc::new(ManualClock::new());
+    let fixture = TestSession::fixture();
+    // Build a vault clone with ITEM_A present, then remove it.
+    let mut items: Vec<Item> = fixture
+        .vault()
+        .items()
+        .map(|i| i.with_revision(Some("2026-11-05T12:00:00Z".into())))
+        .collect();
+    let vault = Vault::with_report(items.clone(), SyncReport::default());
+    let mut lock = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    lock.unlock(|| {
+        Ok::<_, ()>(MutVaultSession {
+            vault: vault.clone(),
+            inner: fixture,
+        })
+    })
+    .unwrap();
+    let audit = RecordingAudit::default();
+    let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://login.example.com/");
+    let broker = Broker::new(
+        tokens,
+        lock,
+        Box::new(audit.clone()),
+        OriginConfig::default(),
+    )
+    .with_grant_clock(clock.clone())
+    .with_fill_backend(Box::new(fake));
+    let _ = broker.observe_vault_after_sync(&vault);
+    // Issue a grant for ITEM_A directly.
+    let now = Duration::from_secs(0);
+    let grant = {
+        let mut store = broker.grant_store().lock().unwrap();
+        let g = store
+            .issue(
+                "alpha",
+                ITEM_A,
+                GrantAction::Fill,
+                "login.example.com",
+                &GrantTerms {
+                    scope: GrantScope::Item(ITEM_A.to_owned()),
+                    kind: GrantKind::PerOrigin,
+                    ttl: Some(Duration::from_secs(3600)),
+                    max_uses: Some(10),
+                },
+                Channel::Cli,
+                None,
+                now,
+            )
+            .unwrap();
+        store.pin_revision(&g.id, Some("2026-11-05T12:00:00Z".into()));
+        g
+    };
+    assert!(
+        !broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .grants_for("alpha", now)
+            .is_empty()
+    );
+    // Remove ITEM_A and observe, with `grant_revoke` appends failing.
+    *audit.fail_event.lock().unwrap() = Some("grant_revoke");
+    items.retain(|i| i.id() != ITEM_A);
+    let vault2 = Vault::with_report(items, SyncReport::default());
+    assert_eq!(
+        broker.observe_vault_after_sync(&vault2),
+        Err(GrantError::AuditFailed)
+    );
+    assert!(
+        broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .grant(&grant.id)
+            .is_none()
+    );
+    assert!(
+        !audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.event == Event::GrantRevoke),
+        "the failed append wrote nothing"
     );
 }
 

@@ -204,13 +204,24 @@ struct ContextReply {
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum OwnerOp<'a> {
-    Unlock { password: &'a str },
-    Approve { request_id: &'a str, kind: &'a str },
+    Unlock {
+        password: &'a str,
+    },
+    Approve {
+        request_id: &'a str,
+        kind: &'a str,
+    },
+    /// The `canary-scan` feature's memory scan (REQ-MEM-003 evidence).
+    Scan {
+        needle: &'a str,
+    },
 }
 
 #[derive(Debug, Deserialize)]
 struct OwnerReply {
     ok: bool,
+    /// `scan` only.
+    hits: Option<u64>,
 }
 
 // ------------------------------------------------------------ test pages
@@ -681,8 +692,7 @@ fn owner_op(socket: &Path, op: &OwnerOp<'_>) -> OwnerReply {
 /// kharond in export mode with agent `alpha` on `chromium`, unlocked,
 /// with the agent's browser context and the item's id.
 struct Running {
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    server: tokio::task::JoinHandle<std::io::Result<()>>,
+    host: Host,
     addr: std::net::SocketAddr,
     socket: PathBuf,
     data: tempfile::TempDir,
@@ -691,12 +701,63 @@ struct Running {
     context: String,
 }
 
+/// Where kharond runs.
+enum Host {
+    /// `daemon::start` in this test process.
+    InProcess {
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+    },
+    /// The `kharond` binary as a child process, so a memory scan of it
+    /// sees none of this test's own copies of the secrets.
+    Child(Child),
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Host::Child(child) = self {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Whether the owner socket answers `status` yet.
+fn owner_socket_up(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    if stream.write_all(b"{\"op\":\"status\"}\n").is_err() {
+        return false;
+    }
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).is_ok() && reply.contains("\"ok\":true")
+}
+
 impl Running {
     /// `policy` is extra `[policy]` TOML (empty for the defaults).
     async fn start(chromium: &Chromium, policy: &str) -> Self {
+        Self::start_on(chromium, policy, false).await
+    }
+
+    /// [`Running::start`] with kharond as a child process.
+    async fn start_binary(chromium: &Chromium) -> Self {
+        Self::start_on(chromium, "", true).await
+    }
+
+    async fn start_on(chromium: &Chromium, policy: &str, binary: bool) -> Self {
         let (token, hash) = generate("alpha");
         let token = token.expose_secret().clone();
         let data = tempfile::tempdir().unwrap();
+        // The child gets a fixed port (its bound address is not
+        // reported); in-process, the daemon reports what it bound.
+        let listen = if binary {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().to_string()
+        } else {
+            "127.0.0.1:0".to_owned()
+        };
         let toml = format!(
             r#"mode = "export"
 data_dir = "{data}"
@@ -715,7 +776,7 @@ checkpoint_local_only = true
 require_mlock = false
 
 [api]
-listen = "127.0.0.1:0"
+listen = "{listen}"
 
 [policy]
 {policy}
@@ -723,16 +784,41 @@ listen = "127.0.0.1:0"
             data = data.path().display(),
             cdp = chromium.ws,
         );
-        let cfg = Config::from_toml_str(&toml).unwrap();
-        let d = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
-            .await
-            .unwrap();
-        let addr = d.local_addr().unwrap();
-        let socket = d.owner_socket().to_path_buf();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(d.run(async {
-            let _ = stopped.await;
-        }));
+        let (host, addr, socket) = if binary {
+            let path = data.path().join("kharon.toml");
+            std::fs::write(&path, &toml).unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_kharond"))
+                .arg("--config")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let host = Host::Child(child);
+            let socket = data.path().join("owner.sock");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !owner_socket_up(&socket) {
+                assert!(Instant::now() < deadline, "kharond did not start");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            (host, listen.parse().unwrap(), socket)
+        } else {
+            let cfg = Config::from_toml_str(&toml).unwrap();
+            let d = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+                .await
+                .unwrap();
+            let addr = d.local_addr().unwrap();
+            let socket = d.owner_socket().to_path_buf();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(d.run(async {
+                let _ = stopped.await;
+            }));
+            let host = Host::InProcess {
+                stop: Some(stop),
+                server,
+            };
+            (host, addr, socket)
+        };
 
         let s = socket.clone();
         let reply = tokio::task::spawn_blocking(move || {
@@ -767,8 +853,7 @@ listen = "127.0.0.1:0"
             .browser_context_id;
 
         Self {
-            stop: Some(stop),
-            server,
+            host,
             addr,
             socket,
             data,
@@ -831,9 +916,25 @@ listen = "127.0.0.1:0"
             .collect()
     }
 
+    /// Occurrences of `needle` in kharond's memory (`scan` op). A
+    /// scan that could not run fails here, never reads as 0.
+    async fn scan(&self, needle: &str) -> u64 {
+        let socket = self.socket.clone();
+        let needle = needle.to_owned();
+        let reply = tokio::task::spawn_blocking(move || {
+            owner_op(&socket, &OwnerOp::Scan { needle: &needle })
+        })
+        .await
+        .unwrap();
+        assert!(reply.ok, "scan: {reply:?}");
+        reply.hits.unwrap()
+    }
+
     async fn shutdown(mut self) {
-        self.stop.take().unwrap().send(()).unwrap();
-        self.server.await.unwrap().unwrap();
+        if let Host::InProcess { stop, server } = &mut self.host {
+            stop.take().unwrap().send(()).unwrap();
+            server.await.unwrap().unwrap();
+        }
     }
 }
 
@@ -1131,6 +1232,93 @@ async fn req_org_003_redirect_race_never_lands_a_fill_on_the_other_site() {
             assert!(!text.contains(secret), "a secret reached the server");
         }
     }
+
+    drop(cdp);
+    run.shutdown().await;
+    drop(chromium);
+}
+
+/// REQ-CRY-006's second half: "after a fill completes, the canary is
+/// absent within 1 s". kharond runs as a child process, so the
+/// `canary-scan` op sees only the daemon's memory, never this test's
+/// copies of the secrets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_cry_006_no_secret_left_in_the_daemon_after_a_fill() {
+    let Some(bin) = chromium_or_skip("req_cry_006_no_secret_left_in_the_daemon_after_a_fill")
+    else {
+        return;
+    };
+    let (port, spki) = serve_https().await;
+    let chromium = launch_chromium(&bin, Some(&spki));
+    let run = Running::start_binary(&chromium).await;
+
+    // Positive control: the item's username is metadata, decrypted at
+    // unlock and held for list and match (REQ-CRY-006), so a scanner
+    // that reads the daemon's heap finds it.
+    assert!(
+        run.scan(ITEM_USERNAME).await > 0,
+        "the scan cannot see the item's metadata in the daemon"
+    );
+    // Secrets are decrypted per fill only: none is in memory yet.
+    for secret in SECRETS {
+        assert_eq!(
+            run.scan(secret).await,
+            0,
+            "a secret is in memory before any fill"
+        );
+    }
+
+    let login = format!("https://{HOST}:{port}/login");
+    let origin = format!("https://{HOST}:{port}");
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (target, session) = cdp.open(&run.context, &login).await;
+    let first = run.fill(&target, &origin).await;
+    assert_eq!(first.status, "pending_approval", "{first:?}");
+    run.approve_once(first.grant_request_id.as_deref().unwrap())
+        .await;
+    let filled = run.fill(&target, &origin).await;
+    let done = Instant::now();
+    assert_eq!(filled.status, "filled", "{filled:?}");
+
+    // The password went through the daemon to the page. Within 1 s of
+    // the fill's reply, a scan finds no copy of it in the daemon (a
+    // full scan of a debug build takes most of a second, so the first
+    // one usually decides). The other two secrets must be absent too.
+    let deadline = done + Duration::from_secs(1);
+    let password_gone = loop {
+        let started = Instant::now();
+        if run.scan(SECRETS[0]).await == 0 {
+            break started <= deadline;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the item's password is still in the daemon's memory 1 s after the fill"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        password_gone,
+        "no zero-hit scan began within 1 s of the fill"
+    );
+    // Not even a fragment: a freed small allocation loses its first
+    // 16 bytes to the allocator's free-list pointers, so a leaked copy
+    // of the 27-byte password can survive as its tail alone.
+    assert_eq!(
+        run.scan(&SECRETS[0][16..]).await,
+        0,
+        "the tail of the item's password is still in the daemon's memory"
+    );
+    for secret in &SECRETS[1..] {
+        assert_eq!(
+            run.scan(secret).await,
+            0,
+            "a secret is in memory after the fill"
+        );
+    }
+    assert!(
+        cdp.fields(&session).await.1 == SECRETS[0],
+        "the page's password field does not hold the item's password"
+    );
 
     drop(cdp);
     run.shutdown().await;

@@ -238,7 +238,7 @@ There is no read-secret, export, or reveal route, and no `include_secret` flag. 
 
 ## 5. Approval flow
 
-Grant = `{id, agent_id, item_id|*collection, origin (eTLD+1 or host), actions ⊆ {fill, totp}, expires_at, max_uses, uses, created_by_channel}`. A fill without a matching live grant creates a `GrantRequest` and returns `pending_approval`. The agent may poll `kharon_status`, or call with `wait_s ≤ 60`. Requests time out after 120 s and are denied by default.
+Grant = `{id, agent_id, item_id|*collection, origin (eTLD+1 or host), actions ⊆ {fill, totp}, expires_at, max_uses, uses, created_by_channel}`. `uses` counts fills that sent field values to the browser (REQ-APR-008). A fill without a matching live grant creates a `GrantRequest` and returns `pending_approval`. The agent may poll `kharon_status`, or call with `wait_s ≤ 60`. Requests time out after 120 s and are denied by default.
 
 | Grant type | Default TTL | Use |
 |---|---|---|
@@ -261,6 +261,7 @@ Grant = `{id, agent_id, item_id|*collection, origin (eTLD+1 or host), actions �
 | REQ-APR-005 | Web UI with WebAuthn-only owner login. | A login without passkey assertion is impossible (no password route). E2E with a virtual authenticator. |
 | REQ-APR-006 | CLI over unix socket with peer uid check. | Connect as another uid → rejected and audited. |
 | REQ-APR-007 | Approval prompt shows the live origin observed at request time, not the agent's claim. | Test: agent claims origin A while the tab is on B. The prompt shows B and the request is `origin_mismatch` before prompting. |
+| REQ-APR-008 | A grant use is spent when a fill is admitted, so two concurrent fills cannot both spend one use. It is given back if the fill ends before the broker has sent any field value to the browser. That covers any refusal after admission and before the single in-page fill call: a decrypt or TOTP failure, target ownership, the claimed or live origin, a non-secure context, a failed attach, a navigation seen before the call, or a deadline already spent at dispatch. Once that call has been sent, the use stays spent whatever the outcome (`filled`, an in-page refusal, `navigated`, `timeout`). The fill's outcome entry is the record; the give-back has no audit entry of its own. Retries stay bounded by the grant's TTL and REQ-RL-002. (#151, Lothrop decision 2026-11-07.) | Tests: a `once` grant and a fill refused `origin_mismatch` in step 1 → the grant is still live and the next fill on it is `filled`. `filled` → spent, and a later fill needs a new grant. A fill refused in-page after the call was sent → spent. Deadline expired before dispatch → not spent. Two concurrent fills on one `once` grant → at most one reaches the CDP stub. |
 
 ## 6. Origin binding
 
@@ -430,7 +431,7 @@ M0 skeleton · M1 vault read path · M2 fill path · M3 policy and approvals · 
 | 12 | CDP client and tunnel transport. Per-agent browser contexts. Isolated-world atomic fill. Navigation detection. | REQ-ARCH-002, 003, 005, REQ-ORG-002..005 | 11 |
 | 13 | Fill and fill_and_submit endpoints, fill deadline | REQ-API-008, 009, REQ-GOAL-001 | 7, 9, 12 |
 | 14 | TOTP generation and `fill_totp` | REQ-API-007 | 13 |
-| 15 | Grant model and request lifecycle | REQ-APR-001, 002, 003, 007 | 9, 8 |
+| 15 | Grant model and request lifecycle | REQ-APR-001, 002, 003, 007, 008 | 9, 8 |
 | 16 | Approval channels: CLI socket, ntfy one-time actions | REQ-APR-004, 006 | 15 |
 | 17 | Owner web UI with WebAuthn (approvals, grants, audit tail, unlock) | REQ-APR-005 | 15, 7 |
 | 18 | Rate limits, suspension, revocation, panic | REQ-RL-001..003, REQ-REV-001..004, REQ-MEM-007 | 13, 15 |

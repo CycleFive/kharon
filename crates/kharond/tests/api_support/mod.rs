@@ -525,6 +525,9 @@ pub enum FakeAnswer {
     /// `origin_mismatch` from the in-page check, after the fill call
     /// carrying the values was sent (REQ-APR-008: the use stays spent).
     OriginMismatchInPage,
+    /// REQ-ORG-004's iframe-allowlist refusal (#180), decided in step 1
+    /// like `OriginMismatch`, before any value is sent.
+    IframeNotAllowlisted,
     /// Never completes (the broker's deadline must cut it off).
     Stall,
     /// The engine's answer when the page-side budget aborts the fill
@@ -621,7 +624,10 @@ impl FillBackend for FakeFill {
         // As the engine does: every answer but a step-1 refusal means
         // the in-page fill call carrying the values was sent
         // (REQ-APR-008).
-        if !matches!(answer, FakeAnswer::OriginMismatch) {
+        if !matches!(
+            answer,
+            FakeAnswer::OriginMismatch | FakeAnswer::IframeNotAllowlisted
+        ) {
             plan.values_sent.mark();
         }
         let kinds: Vec<FieldKind> = plan.fields.iter().map(|f| f.kind).collect();
@@ -631,6 +637,7 @@ impl FillBackend for FakeFill {
                 FakeAnswer::OriginMismatch | FakeAnswer::OriginMismatchInPage => {
                     FillOutcome::OriginMismatch
                 }
+                FakeAnswer::IframeNotAllowlisted => FillOutcome::IframeNotAllowlisted,
                 FakeAnswer::Stall => std::future::pending().await,
                 FakeAnswer::PageDeadline => FillOutcome::Timeout,
             }

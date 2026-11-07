@@ -279,6 +279,67 @@ async fn req_rl_004_once_grant_is_not_stranded_by_a_full_fill_bucket() {
 }
 
 #[tokio::test]
+async fn req_rl_002_iframe_not_allowlisted_counts_toward_the_mismatch_streak() {
+    // #180: the iframe-allowlist refusal got its own detail code. It is
+    // still an origin_mismatch, so five in a row still suspend.
+    let rig = Rig::with_policy(
+        "https://login.example.com/",
+        RatePolicy {
+            item_fills_per_window: 100,
+            fills_per_minute: 100,
+            ..RatePolicy::default()
+        },
+    );
+    rig.broker
+        .grant_store()
+        .lock()
+        .unwrap()
+        .issue(
+            "alpha",
+            ITEM_A,
+            GrantAction::Fill,
+            "https://login.example.com",
+            &GrantTerms {
+                scope: GrantScope::Item(ITEM_A.to_owned()),
+                kind: GrantKind::PerOrigin,
+                ttl: None,
+                max_uses: None,
+            },
+            Channel::Cli,
+            None,
+            rig.clock.now(),
+        )
+        .unwrap();
+    rig.fake.script([FakeAnswer::IframeNotAllowlisted; 5]);
+    for i in 0..5 {
+        let r = rig
+            .fill_password(ITEM_A, "https://login.example.com")
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "origin_mismatch", "refusal {i}: {r}");
+        assert_eq!(r["detail"], "iframe_not_allowlisted", "refusal {i}: {r}");
+    }
+    assert!(
+        rig.broker
+            .rate_limiter()
+            .lock()
+            .unwrap()
+            .is_suspended("alpha")
+    );
+    let audited = rig
+        .audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.event == Event::Fill && e.detail_code.as_deref() == Some("iframe_not_allowlisted")
+        })
+        .count();
+    assert_eq!(audited, 5, "each refusal is audited with its detail code");
+}
+
+#[tokio::test]
 async fn req_rl_002_fifth_consecutive_origin_mismatch_suspends_agent() {
     let rig = Rig::with_policy(
         "https://other.example.com/",

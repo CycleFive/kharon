@@ -183,6 +183,11 @@ pub enum FillOutcome {
     },
     OriginMismatch,
     NonSecureContext,
+    /// REQ-ORG-004: the target is an out-of-process iframe whose host
+    /// is not in `allow_cross_origin_iframe_hosts`. Reported as
+    /// `origin_mismatch` with its own detail code (#180), decided in
+    /// step 1, before any value is sent.
+    IframeNotAllowlisted,
     Navigated,
     FieldNotFound {
         kinds: Vec<FieldKind>,
@@ -219,7 +224,9 @@ impl FillOutcome {
     pub fn status(&self) -> &'static str {
         match self {
             Self::Filled { .. } => "filled",
-            Self::OriginMismatch | Self::NonSecureContext => "origin_mismatch",
+            Self::OriginMismatch | Self::NonSecureContext | Self::IframeNotAllowlisted => {
+                "origin_mismatch"
+            }
             Self::Navigated => "navigated",
             Self::FieldNotFound { .. } => "field_not_found",
             Self::TargetNotOwned | Self::DefaultContextRefused => "target_not_owned",
@@ -234,6 +241,7 @@ impl FillOutcome {
     pub fn detail(&self) -> Option<&'static str> {
         match self {
             Self::NonSecureContext => Some("insecure_context"),
+            Self::IframeNotAllowlisted => Some("iframe_not_allowlisted"),
             Self::DefaultContextRefused => Some("default_context_refused"),
             Self::UnknownTarget => Some("unknown_target"),
             Self::ClockSkew => Some("clock_skew"),
@@ -396,14 +404,14 @@ impl FillEngine {
         if info.type_ == "iframe" {
             let host = match url_host(&info.url) {
                 Some(h) => h,
-                None => return FillOutcome::OriginMismatch,
+                None => return FillOutcome::IframeNotAllowlisted,
             };
             if !plan
                 .cross_origin_iframe_hosts
                 .iter()
                 .any(|allowed| allowed.eq_ignore_ascii_case(&host))
             {
-                return FillOutcome::OriginMismatch;
+                return FillOutcome::IframeNotAllowlisted;
             }
         }
 
@@ -788,6 +796,14 @@ fn page_budget(deadline: Option<Instant>, now: Instant) -> PageBudget {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn req_org_004_iframe_refusal_is_origin_mismatch_with_its_own_detail() {
+        let o = super::FillOutcome::IframeNotAllowlisted;
+        assert_eq!(o.status(), "origin_mismatch");
+        assert_eq!(o.detail(), Some("iframe_not_allowlisted"));
+        assert!(o.fields_filled().is_empty());
+    }
+
     use super::*;
 
     #[test]

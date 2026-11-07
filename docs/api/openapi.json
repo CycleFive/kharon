@@ -693,6 +693,7 @@
             "description": "Fixed reason code for some non-filled statuses (also the audit detail_code).",
             "enum": [
               "insecure_context",
+              "iframe_not_allowlisted",
               "default_context_refused",
               "unknown_target",
               "clock_skew",

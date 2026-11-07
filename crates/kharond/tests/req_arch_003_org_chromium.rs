@@ -145,6 +145,7 @@ struct FillReply {
     #[serde(default)]
     fields_filled: Vec<String>,
     grant_request_id: Option<String>,
+    detail: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -936,6 +937,9 @@ async fn req_org_004(test: &str, allowlisted: bool) {
             .unwrap();
         assert_eq!(last.result.as_deref(), Some("origin_mismatch"));
         assert_eq!(last.live_origin.as_deref(), Some(origin.as_str()));
+        // Its own detail code (#180), in the reply and the audit.
+        assert_eq!(outcome.detail.as_deref(), Some("iframe_not_allowlisted"));
+        assert_eq!(last.detail_code.as_deref(), Some("iframe_not_allowlisted"));
         assert_eq!(
             (username, password),
             (String::new(), String::new()),

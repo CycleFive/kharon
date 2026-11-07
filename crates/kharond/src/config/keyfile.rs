@@ -4,24 +4,37 @@
 //! and metadata; it cannot decrypt without the master password. A file
 //! others can *write* lets them swap in their own key (point kharond at
 //! an attacker account), so that is fatal. A file others can *read*, or
-//! one owned by another uid, only warns: Docker secrets are mounted 0444
-//! (root-owned) inside a single-purpose container where kharond runs as
-//! a non-root uid.
+//! one owned by another uid, only warns: a Swarm secret is mounted 0444
+//! and root-owned inside a single-purpose container where kharond runs
+//! as a non-root uid.
+//!
+//! Plain Docker Compose (no Swarm) mounts a `secrets: file:` entry as a
+//! bind mount that keeps the host file's owner and mode, and ignores the
+//! secret's `uid`, `gid` and `mode`. A 0400 file owned by the operator
+//! is then unreadable to kharond (uid 10001 in the Compose example), so
+//! the check opens the file and, if that is refused, says whose uid and
+//! which mode are in the way (#149).
 
 use std::fs::Metadata;
+use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::ConfigWarning;
+use super::{ConfigError, ConfigWarning};
 
 const GROUP_OTHER_WRITE: u32 = 0o022;
 const GROUP_OTHER_READ: u32 = 0o044;
 
 /// Check the file at `path` (symlinks followed) against kharond's
-/// effective uid. `Err` carries fixed text (never file content).
-pub(super) fn check_api_key_file(path: &Path) -> Result<Vec<ConfigWarning>, &'static str> {
-    let meta = std::fs::metadata(path).map_err(|_| "unreadable")?;
-    check_metadata(&meta, rustix::process::geteuid().as_raw())
+/// effective uid, then open it (without reading) to prove that uid can.
+/// Errors carry fixed text, uids and the mode; never file content.
+pub(super) fn check_api_key_file(path: &Path) -> Result<Vec<ConfigWarning>, ConfigError> {
+    let fixed = |reason| ConfigError::ApiKeyFile { reason };
+    let meta = std::fs::metadata(path).map_err(|_| fixed("unreadable"))?;
+    let euid = rustix::process::geteuid().as_raw();
+    let warnings = check_metadata(&meta, euid).map_err(fixed)?;
+    check_openable(path, &meta, euid)?;
+    Ok(warnings)
 }
 
 pub(super) fn check_metadata(
@@ -45,6 +58,22 @@ pub(super) fn check_metadata(
     Ok(w)
 }
 
+fn check_openable(path: &Path, meta: &Metadata, euid: u32) -> Result<(), ConfigError> {
+    match std::fs::File::open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            Err(ConfigError::ApiKeyFileNotReadable {
+                euid,
+                owner: meta.uid(),
+                mode: meta.mode() & 0o7777,
+            })
+        }
+        Err(_) => Err(ConfigError::ApiKeyFile {
+            reason: "unreadable",
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +85,10 @@ mod tests {
         std::fs::write(&p, b"{}").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
         (dir, p)
+    }
+
+    fn fixed(reason: &'static str) -> ConfigError {
+        ConfigError::ApiKeyFile { reason }
     }
 
     #[test]
@@ -81,7 +114,7 @@ mod tests {
             let (_d, p) = key_with_mode(m);
             assert_eq!(
                 check_api_key_file(&p),
-                Err("group- or world-writable (use mode 0400 or 0600)"),
+                Err(fixed("group- or world-writable (use mode 0400 or 0600)")),
                 "mode {m:o}"
             );
         }
@@ -90,7 +123,10 @@ mod tests {
     #[test]
     fn req_dep_008_non_regular_file_refused() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check_api_key_file(dir.path()), Err("not a regular file"));
+        assert_eq!(
+            check_api_key_file(dir.path()),
+            Err(fixed("not a regular file"))
+        );
     }
 
     #[test]
@@ -109,7 +145,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             check_api_key_file(&dir.path().join("nope")),
-            Err("unreadable")
+            Err(fixed("unreadable"))
         );
+    }
+
+    /// #149: a file kharond's uid may not open (the plain-Compose bind
+    /// mount of an operator-owned 0400 file) is refused with the uid,
+    /// owner and mode in the message, not a bare "unreadable". Root
+    /// opens anything, so this needs an unprivileged test run.
+    #[test]
+    fn req_dep_008_not_openable_by_euid_names_uid_owner_and_mode() {
+        let euid = rustix::process::geteuid().as_raw();
+        if euid == 0 {
+            eprintln!("req_dep_008: running as root, which can open any file; skipped");
+            return;
+        }
+        let (_d, p) = key_with_mode(0o000);
+        let err = check_api_key_file(&p).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ApiKeyFileNotReadable {
+                euid,
+                owner: euid,
+                mode: 0
+            }
+        );
+        assert_eq!(err.code(), "api_key_file");
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("euid {euid}")), "{msg}");
+        assert!(msg.contains("mode 0000"), "{msg}");
+        assert!(msg.contains("0400"), "{msg}");
     }
 }

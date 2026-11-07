@@ -21,3 +21,23 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/CycleFive/kharon"
 publish = false
+
+# The KDFs in debug builds: Argon2id at the production floor (m = 19 MiB,
+# t = 2) takes ~330 ms per hash unoptimized, and every authenticated
+# daemon request in the test suite pays it; PBKDF2-SHA256 at 600k
+# iterations (vault and export unlock) is the same story. Optimizing
+# just these crates keeps our own code's debug builds unoptimized.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

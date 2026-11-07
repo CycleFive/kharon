@@ -818,11 +818,17 @@ mod tests {
         // away, appends alone deliver nothing; once the period has
         // elapsed, `checkpoint_if_due` anchors the tail without any
         // new append, and is a no-op until more entries land.
+        //
+        // No wall-clock sleep (#165): the period is an hour, so "not
+        // elapsed" can't flip under load (neither here nor in `append`'s
+        // own period check), and the period is made to elapse by moving
+        // the last checkpoint time back past it.
         let dir = tempfile::tempdir().unwrap();
         let cp_path = dir.path().join("checkpoints.jsonl");
+        let period = Duration::from_secs(3600);
         let cfg = AuditConfig {
             checkpoint_every: 100,
-            checkpoint_period: Duration::from_millis(50),
+            checkpoint_period: period,
             ..AuditConfig::default()
         };
         let mut log = AuditLog::open(
@@ -836,7 +842,7 @@ mod tests {
         assert!(!log.checkpoint_if_due(), "period has not elapsed yet");
         assert!(!cp_path.exists() || std::fs::read_to_string(&cp_path).unwrap().is_empty());
 
-        std::thread::sleep(std::time::Duration::from_millis(70));
+        log.last_checkpoint_at -= period + Duration::from_secs(1);
         assert!(log.checkpoint_if_due(), "due checkpoint must be delivered");
         let text = std::fs::read_to_string(&cp_path).unwrap();
         let cps: Vec<super::super::Checkpoint> = text

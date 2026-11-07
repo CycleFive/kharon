@@ -201,6 +201,83 @@ async fn req_rl_001_eleventh_fill_in_sixty_seconds_is_rate_limited() {
     );
 }
 
+/// REQ-RL-004 (#152): the #121 pilot's case. Refused attempts used up
+/// the agent's fill bucket, then the owner approved a `once` grant; that
+/// fill must not be stranded. A per-origin grant at the same limit stays
+/// under REQ-RL-001.
+#[tokio::test]
+async fn req_rl_004_once_grant_is_not_stranded_by_a_full_fill_bucket() {
+    let rig = Rig::with_policy(
+        "https://login.example.com/",
+        RatePolicy {
+            fills_per_minute: 3,
+            item_fills_per_window: 100, // isolate the per-agent bucket
+            ..RatePolicy::default()
+        },
+    );
+    // Three refused attempts (the tab is not where the agent claims)
+    // spend the whole bucket; three is under the suspension streak.
+    for i in 0..3 {
+        let r = rig
+            .fill_password(ITEM_A, "https://elsewhere.example")
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "origin_mismatch", "attempt {i}: {r}");
+    }
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "rate_limited", "bucket full, no grant: {r}");
+
+    let issue = |kind: GrantKind| {
+        let mut store = rig.broker.grant_store().lock().unwrap();
+        store
+            .issue(
+                "alpha",
+                ITEM_A,
+                GrantAction::Fill,
+                "https://login.example.com",
+                &GrantTerms {
+                    scope: GrantScope::Item(ITEM_A.to_owned()),
+                    kind,
+                    ttl: None,
+                    max_uses: None,
+                },
+                Channel::Cli,
+                None,
+                rig.clock.now(),
+            )
+            .unwrap()
+            .id
+    };
+
+    // The owner approves a once grant: its fill lands despite the
+    // full bucket, and spends the grant.
+    issue(GrantKind::Once);
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "filled", "a once grant is not stranded: {r}");
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "rate_limited", "the once grant is spent: {r}");
+
+    // A per-origin grant does not bypass the bucket.
+    issue(GrantKind::PerOrigin);
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(
+        r["status"], "rate_limited",
+        "multi-use grants stay under REQ-RL-001: {r}"
+    );
+}
+
 #[tokio::test]
 async fn req_rl_002_fifth_consecutive_origin_mismatch_suspends_agent() {
     let rig = Rig::with_policy(

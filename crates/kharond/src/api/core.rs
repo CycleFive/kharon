@@ -65,7 +65,7 @@ use super::grant::{
 };
 use super::meta::{ItemMeta, matches_origin, matches_query};
 use super::notify::ApprovalNotifier;
-use super::rate::{RateDenied, RateLimiter, RatePolicy};
+use super::rate::{FillBacking, RateDenied, RateLimiter, RatePolicy};
 use super::rollback::RollbackGuard;
 use super::token::TokenStore;
 use crate::audit::{AuditLog, Entry, Event};
@@ -938,13 +938,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
         // REQ-RL-001/002: fill bucket + per-item window + suspension.
         // Spent up front so a refused fill still counts (anti-hammer).
+        // A fill a live `once` grant would admit passes a full
+        // per-agent bucket (REQ-RL-004, #152).
         {
             let now = self.grant_now();
+            let backing = self.fill_backing(agent, &req, now);
             let admit = self
                 .rates
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .admit_fill(agent.as_str(), &req.item_id, now);
+                .admit_fill_backed(agent.as_str(), &req.item_id, now, backing);
             if let Err(denied) = admit {
                 let detail = match denied {
                     RateDenied::Suspended => "agent_suspended",
@@ -1924,6 +1927,58 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         match tokio::time::timeout_at(deadline, fill).await {
             Ok(outcome) => FillStatus::Engine(outcome),
             Err(_) => FillStatus::Engine(FillOutcome::Timeout),
+        }
+    }
+
+    /// REQ-RL-004 (#152): whether the grant the grant gate would pick
+    /// for this fill is a live single-use (`once`) grant. The same match
+    /// as `resolve_fill` (a named grant, else the first live match;
+    /// agent, item or collection, origin, action, TTL, uses, revision),
+    /// but nothing is consumed: the gate still decides and spends.
+    fn fill_backing(
+        &self,
+        agent: &AgentId,
+        req: &FillRequest,
+        now: std::time::Duration,
+    ) -> FillBacking {
+        let (collections, revision) = {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            let Ok(session) = lock.require_unlocked() else {
+                return FillBacking::Unbacked;
+            };
+            let Ok(item) = session.vault().get(&req.item_id) else {
+                return FillBacking::Unbacked;
+            };
+            (
+                item.collection_ids().to_vec(),
+                item.revision().map(str::to_owned),
+            )
+        };
+        let action = match req.operation {
+            FillOperation::Fill => GrantAction::Fill,
+            FillOperation::FillTotp => GrantAction::Totp,
+        };
+        let admits = |g: &Grant| {
+            g.matches(
+                agent.as_str(),
+                &req.item_id,
+                &collections,
+                &req.expected_origin,
+                action,
+                now,
+            ) && g.revision_matches(revision.as_deref())
+        };
+        let store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+        let chosen = match &req.grant_id {
+            Some(gid) => store.grant(gid).filter(|g| admits(g)).cloned(),
+            None => store
+                .grants_for(agent.as_str(), now)
+                .into_iter()
+                .find(|g| admits(g)),
+        };
+        match chosen {
+            Some(g) if g.kind == crate::config::GrantKind::Once => FillBacking::OnceGrant,
+            _ => FillBacking::Unbacked,
         }
     }
 

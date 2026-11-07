@@ -362,7 +362,9 @@ async fn req_apr_003_owner_paths_expire_first_so_an_aged_request_cannot_be_appro
     let second = r["grant_request_id"].as_str().unwrap().to_owned();
     rig.clock.advance(Duration::from_secs(121));
     assert_eq!(
-        rig.broker.deny_grant_request(&second).map(|_| ()),
+        rig.broker
+            .deny_grant_request(&second, Channel::Cli)
+            .map(|_| ()),
         Err(GrantError::NotPending)
     );
 }

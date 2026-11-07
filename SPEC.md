@@ -278,7 +278,7 @@ The match is computed from the decrypted `login.uris[]` and their Bitwarden matc
 | RegularExpression (4) | Refused (`origin_mismatch`). Fail closed. |
 | Never (5) | Refused |
 
-Rules: scheme must be `https`, except `http://localhost`/IP only if the item URI is literally http and `allow_http=true`. The page must be a secure context. Frame origin and top-level origin must both match (default). Config `allow_cross_origin_iframe_hosts` permits named IdP iframes. Origins in the IDN and punycode form are compared after `idna` normalization. A PSL private-section entry, such as `github.io`, makes the eTLD+1 the user's subdomain, which is intended.
+Rules: scheme must be `https`, except `http://localhost`/IP only if the item URI is literally http and `allow_http=true`. The page must be a secure context. Frame origin and top-level origin must both match (default). Config `allow_cross_origin_iframe_hosts` permits named IdP iframes. An allowlisted iframe is matched on its own origin: the top-level page need not match the item, since an identity provider's frame is embedded in a relying party's page (#180). A cross-site iframe whose host is not allowlisted is refused as `origin_mismatch` with `detail_code: iframe_not_allowlisted`, and it counts toward REQ-RL-002's mismatch streak like any other `origin_mismatch`. Origins in the IDN and punycode form are compared after `idna` normalization. A PSL private-section entry, such as `github.io`, makes the eTLD+1 the user's subdomain, which is intended.
 
 Redirect-race defense. The check and the write happen in one renderer task:
 1. `Page.createIsolatedWorld(frameId)` → contextId. Record `loaderId`.
@@ -293,7 +293,7 @@ A fallback path, `Input.insertText` for sites that ignore programmatic value set
 | REQ-ORG-001 | Implement the match table above with PSL. | Table tests ≥ 40 cases, including `co.uk`, `github.io`, IDN, ports, `http`, RegEx refused. In-page E2E for Exact and StartsWith: matching origin with a non-matching href → `origin_mismatch`. |
 | REQ-ORG-002 | Origin read from the live frame via CDP, never from agent input. | Test: the agent passes `expected_origin` = item origin while the tab is evil.test → `origin_mismatch`. |
 | REQ-ORG-003 | Atomic check-and-set in an isolated world. Context destruction → `navigated`. | E2E: the page schedules `location = evil` on the `focus` event and in a microtask, 1000 iterations. 0 fills land on evil.test (server logs). |
-| REQ-ORG-004 | Cross-origin iframe fill refused unless allowlisted. | E2E: the login form in an iframe from another eTLD+1 → `origin_mismatch`. Allowlisted → filled. |
+| REQ-ORG-004 | Cross-origin iframe fill refused unless allowlisted. | E2E: the login form in an iframe from another eTLD+1 → `origin_mismatch` (`iframe_not_allowlisted`). Allowlisted → filled, even when the top-level page matches none of the item's URIs. |
 | REQ-ORG-005 | Non-secure context refused. | E2E: an http page with an https item → refused. |
 
 ## 7. Audit, rate limits, revocation

@@ -98,7 +98,20 @@ not something a person chose:
    recover it.
 4. Create the kharon organization and collection, then create the
    account's API key and save it as
-   `deploy/compose/secrets/kharon_bw_api_key.json`.
+   `deploy/compose/secrets/kharon_bw_api_key.json`. Give it to
+   kharond's uid (REQ-DEP-008):
+
+   ```sh
+   sudo chown 10001:10001 deploy/compose/secrets/kharon_bw_api_key.json
+   sudo chmod 0400 deploy/compose/secrets/kharon_bw_api_key.json
+   ```
+
+   Without Swarm, Compose mounts a `secrets:` file as a bind mount
+   that keeps the host file's owner and mode. It ignores a secret's
+   `uid`, `gid` and `mode` (with a warning). kharond runs as uid
+   10001, so a `0400` file owned by your own uid is unreadable to it,
+   and `--check` and startup refuse with `config error
+   [api_key_file]: … not readable by kharond (euid 10001; …)`.
 
 ### Agent tokens (REQ-API-003)
 
@@ -230,6 +243,24 @@ tls_key_file = "/etc/kharon/tls.key"
 listen = "203.0.113.4:8788"
 tls_cert_file = "/etc/kharon/tls.crt"
 tls_key_file = "/etc/kharon/tls.key"
+```
+
+kharond reads both files as its own uid. With the Compose example,
+bind-mount them read-only and give the private key to uid 10001 with
+mode `0400`, as with the API key file (step 4 of
+[the kharon account](#the-kharon-account-and-its-master-password-req-dep-007)):
+
+```yaml
+# docker-compose.override.yml
+services:
+  kharon:
+    volumes:
+      - ./tls/tls.crt:/etc/kharon/tls.crt:ro
+      - ./tls/tls.key:/etc/kharon/tls.key:ro
+```
+
+```sh
+sudo chown 10001:10001 tls/tls.key && sudo chmod 0400 tls/tls.key
 ```
 
 `203.0.113.4` stands for the broker's reachable address. A self-signed

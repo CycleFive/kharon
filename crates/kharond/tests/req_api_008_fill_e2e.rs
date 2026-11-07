@@ -29,10 +29,13 @@ use api_support::{
 use futures_util::{SinkExt, StreamExt};
 use kharond::api::token::{TokenStore, generate_with};
 use kharond::api::{Broker, CdpFillBackend};
-use kharond::cdp::{Browser, CdpClient, CdpEndpoint, FillEngine, Tunnel};
+use kharond::cdp::{
+    Browser, CdpClient, CdpEndpoint, FieldFill, FieldKind, FillEngine, FillPlan, LiveOrigin,
+    Tunnel, ValuesSent,
+};
 use kharond::export::{ExportFile, ExportSession};
 use kharond::lock::{LockController, LockPolicy, ManualClock, StaticHardening};
-use kharond::origin::OriginConfig;
+use kharond::origin::{OriginConfig, OriginMatcher};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
@@ -56,6 +59,16 @@ async fn cdp_stub() -> (String, Received) {
 /// [`cdp_stub`] with page `t1` in browser context `t1_context` (the
 /// agent's own context is always `ctx-A`).
 async fn cdp_stub_in(t1_context: &'static str) -> (String, Received) {
+    cdp_stub_opts(t1_context, false).await
+}
+
+/// [`cdp_stub`] that drops the socket, unanswered, as soon as the
+/// in-page fill call arrives (REQ-APR-008's ambiguous send).
+async fn cdp_stub_dropping_fill() -> (String, Received) {
+    cdp_stub_opts("ctx-A", true).await
+}
+
+async fn cdp_stub_opts(t1_context: &'static str, drop_on_fill: bool) -> (String, Received) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let received: Received = Arc::default();
@@ -90,6 +103,9 @@ async fn cdp_stub_in(t1_context: &'static str) -> (String, Received) {
             let msg: Value = serde_json::from_str(&text).unwrap();
             rec.lock().unwrap().push(msg.clone());
             let method = msg["method"].as_str().unwrap_or_default();
+            if drop_on_fill && method == "Runtime.callFunctionOn" {
+                break;
+            }
             let result = if method == "Runtime.callFunctionOn" {
                 let kinds: Vec<Value> = msg["params"]["arguments"][1]["value"]
                     .as_array()
@@ -680,4 +696,93 @@ async fn req_api_008_submit_false_loader_change_reports_navigated() {
         "scrub after unexpected navigation"
     );
     assert_eq!(calls[0]["params"]["arguments"][3]["value"], json!(false));
+}
+
+/// REQ-APR-008 (#151): the real engine marks `values_sent` only when
+/// it sends the in-page fill call that carries the values. A step-1
+/// refusal (the claim differs from the live origin) leaves it unset
+/// and sends no `Runtime.callFunctionOn`; a fill that lands sets it.
+/// The broker gives the grant use back exactly when it is unset.
+#[tokio::test]
+async fn req_apr_008_engine_marks_values_sent_only_with_the_fill_call() {
+    let (url, received) = cdp_stub().await;
+    let endpoint = CdpEndpoint::validate(&url, Tunnel::Direct, None).unwrap();
+    let browser = Browser::new(CdpClient::connect(&endpoint).await.unwrap());
+    let ctx = browser.create_agent_context("alpha").await.unwrap();
+    let engine = FillEngine::new(browser);
+    let plan = |claim: &str| FillPlan {
+        target_id: "t1".into(),
+        fields: vec![FieldFill {
+            kind: FieldKind::Password,
+            selector: None,
+            value: Zeroizing::new(CANARY_PASSWORD.into()),
+        }],
+        item_matchers: vec![OriginMatcher::new(URL, Some(0)).unwrap()],
+        origin_cfg: OriginConfig::default(),
+        cross_origin_iframe_hosts: Vec::new(),
+        submit: false,
+        expected_origin: Some(claim.into()),
+        live_origin: LiveOrigin::new(),
+        deadline: None,
+        values_sent: ValuesSent::new(),
+    };
+    let fill_calls = || {
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m["method"] == "Runtime.callFunctionOn")
+            .count()
+    };
+
+    let refused = plan("https://other.example");
+    let out = engine.fill(&refused, &ctx, false).await;
+    assert_eq!(out.status(), "origin_mismatch", "{out:?}");
+    assert!(!refused.values_sent.get(), "a step-1 refusal sends nothing");
+    assert_eq!(fill_calls(), 0);
+
+    let landed = plan("https://example.com");
+    let out = engine.fill(&landed, &ctx, false).await;
+    assert_eq!(out.status(), "filled", "{out:?}");
+    assert!(landed.values_sent.get());
+    assert_eq!(fill_calls(), 1);
+}
+
+/// REQ-APR-008 (#157 review): a send whose delivery is unknown keeps the
+/// use spent. The stub drops the socket when the fill call arrives;
+/// the fill fails, and `values_sent` is already set because the engine
+/// marks it before handing the call to the transport.
+#[tokio::test]
+async fn req_apr_008_dropped_socket_on_the_fill_call_counts_as_sent() {
+    let (url, received) = cdp_stub_dropping_fill().await;
+    let endpoint = CdpEndpoint::validate(&url, Tunnel::Direct, None).unwrap();
+    let browser = Browser::new(CdpClient::connect(&endpoint).await.unwrap());
+    let ctx = browser.create_agent_context("alpha").await.unwrap();
+    let plan = FillPlan {
+        target_id: "t1".into(),
+        fields: vec![FieldFill {
+            kind: FieldKind::Password,
+            selector: None,
+            value: Zeroizing::new(CANARY_PASSWORD.into()),
+        }],
+        item_matchers: vec![OriginMatcher::new(URL, Some(0)).unwrap()],
+        origin_cfg: OriginConfig::default(),
+        cross_origin_iframe_hosts: Vec::new(),
+        submit: false,
+        expected_origin: Some("https://example.com".into()),
+        live_origin: LiveOrigin::new(),
+        deadline: None,
+        values_sent: ValuesSent::new(),
+    };
+    let out = FillEngine::new(browser).fill(&plan, &ctx, false).await;
+    assert_ne!(out.status(), "filled", "{out:?}");
+    assert!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m["method"] == "Runtime.callFunctionOn"),
+        "the fill call reached the stub before the drop"
+    );
+    assert!(plan.values_sent.get(), "an unknown send counts as sent");
 }

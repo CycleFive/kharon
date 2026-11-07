@@ -69,7 +69,7 @@ use super::rate::{RateDenied, RateLimiter, RatePolicy};
 use super::rollback::RollbackGuard;
 use super::token::TokenStore;
 use crate::audit::{AuditLog, Entry, Event};
-use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin};
+use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin, ValuesSent};
 use crate::lock::{AuditError, Clock, LockController, LockEvent, LockReason, SystemClock};
 use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::wire::SyncResponse;
@@ -447,10 +447,23 @@ struct DispatchGuard<'b> {
     plan_wiped: Option<&'b PlanWipedHook>,
     audit: &'b Arc<Mutex<Box<dyn AuditSink>>>,
     abort_entry: Option<Entry>,
+    /// The grant store and the grant whose use this fill spent at
+    /// admission (REQ-APR-008).
+    grants: &'b Mutex<GrantStore>,
+    grant_id: String,
 }
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
+        // REQ-APR-008 (#151): every way a fill ends passes through
+        // here (outcome, deadline before dispatch, dropped handler).
+        // If no field value ever left the broker, the use comes back.
+        if !self.plan.values_sent.get() {
+            self.grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .refund(&self.grant_id);
+        }
         for f in &mut self.plan.fields {
             f.value.zeroize();
         }
@@ -976,6 +989,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     plan_wiped: self.plan_wiped.as_ref(),
                     audit: &self.audit,
                     abort_entry: None,
+                    grants: &self.grants,
+                    grant_id: grant_id.clone(),
                 };
                 // #118: the engine converts what remains of this
                 // deadline into the page-side relative budget at
@@ -1952,7 +1967,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // REQ-APR-001/002 (SPEC §5, #20): the grant gate — after the
         // item, the browser and every other pre-decrypt refusal, and
         // before anything is decrypted. A matching live grant is
-        // consumed (one use, spent at admission). An explicitly named
+        // consumed (one use, spent at admission, so concurrent fills
+        // cannot share it), and given back if the fill ends before any
+        // field value is sent to the browser (REQ-APR-008: here on a
+        // refusal below, else in `DispatchGuard`'s drop). An explicitly named
         // grant that fails any dimension (agent, item/collection,
         // origin, action, TTL, uses) is `denied`: naming a grant and
         // missing its terms is a refusal, not a fresh request. No
@@ -2030,34 +2048,53 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             }
         };
 
-        let mut fields = Vec::with_capacity(req.fields.len());
-        for (kind, selector) in &req.fields {
-            let value = match kind {
-                FieldKind::Username => {
-                    Zeroizing::new(item.username().unwrap_or_default().to_owned())
-                }
-                FieldKind::Password => {
-                    match session.decrypt_secret(&req.item_id, SecretField::Password) {
-                        Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
-                        Err(_) => return refuse(FillStatus::DecryptFailed),
+        let decrypt_all = || -> Result<Vec<FieldFill>, Unresolved> {
+            let decrypt_failed = Unresolved::Refused(FillStatus::DecryptFailed);
+            let mut fields = Vec::with_capacity(req.fields.len());
+            for (kind, selector) in &req.fields {
+                let value = match kind {
+                    FieldKind::Username => {
+                        Zeroizing::new(item.username().unwrap_or_default().to_owned())
                     }
-                }
-                FieldKind::Totp => {
-                    let mut seed = match session.decrypt_secret(&req.item_id, SecretField::Totp) {
-                        Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
-                        Err(_) => return refuse(FillStatus::DecryptFailed),
-                    };
-                    let seed = Secret::new(std::mem::take(&mut *seed));
-                    totp_code(&self.clock_skew, seed, SystemTime::now())
-                        .map_err(|o| Unresolved::Refused(FillStatus::Engine(o)))?
-                }
-            };
-            fields.push(FieldFill {
-                kind: *kind,
-                selector: selector.clone(),
-                value,
-            });
-        }
+                    FieldKind::Password => {
+                        match session.decrypt_secret(&req.item_id, SecretField::Password) {
+                            Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
+                            Err(_) => return Err(decrypt_failed),
+                        }
+                    }
+                    FieldKind::Totp => {
+                        let mut seed = match session.decrypt_secret(&req.item_id, SecretField::Totp)
+                        {
+                            Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
+                            Err(_) => return Err(decrypt_failed),
+                        };
+                        let seed = Secret::new(std::mem::take(&mut *seed));
+                        totp_code(&self.clock_skew, seed, SystemTime::now())
+                            .map_err(|o| Unresolved::Refused(FillStatus::Engine(o)))?
+                    }
+                };
+                fields.push(FieldFill {
+                    kind: *kind,
+                    selector: selector.clone(),
+                    value,
+                });
+            }
+            Ok(fields)
+        };
+        let fields = match decrypt_all() {
+            Ok(fields) => fields,
+            Err(refused) => {
+                // REQ-APR-008 (#151): refused after admission, before
+                // any value could leave the broker, so the use spent
+                // at admission comes back. Values decrypted so far are
+                // `Zeroizing` and were wiped with the partial list.
+                self.grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .refund(&admitted);
+                return Err(refused);
+            }
+        };
 
         let plan = FillPlan {
             target_id: req.target_id.clone(),
@@ -2075,6 +2112,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             // Set by `Broker::fill` once the plan is admitted (it owns
             // the deadline); `resolve_fill` runs without one in scope.
             deadline: None,
+            values_sent: ValuesSent::new(),
         };
         Ok((plan, generation, admitted))
     }

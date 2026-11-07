@@ -557,6 +557,20 @@ impl GrantStore {
         }
     }
 
+    /// Give back one use of `grant_id` spent by [`Self::consume`] for a
+    /// fill that ended before any field value was sent to the browser
+    /// (REQ-APR-008, #151). A grant revoked since then is gone, and
+    /// giving back to it does nothing; `uses` never goes below zero.
+    pub fn refund(&mut self, grant_id: &str) -> bool {
+        match self.grants.iter_mut().find(|g| g.id == grant_id) {
+            Some(g) if g.uses > 0 => {
+                g.uses -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Revoke a grant (REQ-REV-001's primitive; the owner surface
     /// that calls it is #16). Effective immediately.
     pub fn revoke(&mut self, grant_id: &str) -> bool {
@@ -1120,6 +1134,36 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn req_apr_008_refund_gives_back_one_spent_use() {
+        let mut s = store();
+        let g = s
+            .issue(
+                "alpha",
+                "item-1",
+                GrantAction::Fill,
+                "https://login.example.com",
+                &GrantTerms::once_item("item-1"),
+                Channel::Cli,
+                None,
+                NOW,
+            )
+            .unwrap();
+        // Nothing spent yet: nothing to give back.
+        assert!(!s.refund(&g.id));
+        assert!(s.consume(&g.id, NOW));
+        assert!(!s.consume(&g.id, NOW), "a once grant has one use");
+        // Given back: live again, and spendable exactly once more.
+        assert!(s.refund(&g.id));
+        assert_eq!(s.grant(&g.id).unwrap().uses, 0);
+        assert!(s.consume(&g.id, NOW));
+        assert!(!s.consume(&g.id, NOW));
+        // A revoked grant is gone; giving back to it does nothing.
+        assert!(s.revoke(&g.id));
+        assert!(!s.refund(&g.id));
+        assert!(!s.refund("g_unknown"));
     }
 
     #[test]

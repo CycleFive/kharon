@@ -9,6 +9,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -517,8 +518,13 @@ pub struct SeenPlan {
 pub enum FakeAnswer {
     /// `filled` with the plan's kinds.
     Filled,
-    /// `origin_mismatch`.
+    /// `origin_mismatch` decided broker-side in fill step 1, before any
+    /// field value is sent to the browser (REQ-APR-008: the grant use
+    /// comes back).
     OriginMismatch,
+    /// `origin_mismatch` from the in-page check, after the fill call
+    /// carrying the values was sent (REQ-APR-008: the use stays spent).
+    OriginMismatchInPage,
     /// Never completes (the broker's deadline must cut it off).
     Stall,
     /// The engine's answer when the page-side budget aborts the fill
@@ -542,6 +548,9 @@ pub struct FakeFill {
     pub context_calls: Arc<Mutex<Vec<String>>>,
     /// How many times [`FillBackend::on_lock`] ran (REQ-REV-002).
     pub locks: Arc<Mutex<u32>>,
+    /// Answers to give, one per fill, before falling back to `answer`
+    /// (REQ-APR-008 tests refuse a fill, then fill on the same grant).
+    pub script: Arc<Mutex<VecDeque<FakeAnswer>>>,
 }
 
 impl FakeFill {
@@ -552,7 +561,13 @@ impl FakeFill {
             live_url: None,
             context_calls: Arc::default(),
             locks: Arc::default(),
+            script: Arc::default(),
         }
+    }
+
+    /// Answer the next fills with `answers`, in order, then `answer`.
+    pub fn script(&self, answers: impl IntoIterator<Item = FakeAnswer>) {
+        self.script.lock().unwrap().extend(answers);
     }
 
     /// Observe `url` as the target's live page on every fill.
@@ -597,12 +612,25 @@ impl FillBackend for FakeFill {
         if let Some(url) = self.live_url {
             plan.live_origin.record_href(url);
         }
-        let answer = self.answer;
+        let answer = self
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(self.answer);
+        // As the engine does: every answer but a step-1 refusal means
+        // the in-page fill call carrying the values was sent
+        // (REQ-APR-008).
+        if !matches!(answer, FakeAnswer::OriginMismatch) {
+            plan.values_sent.mark();
+        }
         let kinds: Vec<FieldKind> = plan.fields.iter().map(|f| f.kind).collect();
         Box::pin(async move {
             match answer {
                 FakeAnswer::Filled => FillOutcome::Filled { kinds },
-                FakeAnswer::OriginMismatch => FillOutcome::OriginMismatch,
+                FakeAnswer::OriginMismatch | FakeAnswer::OriginMismatchInPage => {
+                    FillOutcome::OriginMismatch
+                }
                 FakeAnswer::Stall => std::future::pending().await,
                 FakeAnswer::PageDeadline => FillOutcome::Timeout,
             }

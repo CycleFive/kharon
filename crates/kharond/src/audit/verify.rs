@@ -278,7 +278,7 @@ pub fn verify(
 
 #[cfg(test)]
 mod tests {
-    use super::super::log::AuditConfig;
+    use super::super::log::{AuditConfig, open_retrying};
     use super::super::{
         AuditLog, Checkpoint, Entry, Event, FileCheckpointSink, NullCheckpointSink,
     };
@@ -289,7 +289,8 @@ mod tests {
     }
 
     fn open(dir: &std::path::Path) -> AuditLog {
-        AuditLog::open(dir, AuditConfig::default(), Box::new(NullCheckpointSink)).unwrap()
+        // A reopen after a drop: wait out a fork-held lock (#162).
+        open_retrying(dir, AuditConfig::default(), || Box::new(NullCheckpointSink)).unwrap()
     }
 
     /// The verify key, without going through `AuditLog::open` — opening a
@@ -305,7 +306,7 @@ mod tests {
 
     /// Fail-closed startup: a tampered log cannot be opened for append.
     fn assert_open_fails_closed(dir: &std::path::Path) {
-        let err = AuditLog::open(dir, AuditConfig::default(), Box::new(NullCheckpointSink))
+        let err = open_retrying(dir, AuditConfig::default(), || Box::new(NullCheckpointSink))
             .expect_err("open of a corrupt log must fail closed");
         assert!(
             matches!(err, super::super::OpenError::Corrupt(_)),

@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::cdp::{
     Browser, CdpClient, CdpDial, CdpEndpoint, FieldFill, FieldKind, FillEngine, FillPlan,
-    LiveOrigin, Tunnel,
+    LiveOrigin, Tunnel, ValuesSent,
 };
 use kharond::connector::{
     AgentParams, ClientError, Hub, accept, pin_of_der, run_agent_once, server_config_from_pem,
@@ -155,6 +155,7 @@ fn plan() -> FillPlan {
         expected_origin: Some("https://example.com".into()),
         live_origin: LiveOrigin::new(),
         deadline: None,
+        values_sent: ValuesSent::new(),
     }
 }
 

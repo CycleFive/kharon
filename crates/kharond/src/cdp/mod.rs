@@ -21,5 +21,5 @@ pub(crate) use client::MaybeTls;
 pub use client::{CdpClient, CdpDial, CdpError, CdpSession};
 pub use endpoint::{CdpEndpoint, CertSha256, EndpointError, Tunnel};
 pub use fill::{
-    FieldFill, FieldKind, FillEngine, FillOutcome, FillPlan, LiveOrigin, RETURN_MARGIN,
+    FieldFill, FieldKind, FillEngine, FillOutcome, FillPlan, LiveOrigin, RETURN_MARGIN, ValuesSent,
 };

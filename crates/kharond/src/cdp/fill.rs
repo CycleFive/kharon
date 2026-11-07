@@ -31,6 +31,7 @@
 //! at dispatch (`FillPlan.deadline` / [`page_budget`], #118) so a
 //! single in-page step can abort ahead of the broker's cut-off.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -107,6 +108,11 @@ pub struct FillPlan {
     /// is not dispatched at all — the fill is
     /// [`FillOutcome::Timeout`] before the call is sent.
     pub deadline: Option<Instant>,
+    /// Set by the engine just before it sends the single in-page fill
+    /// call that carries the field values (REQ-APR-008, #151). The
+    /// broker gives the grant use back when a fill ends with this
+    /// still unset: no value ever left the broker.
+    pub values_sent: ValuesSent,
 }
 
 /// The live origin one fill observed (REQ-AUD-003†, #67): the
@@ -140,6 +146,31 @@ impl LiveOrigin {
     /// The recorded origin, if any.
     pub fn get(&self) -> Option<String> {
         self.0.get().cloned()
+    }
+}
+
+/// Whether a fill sent its field values to the browser (REQ-APR-008,
+/// #151). Shared by every clone of the [`FillPlan`] that carries it, so
+/// the broker can read it after the fill future was dropped. It is set
+/// before the in-page call is sent, not after it is delivered: a call
+/// caught mid-send counts as sent, which keeps the grant use spent.
+#[derive(Debug, Clone, Default)]
+pub struct ValuesSent(Arc<AtomicBool>);
+
+impl ValuesSent {
+    /// Not sent yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The values are about to leave the broker.
+    pub fn mark(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::mark`] ran.
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -435,6 +466,7 @@ impl FillEngine {
                 &info.url,
                 plan.submit,
                 plan.deadline,
+                &plan.values_sent,
             )
             .await;
 
@@ -468,6 +500,7 @@ impl FillEngine {
         live_url: &str,
         submit: bool,
         deadline: Option<Instant>,
+        values_sent: &ValuesSent,
     ) -> FillOutcome {
         // Step 1's frame-tree read: the loader id we'll re-check against.
         let tree = match session.request("Page.getFrameTree", json!({})).await {
@@ -519,6 +552,10 @@ impl FillEngine {
             PageBudget::NoCheck => 0,
         };
 
+        // REQ-APR-008 (#151): the values leave the broker with this
+        // call. Marked before the send, so a call caught mid-send
+        // still counts as sent and the grant use stays spent.
+        values_sent.mark();
         let call = session
             .request_with_timeout(
                 "Runtime.callFunctionOn",

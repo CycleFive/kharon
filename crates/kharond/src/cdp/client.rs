@@ -51,7 +51,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type WsSplitSink = SplitSink<WebSocketStream<MaybeTls>, Message>;
 
@@ -527,7 +527,8 @@ impl CdpClient {
         if let Some(session_id) = session_id {
             message["sessionId"] = Value::String(session_id.to_string());
         }
-        let text = Zeroizing::new(serde_json::to_string(&message).expect("Value serializes"));
+        let text = serialize_exact(&message);
+        zeroize_strings(&mut message);
         {
             let mut shutdown = self.shutdown.subscribe();
             let write = self.write.lock().await;
@@ -545,10 +546,14 @@ impl CdpClient {
                 armed: true,
             };
             let sink = guard.write.as_mut().expect("checked above");
-            // REQ-CRY-006: our serialized copy is zeroized on drop.
-            // tungstenite's internal send buffer is the one remaining
-            // plaintext copy — a documented limitation (it is freed by
-            // the library, not zeroized).
+            // REQ-CRY-006: our serialized copy is zeroized on drop,
+            // and `message` was wiped right after serializing. The
+            // clone handed to tungstenite does not stay plaintext: as
+            // a client, tungstenite 0.24 masks the frame payload in
+            // place (`Frame::format` → `apply_mask`) before writing it,
+            // so its buffers only ever hold the masked bytes. Recheck
+            // on a tungstenite upgrade; the post-fill canary scan
+            // (`req_cry_006_*`) is the regression test.
             let mut send = std::pin::pin!(sink.send(Message::Text((*text).clone())));
             let send = std::future::poll_fn(|cx| {
                 let poll = send.as_mut().poll(cx);
@@ -686,9 +691,91 @@ impl CdpSession {
     }
 }
 
+/// Serialize `message` into a buffer allocated once, at its exact size
+/// (REQ-CRY-006). `serde_json::to_string` grows its buffer as it
+/// writes, and each growth frees a partial copy of the frame, field
+/// values included, without wiping it.
+fn serialize_exact(message: &Value) -> Zeroizing<String> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, message).expect("Value serializes");
+    let mut buf = Vec::with_capacity(count.0);
+    serde_json::to_writer(&mut buf, message).expect("Value serializes");
+    debug_assert_eq!(buf.capacity(), count.0, "the frame buffer grew");
+    Zeroizing::new(String::from_utf8(buf).expect("serde_json writes UTF-8"))
+}
+
+/// Zeroize every string in a JSON tree (REQ-CRY-006). A request's
+/// params can carry field values, and a `Value`'s strings are freed on
+/// drop, not wiped.
+fn zeroize_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => s.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(zeroize_strings),
+        Value::Object(map) => map.values_mut().for_each(zeroize_strings),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn req_cry_006_serialize_exact_matches_serde_and_never_grows() {
+        let secret = "CANARY-CDP-FRAME-".repeat(300);
+        let message = json!({
+            "id": 7,
+            "method": "Runtime.callFunctionOn",
+            "params": {"arguments": [{"value": [{"kind": "password", "value": secret}]}]},
+        });
+        let text = serialize_exact(&message);
+        assert_eq!(*text, serde_json::to_string(&message).unwrap());
+        // One allocation at the exact size: no growth ever freed a
+        // partial copy of the frame.
+        assert_eq!(text.capacity(), text.len());
+    }
+
+    #[test]
+    fn req_cry_006_zeroize_strings_wipes_every_string_in_the_tree() {
+        let mut message = json!({
+            "method": "Runtime.callFunctionOn",
+            "params": {
+                "arguments": [
+                    {"value": [{"kind": "password", "value": "CANARY-ONE"}]},
+                    {"value": "CANARY-TWO"},
+                    {"value": 42},
+                    {"value": true},
+                    {"value": null},
+                ],
+            },
+        });
+        zeroize_strings(&mut message);
+        assert_eq!(
+            message,
+            json!({
+                "method": "",
+                "params": {
+                    "arguments": [
+                        {"value": [{"kind": "", "value": ""}]},
+                        {"value": ""},
+                        {"value": 42},
+                        {"value": true},
+                        {"value": null},
+                    ],
+                },
+            })
+        );
+    }
     use futures_util::StreamExt;
     use std::collections::HashMap as StdMap;
     use tokio::net::TcpListener;

@@ -26,6 +26,19 @@
 //! | POST | `/owner/register/finish` | Store the passkey; no session |
 //! | POST | `/owner/logout` | Revoke the session and clear the cookie |
 //! | GET | `/owner/session` | Shell JSON, or 401 |
+//! | GET | `/owner/approvals` | Pending grant requests, or 401 |
+//! | POST | `/owner/approvals/approve` | Approve one (`once` or `per-origin`) |
+//! | POST | `/owner/approvals/deny` | Deny one |
+//!
+//! The approvals routes (#131 slice 1) need a live session. The
+//! request id travels in a JSON body, never in the path. The two
+//! decisions are POST-only and refused unless the request carries an
+//! `Origin` header equal to the configured origin (a missing header is
+//! refused too, not only a mismatched one) and a JSON content type, so
+//! a cross-site form cannot reach them even without `SameSite`. They
+//! call the broker's own approve and deny on the `web_ui` channel
+//! ([`approvals`]), so the REQ-APR-003 expiry pass and the audit
+//! entries are the CLI's.
 //!
 //! The same listener serves ntfy redeem (REQ-APR-004, REQ-DEP-006,
 //! #136): `GET`/`POST` `/owner/approve/<token>` and
@@ -36,8 +49,11 @@
 //! Responses use fixed error codes only (REQ-API-006). Failed login
 //! and enrollment attempts are audited as `owner_auth_fail`.
 
+mod approvals;
 mod store;
 mod webauthn;
+
+pub use self::approvals::{DecideError, NoApprovals, OwnerApprovals, PendingRow, WebGrantKind};
 
 use std::future::Future;
 use std::path::Path;
@@ -85,7 +101,14 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/owner/register/finish"),
     ("POST", "/owner/logout"),
     ("GET", "/owner/session"),
+    ("GET", "/owner/approvals"),
+    ("POST", "/owner/approvals/approve"),
+    ("POST", "/owner/approvals/deny"),
 ];
+
+/// Longest request id the approvals routes accept. Broker ids are
+/// `gr_` plus a short random suffix, well under this.
+const MAX_REQUEST_ID_LEN: usize = 64;
 
 const MAX_BODY: usize = 16 * 1024;
 const MAX_CEREMONIES: usize = 8;
@@ -141,6 +164,7 @@ pub struct OwnerUi {
     secure_cookie: bool,
     shell: Arc<dyn OwnerShell>,
     audit: Arc<dyn OwnerAudit>,
+    approvals: Arc<dyn OwnerApprovals>,
     passkeys: Mutex<PasskeyStore>,
     ceremonies: Mutex<Vec<Ceremony>>,
     sessions: Mutex<Vec<Session>>,
@@ -174,12 +198,15 @@ impl OwnerUi {
     /// Open the passkey store under `data_dir` and build the UI.
     /// `origin` is the browser origin exactly as `clientDataJSON`
     /// will report it (`http://localhost:8787`, no trailing slash).
+    /// `approvals` decides grant requests for the approvals routes
+    /// (the daemon passes its broker).
     pub fn open(
         data_dir: &Path,
         rp_id: impl Into<String>,
         origin: impl Into<String>,
         shell: Arc<dyn OwnerShell>,
         audit: Arc<dyn OwnerAudit>,
+        approvals: Arc<dyn OwnerApprovals>,
     ) -> std::io::Result<Arc<Self>> {
         let origin = origin.into();
         let secure_cookie = origin.starts_with("https://");
@@ -190,6 +217,7 @@ impl OwnerUi {
             secure_cookie,
             shell,
             audit,
+            approvals,
             passkeys: Mutex::new(passkeys),
             ceremonies: Mutex::new(Vec::new()),
             sessions: Mutex::new(Vec::new()),
@@ -327,12 +355,14 @@ impl OwnerUi {
             return respond(StatusCode::FORBIDDEN, "origin", None);
         }
         let allowed = match req.path.as_str() {
-            "/" | "/enroll" | "/owner/session" => Some(Method::GET),
+            "/" | "/enroll" | "/owner/session" | "/owner/approvals" => Some(Method::GET),
             "/owner/login/options"
             | "/owner/login/finish"
             | "/owner/register/options"
             | "/owner/register/finish"
-            | "/owner/logout" => Some(Method::POST),
+            | "/owner/logout"
+            | "/owner/approvals/approve"
+            | "/owner/approvals/deny" => Some(Method::POST),
             _ => None,
         };
         let Some(allowed) = allowed else {
@@ -354,6 +384,9 @@ impl OwnerUi {
             "/owner/register/options" => self.register_options(&req),
             "/owner/register/finish" => self.register_finish(&req),
             "/owner/logout" => self.logout(&req),
+            "/owner/approvals" => self.approvals_list(&req),
+            "/owner/approvals/approve" => self.approvals_decide(&req, Decision::Approve),
+            "/owner/approvals/deny" => self.approvals_decide(&req, Decision::Deny),
             _ => unreachable!("path was matched above"),
         }
     }
@@ -377,6 +410,97 @@ impl OwnerUi {
             json!({"ok": true, "locked": view.locked, "pending": view.pending}).to_string(),
             None,
         )
+    }
+
+    fn approvals_list(&self, req: &Incoming) -> Response {
+        if !self.session_alive(req.cookie.as_deref()) {
+            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+        }
+        let rows: Vec<Value> = self
+            .approvals
+            .pending()
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "request_id": r.request_id,
+                    "agent_id": r.agent_id,
+                    "item_id": r.item_id,
+                    "action": r.action,
+                    "origin": r.origin,
+                    "age_s": r.age_s,
+                })
+            })
+            .collect();
+        json_body(
+            StatusCode::OK,
+            json!({"ok": true, "pending": rows}).to_string(),
+            None,
+        )
+    }
+
+    /// Approve or deny one request. The checks run in this order, and
+    /// each refusal leaves grant state untouched: `Origin` present and
+    /// equal to ours (CSRF), a live session, a JSON body without a
+    /// password key, a well-formed request id and kind. Only then does
+    /// the broker see the call.
+    fn approvals_decide(&self, req: &Incoming, decision: Decision) -> Response {
+        if req.origin.as_deref() != Some(self.origin.as_str()) {
+            self.audit.auth_failed("origin");
+            return respond(StatusCode::FORBIDDEN, "origin", None);
+        }
+        if !self.session_alive(req.cookie.as_deref()) {
+            self.audit.auth_failed("no_session");
+            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+        }
+        if req.body.is_empty() {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        }
+        if let Some(err) = self.precheck_post(req) {
+            return err;
+        }
+        let Ok(body) = serde_json::from_slice::<DecideBody>(&req.body) else {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        };
+        if body.request_id.is_empty()
+            || body.request_id.len() > MAX_REQUEST_ID_LEN
+            || !body.request_id.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        }
+        let result = match decision {
+            Decision::Approve => {
+                let kind = match body.kind.as_deref() {
+                    None => WebGrantKind::Once,
+                    Some(k) => match WebGrantKind::parse(k) {
+                        Some(k) => k,
+                        None => return respond(StatusCode::BAD_REQUEST, "bad_kind", None),
+                    },
+                };
+                self.approvals
+                    .approve(&body.request_id, kind)
+                    .map(|grant_id| json!({"ok": true, "grant_id": grant_id}))
+            }
+            Decision::Deny => {
+                if body.kind.is_some() {
+                    return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+                }
+                self.approvals
+                    .deny(&body.request_id)
+                    .map(|()| json!({"ok": true}))
+            }
+        };
+        match result {
+            Ok(v) => json_body(StatusCode::OK, v.to_string(), None),
+            Err(e) => {
+                let status = match e {
+                    DecideError::NotFound => StatusCode::NOT_FOUND,
+                    DecideError::NotPending => StatusCode::CONFLICT,
+                    DecideError::InvalidTerms => StatusCode::BAD_REQUEST,
+                    DecideError::AuditFailed => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                respond(status, e.code(), None)
+            }
+        }
     }
 
     fn login_options(&self, req: &Incoming) -> Response {
@@ -728,6 +852,21 @@ impl OwnerUi {
                 sign_count: cred.sign_count,
             })
     }
+}
+
+#[derive(Clone, Copy)]
+enum Decision {
+    Approve,
+    Deny,
+}
+
+/// Body of an approve or deny call. Unknown keys are refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecideBody {
+    request_id: String,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 struct CredParts {
@@ -1104,16 +1243,28 @@ document.getElementById("register").addEventListener("click", async () => {
 "#;
 
 fn shell_page(locked: &str, pending: usize) -> String {
-    format!(
-        r#"<!DOCTYPE html>
+    SHELL_PAGE
+        .replace("{locked}", locked)
+        .replace("{pending}", &pending.to_string())
+}
+
+/// The signed-in shell: broker state and the approvals queue
+/// (#131 slice 1). Rows are built with `textContent` only: the
+/// origin is whatever page the agent's tab was on, so nothing from a
+/// row is ever parsed as markup.
+const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>kharon</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body {{ font-family: system-ui, sans-serif; margin: 2.5rem auto; max-width: 32rem; }}
-  button {{ font: inherit; padding: 0.55rem 1rem; }}
+  body { font-family: system-ui, sans-serif; margin: 2.5rem auto; max-width: 48rem; padding: 0 1rem; }
+  button { font: inherit; padding: 0.4rem 0.8rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #ccc; vertical-align: top; }
+  td.origin { word-break: break-all; }
+  .err { min-height: 1.2em; }
 </style>
 </head>
 <body>
@@ -1121,18 +1272,83 @@ fn shell_page(locked: &str, pending: usize) -> String {
 <p id="state">signed-in</p>
 <p>Broker: <span id="locked">{locked}</span></p>
 <p>Pending approvals: <span id="pending">{pending}</span></p>
+<h2>Approvals</h2>
+<p id="empty">Nothing is waiting.</p>
+<table id="queue" hidden>
+<thead><tr><th>Agent</th><th>Action</th><th>Origin</th><th>Item</th><th>Age</th><th></th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+<p id="err" class="err" role="alert"></p>
 <button id="signout" type="button">Sign out</button>
 <script>
-document.getElementById("signout").addEventListener("click", async () => {{
-  await fetch("/owner/logout", {{ method: "POST", credentials: "same-origin" }});
+function cell(text, cls) {
+  const td = document.createElement("td");
+  td.textContent = text;
+  if (cls) td.className = cls;
+  return td;
+}
+async function decide(path, body) {
+  const err = document.getElementById("err");
+  err.textContent = "";
+  const r = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (r.status === 401) { location.assign("/"); return false; }
+  if (!r.ok) {
+    let code = "error";
+    try { code = (await r.json()).error || code; } catch (e) {}
+    err.textContent = "Not done: " + code;
+  }
+  await window.kharonRefresh();
+  return r.ok;
+}
+function button(label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  b.addEventListener("click", onClick);
+  return b;
+}
+window.kharonDecide = decide;
+window.kharonRefresh = async function () {
+  const r = await fetch("/owner/approvals", { credentials: "same-origin" });
+  if (r.status === 401) { location.assign("/"); return; }
+  if (!r.ok) return;
+  const data = await r.json();
+  const rows = document.getElementById("rows");
+  rows.replaceChildren();
+  for (const p of data.pending) {
+    const tr = document.createElement("tr");
+    tr.dataset.requestId = p.request_id;
+    tr.append(cell(p.agent_id), cell(p.action), cell(p.origin, "origin"), cell(p.item_id), cell(p.age_s + " s"));
+    const actions = document.createElement("td");
+    actions.append(
+      button("Approve once", () => decide("/owner/approvals/approve", { request_id: p.request_id, kind: "once" })),
+      " ",
+      button("Approve for 1 h", () => decide("/owner/approvals/approve", { request_id: p.request_id, kind: "per-origin" })),
+      " ",
+      button("Deny", () => decide("/owner/approvals/deny", { request_id: p.request_id })),
+    );
+    tr.append(actions);
+    rows.append(tr);
+  }
+  document.getElementById("pending").textContent = String(data.pending.length);
+  document.getElementById("queue").hidden = data.pending.length === 0;
+  document.getElementById("empty").hidden = data.pending.length !== 0;
+};
+document.getElementById("signout").addEventListener("click", async () => {
+  await fetch("/owner/logout", { method: "POST", credentials: "same-origin" });
   location.assign("/");
-}});
+});
+window.kharonRefresh();
+setInterval(window.kharonRefresh, 5000);
 </script>
 </body>
 </html>
-"#
-    )
-}
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -1172,6 +1388,7 @@ mod tests {
                 pending: 0,
             })),
             Arc::new(NoAudit),
+            Arc::new(NoApprovals),
         )
         .unwrap();
         let cookie = ui.issue_session();
@@ -1200,6 +1417,7 @@ mod tests {
                 pending: 0,
             })),
             Arc::new(NoAudit),
+            Arc::new(NoApprovals),
         )
         .unwrap();
         let response = ui.login_finish(&Incoming {
@@ -1228,6 +1446,7 @@ mod tests {
                 pending: 0,
             })),
             Arc::new(NoAudit),
+            Arc::new(NoApprovals),
         )
         .unwrap();
         let kept = ui.issue_session();
@@ -1269,5 +1488,335 @@ mod tests {
             body: Vec::new(),
         });
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Records every decision it is asked for; `gr_gone` is not
+    /// pending, anything else is.
+    #[derive(Default)]
+    struct FakeApprovals {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl OwnerApprovals for FakeApprovals {
+        fn pending(&self) -> Vec<PendingRow> {
+            vec![PendingRow {
+                request_id: "gr_1".into(),
+                agent_id: "alpha".into(),
+                item_id: "item-1".into(),
+                action: "fill",
+                origin: "https://login.example.com".into(),
+                age_s: 7,
+            }]
+        }
+
+        fn approve(&self, request_id: &str, kind: WebGrantKind) -> Result<String, DecideError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("approve {request_id} {kind:?}"));
+            if request_id == "gr_gone" {
+                return Err(DecideError::NotPending);
+            }
+            Ok("g_1".into())
+        }
+
+        fn deny(&self, request_id: &str) -> Result<(), DecideError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("deny {request_id}"));
+            if request_id == "gr_gone" {
+                return Err(DecideError::NotPending);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailCodes(Mutex<Vec<&'static str>>);
+
+    impl OwnerAudit for FailCodes {
+        fn auth_failed(&self, detail: &'static str) {
+            self.0.lock().unwrap().push(detail);
+        }
+    }
+
+    const ORIGIN: &str = "http://localhost:9";
+
+    struct ApprovalsRig {
+        ui: Arc<OwnerUi>,
+        fake: Arc<FakeApprovals>,
+        audit: Arc<FailCodes>,
+        cookie: String,
+        _dir: tempfile::TempDir,
+    }
+
+    impl ApprovalsRig {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = Arc::new(FakeApprovals::default());
+            let audit = Arc::new(FailCodes::default());
+            let ui = OwnerUi::open(
+                dir.path(),
+                "localhost",
+                ORIGIN,
+                Arc::new(StaticShell(ShellView {
+                    locked: false,
+                    pending: 1,
+                })),
+                audit.clone(),
+                fake.clone(),
+            )
+            .unwrap();
+            let cookie = ui.issue_session().split(';').next().unwrap().to_owned();
+            Self {
+                ui,
+                fake,
+                audit,
+                cookie,
+                _dir: dir,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.fake.calls.lock().unwrap().clone()
+        }
+
+        fn send(
+            &self,
+            method: Method,
+            path: &str,
+            cookie: bool,
+            origin: Option<&str>,
+            content_type: Option<&str>,
+            body: &str,
+        ) -> (StatusCode, String) {
+            let response = self.ui.dispatch(Incoming {
+                method,
+                path: path.into(),
+                cookie: cookie.then(|| self.cookie.clone()),
+                origin: origin.map(str::to_owned),
+                authorization: None,
+                content_type: content_type.map(str::to_owned),
+                body: body.as_bytes().to_vec(),
+            });
+            let status = response.status();
+            let bytes = futures_body(response);
+            (status, bytes)
+        }
+
+        fn post(&self, path: &str, body: &str) -> (StatusCode, String) {
+            self.send(
+                Method::POST,
+                path,
+                true,
+                Some(ORIGIN),
+                Some("application/json"),
+                body,
+            )
+        }
+    }
+
+    fn futures_body(response: Response) -> String {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let bytes = rt
+            .block_on(axum::body::to_bytes(response.into_body(), MAX_BODY))
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn approvals_routes_are_listed_and_are_not_password_routes() {
+        for route in [
+            ("GET", "/owner/approvals"),
+            ("POST", "/owner/approvals/approve"),
+            ("POST", "/owner/approvals/deny"),
+        ] {
+            assert!(ROUTES.contains(&route), "{route:?} missing from ROUTES");
+        }
+        let shell = shell_page("unlocked", 0).to_ascii_lowercase();
+        assert!(
+            !shell.contains("password"),
+            "shell page mentions a password"
+        );
+        assert!(!shell.contains("innerhtml"), "rows must use textContent");
+    }
+
+    #[test]
+    fn approvals_need_a_session() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/approvals", false, None, None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        for path in ["/owner/approvals/approve", "/owner/approvals/deny"] {
+            let (status, body) = rig.send(
+                Method::POST,
+                path,
+                false,
+                Some(ORIGIN),
+                Some("application/json"),
+                r#"{"request_id":"gr_1"}"#,
+            );
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+            assert!(body.contains("unauthenticated"), "{body}");
+        }
+        rig.ui.expire_sessions();
+        let (status, _) = rig.post("/owner/approvals/approve", r#"{"request_id":"gr_1"}"#);
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an expired session decided"
+        );
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+        assert_eq!(
+            *rig.audit.0.lock().unwrap(),
+            ["no_session", "no_session", "no_session"]
+        );
+
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/approvals", true, None, None, "");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["pending"][0]["request_id"], "gr_1");
+        assert_eq!(v["pending"][0]["origin"], "https://login.example.com");
+        assert_eq!(v["pending"][0]["age_s"], 7);
+    }
+
+    #[test]
+    fn approvals_decisions_are_post_only_and_the_list_is_get_only() {
+        let rig = ApprovalsRig::new();
+        for path in ["/owner/approvals/approve", "/owner/approvals/deny"] {
+            for method in [Method::GET, Method::PUT, Method::DELETE] {
+                let (status, body) = rig.send(
+                    method.clone(),
+                    path,
+                    true,
+                    Some(ORIGIN),
+                    Some("application/json"),
+                    r#"{"request_id":"gr_1"}"#,
+                );
+                assert_eq!(
+                    status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path}: {body}"
+                );
+            }
+        }
+        let (status, _) = rig.post("/owner/approvals", r#"{"request_id":"gr_1"}"#);
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn approvals_decisions_need_our_origin() {
+        let rig = ApprovalsRig::new();
+        for origin in [
+            None,
+            Some("https://evil.example"),
+            Some("null"),
+            Some("http://localhost:9/"),
+        ] {
+            for path in ["/owner/approvals/approve", "/owner/approvals/deny"] {
+                let (status, body) = rig.send(
+                    Method::POST,
+                    path,
+                    true,
+                    origin,
+                    Some("application/json"),
+                    r#"{"request_id":"gr_1"}"#,
+                );
+                assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?} {path}: {body}");
+                assert!(body.contains("\"origin\""), "{body}");
+            }
+        }
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+        assert!(rig.audit.0.lock().unwrap().iter().all(|c| *c == "origin"));
+    }
+
+    #[test]
+    fn approvals_decisions_refuse_form_posts_and_odd_bodies() {
+        let rig = ApprovalsRig::new();
+        // What a cross-site <form> can send: no JSON content type.
+        for (ctype, body) in [
+            (Some("application/x-www-form-urlencoded"), "request_id=gr_1"),
+            (Some("text/plain"), r#"{"request_id":"gr_1"}"#),
+            (Some("multipart/form-data; boundary=x"), "--x--"),
+            (None, r#"{"request_id":"gr_1"}"#),
+            (Some("application/json"), ""),
+            (Some("application/json"), "[]"),
+            (
+                Some("application/json"),
+                r#"{"request_id":"gr_1","extra":1}"#,
+            ),
+            (Some("application/json"), r#"{"request_id":""}"#),
+            (Some("application/json"), r#"{"request_id":"gr 1"}"#),
+        ] {
+            for path in ["/owner/approvals/approve", "/owner/approvals/deny"] {
+                let (status, out) = rig.send(Method::POST, path, true, Some(ORIGIN), ctype, body);
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{ctype:?} {body:?} {path}: {out}"
+                );
+            }
+        }
+        let long = format!(
+            r#"{{"request_id":"{}"}}"#,
+            "a".repeat(MAX_REQUEST_ID_LEN + 1)
+        );
+        let (status, _) = rig.post("/owner/approvals/approve", &long);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, out) = rig.post(
+            "/owner/approvals/approve",
+            r#"{"request_id":"gr_1","kind":"standing"}"#,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out.contains("bad_kind"), "{out}");
+        let (status, out) = rig.post(
+            "/owner/approvals/deny",
+            r#"{"request_id":"gr_1","kind":"once"}"#,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
+        let (status, out) = rig.post(
+            "/owner/approvals/approve",
+            r#"{"request_id":"gr_1","password":"hunter2"}"#,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            out.contains("password_rejected") && !out.contains("hunter2"),
+            "{out}"
+        );
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn approvals_decisions_reach_the_backend_and_map_its_refusals() {
+        let rig = ApprovalsRig::new();
+        let (status, out) = rig.post("/owner/approvals/approve", r#"{"request_id":"gr_1"}"#);
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(out.contains("\"grant_id\":\"g_1\""), "{out}");
+        let (status, _) = rig.post(
+            "/owner/approvals/approve",
+            r#"{"request_id":"gr_2","kind":"per-origin"}"#,
+        );
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = rig.post("/owner/approvals/deny", r#"{"request_id":"gr_3"}"#);
+        assert_eq!(status, StatusCode::OK);
+        let (status, out) = rig.post("/owner/approvals/approve", r#"{"request_id":"gr_gone"}"#);
+        assert_eq!(status, StatusCode::CONFLICT, "{out}");
+        assert!(out.contains("not_pending"), "{out}");
+        let (status, _) = rig.post("/owner/approvals/deny", r#"{"request_id":"gr_gone"}"#);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            rig.calls(),
+            [
+                "approve gr_1 Once",
+                "approve gr_2 PerOrigin",
+                "deny gr_3",
+                "approve gr_gone Once",
+                "deny gr_gone",
+            ]
+        );
     }
 }

@@ -117,6 +117,16 @@ struct AgentWindows {
     list_minute: Window,
 }
 
+/// What stands behind a fill when it is admitted (REQ-RL-004, #152).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillBacking {
+    /// No live `once` grant would admit it at the grant gate.
+    Unbacked,
+    /// A live single-use (`once`) grant already issued for this fill
+    /// would admit it. A full per-agent bucket does not refuse it.
+    OnceGrant,
+}
+
 /// Why an admission was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateDenied {
@@ -207,6 +217,21 @@ impl RateLimiter {
         item_id: &str,
         now: Duration,
     ) -> Result<(), RateDenied> {
+        self.admit_fill_backed(agent, item_id, now, FillBacking::Unbacked)
+    }
+
+    /// [`Self::admit_fill`] for a fill with `backing` behind it. A
+    /// `once`-backed fill is not refused by a full per-agent bucket
+    /// (REQ-RL-004, #152): it draws a token when one is left and never
+    /// overdraws. Suspension and the per-item window (REQ-RL-002)
+    /// refuse it as they refuse any fill.
+    pub fn admit_fill_backed(
+        &mut self,
+        agent: &str,
+        item_id: &str,
+        now: Duration,
+        backing: FillBacking,
+    ) -> Result<(), RateDenied> {
         if self.suspended.contains(agent) {
             return Err(RateDenied::Suspended);
         }
@@ -216,9 +241,9 @@ impl RateLimiter {
         // then the item window — so a refusal spends nothing.
         aw.fill_minute.prune(now, MINUTE);
         aw.fill_day.prune(now, DAY);
-        if aw.fill_minute.events.len() as u32 >= pol.fills_per_minute
-            || aw.fill_day.events.len() as u32 >= pol.fills_per_day
-        {
+        let agent_room = (aw.fill_minute.events.len() as u32) < pol.fills_per_minute
+            && (aw.fill_day.events.len() as u32) < pol.fills_per_day;
+        if !agent_room && backing == FillBacking::Unbacked {
             return Err(RateDenied::Limited);
         }
         let item = self.items.entry(item_id.to_owned()).or_default();
@@ -227,9 +252,11 @@ impl RateLimiter {
             return Err(RateDenied::Limited);
         }
         // Spend.
-        let aw = self.agents.entry(agent.to_owned()).or_default();
-        aw.fill_minute.events.push_back(now);
-        aw.fill_day.events.push_back(now);
+        if agent_room {
+            let aw = self.agents.entry(agent.to_owned()).or_default();
+            aw.fill_minute.events.push_back(now);
+            aw.fill_day.events.push_back(now);
+        }
         self.items
             .entry(item_id.to_owned())
             .or_default()
@@ -313,6 +340,83 @@ mod tests {
         // A minute later the minute-bucket refills.
         let later = now + MINUTE;
         assert_eq!(lim.admit_fill("alpha", "item", later), Ok(()));
+    }
+
+    #[test]
+    fn req_rl_004_once_backed_fill_passes_a_full_agent_bucket_without_overdrawing() {
+        let mut lim = RateLimiter::new(RatePolicy {
+            item_fills_per_window: 100, // isolate the per-agent minute bucket
+            ..RatePolicy::default()
+        });
+        let now = Duration::from_secs(1_000);
+        for i in 0..10 {
+            assert_eq!(
+                lim.admit_fill("alpha", "item", now + Duration::from_millis(i)),
+                Ok(())
+            );
+        }
+        let at = now + Duration::from_millis(500);
+        assert_eq!(
+            lim.admit_fill("alpha", "item", at),
+            Err(RateDenied::Limited)
+        );
+        // A live once grant behind the fill: the full bucket does not
+        // refuse it ...
+        assert_eq!(
+            lim.admit_fill_backed("alpha", "item", at, FillBacking::OnceGrant),
+            Ok(())
+        );
+        // ... and it drew no token past the limit: an unbacked fill is
+        // still refused, and the bucket refills on schedule.
+        assert_eq!(
+            lim.admit_fill("alpha", "item", at),
+            Err(RateDenied::Limited)
+        );
+        assert_eq!(lim.admit_fill("alpha", "item", now + MINUTE), Ok(()));
+    }
+
+    #[test]
+    fn req_rl_004_once_backed_fill_draws_a_token_when_one_is_left() {
+        let mut lim = RateLimiter::new(RatePolicy {
+            item_fills_per_window: 100,
+            ..RatePolicy::default()
+        });
+        let now = Duration::from_secs(1_000);
+        for _ in 0..9 {
+            assert_eq!(lim.admit_fill("alpha", "item", now), Ok(()));
+        }
+        // The tenth is once-backed and takes the last token.
+        assert_eq!(
+            lim.admit_fill_backed("alpha", "item", now, FillBacking::OnceGrant),
+            Ok(())
+        );
+        assert_eq!(
+            lim.admit_fill("alpha", "item", now),
+            Err(RateDenied::Limited)
+        );
+    }
+
+    #[test]
+    fn req_rl_004_once_backed_fill_still_obeys_item_window_and_suspension() {
+        let mut lim = RateLimiter::new(RatePolicy::default());
+        let now = Duration::from_secs(5_000);
+        for i in 0..5 {
+            let agent = format!("a{i}");
+            assert_eq!(lim.admit_fill(&agent, "hot", now), Ok(()));
+        }
+        assert_eq!(
+            lim.admit_fill_backed("a99", "hot", now, FillBacking::OnceGrant),
+            Err(RateDenied::Limited),
+            "REQ-RL-002 per-item window"
+        );
+        for _ in 0..5 {
+            lim.note_origin_mismatch("beta");
+        }
+        assert_eq!(
+            lim.admit_fill_backed("beta", "cold", now, FillBacking::OnceGrant),
+            Err(RateDenied::Suspended),
+            "REQ-RL-002 suspension"
+        );
     }
 
     #[test]

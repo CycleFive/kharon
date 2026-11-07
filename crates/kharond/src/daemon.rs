@@ -1230,7 +1230,16 @@ async fn live_sync(
                                 lock.lock(crate::lock::LockReason::RollbackDetected);
                                 return LiveStep::Stop;
                             }
-                            let _ = broker_sync.invalidate_grants_for_vault(&vault);
+                            if let Err(e) = broker_sync.invalidate_grants_for_vault(&vault) {
+                                // Revoke-first (SPEC §7, #135): the grants
+                                // are already gone from memory and stay
+                                // gone; only their `grant_revoke` entries
+                                // are missing. Say so, rather than leave
+                                // an unexplained gap in the log.
+                                eprintln!(
+                                    "kharond: error: a sync revoked grants, but their grant_revoke audit entries could not all be written ({e}); the grants stay revoked"
+                                );
+                            }
                             LiveStep::Continue
                         }
                         Ok(Ok(SyncOutcome::Lock(reason))) => {

@@ -22,7 +22,7 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # connector_token_hash comes from `kharon tunnel mint`, not `kharon token mint`.
 # cdp = { endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }
 # [connector]
-# listen = "203.0.113.4:8788"
+# listen = "203.0.113.4:8789"
 # tls_cert_file = "/etc/kharon/tls.crt"
 # tls_key_file = "/etc/kharon/tls.key"
 

@@ -98,7 +98,20 @@ not something a person chose:
    recover it.
 4. Create the kharon organization and collection, then create the
    account's API key and save it as
-   `deploy/compose/secrets/kharon_bw_api_key.json`.
+   `deploy/compose/secrets/kharon_bw_api_key.json`. Give it to
+   kharond's uid (REQ-DEP-008):
+
+   ```sh
+   sudo chown 10001:10001 deploy/compose/secrets/kharon_bw_api_key.json
+   sudo chmod 0400 deploy/compose/secrets/kharon_bw_api_key.json
+   ```
+
+   Without Swarm, Compose mounts a `secrets:` file as a bind mount
+   that keeps the host file's owner and mode. It ignores a secret's
+   `uid`, `gid` and `mode` (with a warning). kharond runs as uid
+   10001, so a `0400` file owned by your own uid is unreadable to it,
+   and `--check` and startup refuse with `config error
+   [api_key_file]: … not readable by kharond (euid 10001; …)`.
 
 ### Agent tokens (REQ-API-003)
 
@@ -159,6 +172,10 @@ The agent host listens on UDP 51820, so the broker dials it and the
 agent host needs no address for the broker. If the broker should be
 the one listening, set `BROKER_ENDPOINT` when you run
 `provision.sh` and drop `Endpoint` here.
+
+kharond binds `10.66.0.1`. If it binds it on the host rather than in
+a bridge-network container, add the input filter in
+[Tunnel-only listeners](#tunnel-only-listeners-req-dep-006).
 
 ### Pointing kharond at the browser
 
@@ -227,9 +244,27 @@ tls_cert_file = "/etc/kharon/tls.crt"
 tls_key_file = "/etc/kharon/tls.key"
 
 [connector]
-listen = "203.0.113.4:8788"
+listen = "203.0.113.4:8789"
 tls_cert_file = "/etc/kharon/tls.crt"
 tls_key_file = "/etc/kharon/tls.key"
+```
+
+kharond reads both files as its own uid. With the Compose example,
+bind-mount them read-only and give the private key to uid 10001 with
+mode `0400`, as with the API key file (step 4 of
+[the kharon account](#the-kharon-account-and-its-master-password-req-dep-007)):
+
+```yaml
+# docker-compose.override.yml
+services:
+  kharon:
+    volumes:
+      - ./tls/tls.crt:/etc/kharon/tls.crt:ro
+      - ./tls/tls.key:/etc/kharon/tls.key:ro
+```
+
+```sh
+sudo chown 10001:10001 tls/tls.key && sudo chmod 0400 tls/tls.key
 ```
 
 `203.0.113.4` stands for the broker's reachable address. A self-signed
@@ -251,11 +286,98 @@ cargo build --release -p kharon-agent-connector
 
 The binary is `target/release/kharon-agent-connector`. Copy it and the
 tunnel credential file to the agent host, then follow path (B) under
-Agent host. Open inbound TCP `8787` and `8788` on the broker only. The
-agent host accepts nothing.
+Agent host. Open inbound TCP `8787` and `8789` on the broker only. The
+agent host accepts nothing. If kharond binds a host address, also add
+the input filter in
+[Tunnel-only listeners](#tunnel-only-listeners-req-dep-006).
 
 kharond still reads `/json/version` on each connect, over the
 connector, so a Chromium restart needs no config edit.
+
+### Tunnel-only listeners (REQ-DEP-006)
+
+kharond refuses a wildcard bind, and `ss -ltn` shows the agent API
+(and `[connector]`) on one address only. On Linux that alone does not
+make a listener tunnel-only. Linux follows the weak host model: it
+accepts a packet for any local address, whichever interface it
+arrives on. A host on the broker's LAN that adds one route
+(`ip route add 10.66.0.1/32 via <broker LAN address>`) reaches the
+listener without the tunnel, and so does any container on the broker
+host. The bearer token still guards the API, but the "only through
+the tunnel" layer is gone. Whether you have to close it depends on
+where kharond binds:
+
+- **kharond in a container on a Docker bridge** (the Compose
+  example's `wg` network): Docker Engine 28 and later already drop
+  packets for a container address that arrive on any other interface,
+  with one `raw` PREROUTING rule per container
+  (`ip daddr <container> iifname != "<bridge>" drop`). Nothing to add.
+- **kharond on a host address** (Compose with `network_mode: host`,
+  or kharond installed on the host): add an input filter that drops
+  traffic to the listen address unless it arrives on the tunnel
+  interface or loopback.
+
+Use a table of its own, so Docker's rules and anything else in the
+ruleset survive (no `flush ruleset`). Add one line per listen
+address. Under path (A) the interface is `wg0`. Under path (B) it is
+the interface the agent's connection arrives on, for example
+`tailscale0` when the listen address is a tailnet address.
+
+```nft
+# /etc/kharon-guard.nft
+# The first line creates the table if it is missing, so the delete
+# never fails and `nft -f` replaces the table in one transaction.
+table inet kharon_guard
+delete table inet kharon_guard
+table inet kharon_guard {
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		ip daddr 10.66.0.1 iifname != { "wg0", "lo" } counter drop
+	}
+}
+```
+
+`iifname` matches by name, so the rule loads before `wg0` exists.
+Load it at boot, before the network comes up:
+
+```ini
+# /etc/systemd/system/kharon-guard.service
+[Unit]
+Description=kharon broker: agent API answers only on the tunnel (REQ-DEP-006)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/kharon-guard.nft
+ExecReload=/usr/sbin/nft -f /etc/kharon-guard.nft
+ExecStop=/usr/sbin/nft delete table inet kharon_guard
+
+[Install]
+WantedBy=sysinit.target
+```
+
+```sh
+sudo systemctl daemon-reload && sudo systemctl enable --now kharon-guard.service
+```
+
+Then check it with a **negative probe**. `ss` cannot show this. From
+another host on the broker's LAN:
+
+```sh
+sudo ip route add 10.66.0.1/32 via <broker LAN address>
+curl -m 3 -sS -o /dev/null -w '%{http_code}\n' http://10.66.0.1:8787/   # must time out
+sudo ip route del 10.66.0.1/32 via <broker LAN address>
+```
+
+From a container on the broker host
+(`docker run --rm busybox nc -z -w 3 <listen address> 8787` must
+fail), and with `sudo nft list table inet kharon_guard` the drop
+counter must have gone up. The same request through the tunnel still
+gets an HTTP answer (`401` without a token).
 
 ### ntfy approve and deny (REQ-APR-004, REQ-DEP-006)
 
@@ -389,7 +511,7 @@ this host only receives them.
 
 ```sh
 sudo CONNECTOR_BIN=./kharon-agent-connector \
-  BROKER_ADDR=203.0.113.4:8788 \
+  BROKER_ADDR=203.0.113.4:8789 \
   BROKER_PIN=<64 hex sha256 of the broker certificate DER> \
   AGENT_ID=assistant \
   TUNNEL_TOKEN_FILE=./tunnel.token \

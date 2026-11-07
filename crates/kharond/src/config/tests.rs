@@ -190,3 +190,75 @@ fn req_apr_005_owner_ui_is_loopback_and_origin_matches_rp_id() {
         "owner_ui_rp_id"
     );
 }
+
+/// #149: an API key file kharond's uid may not open, which is the
+/// plain-Compose bind mount of an operator-owned 0400 file, fails the
+/// startup check (and so `--check`) with the uid, owner and mode, not
+/// the sync client's bare "API key file unreadable". Root opens
+/// anything, so this needs an unprivileged test run.
+#[test]
+fn req_dep_008_check_startup_names_unopenable_key_file() {
+    let euid = rustix::process::geteuid().as_raw();
+    if euid == 0 {
+        eprintln!("req_dep_008: running as root, which can open any file; skipped");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, text) = spec_example_with_key();
+    let key = dir.path().join("key.json");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let err = cfg.check_startup(&StaticMlockProbe(Ok(()))).unwrap_err();
+    assert_eq!(
+        err,
+        ConfigError::ApiKeyFileNotReadable {
+            euid,
+            owner: euid,
+            mode: 0
+        }
+    );
+    assert_eq!(err.code(), "api_key_file");
+}
+
+/// #149: a TLS certificate or private key kharond's uid may not open
+/// says so; a missing one keeps the plain "unreadable" reason.
+#[test]
+fn req_dep_008_tls_material_not_openable_is_named() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("req_dep_008: running as root, which can open any file; skipped");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("tls.crt");
+    let key = dir.path().join("tls.key");
+    // Never parsed: every case below fails on a read first.
+    std::fs::write(&cert, b"cert").unwrap();
+    std::fs::write(&key, b"key").unwrap();
+    let material = TlsMaterial {
+        cert_file: cert.clone(),
+        key_file: key.clone(),
+    };
+    let reason = |m: &TlsMaterial| match load_tls(m) {
+        Err(ConfigError::TlsMaterial { reason }) => reason,
+        other => panic!("expected a tls_material refusal, got {other:?}"),
+    };
+
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        reason(&material),
+        "private key not readable by kharond's uid (make it owned by that uid, mode 0400)"
+    );
+
+    std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        reason(&material),
+        "certificate not readable by kharond's uid (check owner and mode)"
+    );
+
+    std::fs::remove_file(&cert).unwrap();
+    std::fs::remove_file(&key).unwrap();
+    assert_eq!(reason(&material), "unreadable certificate");
+    std::fs::write(&cert, b"cert").unwrap();
+    assert_eq!(reason(&material), "unreadable private key");
+}

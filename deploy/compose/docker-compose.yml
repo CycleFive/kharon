@@ -3,7 +3,8 @@
 # kharond on owner hardware next to Vaultwarden. Copy
 # kharon.toml.example to kharon.toml and fill it in, put the kharon
 # account's personal API key JSON at secrets/kharon_bw_api_key.json,
-# then:
+# owned by uid 10001 with mode 0400 (README: Compose keeps the host
+# file's owner and mode), then:
 #
 #   docker compose up -d --build
 #   docker compose exec kharon kharon unlock     # master password, once

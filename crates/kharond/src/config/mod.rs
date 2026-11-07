@@ -269,6 +269,20 @@ pub enum ConfigError {
         /// Fixed-text reason.
         reason: &'static str,
     },
+    /// `bitwarden.api_key_file` exists but kharond's effective uid may
+    /// not open it (REQ-DEP-008, #149). Plain Docker Compose secrets are
+    /// bind mounts that keep the host file's owner and mode.
+    #[error(
+        "bitwarden.api_key_file: not readable by kharond (euid {euid}; file owner uid {owner}, mode {mode:04o}); make it owned by uid {euid} with mode 0400"
+    )]
+    ApiKeyFileNotReadable {
+        /// kharond's effective uid.
+        euid: u32,
+        /// The file's owner uid.
+        owner: u32,
+        /// The file's permission bits.
+        mode: u32,
+    },
     /// `bitwarden.ca_file` is unreadable or holds no PEM certificate.
     #[error("bitwarden.ca_file: {reason}")]
     CaFile {
@@ -454,7 +468,7 @@ impl ConfigError {
             Self::StandingGrantsDisabled => "standing_grants_disabled",
             Self::DefaultContextMultiAgent => "default_context_multi_agent",
             Self::AuditNoOffHostSink => "audit_no_off_host_sink",
-            Self::ApiKeyFile { .. } => "api_key_file",
+            Self::ApiKeyFile { .. } | Self::ApiKeyFileNotReadable { .. } => "api_key_file",
             Self::CaFile { .. } => "ca_file",
             Self::MlockUnavailable { .. } => "mlock_unavailable",
             Self::TokenHashWeakParams { .. } => "token_hash_weak_params",
@@ -503,7 +517,7 @@ pub enum ConfigWarning {
     /// `bitwarden.allow_extra_orgs = true` (REQ-CRY-008 escape hatch).
     ExtraOrgsAllowed,
     /// `bitwarden.api_key_file` is group- or world-readable (REQ-DEP-008;
-    /// tolerated for Docker secrets mounted 0444).
+    /// tolerated for Swarm secrets, mounted 0444 and root-owned).
     ApiKeyFileReadableByOthers,
     /// `bitwarden.api_key_file` is not owned by kharond's effective uid
     /// (REQ-DEP-008).
@@ -921,8 +935,7 @@ impl Config {
         }
         let mut warnings = Vec::new();
         if let Source::Sync(bw) = &self.source {
-            warnings = keyfile::check_api_key_file(&bw.api_key_file)
-                .map_err(|reason| ConfigError::ApiKeyFile { reason })?;
+            warnings = keyfile::check_api_key_file(&bw.api_key_file)?;
             bw.sync_client()?;
         }
         if let Some(api) = &self.api
@@ -987,12 +1000,27 @@ impl Config {
 pub fn load_tls(
     material: &TlsMaterial,
 ) -> Result<std::sync::Arc<rustls::ServerConfig>, ConfigError> {
-    let cert = std::fs::read(&material.cert_file).map_err(|_| ConfigError::TlsMaterial {
-        reason: "unreadable certificate",
-    })?;
-    let key = std::fs::read(&material.key_file).map_err(|_| ConfigError::TlsMaterial {
-        reason: "unreadable private key",
-    })?;
+    // Permission denied gets its own reason: under plain Docker Compose
+    // a bind-mounted key keeps the host owner and mode (#149).
+    let read = |path: &Path, unreadable: &'static str, denied: &'static str| {
+        std::fs::read(path).map_err(|e| ConfigError::TlsMaterial {
+            reason: if e.kind() == std::io::ErrorKind::PermissionDenied {
+                denied
+            } else {
+                unreadable
+            },
+        })
+    };
+    let cert = read(
+        &material.cert_file,
+        "unreadable certificate",
+        "certificate not readable by kharond's uid (check owner and mode)",
+    )?;
+    let key = read(
+        &material.key_file,
+        "unreadable private key",
+        "private key not readable by kharond's uid (make it owned by that uid, mode 0400)",
+    )?;
     kharon_connector::server_config_from_pem(&cert, &key).map_err(|_| ConfigError::TlsMaterial {
         reason: "not a PEM certificate and private key",
     })

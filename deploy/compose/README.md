@@ -18,13 +18,22 @@ docker run --rm -it --entrypoint kharon kharon:local token mint assistant
 # token once on the terminal; paste the $argon2id$ token_hash line into kharon.toml
 cp kharon.toml.example kharon.toml        # then edit: org, collections, agents, CDP endpoint, token_hash
 cp /path/to/bw-api-key.json secrets/kharon_bw_api_key.json
+sudo chown 10001:10001 secrets/kharon_bw_api_key.json   # kharond's uid; see below
+sudo chmod 0400 secrets/kharon_bw_api_key.json
 docker compose up -d
 docker compose exec kharon kharon unlock  # owner unlock, master password on the tty
 docker compose exec kharon kharon status
 ```
 
 `secrets/` is git-ignored. kharond reads the API key from
-`/run/secrets/kharon_bw_api_key`.
+`/run/secrets/kharon_bw_api_key`. Without Swarm, Compose mounts that
+file as a bind mount that keeps the host file's owner and mode. It
+ignores a secret's `uid`, `gid` and `mode`, with a warning. So the
+file must belong to uid 10001, which kharond runs as. If it is a
+`0400` file owned by you, kharond refuses to start with `config error
+[api_key_file]: … not readable by kharond (euid 10001; …)`
+(REQ-DEP-008). The same goes for a TLS private key you bind-mount for
+path B.
 
 ## What the example sets
 

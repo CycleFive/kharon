@@ -1342,6 +1342,11 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         terms: &GrantTerms,
         channel: Channel,
     ) -> Result<GrantView, GrantError> {
+        // REQ-APR-003 (#130): a request past its timeout is denied
+        // first, so a quiet agent cannot leave it approvable. If that
+        // denial cannot be audited the request stays pending, and the
+        // approval fails closed with it.
+        self.expire_grant_requests()?;
         let now = self.grant_now();
         let grant = self
             .grants
@@ -1393,6 +1398,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// (`grant_request`, result `denied`, detail `owner_denied`);
     /// an audit failure restores the request to pending.
     pub fn deny_grant_request(&self, request_id: &str) -> Result<GrantRequest, GrantError> {
+        // REQ-APR-003 (#130): an aged request is a timeout denial, not
+        // an owner one.
+        self.expire_grant_requests()?;
         let req = self
             .grants
             .lock()
@@ -1747,7 +1755,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 
     /// Every pending grant request (the approval channels' queue).
+    /// Requests past their timeout are denied first (REQ-APR-003,
+    /// #130); if that denial cannot be audited they stay listed.
     pub fn pending_grant_requests(&self) -> Vec<GrantRequest> {
+        let _ = self.expire_grant_requests();
         self.grants
             .lock()
             .unwrap_or_else(|p| p.into_inner())

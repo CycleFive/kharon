@@ -311,6 +311,62 @@ async fn req_apr_003_request_auto_denies_at_timeout_and_is_audited() {
     );
 }
 
+/// #130: expiry ran only on agent calls, so with a quiet agent an owner
+/// could still approve a request long past its 120 s timeout. The owner
+/// paths now expire first: the aged request is denied (and audited as a
+/// timeout) before approve, deny or the pending list sees it.
+#[tokio::test]
+async fn req_apr_003_owner_paths_expire_first_so_an_aged_request_cannot_be_approved() {
+    let rig = Rig::new("https://login.example.com/signin");
+    let r = rig.fill_password().await;
+    let aged = r["grant_request_id"].as_str().unwrap().to_owned();
+    assert_eq!(rig.broker.pending_grant_requests().len(), 1);
+
+    // +10 min and no agent call since: nothing has run the expiry pass.
+    rig.clock.advance(Duration::from_secs(600));
+
+    // The pending list no longer offers it.
+    assert!(rig.broker.pending_grant_requests().is_empty());
+    // Approve fails closed instead of issuing a grant.
+    assert_eq!(
+        rig.broker
+            .approve_grant_request(&aged, &GrantTerms::once_item(ITEM_A), Channel::Cli),
+        Err(GrantError::NotPending)
+    );
+    assert_eq!(
+        rig.broker.grant_request(&aged).unwrap().state,
+        RequestState::Denied
+    );
+    // Exactly one denial, audited as the timeout; no grant_issue.
+    let entries = rig.audit_entries();
+    let mine: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.request_id.as_deref() == Some(aged.as_str()))
+        .collect();
+    let results: Vec<(Option<&str>, Option<&str>)> = mine
+        .iter()
+        .map(|e| (e.result.as_deref(), e.detail_code.as_deref()))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            (Some("pending"), None),
+            (Some("denied"), Some("request_timeout"))
+        ],
+        "{entries:?}"
+    );
+
+    // Deny takes the same path: a second aged request is already
+    // denied by the timeout, so the owner's deny finds it not pending.
+    let r = rig.fill_password().await;
+    let second = r["grant_request_id"].as_str().unwrap().to_owned();
+    rig.clock.advance(Duration::from_secs(121));
+    assert_eq!(
+        rig.broker.deny_grant_request(&second).map(|_| ()),
+        Err(GrantError::NotPending)
+    );
+}
+
 #[tokio::test]
 async fn req_apr_007_claim_disagreeing_with_live_origin_is_refused_before_prompt() {
     // The tab is on evil.example.com; the agent claims the item's

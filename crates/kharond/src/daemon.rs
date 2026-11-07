@@ -717,7 +717,7 @@ pub async fn start(
             )?,
         )
     };
-    let audit = AuditLog::open(
+    let mut audit = AuditLog::open(
         &audit_dir,
         LogConfig {
             plaintext_item_names: cfg.audit.item_names,
@@ -725,6 +725,16 @@ pub async fn start(
         },
         sink,
     )?;
+    // SPEC §8 (#130): grant requests live in memory, so the last run's
+    // pending ones died with it. Record each as `abandoned` now, before
+    // anything is served, from the log just verified.
+    for request in crate::audit::unresolved_grant_requests(&audit_dir.join("audit.jsonl"))
+        .map_err(OpenError::Io)?
+    {
+        audit
+            .append(request.abandoned_entry())
+            .map_err(OpenError::Recovery)?;
+    }
 
     // The unlock source, assembled at startup: sync mode keeps the
     // source config (a client is built per unlock); export mode
@@ -1011,6 +1021,17 @@ impl Daemon {
                 let _ = tokio::task::spawn_blocking(move || broker.checkpoint_audit_if_due()).await;
             }
         });
+        // REQ-APR-003 (#130): deny requests past their 120 s timeout on
+        // a cadence too, so the denial is audited close to the timeout
+        // even when no agent or owner call comes along to trigger it.
+        let expiry_broker = Arc::clone(&self.broker);
+        let request_expiry = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(REQUEST_EXPIRY_TICK).await;
+                let broker = Arc::clone(&expiry_broker);
+                let _ = tokio::task::spawn_blocking(move || broker.expire_grant_requests()).await;
+            }
+        });
         let owner_ops = Arc::clone(&self.owner_ops);
         let owner = tokio::spawn(crate::owner::serve(self.owner_listener, self.owner_ops));
         let owner_ui = self.owner_ui.map(|(listener, ui)| {
@@ -1032,6 +1053,7 @@ impl Daemon {
             task.abort();
         }
         checkpoint_timer.abort();
+        request_expiry.abort();
         owner.abort();
         if let Some(task) = owner_ui {
             task.abort();
@@ -1055,6 +1077,11 @@ impl Daemon {
 /// due decision itself lives in the log (`AuditConfig::checkpoint_period`),
 /// so this only bounds how late a due checkpoint can be.
 pub const CHECKPOINT_TIMER_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often the daemon denies grant requests past their timeout
+/// (REQ-APR-003, #130). Agent and owner calls also expire first; this
+/// bounds how late a quiet broker audits a timeout denial.
+pub const REQUEST_EXPIRY_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the live sync re-checks that its session still exists
 /// (and enforces the idle/absolute timers, REQ-MEM-004) between

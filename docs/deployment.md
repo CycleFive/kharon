@@ -407,14 +407,26 @@ It:
 - creates a `connector` user that is neither `browser` nor the agent;
 - installs the binary at `/usr/local/bin/kharon-agent-connector`;
 - writes `/etc/kharon-connector/connector.toml` and
-  `/etc/kharon-connector/token` (mode `0400`, owner `connector`);
+  `/etc/kharon-connector/token` (mode `0400`, owner `connector`),
+  and, when `PROXY_CREDS_FILE` is set,
+  `/etc/kharon-connector/proxy-creds` (same mode and owner);
 - writes `kharon-agent-connector.service`, which dials the broker and
   relays to `127.0.0.1:9222`, and restarts itself if the process
   exits. The process also reconnects on its own.
 
 `CDP_PORT` defaults to `9222`. `PROXY=http://proxy-host:3128` is an
-optional HTTP CONNECT proxy with no userinfo; the connector refuses a
-proxy URL that embeds a password. Re-running the script is safe.
+optional HTTP CONNECT proxy. The URL stays `http://host:port` with no
+userinfo; this script and the connector both refuse a proxy URL that
+embeds a password. When that proxy requires authentication, set
+`PROXY_CREDS_FILE` to a file of one line, `user:password` (a trailing
+newline is ignored, and the line is at most 4096 bytes). The script
+installs it at `/etc/kharon-connector/proxy-creds` (mode `0400`, owner
+`connector`) and sets `proxy_creds_file` in the connector config. The
+connector sends that line only as `Proxy-Authorization: Basic …` on
+the CONNECT to the proxy. It does not put the credential in the proxy
+URL, on the command line, in logs, or on the broker TLS session. A
+re-run that omits `PROXY_CREDS_FILE` removes the installed file.
+Re-running the script is safe.
 
 The tunnel credential is the only kharon secret on this host, and
 only the `connector` user can read it. It is not the agent API token.
@@ -422,7 +434,9 @@ Someone holding it could attach a connector and receive the CDP
 session the broker opens, so treat it like an SSH key: do not copy it
 further, and mint a new one (`kharon tunnel mint` on the broker, then
 re-run with the new file) if this host is rebuilt. The broker
-certificate pin is not a secret.
+certificate pin is not a secret. The proxy credential, when set, is
+the egress proxy's secret: the connector presents it to that proxy
+and nowhere else.
 
 Point the agent harness at `https://203.0.113.4:8787` with its agent
 API token, and trust the broker certificate there. The connector does

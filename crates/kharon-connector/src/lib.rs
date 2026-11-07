@@ -58,11 +58,12 @@ pub use auth::{read_client_hello, read_server_hello, write_client_hello, write_s
 pub use client::{AgentParams, run_agent_once};
 pub use frame::{Frame, encode_frame};
 pub use mux::{BrokerSession, MuxIo, OpenError, serve_agent, spawn_broker};
-pub use proxy::connect_http_proxy;
+pub use proxy::{connect_http_proxy, proxy_creds_line};
 pub use tls::{CertSha256, TlsMaterialError, connect_pinned, pin_of_der, server_config_from_pem};
 
 /// Why [`run_agent_once`] stopped. Display text is fixed: it never includes
-/// the tunnel token, the certificate, or a peer's response body.
+/// the tunnel token, the proxy credential, the certificate, or a peer's
+/// response body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClientError {
     /// The broker certificate was not the pinned one (REQ-ARCH-002).
@@ -71,6 +72,10 @@ pub enum ClientError {
     /// The broker refused the tunnel credential (REQ-ARCH-002).
     #[error("tunnel credentials were refused")]
     Unauthorized,
+    /// The HTTP proxy returned 407. The credential and the proxy's
+    /// response are not part of this error.
+    #[error("proxy authentication was refused")]
+    ProxyAuth,
     /// The peer did not speak version 1.
     #[error("connector protocol error")]
     Protocol,

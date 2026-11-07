@@ -233,6 +233,9 @@ pub enum OwnerFailure {
     AlreadyUnlocked,
     /// `require_mlock = true` and `mlockall` failed (REQ-MEM-002).
     MlockUnavailable,
+    /// The process is dumpable again; unlock refused before any key
+    /// was derived (#134, SPEC OQ-10).
+    ProcessDumpable,
     /// The `Unlocked` audit entry could not be written, so the
     /// unlock was rolled back (REQ-AUD-003).
     AuditFailed,
@@ -257,6 +260,7 @@ impl OwnerFailure {
         match self {
             Self::AlreadyUnlocked => "already_unlocked",
             Self::MlockUnavailable => "mlock_unavailable",
+            Self::ProcessDumpable => "process_dumpable",
             Self::AuditFailed => "audit_failed",
             Self::UnlockFailed => "unlock_failed",
             Self::Unsupported => "unknown_op",

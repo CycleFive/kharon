@@ -53,6 +53,13 @@ pub trait MemoryHardening: Send {
 
     /// `mlockall(MCL_CURRENT | MCL_FUTURE)` (REQ-MEM-002). Idempotent.
     fn lock_memory(&self) -> Result<(), HardeningError>;
+
+    /// Whether the process is still non-dumpable (`PR_GET_DUMPABLE ==
+    /// 0`). Unlock checks it right before keys are derived (#134, SPEC
+    /// OQ-10): no core dump can hold keys only while this holds, and a
+    /// credential change since startup would have reset it. `false`
+    /// if it cannot be read.
+    fn is_non_dumpable(&self) -> bool;
 }
 
 /// Fixed answers, for tests and embedding (same shape as the config
@@ -63,6 +70,8 @@ pub struct StaticHardening {
     pub harden: Result<(), HardeningError>,
     /// Result of [`MemoryHardening::lock_memory`].
     pub mlock: Result<(), HardeningError>,
+    /// Answer of [`MemoryHardening::is_non_dumpable`].
+    pub non_dumpable: bool,
 }
 
 impl StaticHardening {
@@ -71,7 +80,15 @@ impl StaticHardening {
         Self {
             harden: Ok(()),
             mlock: Ok(()),
+            non_dumpable: true,
         }
+    }
+
+    /// The same host, but the process has become dumpable again (as a
+    /// credential change would make it): OQ-10's refusal case (#134).
+    pub fn dumpable(mut self) -> Self {
+        self.non_dumpable = false;
+        self
     }
 
     /// A host where `mlockall` fails (no `CAP_IPC_LOCK`, finite
@@ -82,6 +99,7 @@ impl StaticHardening {
             mlock: Err(HardeningError::Os(
                 "Operation not permitted (os error 1, simulated)".to_owned(),
             )),
+            non_dumpable: true,
         }
     }
 }
@@ -93,6 +111,10 @@ impl MemoryHardening for StaticHardening {
 
     fn lock_memory(&self) -> Result<(), HardeningError> {
         self.mlock.clone()
+    }
+
+    fn is_non_dumpable(&self) -> bool {
+        self.non_dumpable
     }
 }
 
@@ -122,6 +144,10 @@ impl MemoryHardening for ProcessHardening {
         use rustix::mm::{MlockAllFlags, mlockall};
         mlockall(MlockAllFlags::CURRENT | MlockAllFlags::FUTURE).map_err(|e| HardeningError::os(&e))
     }
+
+    fn is_non_dumpable(&self) -> bool {
+        process_status().not_dumpable == Some(true)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -132,6 +158,10 @@ impl MemoryHardening for ProcessHardening {
 
     fn lock_memory(&self) -> Result<(), HardeningError> {
         Err(HardeningError::Unsupported)
+    }
+
+    fn is_non_dumpable(&self) -> bool {
+        false
     }
 }
 

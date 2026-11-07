@@ -252,6 +252,7 @@ async fn req_dep_006_hardening_failure_refuses_start() {
         Box::new(StaticHardening {
             harden: Err(HardeningError::Unsupported),
             mlock: Ok(()),
+            non_dumpable: true,
         }),
     )
     .await
@@ -267,6 +268,7 @@ async fn req_dep_006_hardening_failure_refuses_start() {
         Box::new(StaticHardening {
             harden: Ok(()),
             mlock: Err(HardeningError::Os("EPERM".into())),
+            non_dumpable: true,
         }),
     )
     .await

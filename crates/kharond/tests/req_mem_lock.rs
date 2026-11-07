@@ -66,7 +66,13 @@ const CHILD_ENV: &str = "KHARON_REQ_MEM_001_CHILD";
 /// Child half: harden this process, report its own status and its
 /// `/proc/self/limits` core line, then wait to be killed.
 fn child_main() -> ! {
+    // OQ-10 (#134): unlock's dumpable check reads the real flag.
+    assert!(
+        !ProcessHardening.is_non_dumpable(),
+        "a fresh process is dumpable"
+    );
     ProcessHardening.harden_process().expect("harden");
+    assert!(ProcessHardening.is_non_dumpable(), "hardened: not dumpable");
     let st = process_status();
     let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
     let core_line = limits
@@ -180,6 +186,9 @@ fn req_mem_002_unlock_follows_the_real_mlockall_result() {
     // settle it: mlockall(MCL_CURRENT) also depends on the process's
     // current footprint vs RLIMIT_MEMLOCK, which is why the daemon
     // trusts the syscall, not a prediction, and fails closed.)
+    // As the daemon does at startup (step 3), before any unlock: unlock
+    // also refuses a dumpable process (OQ-10, #134).
+    ProcessHardening.harden_process().expect("harden");
     let host = ProcessHardening.lock_memory();
     let clock = Arc::new(ManualClock::new());
     let mut c = LockController::new(LockPolicy::default(), clock, Box::new(ProcessHardening));

@@ -8,6 +8,13 @@ members = [
     "crates/kharon-agent-connector",
 ]
 
+# SPEC §8 process hardening: a release build aborts on panic instead of
+# unwinding (#134). Both binaries that hold secrets make themselves
+# non-dumpable first (kharond at startup, `kharon` in main), so an
+# abort leaves no core dump. `panic` cannot be set per package.
+[profile.release]
+panic = "abort"
+
 [workspace.package]
 version = "0.0.0"
 edition = "2024"

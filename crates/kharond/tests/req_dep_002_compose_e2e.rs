@@ -37,7 +37,8 @@
 //! 4. The test writes `kharon.toml` and the API key to
 //!    `deploy/compose/e2e/run/` and starts `kharon`, which binds its
 //!    agent API on 10.66.0.1:8787 only. The owner unlocks with
-//!    `docker exec kharon unlock` (master password on stdin).
+//!    `docker exec -it kharon unlock`, typing the master password at
+//!    the echo-off prompt on a pty (the CLI refuses a piped one).
 //! 5. The agent (this test) asks for its browser context and fills.
 //!    The first fill is `pending_approval` (#20, REQ-APR-001); the
 //!    owner approves it (per-origin) through the owner socket and
@@ -62,7 +63,7 @@ use std::time::{Duration, Instant};
 
 use api_support::{assert_no_canary, get, post_json, raw_request};
 use base64ct::{Base64, Encoding};
-use docker_support::{docker, docker_raw, wait_for_log};
+use docker_support::{docker, docker_on_tty, docker_raw, wait_for_log};
 use futures_util::{SinkExt, StreamExt};
 use kharond::api::token::generate;
 use kharond::sync::{ApiKey, SyncClient, TlsTrust};
@@ -717,18 +718,16 @@ async fn setup() -> Run {
         Duration::from_secs(60),
     );
 
-    // The owner unlocks through the CLI in the container (stdin, one
-    // line), as an operator would.
-    let unlock = docker_raw(
-        &["exec", "-i", KHAROND, "kharon", "unlock"],
-        Some(format!("{master}\n").as_bytes()),
+    // The owner unlocks through the CLI in the container, typing the
+    // password at its prompt on a terminal, as an operator would. The
+    // CLI refuses a piped password (#131 slice 5a, SPEC §8).
+    let (unlocked, tty) = docker_on_tty(
+        &["exec", "-it", KHAROND, "kharon", "unlock"],
+        "kharon master password:",
+        &master,
     );
-    assert!(
-        unlock.status.success(),
-        "kharon unlock: {}{}",
-        String::from_utf8_lossy(&unlock.stdout),
-        String::from_utf8_lossy(&unlock.stderr)
-    );
+    assert!(!tty.contains(&master), "the master password was echoed");
+    assert!(unlocked, "kharon unlock: {tty}");
 
     // REQ-DEP-006: listeners in kharond's network namespace.
     let ss_tcp = ss_in(KHAROND, "-ltnpH");

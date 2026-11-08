@@ -15,7 +15,8 @@
 //! - **REQ-APR-007**: the prompt shows the live origin the backend
 //!   observed; a claim that disagrees makes the fill
 //!   `origin_mismatch` and the request is refused before any prompt
-//!   exists.
+//!   exists. A claim that fails §6's scheme rule (#180 item 3) is
+//!   refused before a request is even created.
 //! - **REQ-MEM-007**: a standing grant is inert while the broker is
 //!   locked (the fill returns `locked`, with no CDP write and no
 //!   grant use spent) and survives the lock — the same grant admits
@@ -89,6 +90,12 @@ impl Rig {
     /// fills successfully, on a manual clock shared by the lock and
     /// grant timers.
     fn new(live_url: &'static str) -> Self {
+        Self::with_origin_cfg(live_url, OriginConfig::default())
+    }
+
+    /// [`Self::new`] with a non-default origin config (#180's
+    /// `allow_http` cases).
+    fn with_origin_cfg(live_url: &'static str, origin_cfg: OriginConfig) -> Self {
         let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
         let (_beta, hb) = generate_with(&cheap_argon(), "beta");
         let tokens = TokenStore::with_floor(
@@ -113,14 +120,9 @@ impl Rig {
         let audit = RecordingAudit::default();
         let fake = FakeFill::new(FakeAnswer::Filled).with_live_url(live_url);
         let grant_clock: Arc<dyn Clock> = clock.clone();
-        let broker = Broker::new(
-            tokens,
-            lock,
-            Box::new(audit.clone()),
-            OriginConfig::default(),
-        )
-        .with_grant_clock(grant_clock)
-        .with_fill_backend(Box::new(fake.clone()));
+        let broker = Broker::new(tokens, lock, Box::new(audit.clone()), origin_cfg)
+            .with_grant_clock(grant_clock)
+            .with_fill_backend(Box::new(fake.clone()));
         Self {
             broker: Arc::new(broker),
             clock,
@@ -137,6 +139,26 @@ impl Rig {
 
     fn decrypts(&self) -> usize {
         self.decrypts.load(Ordering::SeqCst)
+    }
+
+    /// A password fill claiming `origin` (the APR-007 / #180 cases
+    /// claim something other than the fixture's https origin).
+    async fn fill_claim(&self, origin: &str) -> Value {
+        let req = parse_fill(
+            kharond::api::FillOperation::Fill,
+            json!({
+                "item_id": ITEM_A,
+                "target": {"cdp_target_id": "tab-1", "expected_origin": origin},
+                "fields": [{"kind": "password"}],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        match self.broker.fill(&self.agent(), req, Instant::now()).await {
+            Ok(Outcome::Fill(r)) => serde_json::to_value(r).unwrap(),
+            other => panic!("expected a fill outcome, got {other:?}"),
+        }
     }
 
     async fn fill_password(&self) -> Value {
@@ -419,6 +441,97 @@ async fn req_apr_007_prompt_shows_the_observed_origin_not_the_claim() {
     assert_eq!(prompt.origin, "https://login.example.com");
     assert_eq!(prompt.agent_id, "alpha");
     assert_eq!(prompt.item_id, ITEM_A);
+}
+
+#[tokio::test]
+async fn req_apr_007_http_claim_is_refused_before_a_request_exists() {
+    // #180 item 3: claim and tab agree on an http origin, but
+    // `allow_http` is off, so the fill could never succeed. No
+    // grant request is created and no prompt exists — the refusal
+    // is the live check's `origin_mismatch` / `insecure_context`,
+    // delivered before approval instead of after it.
+    let rig = Rig::new("http://localhost:8080/login");
+    let r = rig.fill_claim("http://localhost:8080").await;
+    assert_eq!(r["status"], "origin_mismatch", "{r}");
+    assert_eq!(r["detail"], "insecure_context", "{r}");
+    assert!(r.get("grant_request_id").is_none(), "{r}");
+    assert_eq!(rig.decrypts(), 0);
+    assert!(rig.fake.seen().is_empty());
+    assert!(
+        rig.broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .pending_requests()
+            .is_empty()
+    );
+    // Audit: the fill outcome only — no grant_request creation.
+    let events: Vec<String> = rig
+        .audit_entries()
+        .iter()
+        .map(|e| {
+            serde_json::to_value(&e.event)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(events, ["fill"], "{events:?}");
+}
+
+#[tokio::test]
+async fn req_apr_007_http_claim_prompts_when_allow_http_is_on() {
+    // The pre-refusal is the scheme rule's, not a new one: with
+    // `allow_http` set, the same claim makes a normal request
+    // (the live check still narrows approval to localhost/IP
+    // pages whose item URI is literally http).
+    let rig = Rig::with_origin_cfg(
+        "http://localhost:8080/login",
+        OriginConfig { allow_http: true },
+    );
+    let r = rig.fill_claim("http://localhost:8080").await;
+    assert_eq!(r["status"], "pending_approval", "{r}");
+    let request_id = r["grant_request_id"].as_str().unwrap().to_owned();
+    let req = rig.broker.grant_request(&request_id).unwrap();
+    assert_eq!(req.state, RequestState::Pending);
+    assert_eq!(req.observed_origin, "http://localhost:8080");
+}
+
+#[tokio::test]
+async fn req_apr_007_request_grant_http_claim_creates_no_request() {
+    // The explicit form (`kharon_request_grant`) pre-refuses the
+    // same way: state `origin_mismatch`, no request id, nothing
+    // pending.
+    let rig = Rig::new("http://localhost:8080/login");
+    let args = parse_grant(
+        json!({
+            "item_id": ITEM_A,
+            "target": {"cdp_target_id": "tab-1", "expected_origin": "http://localhost:8080"},
+            "action": "fill",
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let out = rig
+        .broker
+        .request_grant(&rig.agent(), args, Instant::now())
+        .await
+        .unwrap();
+    let Outcome::GrantRequest(body) = out else {
+        panic!("expected a grant request outcome, got {out:?}");
+    };
+    assert_eq!(body.state, "origin_mismatch");
+    assert!(body.grant_request_id.is_none());
+    assert!(
+        rig.broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .pending_requests()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

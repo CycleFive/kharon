@@ -834,6 +834,13 @@
         ],
         "description": "SPEC §4 {grant_request_id, state}. grant_request_id is null when no request was created (not_found, target_not_owned, timeout).",
         "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Fixed reason code for some refusal states (also the audit detail_code).",
+            "enum": [
+              "insecure_context"
+            ]
+          },
           "grant_request_id": {
             "type": [
               "string",

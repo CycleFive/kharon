@@ -1071,6 +1071,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     );
                 }
             }
+            // An insecure-context refusal (#180 item 3) never counted
+            // toward the streak, and it must not reset one either: a
+            // grantless `http` claim is free to send, so resetting
+            // here would let an agent evade REQ-RL-002 between
+            // mismatch probes. Leave the streak untouched.
+            FillStatus::Engine(FillOutcome::NonSecureContext) => {}
             _ => {
                 self.rates
                     .lock()
@@ -1100,6 +1106,30 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
     }
 
+    /// Whether the claimed origin is refused before a grant request
+    /// exists (#180 item 3, owner decision 2026-11-07): a claim that
+    /// already fails SPEC §6's scheme rule can never be filled, so
+    /// the owner is not prompted to approve a fill that cannot
+    /// succeed. The claim alone decides this — no live peek, so
+    /// nothing about the page leaks to an unapproved agent: `https`
+    /// passes; `http` passes only when `allow_http` is set (the
+    /// live check still narrows that to localhost/IP pages whose
+    /// item URI is literally `http`); any other scheme is refused.
+    /// An unparsable claim is left to the observed-origin
+    /// comparison, which refuses it as a mismatch. Whether an
+    /// iframe target is allowlisted cannot be known from the claim,
+    /// so that refusal stays at the live check.
+    fn claim_pre_refused(&self, claimed_origin: &str) -> bool {
+        match Url::parse(claimed_origin) {
+            Ok(u) => match u.scheme() {
+                "https" => false,
+                "http" => !self.origin_cfg.allow_http,
+                _ => true,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// A grantless fill's second half (REQ-APR-001/007): observe the
     /// target's live origin through the backend (bounded by the fill
     /// deadline), make the grant request, audit its creation, and
@@ -1114,6 +1144,17 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         req: &FillRequest,
         deadline: Instant,
     ) -> Result<(FillStatus, Option<String>, Option<String>), ApiError> {
+        // #180 item 3: a claim that fails the scheme rule is
+        // refused here, before any observation or request — the
+        // same `origin_mismatch` / `insecure_context` the live
+        // check would report after an approval.
+        if self.claim_pre_refused(&req.expected_origin) {
+            return Ok((
+                FillStatus::Engine(FillOutcome::NonSecureContext),
+                None,
+                None,
+            ));
+        }
         let observed = match &self.fill_backend {
             Some(b) => {
                 match tokio::time::timeout_at(
@@ -1235,6 +1276,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             return Ok(Outcome::GrantRequest(GrantRequestBody::refused(
                 "not_found",
             )));
+        }
+        // #180 item 3, as in `pending_for_fill`: a claim that fails
+        // the scheme rule creates no request and prompts no one.
+        if self.claim_pre_refused(&args.expected_origin) {
+            self.append(base("origin_mismatch"))?;
+            return Ok(Outcome::GrantRequest(
+                GrantRequestBody::refused_with_detail("origin_mismatch", "insecure_context"),
+            ));
         }
         let observed = match &self.fill_backend {
             Some(b) => {

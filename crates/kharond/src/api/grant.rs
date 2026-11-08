@@ -958,6 +958,12 @@ pub struct GrantRequestBody {
     /// `pending`, `origin_mismatch`, `not_found` or
     /// `target_not_owned`.
     pub state: &'static str,
+    /// A fixed refusal detail code, when the state has one — the
+    /// same code the fill path reports for the same refusal
+    /// (SPEC §4 `FillResult.detail`; e.g. `insecure_context` on a
+    /// scheme pre-refusal, #180 item 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<&'static str>,
 }
 
 impl GrantRequestBody {
@@ -966,6 +972,7 @@ impl GrantRequestBody {
         Self {
             grant_request_id: Some(req.id.clone()),
             state: req.state.as_str(),
+            detail: None,
         }
     }
 
@@ -974,6 +981,17 @@ impl GrantRequestBody {
         Self {
             grant_request_id: None,
             state,
+            detail: None,
+        }
+    }
+
+    /// The body for a refusal that created no request, carrying
+    /// the refusal's detail code.
+    pub fn refused_with_detail(state: &'static str, detail: &'static str) -> Self {
+        Self {
+            grant_request_id: None,
+            state,
+            detail: Some(detail),
         }
     }
 }

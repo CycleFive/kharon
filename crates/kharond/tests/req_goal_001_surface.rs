@@ -94,6 +94,7 @@ const REVIEWED_STRINGS: &[(&str, &str)] = &[
         "broker-assigned grant request id (#20)",
     ),
     ("GrantRequestBody.state", "fixed request-state literal"),
+    ("GrantRequestBody.detail", "fixed detail-code literal"),
     ("ContextResult.status", "fixed literal"),
     (
         "ContextResult.browser_context_id",

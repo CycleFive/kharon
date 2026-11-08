@@ -17,10 +17,11 @@
 //!   `kharon_fill` isolated world being created. SPEC says the second
 //!   client sees that, so it was really subscribed during the fill.
 //! - **REQ-ORG-005.** The same page served over plain HTTP, with the
-//!   item's URI on `https`. The grant gate runs first, so the owner
-//!   approves the request. The fill is still `origin_mismatch`, audited
-//!   with `detail_code: insecure_context` and the live `http` origin,
-//!   and the page's fields stay empty.
+//!   item's URI on `https`. The claimed `http` origin is pre-refused
+//!   before a grant request exists (#180 item 3), so the first fill is
+//!   already `origin_mismatch`, audited fill-only with
+//!   `detail_code: insecure_context` and no live origin (claim-only,
+//!   no live peek), and the page's fields stay empty.
 //! - **REQ-ORG-004.** A relying party on another site
 //!   (`rp.example.org`) frames the item's login page. Site isolation
 //!   makes that frame an `iframe` target of its own, which the agent
@@ -1037,19 +1038,28 @@ async fn req_org_005_http_page_with_an_https_item_is_refused() {
         "the HTTP test page must not be a secure context"
     );
 
-    // The grant gate runs first, so with no grant the fill is pending,
-    // and the owner approves it. Even with a grant, the live check
-    // refuses the page before any value is sent.
-    let first = run.fill(&target, &origin).await;
-    assert_eq!(first.status, "pending_approval", "{first:?}");
-    run.approve_once(first.grant_request_id.as_deref().unwrap())
-        .await;
+    // #180 item 3: the claimed origin is `http` with `allow_http`
+    // off, so the fill could never succeed — it is pre-refused
+    // before a grant request exists, rather than prompting the
+    // owner first and refusing only after an approval.
     let refused = run.fill(&target, &origin).await;
     assert_eq!(refused.status, "origin_mismatch", "{refused:?}");
+    assert_eq!(
+        refused.detail.as_deref(),
+        Some("insecure_context"),
+        "{refused:?}"
+    );
+    assert!(refused.grant_request_id.is_none(), "{refused:?}");
     assert!(refused.fields_filled.is_empty(), "{refused:?}");
 
-    // Audited as REQ-ORG-005's refusal, with the live origin.
+    // Audited as REQ-ORG-005's refusal: the fill outcome only — no
+    // grant_request creation — and no live origin, because the
+    // pre-refusal judges the claim alone and never peeks at the page.
     let audit = run.audit();
+    assert!(
+        !audit.iter().any(|e| matches!(e.event, Event::GrantRequest)),
+        "a pre-refused fill must not create a grant request: {audit:?}"
+    );
     let outcome = audit
         .iter()
         .rev()
@@ -1057,7 +1067,7 @@ async fn req_org_005_http_page_with_an_https_item_is_refused() {
         .unwrap();
     assert_eq!(outcome.result.as_deref(), Some("origin_mismatch"));
     assert_eq!(outcome.detail_code.as_deref(), Some("insecure_context"));
-    assert_eq!(outcome.live_origin.as_deref(), Some(origin.as_str()));
+    assert_eq!(outcome.live_origin.as_deref(), None);
 
     assert_eq!(
         cdp.fields(&session).await,

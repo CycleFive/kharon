@@ -32,18 +32,22 @@
 //! | GET | `/owner/grants` | Live grants, or 401 |
 //! | POST | `/owner/grants/revoke` | Revoke one |
 //! | GET | `/owner/audit` | The audit tail, or 401 |
+//! | POST | `/owner/panic` | Panic: revoke all grants, then lock |
 //!
-//! The approvals routes (#131 slice 1), the grants routes (slice 2)
-//! and the audit tail (slice 4) need a live session. The audit tail
-//! is read-only and unaudited, like the grants list. Ids travel in a JSON body, never in the
-//! path. The state-changing calls are POST-only and refused unless
-//! the request carries an `Origin` header equal to the configured
-//! origin (a missing header is refused too, not only a mismatched
-//! one) and a JSON content type, so a cross-site form cannot reach
-//! them even without `SameSite`. They call the broker's own approve,
-//! deny and revoke on the `web_ui` channel ([`approvals`]), so the
+//! The approvals routes (#131 slice 1), the grants routes (slice 2),
+//! the panic route (slice 3) and the audit tail (slice 4) need a live
+//! session. The audit tail is read-only and unaudited, like the
+//! grants list. Ids travel in a JSON body, never in the path. The
+//! state-changing calls are POST-only and refused unless the request
+//! carries an `Origin` header equal to the configured origin (a
+//! missing header is refused too, not only a mismatched one) and a
+//! JSON content type, so a cross-site form cannot reach them even
+//! without `SameSite`. They call the broker's own approve, deny,
+//! revoke and panic on the `web_ui` channel ([`approvals`]), so the
 //! REQ-APR-003 expiry pass, the rollbacks and the audit entries are
-//! the CLI's.
+//! the CLI's. Panic also needs `{"confirm": true}` in the body: the
+//! shell's button arms on a first click and only the second sends
+//! it, so neither a stray click nor a bare POST can fire it.
 //!
 //! The same listener serves ntfy redeem (REQ-APR-004, REQ-DEP-006,
 //! #136): `GET`/`POST` `/owner/approve/<token>` and
@@ -114,6 +118,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/owner/grants"),
     ("POST", "/owner/grants/revoke"),
     ("GET", "/owner/audit"),
+    ("POST", "/owner/panic"),
 ];
 
 /// Longest request or grant id the owner routes accept. Broker ids
@@ -374,7 +379,8 @@ impl OwnerUi {
             | "/owner/logout"
             | "/owner/approvals/approve"
             | "/owner/approvals/deny"
-            | "/owner/grants/revoke" => Some(Method::POST),
+            | "/owner/grants/revoke"
+            | "/owner/panic" => Some(Method::POST),
             _ => None,
         };
         let Some(allowed) = allowed else {
@@ -402,6 +408,7 @@ impl OwnerUi {
             "/owner/grants" => self.grants_list(&req),
             "/owner/grants/revoke" => self.grants_revoke(&req),
             "/owner/audit" => self.audit_tail(&req),
+            "/owner/panic" => self.panic(&req),
             _ => unreachable!("path was matched above"),
         }
     }
@@ -558,6 +565,28 @@ impl OwnerUi {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         }
         match self.approvals.revoke(&body.grant_id) {
+            Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
+            Err(e) => decide_error(e),
+        }
+    }
+
+    /// Panic (REQ-REV-002), behind [`Self::gate_owner_post`] and an
+    /// explicit `{"confirm": true}` body. The broker's panic is
+    /// revoke-first: every grant goes, then the lock (zeroize and
+    /// CDP close ride the lock hook). The session is not revoked —
+    /// the shell stays signed in and shows the locked broker, like
+    /// after a CLI panic.
+    fn panic(&self, req: &Incoming) -> Response {
+        if let Some(err) = self.gate_owner_post(req) {
+            return err;
+        }
+        let Ok(body) = serde_json::from_slice::<PanicBody>(&req.body) else {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        };
+        if !body.confirm {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        }
+        match self.approvals.panic() {
             Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
             Err(e) => decide_error(e),
         }
@@ -934,6 +963,15 @@ struct DecideBody {
 #[serde(deny_unknown_fields)]
 struct RevokeBody {
     grant_id: String,
+}
+
+/// Body of a panic call. Unknown keys are refused, and `confirm`
+/// must be present and true: the confirm step is part of the wire
+/// contract, not only of the shell page.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PanicBody {
+    confirm: bool,
 }
 
 /// A request or grant id the owner routes pass to the broker:
@@ -1333,7 +1371,8 @@ fn shell_page(locked: &str, pending: usize) -> String {
 }
 
 /// The signed-in shell: broker state, the approvals queue (#131
-/// slice 1), the live grants (slice 2) and the audit tail (slice 4).
+/// slice 1), the live grants (slice 2), the panic button (slice 3,
+/// two clicks: arm, then confirm) and the audit tail (slice 4).
 /// Rows are built with `textContent` only: origins come from agents
 /// (the page the tab was on, or the origin a grant was approved for),
 /// so nothing from a row is ever parsed as markup.
@@ -1375,6 +1414,9 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <thead><tr><th>Seq</th><th>Time</th><th>Event</th><th>Agent</th><th>Origin</th><th>Result</th><th>Channel</th></tr></thead>
 <tbody id="audit-rows"></tbody>
 </table>
+<h2>Panic</h2>
+<p>Lock the broker and revoke every grant. Fills stop until the next unlock.</p>
+<button id="panic" type="button">Panic</button>
 <p id="err" class="err" role="alert"></p>
 <button id="signout" type="button">Sign out</button>
 <script>
@@ -1477,6 +1519,26 @@ window.kharonRefresh = async function () {
   document.getElementById("queue").hidden = data.pending.length === 0;
   document.getElementById("empty").hidden = data.pending.length !== 0;
 };
+const panicButton = document.getElementById("panic");
+let panicArmed = false;
+let panicTimer = null;
+function disarmPanic() {
+  panicArmed = false;
+  if (panicTimer !== null) { clearTimeout(panicTimer); panicTimer = null; }
+  panicButton.textContent = "Panic";
+}
+panicButton.addEventListener("click", async () => {
+  if (!panicArmed) {
+    panicArmed = true;
+    panicButton.textContent = "Confirm panic: lock and revoke all";
+    panicTimer = setTimeout(disarmPanic, 10000);
+    return;
+  }
+  disarmPanic();
+  if (await decide("/owner/panic", { confirm: true })) {
+    document.getElementById("locked").textContent = "locked";
+  }
+});
 document.getElementById("signout").addEventListener("click", async () => {
   await fetch("/owner/logout", { method: "POST", credentials: "same-origin" });
   location.assign("/");
@@ -1633,6 +1695,7 @@ mod tests {
     #[derive(Default)]
     struct FakeApprovals {
         calls: Mutex<Vec<String>>,
+        panic_fails: std::sync::atomic::AtomicBool,
     }
 
     impl OwnerApprovals for FakeApprovals {
@@ -1715,6 +1778,14 @@ mod tests {
             e.item_name_hash = Some("ab".repeat(32));
             e.log_id = "log-1".into();
             vec![AuditRow::from(&e)]
+        }
+
+        fn panic(&self) -> Result<(), DecideError> {
+            self.calls.lock().unwrap().push("panic".to_owned());
+            if self.panic_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(DecideError::AuditFailed);
+            }
+            Ok(())
         }
     }
 
@@ -2213,5 +2284,125 @@ mod tests {
         assert!(!body.contains("Bank of Example"), "{body}");
         assert!(!body.contains(&"ab".repeat(32)), "{body}");
         assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+    // ---- #131 slice 3: panic ----
+
+    #[test]
+    fn panic_route_is_listed() {
+        assert!(
+            ROUTES.contains(&("POST", "/owner/panic")),
+            "panic route missing from ROUTES"
+        );
+        let shell = shell_page("unlocked", 0);
+        assert!(shell.contains("/owner/panic"), "no panic button");
+        assert!(shell.contains("confirm: true"), "button sends no confirm");
+    }
+
+    #[test]
+    fn panic_needs_a_session() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(
+            Method::POST,
+            "/owner/panic",
+            false,
+            Some(ORIGIN),
+            Some("application/json"),
+            r#"{"confirm":true}"#,
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(*rig.audit.0.lock().unwrap(), ["no_session"]);
+        rig.ui.expire_sessions();
+        let (status, _) = rig.post("/owner/panic", r#"{"confirm":true}"#);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn panic_is_post_only() {
+        let rig = ApprovalsRig::new();
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            let (status, _) = rig.send(
+                method.clone(),
+                "/owner/panic",
+                true,
+                Some(ORIGIN),
+                Some("application/json"),
+                r#"{"confirm":true}"#,
+            );
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        }
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn panic_needs_our_origin() {
+        let rig = ApprovalsRig::new();
+        for origin in [
+            None,
+            Some("https://evil.example"),
+            Some("null"),
+            Some("http://localhost:9/"),
+        ] {
+            let (status, body) = rig.send(
+                Method::POST,
+                "/owner/panic",
+                true,
+                origin,
+                Some("application/json"),
+                r#"{"confirm":true}"#,
+            );
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?}: {body}");
+        }
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+        assert!(rig.audit.0.lock().unwrap().iter().all(|c| *c == "origin"));
+    }
+
+    #[test]
+    fn panic_refuses_form_posts_and_unconfirmed_bodies() {
+        let rig = ApprovalsRig::new();
+        for (ctype, body) in [
+            (Some("application/x-www-form-urlencoded"), "confirm=true"),
+            (Some("text/plain"), r#"{"confirm":true}"#),
+            (Some("multipart/form-data; boundary=x"), "--x--"),
+            (None, r#"{"confirm":true}"#),
+            (Some("application/json"), ""),
+            (Some("application/json"), "[]"),
+            (Some("application/json"), "{}"),
+            (Some("application/json"), r#"{"confirm":false}"#),
+            (Some("application/json"), r#"{"confirm":"true"}"#),
+            (Some("application/json"), r#"{"confirm":true,"extra":1}"#),
+        ] {
+            let (status, out) = rig.send(
+                Method::POST,
+                "/owner/panic",
+                true,
+                Some(ORIGIN),
+                ctype,
+                body,
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{ctype:?} {body:?}: {out}");
+        }
+        let (status, out) = rig.post("/owner/panic", r#"{"confirm":true,"password":"hunter2"}"#);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            out.contains("password_rejected") && !out.contains("hunter2"),
+            "{out}"
+        );
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn panic_reaches_the_backend_and_maps_its_refusals() {
+        let rig = ApprovalsRig::new();
+        let (status, out) = rig.post("/owner/panic", r#"{"confirm":true}"#);
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        rig.fake
+            .panic_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, out) = rig.post("/owner/panic", r#"{"confirm":true}"#);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
+        assert!(out.contains("audit_failed"), "{out}");
+        assert_eq!(rig.calls(), ["panic", "panic"]);
     }
 }

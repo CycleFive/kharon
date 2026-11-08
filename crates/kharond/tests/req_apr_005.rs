@@ -15,6 +15,12 @@
 //! approve and deny (the fill then runs), write the CLI's audit
 //! entries on the `web_ui` channel, and fail closed for a request past
 //! its 120 s timeout (REQ-APR-003, #130).
+//!
+//! The panic cases (#131 slice 3) drive the same UI's
+//! `POST /owner/panic`: session, `Origin` and a `{"confirm": true}`
+//! body gate the broker's own `panic_lock` (REQ-REV-002), which
+//! revokes every grant and locks; a failed `grant_revoke` append
+//! does not undo the revocations (revoke-first, #135).
 
 mod api_support;
 
@@ -1327,6 +1333,47 @@ impl ApprovalsRig {
             other => panic!("expected a status, got {other:?}"),
         }
     }
+
+    /// The agent's own `kharon_status`, whole body.
+    fn status(&self) -> Json {
+        let agent = self.broker.authenticate(&self.alpha).unwrap();
+        match self.broker.dispatch(&agent, Request::Status).unwrap() {
+            Outcome::Status(s) => serde_json::to_value(s).unwrap(),
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+
+    /// Whether the broker's lock controller reports locked.
+    fn locked(&self) -> bool {
+        self.broker.lock_controller().lock().unwrap().is_locked()
+    }
+
+    /// The `panic` audit entries (the lock sink's, when wired).
+    fn panics(&self) -> Vec<kharond::audit::Entry> {
+        self.audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.event == kharond::audit::Event::Panic)
+            .cloned()
+            .collect()
+    }
+
+    /// `grant_revoke` entries written by a panic (`detail_code`).
+    fn panic_revokes(&self) -> Vec<kharond::audit::Entry> {
+        self.audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.event == kharond::audit::Event::GrantRevoke
+                    && e.detail_code.as_deref() == Some("panic")
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 /// An entry with the per-request fields blanked, so a web entry and a
@@ -1894,6 +1941,210 @@ async fn req_apr_005_chromium_revoke_click() {
         assert!(
             Instant::now() < deadline,
             "the audit tail never showed the revoke: {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(cdp);
+    drop(chromium);
+}
+
+// ---- #131 slice 3: panic ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_panic_locks_and_revokes_everything() {
+    let rig = ApprovalsRig::new().await;
+    // Same wiring as the daemon: the lock sink owns the single
+    // `panic` entry (REQ-AUD-003).
+    rig.broker.wire_lock_audit();
+    let grant = rig.per_origin_grant().await;
+    assert_eq!(rig.fill().await["status"], "filled");
+
+    // No session: refused, and nothing changes.
+    let anon = http(
+        rig.ui,
+        &rig.origin,
+        Http::post(
+            "/owner/panic",
+            Some("application/json"),
+            &json!({"confirm": true}).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(anon.status, 401, "{}", anon.body);
+    // A cross-site POST with the session cookie: refused too.
+    let forged = http(
+        rig.ui,
+        "https://evil.example",
+        Http::post(
+            "/owner/panic",
+            Some("application/json"),
+            &json!({"confirm": true}).to_string(),
+        )
+        .cookie(&rig.cookie),
+    )
+    .await;
+    assert_eq!(forged.status, 403, "{}", forged.body);
+    // A form post, and a POST without the confirm step: refused.
+    let form = http(
+        rig.ui,
+        &rig.origin,
+        Http::post(
+            "/owner/panic",
+            Some("application/x-www-form-urlencoded"),
+            "confirm=true",
+        )
+        .cookie(&rig.cookie),
+    )
+    .await;
+    assert_eq!(form.status, 400, "{}", form.body);
+    let unconfirmed = rig.decide("/owner/panic", &json!({"confirm": false})).await;
+    assert_eq!(unconfirmed.status, 400, "{}", unconfirmed.body);
+    assert!(!rig.locked());
+    assert_eq!(rig.fill().await["status"], "filled");
+
+    // The confirmed panic: every grant revoked, then locked.
+    let panicked = rig.decide("/owner/panic", &json!({"confirm": true})).await;
+    assert_eq!(panicked.status, 200, "{}", panicked.body);
+    assert!(rig.locked());
+    let status = rig.status();
+    assert_eq!(status["locked"], json!(true), "{status}");
+    assert_eq!(status["grants"], json!([]), "{status}");
+    assert_eq!(rig.grants().await.json()["grants"], json!([]));
+
+    // Exactly one `panic` entry, and the grant's revoke is the
+    // panic's own (`detail_code: panic`), as the CLI path writes it.
+    let panics = rig.panics();
+    assert_eq!(panics.len(), 1, "{panics:?}");
+    let revokes = rig.panic_revokes();
+    assert_eq!(revokes.len(), 1, "{revokes:?}");
+    assert_eq!(revokes[0].grant_id.as_deref(), Some(grant.as_str()));
+    assert_eq!(revokes[0].result.as_deref(), Some("revoked"));
+
+    // A fill now fails closed as `locked` (REQ-REV-002).
+    let req = parse_fill(
+        kharond::api::FillOperation::Fill,
+        json!({
+            "item_id": ITEM_A,
+            "target": {"cdp_target_id": "tab-1", "expected_origin": "https://login.example.com"},
+            "fields": [{"kind": "password"}],
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let agent = rig.broker.authenticate(&rig.alpha).unwrap();
+    let err = rig
+        .broker
+        .fill(&agent, req, tokio::time::Instant::now())
+        .await
+        .unwrap_err();
+    assert_eq!(err, kharond::api::ApiError::LOCKED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_panic_keeps_grants_revoked_when_the_audit_append_fails() {
+    let rig = ApprovalsRig::new().await;
+    let _grant = rig.per_origin_grant().await;
+    // Revoke-first (#135): a restriction's audit failure must never
+    // undo it. The panic proceeds, the grants stay gone, the broker
+    // locks, and the call still succeeds.
+    *rig.audit.fail_event.lock().unwrap() = Some("grant_revoke");
+    let panicked = rig.decide("/owner/panic", &json!({"confirm": true})).await;
+    assert_eq!(panicked.status, 200, "{}", panicked.body);
+    *rig.audit.fail_event.lock().unwrap() = None;
+    assert!(rig.locked());
+    assert_eq!(rig.status()["grants"], json!([]));
+    assert_eq!(rig.grants().await.json()["grants"], json!([]));
+}
+
+/// The shell page's Panic button, in a real browser: the first
+/// click only arms it, the second panics the broker.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_chromium_panic_click() {
+    let Some(bin) = chromium_bin() else {
+        if std::env::var_os("KHARON_REQUIRE_WEBAUTHN").is_some() {
+            panic!("KHARON_REQUIRE_WEBAUTHN is set but no Chromium binary was found");
+        }
+        eprintln!("SKIP req_apr_005_chromium_panic_click: no Chromium binary");
+        return;
+    };
+    let rig = ApprovalsRig::new().await;
+    let _grant = rig.per_origin_grant().await;
+    let token = rig.owner.mint_enroll_token();
+
+    let chromium = launch_chromium(&bin);
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (session, _authenticator) =
+        browser_register_and_sign_in(&mut cdp, &rig.origin, &token).await;
+    let _ = cdp
+        .eval_navigating(&session, &format!("location.assign({:?})", rig.origin))
+        .await;
+    // Wait for the shell (the grants list shows the grant).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let n = cdp
+            .eval_navigating(
+                &session,
+                "document.getElementById('grant-rows').children.length",
+            )
+            .await
+            .unwrap_or(Json::Null);
+        if n == json!(1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the grants list never showed the grant"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // First click arms the button and nothing else happens.
+    assert_eq!(
+        cdp.eval(&session, "document.getElementById('panic').click(); true")
+            .await,
+        json!(true)
+    );
+    let label = cdp
+        .eval(&session, "document.getElementById('panic').textContent")
+        .await;
+    assert!(
+        label.as_str().unwrap_or("").contains("Confirm panic"),
+        "{label}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.locked(), "the arming click panicked the broker");
+
+    // Second click fires the panic.
+    assert_eq!(
+        cdp.eval(&session, "document.getElementById('panic').click(); true")
+            .await,
+        json!(true)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rig.locked() {
+        assert!(Instant::now() < deadline, "the click never panicked");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(rig.status()["grants"], json!([]));
+
+    // The page refreshed its grants list and shows the locked broker.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = cdp
+            .eval(
+                &session,
+                "JSON.stringify([document.getElementById('grant-rows').children.length, \
+                 document.getElementById('locked').textContent])",
+            )
+            .await;
+        let state: Json = serde_json::from_str(state.as_str().unwrap_or("[]")).unwrap();
+        if state == json!([0, "locked"]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the page never showed the panic: {state}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

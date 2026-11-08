@@ -1,6 +1,8 @@
 //! The owner web UI's approvals queue (#131 slice 1), grants list
-//! (#131 slice 2; SPEC §5's web UI channel, REQ-APR-005, REQ-REV-001)
-//! and audit tail (#131 slice 4; SPEC §5 "audit tail", §7).
+//! (#131 slice 2), panic button (#131 slice 3) and audit tail
+//! (#131 slice 4; SPEC §5's web UI channel, REQ-APR-005,
+//! REQ-REV-001, REQ-REV-002; the audit tail is SPEC §5 "audit
+//! tail", §7).
 //!
 //! The UI decides requests through the same broker calls the CLI
 //! uses: [`Broker::approve_grant_request`] and
@@ -8,10 +10,11 @@
 //! REQ-APR-003 expiry pass first (#130), so a request past its 120 s
 //! timeout is denied as a timeout and the owner's decision fails
 //! closed as [`DecideError::NotPending`]. A revoke is the owner
-//! socket's [`Broker::revoke_grant`], on the same channel. The UI adds
-//! no grant logic of its own. The audit tail is read-only: the last
-//! [`AUDIT_TAIL_LEN`] durable entries from the log's in-memory tail,
-//! projected to [`AuditRow`].
+//! socket's [`Broker::revoke_grant`], on the same channel. A panic is
+//! [`Broker::panic_lock`], the `kharon panic` primitive itself. The UI
+//! adds no grant logic of its own. The audit tail is read-only: the
+//! last [`AUDIT_TAIL_LEN`] durable entries from the log's in-memory
+//! tail, projected to [`AuditRow`].
 
 use crate::api::Broker;
 use crate::api::VaultView;
@@ -191,6 +194,15 @@ pub trait OwnerApprovals: Send + Sync + 'static {
     fn audit_tail(&self) -> Vec<AuditRow> {
         Vec::new()
     }
+
+    /// Panic (REQ-REV-002): revoke every grant, then lock. The one
+    /// `panic` audit entry is the lock's, written by the lock sink —
+    /// the broker appends no second one (REQ-AUD-003). Default:
+    /// refused, so a backend without the slice cannot silently
+    /// report a panic that never happened.
+    fn panic(&self) -> Result<(), DecideError> {
+        Err(DecideError::AuditFailed)
+    }
 }
 
 /// No approvals backend: an empty queue, and every decision is
@@ -277,5 +289,14 @@ where
             .iter()
             .map(AuditRow::from)
             .collect()
+    }
+
+    fn panic(&self) -> Result<(), DecideError> {
+        // The same primitive the owner socket's `panic` op and the
+        // ntfy action reach. Its per-grant `grant_revoke` entries
+        // are revoke-first (#135): a failed append never restores a
+        // grant, and the lock proceeds — the closed state is the
+        // safe one.
+        self.panic_lock().map_err(DecideError::from)
     }
 }

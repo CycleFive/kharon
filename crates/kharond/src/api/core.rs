@@ -1406,6 +1406,21 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// reported; if the append fails the approval is rolled back —
     /// the request is pending again and no grant exists
     /// (REQ-AUD-003 fail-closed, as for unlock).
+    ///
+    /// #193: the grant must not be *usable* before that entry is
+    /// durable, not merely unreported. The grant-store lock is
+    /// therefore held across the append: every consuming path
+    /// (fill admission in `resolve_fill`, the REQ-RL-004 backing
+    /// check in `fill_backing`, status) takes the same lock, so a
+    /// concurrent fill cannot match or consume the grant while the
+    /// append is in flight — it waits, and then sees the grant
+    /// only if the append succeeded (on failure the rollback also
+    /// runs under the lock, so it never sees a grant at all). The
+    /// append itself only takes the audit lock, so holding the
+    /// store across it cannot deadlock. The REQ-REV-004 revision
+    /// is read *before* the store lock is taken, because the fill
+    /// paths take the lock controller before the grant store —
+    /// taking them in the opposite order here would invert that.
     pub fn approve_grant_request(
         &self,
         request_id: &str,
@@ -1418,32 +1433,28 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // approval fails closed with it.
         self.expire_grant_requests()?;
         let now = self.grant_now();
-        let grant = self
-            .grants
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .approve(request_id, terms, channel, now)?;
-        // REQ-REV-004: pin the item revision at issuance.
-        if let GrantScope::Item(ref item_id) = grant.scope {
-            let rev = {
+        // REQ-REV-004: pin the item revision at issuance. Read it
+        // before the grant store is locked (see above); the terms'
+        // item scope is the grant's scope once issued, and an
+        // item-scoped grant for a different item than the request's
+        // is refused by the store, so this is the revision the
+        // issued grant would have pinned.
+        let pinned_revision = match &terms.scope {
+            GrantScope::Item(item_id) => {
                 let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
                 lock.require_unlocked()
                     .ok()
                     .and_then(|s| s.vault().get(item_id).ok())
                     .and_then(|i| i.revision().map(str::to_owned))
-            };
-            self.grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pin_revision(&grant.id, rev);
+            }
+            GrantScope::Collection(_) => None,
+        };
+        let mut store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+        let grant = store.approve(request_id, terms, channel, now)?;
+        if let GrantScope::Item(_) = grant.scope {
+            store.pin_revision(&grant.id, pinned_revision);
         }
-        let grant = self
-            .grants
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .grant(&grant.id)
-            .cloned()
-            .unwrap_or(grant);
+        let grant = store.grant(&grant.id).cloned().unwrap_or(grant);
         let entry = Entry::new(Event::GrantIssue)
             .agent_id(grant.agent_id.clone())
             .grant_id(grant.id.clone())
@@ -1454,11 +1465,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             Some(id) => entry.item_id(id),
             None => entry,
         };
+        // Still holding the store lock (see the doc comment): the
+        // grant becomes visible to consumers only when this guard
+        // drops, which is after the entry is durable — or, on
+        // failure, after the rollback has removed it again.
         if self.append(entry).is_err() {
-            self.grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .rollback_approval(request_id, &grant.id);
+            store.rollback_approval(request_id, &grant.id);
             return Err(GrantError::AuditFailed);
         }
         Ok(grant.view(now))

@@ -11,9 +11,9 @@
 //! one-time WebAuthn enrollment code (REQ-APR-005); it is not a
 //! password and does not sign in. The unlock password is read
 //! from the terminal with echo disabled — never from argv, env,
-//! or a file (REQ-EXP-003); when stdin is not a terminal it is
-//! read from stdin instead (one line), which is what automation
-//! and tests use. `kharon init` generates the kharon account's
+//! or a file (REQ-EXP-003). A non-terminal stdin is refused, not
+//! read (SPEC §8 "CLI (tty, no echo)"): a piped password would sit
+//! in a script or another process's pipe buffer. `kharon init` generates the kharon account's
 //! master password and prints it once to the terminal
 //! (REQ-DEP-007). `kharon token mint` mints an agent token the
 //! same way (once, on the terminal only) and prints the Argon2id
@@ -255,18 +255,23 @@ fn owner_request(
 /// plus framing still fits comfortably.
 const MAX_PASSWORD_BYTES: usize = 1024;
 
-/// Read the unlock password: from the terminal with echo off when
-/// stdin is a terminal, else one line from stdin.
+/// Read the unlock password from the terminal with echo off (SPEC
+/// §8: "CLI (tty, no echo)"). A password piped or redirected into
+/// stdin is refused before anything is read: it would sit in shell
+/// history, a script, or another process's pipe buffer, and the
+/// owner's terminal is the only CLI channel the spec allows.
 fn read_password() -> Result<Zeroizing<String>, String> {
     use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
-        read_password_tty()
-    } else {
-        use std::os::fd::AsFd;
-        let stdin = std::io::stdin();
-        read_password_line(&mut FdReader(stdin.as_fd()), "stdin")
+    if !std::io::stdin().is_terminal() {
+        return Err(STDIN_NOT_A_TERMINAL.to_owned());
     }
+    read_password_tty()
 }
+
+/// The refusal for a non-terminal stdin. Fixed text: nothing from
+/// the input is echoed back.
+const STDIN_NOT_A_TERMINAL: &str = "unlock needs a terminal: the master password is read \
+     from the tty with echo off, never from a pipe or a file";
 
 /// Unbuffered [`Read`] over a borrowed fd: each `read` is exactly
 /// one `rustix::io::read`, with no intermediate buffer of its own

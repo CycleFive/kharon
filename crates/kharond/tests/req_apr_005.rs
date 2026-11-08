@@ -1597,17 +1597,24 @@ async fn req_apr_005_chromium_approve_click() {
         sel = serde_json::to_string(&row).unwrap()
     );
     assert_eq!(cdp.eval(&session, &click).await, json!(true));
+    // Wait for the `issued` entry, not the request state: the broker
+    // marks the request approved before it appends that entry (and
+    // rolls the approval back if the append fails), so the state can
+    // flip while the append is still waiting on the audit lock.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while rig.state(&approve) == RequestState::Pending {
+    let issued = loop {
+        let issued: Vec<_> = rig
+            .entries_for(&approve)
+            .into_iter()
+            .filter(|e| e.result.as_deref() == Some("issued"))
+            .collect();
+        if !issued.is_empty() {
+            break issued;
+        }
         assert!(Instant::now() < deadline, "the click never approved");
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    };
     assert_eq!(rig.state(&approve), RequestState::Approved);
-    let issued: Vec<_> = rig
-        .entries_for(&approve)
-        .into_iter()
-        .filter(|e| e.result.as_deref() == Some("issued"))
-        .collect();
     assert_eq!(issued.len(), 1, "{issued:?}");
     assert_eq!(issued[0].channel.as_deref(), Some("web_ui"));
     assert_eq!(rig.fill().await["status"], "filled");
@@ -1865,22 +1872,28 @@ async fn req_apr_005_chromium_revoke_click() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // ... and its audit tail (#131 slice 4): the revoke is the newest
-    // row, on the web channel.
-    let probe = "JSON.stringify((() => { const r = document.querySelector('#audit-rows tr'); \
-                 return r ? Array.from(r.cells, c => c.textContent) : null; })())";
+    // ... and its audit tail (#131 slice 4) shows the revoke on the
+    // web channel. Not necessarily as the newest row: the fill above
+    // appends after it, and the page may have refreshed in between.
+    let probe = "JSON.stringify(Array.from(document.querySelectorAll('#audit-rows tr'), \
+                 r => Array.from(r.cells, c => c.textContent)))";
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let got = cdp.eval(&session, probe).await;
-        let cells: Json = serde_json::from_str(got.as_str().unwrap_or("null")).unwrap();
-        if cells[2] == "grant_revoke" {
+        let rows: Json = serde_json::from_str(got.as_str().unwrap_or("[]")).unwrap();
+        let revoke = rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|cells| cells[2] == "grant_revoke");
+        if let Some(cells) = revoke {
             assert_eq!(cells[3], "alpha", "{cells}");
             assert_eq!(cells[6], "web_ui", "{cells}");
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the audit tail never showed the revoke: {cells}"
+            "the audit tail never showed the revoke: {rows}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

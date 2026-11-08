@@ -1071,6 +1071,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     );
                 }
             }
+            // An insecure-context refusal (#180 item 3) never counted
+            // toward the streak, and it must not reset one either: a
+            // grantless `http` claim is free to send, so resetting
+            // here would let an agent evade REQ-RL-002 between
+            // mismatch probes. Leave the streak untouched.
+            FillStatus::Engine(FillOutcome::NonSecureContext) => {}
             _ => {
                 self.rates
                     .lock()

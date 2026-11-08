@@ -387,6 +387,61 @@ async fn req_rl_002_fifth_consecutive_origin_mismatch_suspends_agent() {
 }
 
 #[tokio::test]
+async fn req_rl_002_non_secure_context_neither_counts_nor_resets_the_streak() {
+    // #180 item 3 review (Nyx on #188): the scheme pre-refusal
+    // returns NonSecureContext, which never counted toward the
+    // REQ-RL-002 streak — but it must not reset one either. A
+    // grantless `http` claim costs nothing to send, so a reset
+    // would be a free evasion between mismatch probes.
+    let rig = Rig::with_policy(
+        "https://other.example.com/",
+        RatePolicy {
+            item_fills_per_window: 100,
+            fills_per_minute: 100,
+            ..RatePolicy::default()
+        },
+    );
+    // Build a streak of four mismatches (suspension is at five).
+    for i in 0..4 {
+        let r = rig
+            .fill_password(ITEM_A, "https://login.example.com")
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "origin_mismatch", "mismatch {i}: {r}");
+    }
+    // A grantless http claim is pre-refused as insecure_context.
+    let r = rig
+        .fill_password(ITEM_A, "http://anything.example")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "origin_mismatch", "{r}");
+    assert_eq!(r["detail"], "insecure_context", "{r}");
+    assert!(
+        !rig.broker
+            .rate_limiter()
+            .lock()
+            .unwrap()
+            .is_suspended("alpha"),
+        "the insecure-context refusal itself must not suspend"
+    );
+    // The next mismatch is the fifth consecutive one: the streak
+    // survived the pre-refusal, so the agent suspends.
+    let r = rig
+        .fill_password(ITEM_A, "https://login.example.com")
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "origin_mismatch", "{r}");
+    assert!(
+        rig.broker
+            .rate_limiter()
+            .lock()
+            .unwrap()
+            .is_suspended("alpha"),
+        "the pre-refusal must not have reset the streak"
+    );
+}
+
+#[tokio::test]
 async fn req_rl_003_fourth_pending_grant_is_rate_limited_without_notification() {
     let rig = Rig::with_policy(
         "https://login.example.com/",

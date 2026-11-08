@@ -40,7 +40,7 @@ use api_support::{
 };
 use kharond::api::grant::{Channel, GrantAction, GrantError, GrantTerms, RequestState};
 use kharond::api::token::{TokenStore, generate_with};
-use kharond::api::{Broker, Outcome, VaultView, parse_fill, parse_grant};
+use kharond::api::{Broker, GrantRequestArgs, Outcome, VaultView, parse_fill, parse_grant};
 use kharond::audit::Entry;
 use kharond::lock::{Clock, LockController, LockPolicy, LockReason, ManualClock, StaticHardening};
 use kharond::origin::OriginConfig;
@@ -523,6 +523,57 @@ async fn req_apr_007_request_grant_http_claim_creates_no_request() {
         panic!("expected a grant request outcome, got {out:?}");
     };
     assert_eq!(body.state, "origin_mismatch");
+    // The body carries the SPEC row's detail, as the fill path does.
+    assert_eq!(body.detail, Some("insecure_context"));
+    assert!(body.grant_request_id.is_none());
+    assert!(
+        rig.broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .pending_requests()
+            .is_empty()
+    );
+    // Audit (REQ-AUD-003): exactly one entry — the refusal itself.
+    // A request creation would be audited with the new request's id
+    // and a `pending` result; there is neither.
+    let entries = rig.audit_entries();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        serde_json::to_value(&entries[0].event)
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        "grant_request"
+    );
+    assert_eq!(entries[0].result.as_deref(), Some("origin_mismatch"));
+    assert!(entries[0].request_id.is_none());
+}
+
+#[tokio::test]
+async fn req_apr_007_request_grant_non_http_scheme_claim_creates_no_request() {
+    // #180 item 3, the pre-refusal's catch-all arm: a claim whose
+    // scheme is neither `http` nor `https` is pre-refused the same
+    // way. The wire parser rejects such claims before they reach
+    // the broker, so the args are built directly — the refusal
+    // holds in depth.
+    let rig = Rig::new("https://login.example.com/signin");
+    let args = GrantRequestArgs {
+        item_id: ITEM_A.to_owned(),
+        target_id: "tab-1".to_owned(),
+        expected_origin: "ftp://login.example.com".to_owned(),
+        action: GrantAction::Fill,
+    };
+    let out = rig
+        .broker
+        .request_grant(&rig.agent(), args, Instant::now())
+        .await
+        .unwrap();
+    let Outcome::GrantRequest(body) = out else {
+        panic!("expected a grant request outcome, got {out:?}");
+    };
+    assert_eq!(body.state, "origin_mismatch");
+    assert_eq!(body.detail, Some("insecure_context"));
     assert!(body.grant_request_id.is_none());
     assert!(
         rig.broker

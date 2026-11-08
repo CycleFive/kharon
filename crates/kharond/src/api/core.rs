@@ -1275,9 +1275,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // the scheme rule creates no request and prompts no one.
         if self.claim_pre_refused(&args.expected_origin) {
             self.append(base("origin_mismatch"))?;
-            return Ok(Outcome::GrantRequest(GrantRequestBody::refused(
-                "origin_mismatch",
-            )));
+            return Ok(Outcome::GrantRequest(
+                GrantRequestBody::refused_with_detail("origin_mismatch", "insecure_context"),
+            ));
         }
         let observed = match &self.fill_backend {
             Some(b) => {

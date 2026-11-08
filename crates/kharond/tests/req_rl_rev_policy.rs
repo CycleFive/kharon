@@ -460,7 +460,7 @@ async fn req_rev_001_revoke_grant_denies_next_fill() {
         )
         .unwrap()
         .id;
-    assert!(rig.broker.revoke_grant(&gid).unwrap());
+    assert!(rig.broker.revoke_grant(&gid, Channel::Cli).unwrap());
     let r = rig
         .fill_password(ITEM_A, "https://login.example.com")
         .await

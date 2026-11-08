@@ -544,6 +544,19 @@ impl GrantStore {
             .collect()
     }
 
+    /// Every live grant at `now`, across agents, oldest first (the
+    /// owner web UI's grants list, #131 slice 2).
+    pub fn live_grants(&self, now: Duration) -> Vec<Grant> {
+        let mut live: Vec<Grant> = self
+            .grants
+            .iter()
+            .filter(|g| g.is_live(now))
+            .cloned()
+            .collect();
+        live.sort_by_key(|g| g.created_at);
+        live
+    }
+
     /// Spend one use of `grant_id`. Refuses (returns `false`) a
     /// grant that is no longer live — the caller re-checks under the
     /// same lock, so a use is never spent twice for one admission.

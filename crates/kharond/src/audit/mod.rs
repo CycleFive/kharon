@@ -51,4 +51,4 @@ pub use log::{
     OpenError,
 };
 pub use requests::{UnresolvedRequest, unresolved_grant_requests};
-pub use verify::{VerifyError, VerifyOutcome, verify};
+pub use verify::{TAIL_KEEP, VerifyError, VerifyOutcome, verify};

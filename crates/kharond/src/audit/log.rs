@@ -2,6 +2,7 @@
 
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -12,7 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use super::checkpoint::{Checkpoint, CheckpointSink};
 use super::entry::{Entry, Event, GENESIS_PREV_HASH};
 use super::keys::{AuditKeys, KeysError};
-use super::verify::{self, VerifyError};
+use super::verify::{self, TAIL_KEEP, VerifyError};
 
 /// Default: checkpoint after this many entries (spec §7, N=100).
 pub const DEFAULT_CHECKPOINT_EVERY: u64 = 100;
@@ -96,6 +97,11 @@ pub struct AuditLog {
     since_checkpoint: u64,
     last_checkpoint_at: OffsetDateTime,
     poisoned: bool,
+    /// The last [`TAIL_KEEP`] durable entries, oldest first, as written
+    /// (item names already hashed unless plaintext mode is on). Seeded
+    /// from the verified chain at open; the owner web UI's audit tail
+    /// reads it (#131 slice 4) so a view never re-reads the file.
+    recent: VecDeque<Entry>,
 }
 
 impl std::fmt::Debug for AuditLog {
@@ -148,7 +154,7 @@ impl AuditLog {
             torn_tail = true;
         }
 
-        let chain = verify::read_chain(&path).map_err(|e| match e {
+        let mut chain = verify::read_chain(&path).map_err(|e| match e {
             VerifyError::Io(e) => OpenError::Io(e),
             VerifyError::Json(line, msg) => OpenError::Json(line, msg),
             VerifyError::BadHash(seq)
@@ -162,6 +168,7 @@ impl AuditLog {
         let head_hash = chain
             .head_hash()
             .unwrap_or_else(|| GENESIS_PREV_HASH.to_string());
+        let recent = chain.take_tail();
         let mut log = Self {
             writer: Box::new(file),
             keys,
@@ -172,6 +179,7 @@ impl AuditLog {
             since_checkpoint: 0,
             last_checkpoint_at: OffsetDateTime::now_utc(),
             poisoned: false,
+            recent,
         };
         if let Some(recovered_seq) = torn_recovered {
             log.append(Entry::new(Event::LogTruncated).recovered_seq(recovered_seq))?;
@@ -228,6 +236,10 @@ impl AuditLog {
 
         self.head_seq += 1;
         self.head_hash = hash;
+        if self.recent.len() == TAIL_KEEP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(entry);
         self.since_checkpoint += 1;
         if self.since_checkpoint >= self.config.checkpoint_every
             || now - self.last_checkpoint_at >= self.config.checkpoint_period
@@ -289,6 +301,13 @@ impl AuditLog {
         &self.keys
     }
 
+    /// The last `n` durable entries (at most [`TAIL_KEEP`]), newest
+    /// first. Only entries whose append returned `Ok` are here: a failed
+    /// or poisoned append never shows (REQ-AUD-003).
+    pub fn tail(&self, n: usize) -> Vec<Entry> {
+        self.recent.iter().rev().take(n).cloned().collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn open_for_test(
         writer: impl AuditWriter + 'static,
@@ -306,6 +325,7 @@ impl AuditLog {
             since_checkpoint: 0,
             last_checkpoint_at: OffsetDateTime::now_utc(),
             poisoned: false,
+            recent: VecDeque::new(),
         }
     }
 }
@@ -893,5 +913,70 @@ mod tests {
             cps.iter()
                 .all(|cp| cp.verify_signature(&log.keys().verifying_key()))
         );
+    }
+
+    // ---- #131 slice 4: the in-memory tail ----
+
+    #[test]
+    fn tail_follows_appends_newest_first_and_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = open_retrying(dir.path(), AuditConfig::default(), || {
+            Box::new(NullCheckpointSink)
+        })
+        .unwrap();
+        assert!(log.tail(10).is_empty());
+        for i in 0..(TAIL_KEEP + 5) {
+            log.append(Entry::new(Event::List).agent_id(format!("a{i}")))
+                .unwrap();
+        }
+        let all = log.tail(usize::MAX);
+        assert_eq!(all.len(), TAIL_KEEP);
+        assert_eq!(all[0].seq, (TAIL_KEEP + 5) as u64);
+        assert_eq!(all[TAIL_KEEP - 1].seq, 6);
+        let three: Vec<u64> = log.tail(3).iter().map(|e| e.seq).collect();
+        let head = (TAIL_KEEP + 5) as u64;
+        assert_eq!(three, [head, head - 1, head - 2]);
+    }
+
+    #[test]
+    fn tail_is_seeded_from_the_chain_at_open_with_names_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut log = open_retrying(dir.path(), AuditConfig::default(), || {
+                Box::new(NullCheckpointSink)
+            })
+            .unwrap();
+            log.append(Entry::new(Event::Unlock)).unwrap();
+            log.append(
+                Entry::new(Event::Fill)
+                    .item_id("item-1")
+                    .item_name("Bank of Example"),
+            )
+            .unwrap();
+        }
+        let log = open_retrying(dir.path(), AuditConfig::default(), || {
+            Box::new(NullCheckpointSink)
+        })
+        .unwrap();
+        let tail = log.tail(10);
+        assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(tail[0].event, Event::Fill);
+        assert!(tail[0].item_name.is_none(), "the name is hashed on disk");
+        assert!(tail[0].item_name_hash.is_some());
+    }
+
+    #[test]
+    fn a_failed_append_never_reaches_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = AuditKeys::load_or_generate(&dir.path().join("keys")).unwrap();
+        let mut log = AuditLog::open_for_test(
+            SyncFails,
+            keys,
+            AuditConfig::default(),
+            Box::new(NullCheckpointSink),
+        );
+        assert!(log.append(Entry::new(Event::Unlock)).is_err());
+        assert!(log.append(Entry::new(Event::Lock)).is_err());
+        assert!(log.tail(10).is_empty());
     }
 }

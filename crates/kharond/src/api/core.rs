@@ -162,6 +162,12 @@ pub trait AuditSink: Send {
     fn checkpoint_now(&mut self) -> bool {
         false
     }
+    /// The last `n` durable entries, newest first (#131 slice 4).
+    /// Default: none (test sinks keep no history).
+    fn tail(&self, n: usize) -> Vec<Entry> {
+        let _ = n;
+        Vec::new()
+    }
 }
 
 impl AuditSink for AuditLog {
@@ -173,6 +179,9 @@ impl AuditSink for AuditLog {
     }
     fn checkpoint_now(&mut self) -> bool {
         AuditLog::checkpoint_now(self)
+    }
+    fn tail(&self, n: usize) -> Vec<Entry> {
+        AuditLog::tail(self, n)
     }
 }
 
@@ -690,6 +699,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// audited path (REQ-AUD-003).
     pub fn append_audit(&self, entry: Entry) -> Result<(), ApiError> {
         self.append(entry)
+    }
+
+    /// The last `n` audit entries, newest first, for the owner web
+    /// UI's audit tail (#131 slice 4). Waits behind an in-flight
+    /// append (the sink's lock), so call it on a blocking thread.
+    pub fn recent_audit(&self, n: usize) -> Vec<Entry> {
+        self.audit.lock().unwrap_or_else(|p| p.into_inner()).tail(n)
     }
 
     /// REQ-AUD-002 timer leg (#127): ask the audit log to anchor its

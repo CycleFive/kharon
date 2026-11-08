@@ -1123,10 +1123,25 @@ struct ApprovalsRig {
     origin: String,
     cookie: String,
     _data: tempfile::TempDir,
+    /// The real audit log's directory, when the rig runs on one.
+    _log: Option<tempfile::TempDir>,
 }
 
 impl ApprovalsRig {
     async fn new() -> Self {
+        Self::build(false).await
+    }
+
+    /// The same rig over a real hash-chained [`AuditLog`] in a temp
+    /// directory instead of [`RecordingAudit`] (#131 slice 4: the
+    /// audit tail reads the log's own in-memory tail).
+    ///
+    /// [`AuditLog`]: kharond::audit::AuditLog
+    async fn with_audit_log() -> Self {
+        Self::build(true).await
+    }
+
+    async fn build(real_log: bool) -> Self {
         let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
         let tokens = TokenStore::with_floor([("alpha", ha.as_str())], &CHEAP_FLOOR).unwrap();
         let clock = Arc::new(ManualClock::new());
@@ -1139,15 +1154,22 @@ impl ApprovalsRig {
         let audit = RecordingAudit::default();
         let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://login.example.com/");
         let grant_clock: Arc<dyn Clock> = clock.clone();
+        let log_dir = real_log.then(|| tempfile::tempdir().unwrap());
+        let sink: Box<dyn kharond::api::AuditSink> = match &log_dir {
+            Some(dir) => Box::new(
+                kharond::audit::AuditLog::open(
+                    dir.path(),
+                    kharond::audit::AuditConfig::default(),
+                    Box::new(kharond::audit::NullCheckpointSink),
+                )
+                .unwrap(),
+            ),
+            None => Box::new(audit.clone()),
+        };
         let broker = Arc::new(
-            Broker::new(
-                tokens,
-                lock,
-                Box::new(audit.clone()),
-                OriginConfig::default(),
-            )
-            .with_grant_clock(grant_clock)
-            .with_fill_backend(Box::new(fake)),
+            Broker::new(tokens, lock, sink, OriginConfig::default())
+                .with_grant_clock(grant_clock)
+                .with_fill_backend(Box::new(fake)),
         );
 
         let data = tempfile::tempdir().unwrap();
@@ -1180,6 +1202,7 @@ impl ApprovalsRig {
             origin,
             cookie,
             _data: data,
+            _log: log_dir,
         }
     }
 
@@ -1268,6 +1291,15 @@ impl ApprovalsRig {
             self.ui,
             &self.origin,
             Http::get("/owner/grants").cookie(&self.cookie),
+        )
+        .await
+    }
+
+    async fn audit(&self) -> RawResponse {
+        http(
+            self.ui,
+            &self.origin,
+            Http::get("/owner/audit").cookie(&self.cookie),
         )
         .await
     }
@@ -1697,6 +1729,60 @@ async fn req_apr_005_web_revoke_keeps_the_grant_when_the_audit_append_fails() {
     assert_eq!(rig.fill().await["status"], "filled");
 }
 
+// ---- #131 slice 4: the audit tail ----
+
+/// The audit tail over the real hash-chained log: it needs the passkey
+/// session, it is GET-only, and it shows the web revoke the owner just
+/// made, newest first, with the chain's own seq numbers. Item names
+/// and chain hashes stay out of the page.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_audit_tail_reads_the_real_log() {
+    let rig = ApprovalsRig::with_audit_log().await;
+    let anon = http(rig.ui, &rig.origin, Http::get("/owner/audit")).await;
+    assert_eq!(anon.status, 401, "{}", anon.body);
+    let post = rig.decide("/owner/audit", &json!({})).await;
+    assert_eq!(post.status, 405, "{}", post.body);
+
+    let grant = rig.per_origin_grant().await;
+    let revoked = rig
+        .decide("/owner/grants/revoke", &json!({"grant_id": grant}))
+        .await;
+    assert_eq!(revoked.status, 200, "{}", revoked.body);
+
+    let tail = rig.audit().await;
+    assert_eq!(tail.status, 200, "{}", tail.body);
+    let v = tail.json();
+    assert_eq!(v["ok"], true);
+    let entries = v["entries"].as_array().unwrap();
+    let events: Vec<&str> = entries
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        events,
+        ["grant_revoke", "grant_issue", "fill", "grant_request"],
+        "{entries:?}"
+    );
+    let seqs: Vec<u64> = entries.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, [4, 3, 2, 1]);
+    let newest = &entries[0];
+    assert_eq!(newest["grant_id"], json!(grant));
+    assert_eq!(newest["channel"], "web_ui");
+    assert_eq!(newest["result"], "revoked");
+    assert_eq!(newest["agent_id"], "alpha");
+    assert!(newest["ts"].as_str().is_some_and(|t| !t.is_empty()));
+    assert_eq!(entries[1]["channel"], "cli");
+    for e in entries {
+        for absent in ["item_name", "item_name_hash", "prev_hash", "hash", "log_id"] {
+            assert!(e.get(absent).is_none(), "{absent} in {e}");
+        }
+    }
+
+    // Reading the tail is not itself audited.
+    let again = rig.audit().await.json();
+    assert_eq!(again["entries"].as_array().unwrap().len(), 4, "{again}");
+}
+
 /// The shell page's Revoke button, in a real browser: the grant row
 /// shows the grant, and the click revokes it over `web_ui`.
 #[tokio::test(flavor = "multi_thread")]
@@ -1776,6 +1862,26 @@ async fn req_apr_005_chromium_revoke_click() {
             break;
         }
         assert!(Instant::now() < deadline, "the revoked row stayed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // ... and its audit tail (#131 slice 4): the revoke is the newest
+    // row, on the web channel.
+    let probe = "JSON.stringify((() => { const r = document.querySelector('#audit-rows tr'); \
+                 return r ? Array.from(r.cells, c => c.textContent) : null; })())";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = cdp.eval(&session, probe).await;
+        let cells: Json = serde_json::from_str(got.as_str().unwrap_or("null")).unwrap();
+        if cells[2] == "grant_revoke" {
+            assert_eq!(cells[3], "alpha", "{cells}");
+            assert_eq!(cells[6], "web_ui", "{cells}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the audit tail never showed the revoke: {cells}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     drop(cdp);

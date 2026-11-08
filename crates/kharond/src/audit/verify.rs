@@ -4,7 +4,7 @@
 use ed25519_dalek::VerifyingKey;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -114,6 +114,9 @@ pub(crate) struct Chain {
     log_id: Option<String>,
     /// REQ-AUD-003† pairing finding (first one), if any.
     fill_finding: Option<VerifyOutcome>,
+    /// The last [`TAIL_KEEP`] entries, oldest first: the seed of the
+    /// writer's in-memory tail (#131 slice 4).
+    tail: VecDeque<Entry>,
 }
 
 impl Chain {
@@ -124,7 +127,18 @@ impl Chain {
     pub(crate) fn head_hash(&self) -> Option<String> {
         self.hashes.last().cloned()
     }
+
+    /// Take the verified tail (oldest first, at most [`TAIL_KEEP`]).
+    pub(crate) fn take_tail(&mut self) -> VecDeque<Entry> {
+        std::mem::take(&mut self.tail)
+    }
 }
+
+/// How many recent entries the writer keeps in memory for the owner
+/// web UI's audit tail (#131 slice 4). The UI shows fewer; this bounds
+/// memory, not the view.
+pub const TAIL_KEEP: usize = 200;
+
 /// Scan and verify the local chain: parse every line, recompute each hash
 /// (self-consistency) and check the link to the previous line.
 pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
@@ -134,6 +148,7 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
     // request_id → (dispatch seq, outcome seen, is context_open).
     let mut dispatches: HashMap<String, (u64, bool, bool)> = HashMap::new();
     let mut duplicate: Option<u64> = None;
+    let mut tail: VecDeque<Entry> = VecDeque::with_capacity(TAIL_KEEP);
     for (i, line) in data.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -212,6 +227,10 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
                 _ => {}
             }
         }
+        if tail.len() == TAIL_KEEP {
+            tail.pop_front();
+        }
+        tail.push_back(entry);
     }
     let unmatched = dispatches
         .values()
@@ -228,6 +247,7 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
         hashes,
         log_id,
         fill_finding,
+        tail,
     })
 }
 

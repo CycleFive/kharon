@@ -198,6 +198,22 @@ impl AuditSink for RecordingAudit {
         self.entries.lock().unwrap().push(entry);
         Ok(())
     }
+
+    /// Newest first, numbered as the real log would (seq = position).
+    fn tail(&self, n: usize) -> Vec<Entry> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .iter()
+            .enumerate()
+            .rev()
+            .take(n)
+            .map(|(i, e)| {
+                let mut e = e.clone();
+                e.seq = i as u64 + 1;
+                e
+            })
+            .collect()
+    }
 }
 
 impl RecordingAudit {

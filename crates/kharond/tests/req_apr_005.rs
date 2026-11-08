@@ -23,6 +23,7 @@
 //! does not undo the revocations (revoke-first, #135).
 
 mod api_support;
+mod owner_ui_support;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -34,12 +35,8 @@ use std::time::{Duration, Instant};
 
 use api_support::{
     CHEAP_FLOOR, FakeAnswer, FakeFill, ITEM_A, RawResponse, RecordingAudit, TestBroker,
-    TestSession, cheap_argon, raw_request,
+    TestSession, cheap_argon,
 };
-use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
-use base64ct::{Base64UrlUnpadded, Encoding};
-use ciborium::Value;
 use futures_util::{SinkExt, StreamExt};
 use kharond::api::grant::{Channel, GrantTerms, RequestState};
 use kharond::api::http::ApprovalRedeemer;
@@ -50,9 +47,12 @@ use kharond::daemon;
 use kharond::lock::StaticHardening;
 use kharond::lock::{Clock, LockController, LockPolicy, ManualClock};
 use kharond::origin::OriginConfig;
+use kharond::owner_ui::unlock::seal_password;
 use kharond::owner_ui::{NoAudit, OwnerApprovals, OwnerUi, ROUTES, ShellView, StaticShell};
+use owner_ui_support::{
+    Http, VirtAuth, b64url, b64url_dec, http, register_and_sign_in, session_cookie,
+};
 use serde_json::{Value as Json, json};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -151,238 +151,20 @@ fn owner_op(socket: &Path, request: &Json) -> Json {
     serde_json::from_str(reply.trim()).unwrap_or_else(|_| panic!("bad owner reply: {reply}"))
 }
 
-struct Http<'a> {
-    method: &'a str,
-    path: &'a str,
-    cookie: Option<&'a str>,
-    bearer: Option<&'a str>,
-    content_type: Option<&'a str>,
-    body: &'a str,
-}
-
-impl<'a> Http<'a> {
-    fn get(path: &'a str) -> Self {
-        Self {
-            method: "GET",
-            path,
-            cookie: None,
-            bearer: None,
-            content_type: None,
-            body: "",
-        }
-    }
-
-    fn post(path: &'a str, content_type: Option<&'a str>, body: &'a str) -> Self {
-        Self {
-            method: "POST",
-            path,
-            cookie: None,
-            bearer: None,
-            content_type,
-            body,
-        }
-    }
-
-    fn cookie(mut self, cookie: &'a str) -> Self {
-        self.cookie = Some(cookie);
-        self
-    }
-
-    fn bearer(mut self, bearer: &'a str) -> Self {
-        self.bearer = Some(bearer);
-        self
-    }
-}
-
-async fn http(addr: std::net::SocketAddr, origin: &str, req: Http<'_>) -> RawResponse {
-    let method = req.method;
-    let path = req.path;
-    let body = req.body;
-    let cookie = req
-        .cookie
-        .map(|c| format!("Cookie: {c}\r\n"))
-        .unwrap_or_default();
-    let bearer = req
-        .bearer
-        .map(|t| format!("Authorization: Bearer {t}\r\n"))
-        .unwrap_or_default();
-    let ctype = req
-        .content_type
-        .map(|t| format!("Content-Type: {t}\r\nContent-Length: {}\r\n", body.len()))
-        .unwrap_or_default();
-    let origin = if method == "POST" {
-        format!("Origin: {origin}\r\n")
-    } else {
-        String::new()
-    };
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{origin}{cookie}{bearer}{ctype}Connection: close\r\n\r\n{body}"
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => break,
-            Err(e) => {
-                assert!(Instant::now() < deadline, "owner UI never came up: {e}");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-    raw_request(addr, head.as_bytes()).await
-}
-
-fn session_cookie(resp: &RawResponse) -> Option<String> {
-    resp.headers.iter().find_map(|(k, v)| {
-        (k.eq_ignore_ascii_case("set-cookie") && v.starts_with("kharon_owner="))
-            .then(|| v.split(';').next().unwrap().to_owned())
-    })
-}
-
-fn b64url(bytes: &[u8]) -> String {
-    Base64UrlUnpadded::encode_string(bytes)
-}
-
-fn b64url_dec(s: &str) -> Vec<u8> {
-    let mut buf = vec![0u8; s.len()];
-    let n = Base64UrlUnpadded::decode(s, &mut buf).unwrap().len();
-    buf.truncate(n);
-    buf
-}
-
-/// A software passkey: ES256, `none` attestation, UV+UP. The same
-/// shape Chrome's WebAuthn virtual authenticator produces.
-struct VirtAuth {
-    key: EcdsaKeyPair,
-    /// PKCS#8 of the private key, kept only to prove it never hits disk.
-    pkcs8: Vec<u8>,
-    cred_id: Vec<u8>,
-    sign_count: u32,
-    user_handle: Vec<u8>,
-}
-
-impl VirtAuth {
-    fn new() -> Self {
-        let rng = SystemRandom::new();
-        let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let pkcs8 = doc.as_ref().to_vec();
-        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8).unwrap();
-        Self {
-            key,
-            pkcs8,
-            cred_id: vec![0x11; 16],
-            sign_count: 0,
-            user_handle: Vec::new(),
-        }
-    }
-
-    fn public_point(&self) -> [u8; 65] {
-        let raw = self.key.public_key().as_ref();
-        assert_eq!(
-            raw.len(),
-            65,
-            "uncompressed P-256 point, got {} bytes",
-            raw.len()
-        );
-        raw.try_into().unwrap()
-    }
-
-    fn cose(&self) -> Vec<u8> {
-        let point = self.public_point();
-        let map = Value::Map(vec![
-            (Value::Integer(1i64.into()), Value::Integer(2i64.into())),
-            (Value::Integer(3i64.into()), Value::Integer((-7i64).into())),
-            (Value::Integer((-1i64).into()), Value::Integer(1i64.into())),
-            (
-                Value::Integer((-2i64).into()),
-                Value::Bytes(point[1..33].to_vec()),
-            ),
-            (
-                Value::Integer((-3i64).into()),
-                Value::Bytes(point[33..65].to_vec()),
-            ),
-        ]);
-        let mut out = Vec::new();
-        ciborium::into_writer(&map, &mut out).unwrap();
-        out
-    }
-
-    fn auth_data(&self, rp_id: &str, attested: bool) -> Vec<u8> {
-        let mut data = Sha256::digest(rp_id.as_bytes()).to_vec();
-        data.push(if attested {
-            0x01 | 0x04 | 0x40
-        } else {
-            0x01 | 0x04
-        });
-        data.extend_from_slice(&self.sign_count.to_be_bytes());
-        if attested {
-            data.extend_from_slice(&[0u8; 16]);
-            data.extend_from_slice(&(self.cred_id.len() as u16).to_be_bytes());
-            data.extend_from_slice(&self.cred_id);
-            data.extend_from_slice(&self.cose());
-        }
-        data
-    }
-
-    fn client_data(&self, kind: &str, challenge_b64: &str, origin: &str) -> String {
-        format!(
-            r#"{{"type":"{kind}","challenge":"{challenge_b64}","origin":"{origin}","crossOrigin":false}}"#
-        )
-    }
-
-    fn registration(&self, challenge_b64: &str, origin: &str, rp_id: &str) -> Json {
-        let client = self.client_data("webauthn.create", challenge_b64, origin);
-        let auth = self.auth_data(rp_id, true);
-        let map = Value::Map(vec![
-            (Value::Text("fmt".into()), Value::Text("none".into())),
-            (Value::Text("attStmt".into()), Value::Map(vec![])),
-            (Value::Text("authData".into()), Value::Bytes(auth)),
-        ]);
-        let mut attestation = Vec::new();
-        ciborium::into_writer(&map, &mut attestation).unwrap();
-        json!({
-            "id": b64url(&self.cred_id),
-            "type": "public-key",
-            "response": {
-                "clientDataJSON": b64url(client.as_bytes()),
-                "attestationObject": b64url(&attestation),
-            }
-        })
-    }
-
-    fn assertion(&mut self, challenge_b64: &str, origin: &str, rp_id: &str) -> Json {
-        self.sign_count += 1;
-        let client = self.client_data("webauthn.get", challenge_b64, origin);
-        let auth = self.auth_data(rp_id, false);
-        let mut message = auth.clone();
-        message.extend_from_slice(&Sha256::digest(client.as_bytes()));
-        let sig = self
-            .key
-            .sign(&SystemRandom::new(), &message)
-            .unwrap()
-            .as_ref()
-            .to_vec();
-        let mut response = json!({
-            "clientDataJSON": b64url(client.as_bytes()),
-            "authenticatorData": b64url(&auth),
-            "signature": b64url(&sig),
-        });
-        if !self.user_handle.is_empty() {
-            response["userHandle"] = json!(b64url(&self.user_handle));
-        }
-        json!({
-            "id": b64url(&self.cred_id),
-            "type": "public-key",
-            "response": response,
-        })
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn req_apr_005_no_password_route() {
+    // No password route. The only unlock routes are slice 5b's pair:
+    // a live passkey session first, and ciphertext only on the wire
+    // (`req_apr_005_web_unlock_*` below).
     for (method, path) in ROUTES {
         let blob = format!("{method} {path}").to_ascii_lowercase();
         assert!(!blob.contains("password"), "{blob}");
-        assert!(!blob.contains("unlock"), "{blob}");
+        assert!(
+            !blob.contains("unlock")
+                || blob == "post /owner/unlock/begin"
+                || blob == "post /owner/unlock",
+            "{blob}"
+        );
     }
 
     let run = start(true).await;
@@ -407,7 +189,6 @@ async fn req_apr_005_no_password_route() {
         "/owner/password",
         "/password",
         "/unlock",
-        "/owner/unlock",
     ] {
         let resp = http(
             run.ui,
@@ -419,6 +200,22 @@ async fn req_apr_005_no_password_route() {
         assert!(session_cookie(&resp).is_none(), "{path} set a session");
         assert!(!resp.body.contains("hunter2"), "{path} echoed the secret");
     }
+
+    // The web unlock is no way in: without a session it is 401, and
+    // no session is ever issued by it.
+    let unlock = http(
+        run.ui,
+        &origin,
+        Http::post(
+            "/owner/unlock",
+            Some("application/json"),
+            r#"{"password":"hunter2"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(unlock.status, 401, "{}", unlock.body);
+    assert!(session_cookie(&unlock).is_none());
+    assert!(!unlock.body.contains("hunter2"));
 
     let rejected = http(
         run.ui,
@@ -670,49 +467,6 @@ async fn enroll_and_sign_in(run: &Running) -> String {
     assert_eq!(minted["ok"], json!(true), "{minted}");
     let token = minted["enroll_token"].as_str().unwrap();
     register_and_sign_in(run.ui, &run.origin, token).await
-}
-
-/// Register a software passkey with the enrollment code `token`, then
-/// sign in with an assertion. Returns the `Cookie` value.
-async fn register_and_sign_in(ui: std::net::SocketAddr, origin: &str, token: &str) -> String {
-    let mut auth = VirtAuth::new();
-    let opts = http(
-        ui,
-        origin,
-        Http::post("/owner/register/options", None, "").bearer(token),
-    )
-    .await;
-    assert_eq!(opts.status, 200, "{}", opts.body);
-    let opts: Json = serde_json::from_str(&opts.body).unwrap();
-    auth.user_handle = b64url_dec(opts["publicKey"]["user"]["id"].as_str().unwrap());
-    let ceremony = opts["ceremony_id"].as_str().unwrap();
-    let challenge = opts["publicKey"]["challenge"].as_str().unwrap();
-    let reg = auth.registration(challenge, origin, "localhost");
-    let body = json!({"ceremony_id": ceremony, "credential": reg}).to_string();
-    let registered = http(
-        ui,
-        origin,
-        Http::post("/owner/register/finish", Some("application/json"), &body),
-    )
-    .await;
-    assert_eq!(registered.status, 200, "{}", registered.body);
-    assert!(session_cookie(&registered).is_none());
-
-    let login_opts = http(ui, origin, Http::post("/owner/login/options", None, "")).await;
-    assert_eq!(login_opts.status, 200, "{}", login_opts.body);
-    let login_opts: Json = serde_json::from_str(&login_opts.body).unwrap();
-    let ceremony = login_opts["ceremony_id"].as_str().unwrap();
-    let challenge = login_opts["publicKey"]["challenge"].as_str().unwrap();
-    let assertion = auth.assertion(challenge, origin, "localhost");
-    let body = json!({"ceremony_id": ceremony, "credential": assertion}).to_string();
-    let ok = http(
-        ui,
-        origin,
-        Http::post("/owner/login/finish", Some("application/json"), &body),
-    )
-    .await;
-    assert_eq!(ok.status, 200, "{}", ok.body);
-    session_cookie(&ok).expect("session cookie")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2150,4 +1904,293 @@ async fn req_apr_005_chromium_panic_click() {
     }
     drop(cdp);
     drop(chromium);
+}
+
+// ---- #131 slice 5b: web unlock ----
+
+/// The export fixture's password (the daemon in [`start`] runs in
+/// export mode on that fixture).
+const EXPORT_PASSWORD: &str = "kharon export fixture password 9";
+
+/// One web unlock through the real listener: begin, seal `password`
+/// to the attempt's key exactly as the shell does, finish.
+async fn web_unlock(run: &Running, cookie: &str, password: &str) -> RawResponse {
+    let begun = http(
+        run.ui,
+        &run.origin,
+        Http::post("/owner/unlock/begin", Some("application/json"), "{}").cookie(cookie),
+    )
+    .await;
+    assert_eq!(begun.status, 200, "{}", begun.body);
+    let begun: Json = serde_json::from_str(&begun.body).unwrap();
+    let server_pub = b64url_dec(begun["server_pub"].as_str().unwrap());
+    let (client_pub, nonce, ciphertext) = seal_password(&server_pub, password).unwrap();
+    let body = json!({
+        "attempt_id": begun["attempt_id"],
+        "client_pub": b64url(&client_pub),
+        "nonce": b64url(&nonce),
+        "ciphertext": b64url(&ciphertext),
+    })
+    .to_string();
+    assert!(!body.contains(password), "the wire carries ciphertext only");
+    http(
+        run.ui,
+        &run.origin,
+        Http::post("/owner/unlock", Some("application/json"), &body).cookie(cookie),
+    )
+    .await
+}
+
+/// SPEC §8 "web UI after WebAuthn": the daemon's own unlock behind a
+/// passkey session. A wrong password is `owner_auth_fail`
+/// (`unlock_failed`, `web_ui`) and leaves the broker locked; the
+/// right one unlocks it through the owner socket's path (the
+/// `export_loaded` entry is that path's); a second is
+/// `already_unlocked` and is not an auth failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_unlock_through_the_owner_unlock_path() {
+    let run = start(true).await;
+    let cookie = enroll_and_sign_in(&run).await;
+    assert_eq!(
+        owner_op(&run.socket, &json!({"op":"status"}))["locked"],
+        json!(true)
+    );
+
+    let wrong = web_unlock(&run, &cookie, "not the password").await;
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
+    assert!(wrong.body.contains("unlock_failed"), "{}", wrong.body);
+    assert_eq!(
+        owner_op(&run.socket, &json!({"op":"status"}))["locked"],
+        json!(true)
+    );
+
+    let right = web_unlock(&run, &cookie, EXPORT_PASSWORD).await;
+    assert_eq!(right.status, 200, "{}", right.body);
+    assert_eq!(
+        owner_op(&run.socket, &json!({"op":"status"}))["locked"],
+        json!(false)
+    );
+    let session = http(
+        run.ui,
+        &run.origin,
+        Http::get("/owner/session").cookie(&cookie),
+    )
+    .await;
+    let session: Json = serde_json::from_str(&session.body).unwrap();
+    assert_eq!(session["locked"], json!(false), "{session}");
+
+    let again = web_unlock(&run, &cookie, EXPORT_PASSWORD).await;
+    assert_eq!(again.status, 409, "{}", again.body);
+    assert!(again.body.contains("already_unlocked"), "{}", again.body);
+
+    let audit = std::fs::read_to_string(run.data.path().join("audit/audit.jsonl")).unwrap();
+    let entries: Vec<Json> = audit
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let fails: Vec<&Json> = entries
+        .iter()
+        .filter(|e| e["event"] == "owner_auth_fail" && e["detail_code"] == "unlock_failed")
+        .collect();
+    assert_eq!(fails.len(), 1, "{audit}");
+    assert_eq!(fails[0]["channel"], "web_ui", "{audit}");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e["event"] == "export_loaded")
+            .count(),
+        1,
+        "{audit}"
+    );
+    assert!(!audit.contains(EXPORT_PASSWORD) && !audit.contains("not the password"));
+
+    run.shutdown().await;
+}
+
+/// A cross-site POST and a spent attempt never reach the unlock
+/// (session binding is covered by the unit tests).
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_unlock_refusals_change_nothing() {
+    let run = start(true).await;
+    let cookie = enroll_and_sign_in(&run).await;
+
+    let forged = http(
+        run.ui,
+        "https://evil.example",
+        Http::post("/owner/unlock/begin", Some("application/json"), "{}").cookie(&cookie),
+    )
+    .await;
+    assert_eq!(forged.status, 403, "{}", forged.body);
+
+    // An attempt begun by one session, spent by another.
+    let begun = http(
+        run.ui,
+        &run.origin,
+        Http::post("/owner/unlock/begin", Some("application/json"), "{}").cookie(&cookie),
+    )
+    .await;
+    let begun: Json = serde_json::from_str(&begun.body).unwrap();
+    let server_pub = b64url_dec(begun["server_pub"].as_str().unwrap());
+    let (client_pub, nonce, ciphertext) = seal_password(&server_pub, EXPORT_PASSWORD).unwrap();
+    let body = json!({
+        "attempt_id": begun["attempt_id"],
+        "client_pub": b64url(&client_pub),
+        "nonce": b64url(&nonce),
+        "ciphertext": b64url(&ciphertext),
+    })
+    .to_string();
+    // A tampered ciphertext does not open, and spends the attempt.
+    let mut tampered = ciphertext.clone();
+    tampered[0] ^= 1;
+    let bad = json!({
+        "attempt_id": begun["attempt_id"],
+        "client_pub": b64url(&client_pub),
+        "nonce": b64url(&nonce),
+        "ciphertext": b64url(&tampered),
+    })
+    .to_string();
+    let stolen = http(
+        run.ui,
+        &run.origin,
+        Http::post("/owner/unlock", Some("application/json"), &bad).cookie(&cookie),
+    )
+    .await;
+    assert_eq!(stolen.status, 400, "{}", stolen.body);
+    // Burned: the intact ciphertext cannot spend it afterwards.
+    let late = http(
+        run.ui,
+        &run.origin,
+        Http::post("/owner/unlock", Some("application/json"), &body).cookie(&cookie),
+    )
+    .await;
+    assert_eq!(late.status, 400, "{}", late.body);
+    assert_eq!(
+        owner_op(&run.socket, &json!({"op":"status"}))["locked"],
+        json!(true)
+    );
+
+    run.shutdown().await;
+}
+
+/// The shell's unlock form in a real browser: WebCrypto seals the
+/// master password to the attempt's key, so no request body the page
+/// sends carries it. A wrong password shows `unlock_failed` and the
+/// broker stays locked; the right one unlocks it and hides the form.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_chromium_unlock_form() {
+    let Some(bin) = chromium_bin() else {
+        if std::env::var_os("KHARON_REQUIRE_WEBAUTHN").is_some() {
+            panic!("KHARON_REQUIRE_WEBAUTHN is set but no Chromium binary was found");
+        }
+        eprintln!("SKIP req_apr_005_chromium_unlock_form: no Chromium binary");
+        return;
+    };
+    let run = start(true).await;
+    let origin = run.origin.clone();
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let token = minted["enroll_token"].as_str().unwrap().to_owned();
+
+    let chromium = launch_chromium(&bin);
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (session, _authenticator) = browser_register_and_sign_in(&mut cdp, &origin, &token).await;
+    let _ = cdp
+        .eval_navigating(&session, &format!("location.assign({origin:?})"))
+        .await;
+    // The shell renders the locked broker with the form shown.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let shown = cdp
+            .eval_navigating(
+                &session,
+                "(() => { const f = document.getElementById('unlock'); return !!f && !f.hidden; })()",
+            )
+            .await
+            .unwrap_or(Json::Null);
+        if shown == json!(true) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the unlock form never showed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Record every request body the page sends from here on.
+    cdp.eval(
+        &session,
+        "window.__bodies = []; const f0 = window.fetch; \
+         window.fetch = (u, o) => { window.__bodies.push(String((o && o.body) || '')); return f0(u, o); }; true",
+    )
+    .await;
+
+    let submit = |pw: &str| {
+        format!(
+            "document.getElementById('unlock-master').value = {pw:?}; \
+             document.getElementById('unlock').requestSubmit(); true"
+        )
+    };
+    assert_eq!(
+        cdp.eval(&session, &submit("not the password")).await,
+        json!(true)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let err = cdp
+            .eval(&session, "document.getElementById('err').textContent")
+            .await;
+        if err.as_str().unwrap_or("").contains("unlock_failed") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no unlock_failed shown: {err}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        owner_op(&run.socket, &json!({"op":"status"}))["locked"],
+        json!(true)
+    );
+
+    assert_eq!(
+        cdp.eval(&session, &submit(EXPORT_PASSWORD)).await,
+        json!(true)
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while owner_op(&run.socket, &json!({"op":"status"}))["locked"] != json!(false) {
+        assert!(
+            Instant::now() < deadline,
+            "the form never unlocked the broker"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = cdp
+            .eval(
+                &session,
+                "JSON.stringify([document.getElementById('locked').textContent, \
+                 document.getElementById('unlock').hidden, \
+                 document.getElementById('unlock-master').value])",
+            )
+            .await;
+        let state: Json = serde_json::from_str(state.as_str().unwrap_or("[]")).unwrap();
+        if state == json!(["unlocked", true, ""]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the page never showed the unlock: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let bodies = cdp.eval(&session, "JSON.stringify(window.__bodies)").await;
+    let bodies: Vec<String> = serde_json::from_str(bodies.as_str().unwrap()).unwrap();
+    assert!(
+        bodies.iter().filter(|b| b.contains("ciphertext")).count() >= 2,
+        "{bodies:?}"
+    );
+    for b in &bodies {
+        assert!(
+            !b.contains(EXPORT_PASSWORD) && !b.contains("not the password"),
+            "a request carried the password: {b}"
+        );
+    }
+    drop(cdp);
+    drop(chromium);
+    run.shutdown().await;
 }

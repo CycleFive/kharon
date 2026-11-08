@@ -829,6 +829,15 @@ pub async fn start(
         sync_task: std::sync::Mutex::new(None),
         owner_ui: owner_ui.as_ref().map(|(_, ui)| Arc::clone(ui)),
     });
+    if let Some((_, ui)) = &owner_ui {
+        // Web unlock (#131 slice 5b): the UI reaches the owner
+        // socket's own unlock. `Weak`, because the owner ops already
+        // hold the UI.
+        ui.set_unlocker(Arc::new(DaemonUiUnlock {
+            owner: Arc::downgrade(&owner_ops),
+            runtime: tokio::runtime::Handle::current(),
+        }));
+    }
 
     let listener = TcpListener::bind(listen)
         .await
@@ -971,6 +980,25 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
             .result("denied")
             .detail_code(detail);
         let _ = self.broker.append_audit(entry);
+    }
+}
+
+/// Web unlock backend (#131 slice 5b): the owner socket's own
+/// [`OwnerOps::unlock`], so the derivation, the mlock and dumpable
+/// checks, the `unlocked` / `export_loaded` audit entries and the
+/// live sync start are exactly the CLI's. Runs on the UI's blocking
+/// thread, where blocking on the runtime is allowed.
+struct DaemonUiUnlock {
+    owner: std::sync::Weak<DaemonOwner>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl crate::owner_ui::OwnerUnlock for DaemonUiUnlock {
+    fn unlock(&self, password: Zeroizing<String>) -> Result<(), OwnerFailure> {
+        let Some(owner) = self.owner.upgrade() else {
+            return Err(OwnerFailure::Unsupported);
+        };
+        self.runtime.block_on(OwnerOps::unlock(&*owner, password))
     }
 }
 

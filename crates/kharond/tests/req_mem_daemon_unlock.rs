@@ -13,6 +13,9 @@
 //!   item-secret canary 0 times after unlock and after lock, and
 //!   the export-derived key (a non-UTF-8 needle, sent hex-encoded)
 //!   0 times after lock (REQ-CRY-006).
+//! - REQ-MEM-003, web channel (#131 slice 5b): the same scan after an
+//!   unlock through the owner web UI (passkey session, password
+//!   sealed to a per-attempt daemon key) finds the password 0 times.
 //! - REQ-MEM-005: kill -9 → restart comes up `locked`; `strings`
 //!   over `data_dir` finds no password or canary.
 //! - REQ-EXP-001: export mode fully works inside a network
@@ -24,6 +27,7 @@
 //! binary is the thing that will be deployed).
 
 mod api_support;
+mod owner_ui_support;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -524,6 +528,116 @@ fn req_mem_003_canary_scan_with_an_escaped_password() {
 
 /// REQ-MEM-005: kill -9 leaves nothing behind — the restart boots
 /// locked, and no file under `data_dir` contains a secret.
+/// A free loopback port for the owner UI (the binary prints its
+/// bound address only to stderr).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Slice 5b: the web unlock keeps REQ-MEM-003. The password goes in
+/// the page's place through the real listener (sealed to the
+/// attempt's key, as the shell does), and the scan of the real
+/// binary afterwards finds it 0 times — hyper's buffers and the JSON
+/// parse only ever held ciphertext.
+#[test]
+fn req_mem_003_canary_scan_after_a_web_unlock_finds_zero_hits() {
+    use owner_ui_support::{Http, b64url, b64url_dec, http, register_and_sign_in};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (token, hash) = generate("alpha");
+    let _ = token;
+    let data_dir = dir.path().join("data");
+    let port = free_port();
+    let origin = format!("http://localhost:{port}");
+    let cfg = format!(
+        "{}\n[owner_ui]\nlisten = \"127.0.0.1:{port}\"\nrp_id = \"localhost\"\norigin = \"{origin}\"\n",
+        config_toml(
+            &hash,
+            &data_dir,
+            &fixture_path("password_protected.json"),
+            "127.0.0.1:0"
+        )
+    );
+    let cfg_path = dir.path().join("kharon.toml");
+    std::fs::write(&cfg_path, cfg).unwrap();
+    let mut d = spawn_kharond(&cfg_path, &data_dir);
+    assert_eq!(owner_status(&d.socket)["locked"], json!(true));
+
+    let ui: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let unlocked = rt.block_on(async {
+        let minted = owner_op(&d.socket, &json!({"op": "passkey_enroll"}));
+        let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
+        let cookie = register_and_sign_in(ui, &origin, &enroll).await;
+        let begun = http(
+            ui,
+            &origin,
+            Http::post("/owner/unlock/begin", Some("application/json"), "{}").cookie(&cookie),
+        )
+        .await;
+        assert_eq!(begun.status, 200, "{}", begun.body);
+        let begun: Value = serde_json::from_str(&begun.body).unwrap();
+        let server_pub = b64url_dec(begun["server_pub"].as_str().unwrap());
+        let (client_pub, nonce, ciphertext) =
+            kharond::owner_ui::unlock::seal_password(&server_pub, PASSWORD).unwrap();
+        let body = json!({
+            "attempt_id": begun["attempt_id"],
+            "client_pub": b64url(&client_pub),
+            "nonce": b64url(&nonce),
+            "ciphertext": b64url(&ciphertext),
+        })
+        .to_string();
+        http(
+            ui,
+            &origin,
+            Http::post("/owner/unlock", Some("application/json"), &body).cookie(&cookie),
+        )
+        .await
+    });
+    assert_eq!(unlocked.status, 200, "{}", unlocked.body);
+    assert_eq!(owner_status(&d.socket)["locked"], json!(false));
+
+    // Same positive control as the socket test: a needle that lives
+    // only in the daemon's heap must be found.
+    let sha_hex = ExportFile::from_bytes(FIXTURE_A)
+        .unwrap()
+        .sha256_hex()
+        .to_owned();
+    let control = scan_until_hit(&d.socket, &sha_hex);
+    assert!(control >= 1, "heap scanner control: hits={control}");
+    assert_eq!(
+        owner_scan(&d.socket, PASSWORD),
+        0,
+        "password after web unlock"
+    );
+    assert_eq!(
+        owner_scan(&d.socket, CANARY),
+        0,
+        "item canary after web unlock"
+    );
+    let (master_key, export_key) = derive_fixture_keys(FIXTURE_A);
+    assert_eq!(
+        owner_scan_hex(&d.socket, &export_key),
+        0,
+        "export key after web unlock"
+    );
+    assert_eq!(
+        owner_scan_hex(&d.socket, &master_key),
+        0,
+        "master key after web unlock"
+    );
+
+    d.child.kill().unwrap();
+    let _ = d.child.wait();
+}
+
 #[test]
 fn req_mem_005_kill9_restart_locked_and_no_secret_on_disk() {
     let dir = tempfile::tempdir().unwrap();

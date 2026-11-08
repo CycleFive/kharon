@@ -15,8 +15,10 @@
 //!
 //! - `{"op":"unlock","password":"…"}` — the password is used for
 //!   key derivation only and zeroized after it (REQ-MEM-003). It is
-//!   never in config, env, or argv (REQ-EXP-003); this socket (or
-//!   the future web UI) is the only way in.
+//!   never in config, env, or argv (REQ-EXP-003); this socket and
+//!   the owner web UI's unlock (`owner_ui::unlock`, behind a passkey
+//!   session, password sealed to a per-attempt key) are the only ways
+//!   in, and both reach the same `OwnerOps::unlock`.
 //! - `{"op":"lock"}` — lock now, destroying the session.
 //! - `{"op":"status"}` — `{"ok":true,"locked":<bool>}`.
 //! - `{"op":"revoke_grant","grant_id":"g_…"}` — REQ-REV-001.

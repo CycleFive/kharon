@@ -2,8 +2,11 @@
 //!
 //! A loopback HTTP server, separate from the agent API. Login is a
 //! WebAuthn passkey assertion and nothing else: there is no password
-//! field, no password route, and a JSON body that carries a
-//! `password` key is refused before any session is issued. A session
+//! login, and a JSON body that carries a `password` key is refused on
+//! every route, before any session is issued. The master password
+//! reaches the broker from this UI only through the web unlock
+//! ([`unlock`], #131 slice 5b), behind a live session, and only
+//! encrypted to a per-attempt daemon key. A session
 //! lasts at most [`SESSION_TTL`] (15 minutes, SPEC §5) and is an
 //! `HttpOnly; SameSite=Strict` cookie. Logout drops that session
 //! on the server; clearing the cookie alone does not end it.
@@ -33,19 +36,24 @@
 //! | POST | `/owner/grants/revoke` | Revoke one |
 //! | GET | `/owner/audit` | The audit tail, or 401 |
 //! | POST | `/owner/panic` | Panic: revoke all grants, then lock |
+//! | POST | `/owner/unlock/begin` | Begin a web unlock: a one-attempt key |
+//! | POST | `/owner/unlock` | Unlock with the password encrypted to it |
 //!
 //! The approvals routes (#131 slice 1), the grants routes (slice 2),
-//! the panic route (slice 3) and the audit tail (slice 4) need a live
-//! session. The audit tail is read-only and unaudited, like the
+//! the panic route (slice 3), the audit tail (slice 4) and the web
+//! unlock (slice 5b) need a live session. The audit tail is read-only and unaudited, like the
 //! grants list. Ids travel in a JSON body, never in the path. The
 //! state-changing calls are POST-only and refused unless the request
 //! carries an `Origin` header equal to the configured origin (a
 //! missing header is refused too, not only a mismatched one) and a
 //! JSON content type, so a cross-site form cannot reach them even
-//! without `SameSite`. They call the broker's own approve, deny,
-//! revoke and panic on the `web_ui` channel ([`approvals`]), so the
-//! REQ-APR-003 expiry pass, the rollbacks and the audit entries are
-//! the CLI's. Panic also needs `{"confirm": true}` in the body: the
+//! without `SameSite`. They call the broker's own approve, deny and
+//! revoke on the `web_ui` channel ([`approvals`]), so the REQ-APR-003
+//! expiry pass, the rollbacks and the audit entries are the CLI's.
+//! Panic is the broker's `panic_lock` and carries no channel: its
+//! entries are exactly a CLI panic's. Unlock is the owner socket's
+//! own unlock; a failed attempt is `owner_auth_fail`
+//! (`unlock_failed`) on the `web_ui` channel. Panic also needs `{"confirm": true}` in the body: the
 //! shell's button arms on a first click and only the second sends
 //! it, so neither a stray click nor a bare POST can fire it.
 //!
@@ -60,15 +68,17 @@
 
 mod approvals;
 mod store;
+pub mod unlock;
 mod webauthn;
 
 pub use self::approvals::{
     AUDIT_TAIL_LEN, AuditRow, DecideError, NoApprovals, OwnerApprovals, PendingRow, WebGrantKind,
 };
+pub use self::unlock::OwnerUnlock;
 
 use std::future::Future;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -119,6 +129,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/owner/grants/revoke"),
     ("GET", "/owner/audit"),
     ("POST", "/owner/panic"),
+    ("POST", "/owner/unlock/begin"),
+    ("POST", "/owner/unlock"),
 ];
 
 /// Longest request or grant id the owner routes accept. Broker ids
@@ -184,6 +196,11 @@ pub struct OwnerUi {
     ceremonies: Mutex<Vec<Ceremony>>,
     sessions: Mutex<Vec<Session>>,
     enroll: Mutex<Vec<Enroll>>,
+    /// The web unlock backend (slice 5b). Set once, after the daemon
+    /// has built its owner ops; unset → the unlock routes answer
+    /// `unknown_op`.
+    unlocker: OnceLock<Arc<dyn OwnerUnlock>>,
+    unlock_attempts: Mutex<Vec<unlock::Attempt>>,
 }
 
 struct Ceremony {
@@ -237,7 +254,17 @@ impl OwnerUi {
             ceremonies: Mutex::new(Vec::new()),
             sessions: Mutex::new(Vec::new()),
             enroll: Mutex::new(Vec::new()),
+            unlocker: OnceLock::new(),
+            unlock_attempts: Mutex::new(Vec::new()),
         }))
+    }
+
+    /// Attach the web unlock backend. The daemon calls this once,
+    /// after its owner ops exist (they hold this UI for
+    /// `passkey_enroll`, so the UI cannot take them at
+    /// [`Self::open`]). Returns `false` if one was already set.
+    pub fn set_unlocker(&self, unlocker: Arc<dyn OwnerUnlock>) -> bool {
+        self.unlocker.set(unlocker).is_ok()
     }
 
     /// The origin assertions are checked against.
@@ -380,7 +407,9 @@ impl OwnerUi {
             | "/owner/approvals/approve"
             | "/owner/approvals/deny"
             | "/owner/grants/revoke"
-            | "/owner/panic" => Some(Method::POST),
+            | "/owner/panic"
+            | "/owner/unlock/begin"
+            | "/owner/unlock" => Some(Method::POST),
             _ => None,
         };
         let Some(allowed) = allowed else {
@@ -409,6 +438,8 @@ impl OwnerUi {
             "/owner/grants/revoke" => self.grants_revoke(&req),
             "/owner/audit" => self.audit_tail(&req),
             "/owner/panic" => self.panic(&req),
+            "/owner/unlock/begin" => self.unlock_begin(&req),
+            "/owner/unlock" => self.unlock_finish(&req),
             _ => unreachable!("path was matched above"),
         }
     }
@@ -589,6 +620,105 @@ impl OwnerUi {
         match self.approvals.panic() {
             Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
             Err(e) => decide_error(e),
+        }
+    }
+
+    /// Begin a web unlock (slice 5b): behind [`Self::gate_owner_post`]
+    /// and an empty JSON object, mint a single-use attempt bound to
+    /// this session and return its public key. No password is
+    /// involved yet, so nothing is audited here.
+    fn unlock_begin(&self, req: &Incoming) -> Response {
+        if let Some(err) = self.gate_owner_post(req) {
+            return err;
+        }
+        if serde_json::from_slice::<EmptyBody>(&req.body).is_err() {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        }
+        if self.unlocker.get().is_none() {
+            return respond(StatusCode::NOT_IMPLEMENTED, "unknown_op", None);
+        }
+        let Some(session) = session_hash(req.cookie.as_deref()) else {
+            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+        };
+        let id = b64url_encode(&random_bytes::<16>());
+        let Some(attempt) = unlock::Attempt::new(id.clone(), session) else {
+            return respond(StatusCode::INTERNAL_SERVER_ERROR, "error", None);
+        };
+        let server_pub = b64url_encode(attempt.server_pub());
+        let mut guard = self
+            .unlock_attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        guard.retain(|a| a.expires > now);
+        if guard.len() >= unlock::MAX_ATTEMPTS {
+            guard.remove(0);
+        }
+        guard.push(attempt);
+        drop(guard);
+        json_body(
+            StatusCode::OK,
+            json!({"ok": true, "attempt_id": id, "server_pub": server_pub}).to_string(),
+            None,
+        )
+    }
+
+    /// Finish a web unlock: behind [`Self::gate_owner_post`], take
+    /// the attempt (single use, this session's, unexpired), decrypt
+    /// the password straight into a `Zeroizing` buffer and hand it to
+    /// the owner socket's own unlock. Any failed attempt past the
+    /// gate — an unknown, stale or foreign attempt, a ciphertext that
+    /// does not open, or a wrong password — is `owner_auth_fail`
+    /// (`unlock_failed`) and changes nothing. State refusals (already
+    /// unlocked, mlock, audit) are not auth failures, as on the
+    /// socket.
+    fn unlock_finish(&self, req: &Incoming) -> Response {
+        if let Some(err) = self.gate_owner_post(req) {
+            return err;
+        }
+        let Ok(body) = serde_json::from_slice::<UnlockBody>(&req.body) else {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        };
+        let Some(unlocker) = self.unlocker.get() else {
+            return respond(StatusCode::NOT_IMPLEMENTED, "unknown_op", None);
+        };
+        let session = session_hash(req.cookie.as_deref());
+        let attempt = {
+            let mut guard = self
+                .unlock_attempts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            guard.retain(|a| a.expires > now);
+            guard
+                .iter()
+                .position(|a| ct_eq(a.id.as_bytes(), body.attempt_id.as_bytes()))
+                .map(|i| guard.remove(i))
+        };
+        let password = attempt
+            .filter(|a| session.is_some_and(|s| ct_eq(&a.session, &s)))
+            .and_then(|a| {
+                let client_pub = b64url_decode(&body.client_pub).ok()?;
+                let nonce = b64url_decode(&body.nonce).ok()?;
+                let ciphertext = b64url_decode(&body.ciphertext).ok()?;
+                a.open(&client_pub, &nonce, ciphertext).ok()
+            });
+        let Some(password) = password else {
+            self.audit.auth_failed("unlock_failed");
+            return respond(StatusCode::BAD_REQUEST, "unlock_failed", None);
+        };
+        match unlocker.unlock(password) {
+            Ok(()) => json_body(
+                StatusCode::OK,
+                json!({"ok": true, "locked": false}).to_string(),
+                None,
+            ),
+            Err(e) => {
+                if e == crate::owner::OwnerFailure::UnlockFailed {
+                    self.audit.auth_failed("unlock_failed");
+                }
+                respond(unlock_status(&e), e.code(), None)
+            }
         }
     }
 
@@ -963,6 +1093,35 @@ struct DecideBody {
 #[serde(deny_unknown_fields)]
 struct RevokeBody {
     grant_id: String,
+}
+
+/// Body of `/owner/unlock/begin`: an empty JSON object.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyBody {}
+
+/// Body of `/owner/unlock`. Only ciphertext and public values: the
+/// password is never a field (base64url, see [`unlock`]).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnlockBody {
+    attempt_id: String,
+    client_pub: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+/// HTTP status for an owner unlock refusal.
+fn unlock_status(e: &crate::owner::OwnerFailure) -> StatusCode {
+    use crate::owner::OwnerFailure as F;
+    match e {
+        F::UnlockFailed => StatusCode::BAD_REQUEST,
+        F::AlreadyUnlocked => StatusCode::CONFLICT,
+        F::MlockUnavailable | F::ProcessDumpable | F::AuditFailed => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => StatusCode::NOT_IMPLEMENTED,
+    }
 }
 
 /// Body of a panic call. Unknown keys are refused, and `confirm`
@@ -1395,6 +1554,12 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <h1>kharon</h1>
 <p id="state">signed-in</p>
 <p>Broker: <span id="locked">{locked}</span></p>
+<form id="unlock" hidden>
+<h2>Unlock</h2>
+<p>The master password is encrypted in this page to a one-time broker key before it is sent.</p>
+<input id="unlock-master" type="password" autocomplete="off" aria-label="Master password" required>
+<button id="unlock-go" type="submit">Unlock</button>
+</form>
 <p>Pending approvals: <span id="pending">{pending}</span></p>
 <h2>Approvals</h2>
 <p id="empty">Nothing is waiting.</p>
@@ -1536,9 +1701,80 @@ panicButton.addEventListener("click", async () => {
   }
   disarmPanic();
   if (await decide("/owner/panic", { confirm: true })) {
-    document.getElementById("locked").textContent = "locked";
+    setLocked(true);
   }
 });
+function setLocked(locked) {
+  document.getElementById("locked").textContent = locked ? "locked" : "unlocked";
+  document.getElementById("unlock").hidden = !locked;
+}
+function b64u(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function unb64u(s) {
+  const t = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(t, (c) => c.charCodeAt(0));
+}
+function joinBytes(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let i = 0;
+  for (const p of parts) { out.set(p, i); i += p.length; }
+  return out;
+}
+// The web unlock wire format (owner_ui::unlock): ECDH P-256 to the
+// attempt's key, HKDF-SHA256 (empty salt, info = INFO || server_pub
+// || client_pub), AES-256-GCM with aad = INFO. Only ciphertext and
+// public values leave the page.
+async function sealMaster(serverPubB64, secret) {
+  const enc = new TextEncoder();
+  const info = enc.encode("kharon web unlock v1");
+  const serverPub = unb64u(serverPubB64);
+  const theirs = await crypto.subtle.importKey("raw", serverPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const mine = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const clientPub = new Uint8Array(await crypto.subtle.exportKey("raw", mine.publicKey));
+  const shared = await crypto.subtle.deriveBits({ name: "ECDH", public: theirs }, mine.privateKey, 256);
+  const ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: joinBytes(info, serverPub, clientPub) },
+    ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const plain = enc.encode(secret);
+  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: info }, key, plain));
+  plain.fill(0);
+  return { client_pub: b64u(clientPub), nonce: b64u(nonce), ciphertext: b64u(sealed) };
+}
+document.getElementById("unlock").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const field = document.getElementById("unlock-master");
+  const err = document.getElementById("err");
+  err.textContent = "";
+  const secret = field.value;
+  field.value = "";
+  const post = (path, body) => fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const begun = await post("/owner/unlock/begin", {});
+  if (begun.status === 401) { location.assign("/"); return; }
+  if (!begun.ok) { err.textContent = "Not done: " + ((await begun.json()).error || "error"); return; }
+  const attempt = await begun.json();
+  const sealed = await sealMaster(attempt.server_pub, secret);
+  const r = await post("/owner/unlock", { attempt_id: attempt.attempt_id, ...sealed });
+  if (r.status === 401) { location.assign("/"); return; }
+  if (!r.ok) {
+    let code = "error";
+    try { code = (await r.json()).error || code; } catch (e) {}
+    err.textContent = "Not done: " + code;
+    return;
+  }
+  setLocked(false);
+  await window.kharonRefresh();
+});
+setLocked(document.getElementById("locked").textContent === "locked");
 document.getElementById("signout").addEventListener("click", async () => {
   await fetch("/owner/logout", { method: "POST", credentials: "same-origin" });
   location.assign("/");
@@ -1556,10 +1792,17 @@ mod tests {
 
     #[test]
     fn req_apr_005_routes_have_no_password_login() {
+        // No route is a password route. The only unlock routes are
+        // the slice 5b pair, which need a live passkey session and
+        // carry ciphertext, never a `password` field (see
+        // `unlock_*` below).
         assert!(
             ROUTES.iter().all(|(method, path)| {
                 let blob = format!("{method} {path}").to_ascii_lowercase();
-                !blob.contains("password") && !blob.contains("unlock")
+                !blob.contains("password")
+                    && (!blob.contains("unlock")
+                        || blob == "post /owner/unlock/begin"
+                        || blob == "post /owner/unlock")
             }),
             "owner UI routes: {ROUTES:?}"
         );
@@ -1692,6 +1935,27 @@ mod tests {
 
     /// Records every decision it is asked for; `gr_gone` is not
     /// pending, anything else is.
+    /// Fake web unlock backend: accepts one password.
+    #[derive(Default)]
+    struct FakeUnlock {
+        seen: Mutex<Vec<String>>,
+        already: std::sync::atomic::AtomicBool,
+    }
+
+    impl OwnerUnlock for FakeUnlock {
+        fn unlock(&self, password: Zeroizing<String>) -> Result<(), crate::owner::OwnerFailure> {
+            self.seen.lock().unwrap().push(password.to_string());
+            if self.already.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::owner::OwnerFailure::AlreadyUnlocked);
+            }
+            if password.as_str() == "right horse" {
+                Ok(())
+            } else {
+                Err(crate::owner::OwnerFailure::UnlockFailed)
+            }
+        }
+    }
+
     #[derive(Default)]
     struct FakeApprovals {
         calls: Mutex<Vec<String>>,
@@ -1894,10 +2158,12 @@ mod tests {
             assert!(ROUTES.contains(&route), "{route:?} missing from ROUTES");
         }
         let shell = shell_page("unlocked", 0).to_ascii_lowercase();
-        assert!(
-            !shell.contains("password"),
-            "shell page mentions a password"
-        );
+        // The signed-in shell's one secret field is the slice 5b
+        // unlock form; its value is only ever sealed, never a JSON
+        // key of its own.
+        assert_eq!(shell.matches(r#"type="password""#).count(), 1);
+        assert!(shell.contains(r#"id="unlock-master" type="password""#));
+        assert!(!shell.contains("password:") && !shell.contains(r#""password":"#));
         assert!(!shell.contains("innerhtml"), "rows must use textContent");
     }
 
@@ -2404,5 +2670,276 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
         assert!(out.contains("audit_failed"), "{out}");
         assert_eq!(rig.calls(), ["panic", "panic"]);
+    }
+
+    // ---- #131 slice 5b: web unlock ----
+
+    impl ApprovalsRig {
+        fn with_unlock() -> (Self, Arc<FakeUnlock>) {
+            let rig = Self::new();
+            let unlock = Arc::new(FakeUnlock::default());
+            assert!(rig.ui.set_unlocker(unlock.clone()));
+            (rig, unlock)
+        }
+
+        fn begin(&self) -> (String, Vec<u8>) {
+            let (status, out) = self.post("/owner/unlock/begin", "{}");
+            assert_eq!(status, StatusCode::OK, "{out}");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let id = v["attempt_id"].as_str().unwrap().to_owned();
+            let key = b64url_decode(v["server_pub"].as_str().unwrap()).unwrap();
+            (id, key)
+        }
+
+        fn sealed(id: &str, server_pub: &[u8], password: &str) -> String {
+            let (client, nonce, ct) = unlock::seal_password(server_pub, password).unwrap();
+            json!({
+                "attempt_id": id,
+                "client_pub": b64url_encode(&client),
+                "nonce": b64url_encode(&nonce),
+                "ciphertext": b64url_encode(&ct),
+            })
+            .to_string()
+        }
+    }
+
+    #[test]
+    fn unlock_routes_are_listed_and_on_the_shell() {
+        assert!(ROUTES.contains(&("POST", "/owner/unlock/begin")));
+        assert!(ROUTES.contains(&("POST", "/owner/unlock")));
+        let shell = shell_page("locked", 0);
+        assert!(shell.contains("/owner/unlock/begin") && shell.contains("/owner/unlock\""));
+        assert!(
+            shell.contains("kharon web unlock v1"),
+            "page and daemon must agree"
+        );
+        assert_eq!(unlock::INFO, b"kharon web unlock v1");
+    }
+
+    #[test]
+    fn unlock_round_trip_reaches_the_backend_with_the_plaintext() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        let (id, key) = rig.begin();
+        let body = ApprovalsRig::sealed(&id, &key, "right horse");
+        assert!(
+            !body.contains("right horse"),
+            "the wire carries ciphertext only"
+        );
+        let (status, out) = rig.post("/owner/unlock", &body);
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(out.contains("\"locked\":false"), "{out}");
+        assert_eq!(*unlock.seen.lock().unwrap(), ["right horse"]);
+        assert!(rig.audit.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlock_wrong_password_is_audited_and_refused() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        let (id, key) = rig.begin();
+        let (status, out) = rig.post("/owner/unlock", &ApprovalsRig::sealed(&id, &key, "wrong"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
+        assert!(
+            out.contains("unlock_failed") && !out.contains("wrong"),
+            "{out}"
+        );
+        assert_eq!(*rig.audit.0.lock().unwrap(), ["unlock_failed"]);
+        assert_eq!(unlock.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unlock_state_refusals_are_not_auth_failures() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        unlock
+            .already
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (id, key) = rig.begin();
+        let (status, out) = rig.post(
+            "/owner/unlock",
+            &ApprovalsRig::sealed(&id, &key, "right horse"),
+        );
+        assert_eq!(status, StatusCode::CONFLICT, "{out}");
+        assert!(out.contains("already_unlocked"), "{out}");
+        assert!(rig.audit.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlock_attempt_is_single_use_and_session_bound() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        let (id, key) = rig.begin();
+        let body = ApprovalsRig::sealed(&id, &key, "right horse");
+        // Another live session cannot spend this session's attempt,
+        // and trying burns it.
+        let other = rig.ui.issue_session().split(';').next().unwrap().to_owned();
+        let response = rig.ui.dispatch(Incoming {
+            method: Method::POST,
+            path: "/owner/unlock".into(),
+            cookie: Some(other),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            content_type: Some("application/json".into()),
+            body: body.as_bytes().to_vec(),
+        });
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (status, _) = rig.post("/owner/unlock", &body);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "attempt was not burned");
+        // A fresh attempt works once, then is gone.
+        let (id, key) = rig.begin();
+        let body = ApprovalsRig::sealed(&id, &key, "right horse");
+        assert_eq!(rig.post("/owner/unlock", &body).0, StatusCode::OK);
+        assert_eq!(rig.post("/owner/unlock", &body).0, StatusCode::BAD_REQUEST);
+        assert_eq!(*unlock.seen.lock().unwrap(), ["right horse"]);
+        assert_eq!(
+            *rig.audit.0.lock().unwrap(),
+            ["unlock_failed", "unlock_failed", "unlock_failed"]
+        );
+    }
+
+    #[test]
+    fn unlock_attempt_expires() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        let (id, key) = rig.begin();
+        for a in rig.ui.unlock_attempts.lock().unwrap().iter_mut() {
+            a.expires = Instant::now();
+        }
+        let (status, _) = rig.post(
+            "/owner/unlock",
+            &ApprovalsRig::sealed(&id, &key, "right horse"),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(unlock.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlock_keeps_at_most_a_few_attempts() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        let (first, key) = rig.begin();
+        for _ in 0..unlock::MAX_ATTEMPTS {
+            rig.begin();
+        }
+        assert_eq!(
+            rig.ui.unlock_attempts.lock().unwrap().len(),
+            unlock::MAX_ATTEMPTS
+        );
+        let (status, _) = rig.post(
+            "/owner/unlock",
+            &ApprovalsRig::sealed(&first, &key, "right horse"),
+        );
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "oldest attempt was not dropped"
+        );
+        assert!(unlock.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlock_routes_need_a_session_and_our_origin() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        let (id, key) = rig.begin();
+        let body = ApprovalsRig::sealed(&id, &key, "right horse");
+        for path in ["/owner/unlock/begin", "/owner/unlock"] {
+            let b = if path.ends_with("begin") {
+                "{}"
+            } else {
+                body.as_str()
+            };
+            let (status, _) = rig.send(
+                Method::POST,
+                path,
+                false,
+                Some(ORIGIN),
+                Some("application/json"),
+                b,
+            );
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+            for origin in [None, Some("https://evil.example"), Some("null")] {
+                let (status, _) = rig.send(
+                    Method::POST,
+                    path,
+                    true,
+                    origin,
+                    Some("application/json"),
+                    b,
+                );
+                assert_eq!(status, StatusCode::FORBIDDEN, "{path} {origin:?}");
+            }
+            for method in [Method::GET, Method::PUT] {
+                let (status, _) = rig.send(
+                    method.clone(),
+                    path,
+                    true,
+                    Some(ORIGIN),
+                    Some("application/json"),
+                    b,
+                );
+                assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{path} {method}");
+            }
+        }
+        rig.ui.expire_sessions();
+        assert_eq!(rig.post("/owner/unlock", &body).0, StatusCode::UNAUTHORIZED);
+        assert!(unlock.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlock_refuses_a_plain_password_and_malformed_bodies() {
+        let (rig, unlock) = ApprovalsRig::with_unlock();
+        // The password-key refusal has no carve-out: a plaintext
+        // password is refused before anything else, and not echoed.
+        for path in ["/owner/unlock/begin", "/owner/unlock"] {
+            let (status, out) = rig.post(path, r#"{"password":"hunter2"}"#);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(
+                out.contains("password_rejected") && !out.contains("hunter2"),
+                "{out}"
+            );
+        }
+        let (id, key) = rig.begin();
+        let good: Value =
+            serde_json::from_str(&ApprovalsRig::sealed(&id, &key, "right horse")).unwrap();
+        let mut extra = good.clone();
+        extra["kind"] = json!("x");
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().remove("nonce");
+        for (ctype, body) in [
+            (
+                Some("application/x-www-form-urlencoded"),
+                "attempt_id=x".to_owned(),
+            ),
+            (Some("text/plain"), good.to_string()),
+            (None, good.to_string()),
+            (Some("application/json"), "[]".to_owned()),
+            (Some("application/json"), extra.to_string()),
+            (Some("application/json"), missing.to_string()),
+        ] {
+            let (status, out) = rig.send(
+                Method::POST,
+                "/owner/unlock",
+                true,
+                Some(ORIGIN),
+                ctype,
+                &body,
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{ctype:?} {body}: {out}");
+        }
+        let (status, _) = rig.post("/owner/unlock/begin", r#"{"x":1}"#);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(unlock.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlock_without_a_backend_is_unknown_op() {
+        let rig = ApprovalsRig::new();
+        let (status, out) = rig.post("/owner/unlock/begin", "{}");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{out}");
+        assert!(out.contains("unknown_op"), "{out}");
+        let (_, key) = {
+            let (rig2, _) = ApprovalsRig::with_unlock();
+            rig2.begin()
+        };
+        let (status, _) = rig.post(
+            "/owner/unlock",
+            &ApprovalsRig::sealed("x", &key, "right horse"),
+        );
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 }

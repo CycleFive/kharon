@@ -195,7 +195,7 @@ Exposed as MCP (tools below) and HTTP `/v1/*`, with identical semantics. Auth: `
 | `kharon_search` | `GET /v1/items?q=&origin=` | `[ItemMeta]` |
 | `kharon_fill` | `POST /v1/fill` | `FillResult` |
 | `kharon_fill_totp` | `POST /v1/fill_totp` | `FillResult` |
-| `kharon_request_grant` | `POST /v1/grants` | `{grant_request_id, state}` |
+| `kharon_request_grant` | `POST /v1/grants` | `{grant_request_id, state, detail?}` |
 
 There is no read-secret, export, or reveal route, and no `include_secret` flag. This is permanent, enforced by REQ-GOAL-001 and REQ-API-005.
 

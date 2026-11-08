@@ -1,5 +1,6 @@
-//! The owner web UI's approvals queue (#131 slice 1) and grants list
-//! (#131 slice 2; SPEC §5's web UI channel, REQ-APR-005, REQ-REV-001).
+//! The owner web UI's approvals queue (#131 slice 1), grants list
+//! (#131 slice 2; SPEC §5's web UI channel, REQ-APR-005, REQ-REV-001)
+//! and audit tail (#131 slice 4; SPEC §5 "audit tail", §7).
 //!
 //! The UI decides requests through the same broker calls the CLI
 //! uses: [`Broker::approve_grant_request`] and
@@ -8,11 +9,14 @@
 //! timeout is denied as a timeout and the owner's decision fails
 //! closed as [`DecideError::NotPending`]. A revoke is the owner
 //! socket's [`Broker::revoke_grant`], on the same channel. The UI adds
-//! no grant logic of its own.
+//! no grant logic of its own. The audit tail is read-only: the last
+//! [`AUDIT_TAIL_LEN`] durable entries from the log's in-memory tail,
+//! projected to [`AuditRow`].
 
 use crate::api::Broker;
 use crate::api::VaultView;
 use crate::api::grant::{Channel, GrantError, GrantTerms, GrantView};
+use crate::audit::Entry;
 use crate::config::GrantKind;
 use crate::lock::Clock;
 
@@ -32,6 +36,61 @@ pub struct PendingRow {
     pub origin: String,
     /// Seconds since the request was created.
     pub age_s: u64,
+}
+
+/// How many audit entries the web UI shows, newest first.
+pub const AUDIT_TAIL_LEN: usize = 50;
+
+/// One row of the audit tail: a typed projection of an [`Entry`]
+/// (SPEC §7). It carries what an owner reads a tail for (who, what,
+/// where, how it ended) and drops the rest: no item name in either
+/// form (REQ-AUD-004 hashes it by default, and a plaintext name is a
+/// choice made for the log file, not for a browser page), no chain
+/// hashes and no `log_id`. Absent fields are omitted, as in the log.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AuditRow {
+    pub seq: u64,
+    /// RFC 3339, as written.
+    pub ts: String,
+    /// The event's wire name (`grant_revoke`, `fill`, ...).
+    pub event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl From<&Entry> for AuditRow {
+    fn from(e: &Entry) -> Self {
+        Self {
+            seq: e.seq,
+            ts: e.ts.clone(),
+            event: e.event.as_str(),
+            agent_id: e.agent_id.clone(),
+            item_id: e.item_id.clone(),
+            origin: e.origin.clone(),
+            live_origin: e.live_origin.clone(),
+            grant_id: e.grant_id.clone(),
+            channel: e.channel.clone(),
+            result: e.result.clone(),
+            detail_code: e.detail_code.clone(),
+            request_id: e.request_id.clone(),
+        }
+    }
 }
 
 /// The grant kinds the web UI can approve. `standing` stays with the
@@ -126,6 +185,12 @@ pub trait OwnerApprovals: Send + Sync + 'static {
         let _ = grant_id;
         Err(DecideError::NotFound)
     }
+
+    /// The last [`AUDIT_TAIL_LEN`] audit entries, newest first (#131
+    /// slice 4). Default: none.
+    fn audit_tail(&self) -> Vec<AuditRow> {
+        Vec::new()
+    }
 }
 
 /// No approvals backend: an empty queue, and every decision is
@@ -205,5 +270,12 @@ where
             Ok(false) => Err(DecideError::NotFound),
             Err(e) => Err(DecideError::from(e)),
         }
+    }
+
+    fn audit_tail(&self) -> Vec<AuditRow> {
+        self.recent_audit(AUDIT_TAIL_LEN)
+            .iter()
+            .map(AuditRow::from)
+            .collect()
     }
 }

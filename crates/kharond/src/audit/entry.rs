@@ -76,7 +76,8 @@ pub enum Event {
 }
 
 impl Event {
-    fn as_str(&self) -> &str {
+    /// The wire name (`grant_revoke`, `fill_dispatch`, ...).
+    pub fn as_str(&self) -> &'static str {
         match self {
             Event::Unlock => "unlock",
             Event::Lock => "lock",

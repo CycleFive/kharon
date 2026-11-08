@@ -31,9 +31,11 @@
 //! | POST | `/owner/approvals/deny` | Deny one |
 //! | GET | `/owner/grants` | Live grants, or 401 |
 //! | POST | `/owner/grants/revoke` | Revoke one |
+//! | GET | `/owner/audit` | The audit tail, or 401 |
 //!
-//! The approvals routes (#131 slice 1) and the grants routes (slice
-//! 2) need a live session. Ids travel in a JSON body, never in the
+//! The approvals routes (#131 slice 1), the grants routes (slice 2)
+//! and the audit tail (slice 4) need a live session. The audit tail
+//! is read-only and unaudited, like the grants list. Ids travel in a JSON body, never in the
 //! path. The state-changing calls are POST-only and refused unless
 //! the request carries an `Origin` header equal to the configured
 //! origin (a missing header is refused too, not only a mismatched
@@ -56,7 +58,9 @@ mod approvals;
 mod store;
 mod webauthn;
 
-pub use self::approvals::{DecideError, NoApprovals, OwnerApprovals, PendingRow, WebGrantKind};
+pub use self::approvals::{
+    AUDIT_TAIL_LEN, AuditRow, DecideError, NoApprovals, OwnerApprovals, PendingRow, WebGrantKind,
+};
 
 use std::future::Future;
 use std::path::Path;
@@ -109,6 +113,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/owner/approvals/deny"),
     ("GET", "/owner/grants"),
     ("POST", "/owner/grants/revoke"),
+    ("GET", "/owner/audit"),
 ];
 
 /// Longest request or grant id the owner routes accept. Broker ids
@@ -360,9 +365,8 @@ impl OwnerUi {
             return respond(StatusCode::FORBIDDEN, "origin", None);
         }
         let allowed = match req.path.as_str() {
-            "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants" => {
-                Some(Method::GET)
-            }
+            "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants"
+            | "/owner/audit" => Some(Method::GET),
             "/owner/login/options"
             | "/owner/login/finish"
             | "/owner/register/options"
@@ -397,6 +401,7 @@ impl OwnerUi {
             "/owner/approvals/deny" => self.approvals_decide(&req, Decision::Deny),
             "/owner/grants" => self.grants_list(&req),
             "/owner/grants/revoke" => self.grants_revoke(&req),
+            "/owner/audit" => self.audit_tail(&req),
             _ => unreachable!("path was matched above"),
         }
     }
@@ -521,6 +526,21 @@ impl OwnerUi {
         json_body(
             StatusCode::OK,
             json!({"ok": true, "grants": grants}).to_string(),
+            None,
+        )
+    }
+
+    /// The last [`AUDIT_TAIL_LEN`] audit entries, newest first, as
+    /// [`AuditRow`]s (#131 slice 4). Read-only; reading it is
+    /// unaudited, like the grants list.
+    fn audit_tail(&self, req: &Incoming) -> Response {
+        if !self.session_alive(req.cookie.as_deref()) {
+            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+        }
+        let entries = self.approvals.audit_tail();
+        json_body(
+            StatusCode::OK,
+            json!({"ok": true, "entries": entries}).to_string(),
             None,
         )
     }
@@ -1313,10 +1333,10 @@ fn shell_page(locked: &str, pending: usize) -> String {
 }
 
 /// The signed-in shell: broker state, the approvals queue (#131
-/// slice 1) and the live grants (slice 2). Rows are built with
-/// `textContent` only: origins come from agents (the page the tab
-/// was on, or the origin a grant was approved for), so nothing from
-/// a row is ever parsed as markup.
+/// slice 1), the live grants (slice 2) and the audit tail (slice 4).
+/// Rows are built with `textContent` only: origins come from agents
+/// (the page the tab was on, or the origin a grant was approved for),
+/// so nothing from a row is ever parsed as markup.
 const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1348,6 +1368,12 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <table id="grants" hidden>
 <thead><tr><th>Agent</th><th>Scope</th><th>Origin</th><th>Actions</th><th>Uses</th><th>Expires</th><th></th></tr></thead>
 <tbody id="grant-rows"></tbody>
+</table>
+<h2>Audit</h2>
+<p id="audit-empty">No audit entries yet.</p>
+<table id="audit" hidden>
+<thead><tr><th>Seq</th><th>Time</th><th>Event</th><th>Agent</th><th>Origin</th><th>Result</th><th>Channel</th></tr></thead>
+<tbody id="audit-rows"></tbody>
 </table>
 <p id="err" class="err" role="alert"></p>
 <button id="signout" type="button">Sign out</button>
@@ -1405,8 +1431,27 @@ async function refreshGrants() {
   document.getElementById("grants").hidden = data.grants.length === 0;
   document.getElementById("grants-empty").hidden = data.grants.length !== 0;
 }
+async function refreshAudit() {
+  const r = await fetch("/owner/audit", { credentials: "same-origin" });
+  if (r.status === 401) { location.assign("/"); return; }
+  if (!r.ok) return;
+  const data = await r.json();
+  const rows = document.getElementById("audit-rows");
+  rows.replaceChildren();
+  for (const e of data.entries) {
+    const tr = document.createElement("tr");
+    tr.dataset.seq = String(e.seq);
+    const result = e.detail_code ? (e.result || "") + " (" + e.detail_code + ")" : (e.result || "");
+    tr.append(cell(String(e.seq)), cell(e.ts), cell(e.event), cell(e.agent_id || ""),
+      cell(e.live_origin || e.origin || "", "origin"), cell(result), cell(e.channel || ""));
+    rows.append(tr);
+  }
+  document.getElementById("audit").hidden = data.entries.length === 0;
+  document.getElementById("audit-empty").hidden = data.entries.length !== 0;
+}
 window.kharonRefresh = async function () {
   await refreshGrants();
+  await refreshAudit();
   const r = await fetch("/owner/approvals", { credentials: "same-origin" });
   if (r.status === 401) { location.assign("/"); return; }
   if (!r.ok) return;
@@ -1651,6 +1696,25 @@ mod tests {
                 "g_audit" => Err(DecideError::AuditFailed),
                 _ => Ok(()),
             }
+        }
+
+        /// One web revoke, newest first, built from a full [`Entry`]
+        /// that also carries an item name in both forms, so the
+        /// projection is what gets tested.
+        fn audit_tail(&self) -> Vec<AuditRow> {
+            use crate::audit::{Entry, Event};
+            let mut e = Entry::new(Event::GrantRevoke)
+                .agent_id("alpha")
+                .item_id("item-1")
+                .item_name("Bank of Example")
+                .grant_id("g_1")
+                .channel("web_ui")
+                .result("revoked");
+            e.seq = 7;
+            e.ts = "2026-11-08T02:00:00Z".into();
+            e.item_name_hash = Some("ab".repeat(32));
+            e.log_id = "log-1".into();
+            vec![AuditRow::from(&e)]
         }
     }
 
@@ -2088,5 +2152,66 @@ mod tests {
             rig.calls(),
             ["revoke g_1", "revoke g_gone", "revoke g_audit"]
         );
+    }
+
+    // ---- #131 slice 4: audit tail ----
+
+    #[test]
+    fn audit_route_is_listed_and_on_the_shell() {
+        assert!(ROUTES.contains(&("GET", "/owner/audit")));
+        let shell = shell_page("unlocked", 0);
+        assert!(shell.contains("/owner/audit"), "no audit fetch");
+        assert!(shell.contains("id=\"audit-rows\""), "no audit table");
+    }
+
+    #[test]
+    fn audit_tail_needs_a_session() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/audit", false, None, None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(!body.contains("g_1"), "{body}");
+    }
+
+    #[test]
+    fn audit_tail_is_get_only() {
+        let rig = ApprovalsRig::new();
+        let (status, _) = rig.post("/owner/audit", "{}");
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        for method in [Method::PUT, Method::DELETE] {
+            let (status, _) = rig.send(method.clone(), "/owner/audit", true, None, None, "");
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        }
+    }
+
+    #[test]
+    fn audit_tail_renders_the_projection_without_item_names() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/audit", true, None, None, "");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        let e = &v["entries"][0];
+        assert_eq!(e["seq"], 7);
+        assert_eq!(e["ts"], "2026-11-08T02:00:00Z");
+        assert_eq!(e["event"], "grant_revoke");
+        assert_eq!(e["agent_id"], "alpha");
+        assert_eq!(e["item_id"], "item-1");
+        assert_eq!(e["grant_id"], "g_1");
+        assert_eq!(e["channel"], "web_ui");
+        assert_eq!(e["result"], "revoked");
+        for absent in [
+            "item_name",
+            "item_name_hash",
+            "prev_hash",
+            "hash",
+            "log_id",
+            "origin",
+            "detail_code",
+        ] {
+            assert!(e.get(absent).is_none(), "{absent} in {e}");
+        }
+        assert!(!body.contains("Bank of Example"), "{body}");
+        assert!(!body.contains(&"ab".repeat(32)), "{body}");
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
     }
 }

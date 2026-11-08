@@ -413,7 +413,7 @@ impl OwnerOps for DaemonOwner {
         let broker = Arc::clone(&self.broker);
         tokio::task::spawn_blocking(move || {
             broker
-                .deny_grant_request(&request_id)
+                .deny_grant_request(&request_id, Channel::Cli)
                 .map(|_| ())
                 .map_err(map_grant_error)
         })
@@ -926,6 +926,7 @@ async fn bind_owner_ui(
         Arc::new(DaemonUiAudit {
             broker: Arc::clone(broker),
         }),
+        Arc::clone(broker) as Arc<dyn crate::owner_ui::OwnerApprovals>,
     )
     .map_err(|e| StartupError::OwnerUiStore {
         kind: e.kind().to_string(),

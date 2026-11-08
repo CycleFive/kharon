@@ -599,7 +599,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 
     /// The grant clock's current reading.
-    fn grant_now(&self) -> std::time::Duration {
+    pub(crate) fn grant_now(&self) -> std::time::Duration {
         self.grant_clock.now()
     }
 
@@ -1399,10 +1399,15 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         Ok(grant.view(now))
     }
 
-    /// Deny a pending grant request (owner action). Audited
-    /// (`grant_request`, result `denied`, detail `owner_denied`);
-    /// an audit failure restores the request to pending.
-    pub fn deny_grant_request(&self, request_id: &str) -> Result<GrantRequest, GrantError> {
+    /// Deny a pending grant request (owner action) on `channel`.
+    /// Audited (`grant_request`, result `denied`, detail
+    /// `owner_denied`, the deciding channel); an audit failure
+    /// restores the request to pending.
+    pub fn deny_grant_request(
+        &self,
+        request_id: &str,
+        channel: Channel,
+    ) -> Result<GrantRequest, GrantError> {
         // REQ-APR-003 (#130): an aged request is a timeout denial, not
         // an owner one.
         self.expire_grant_requests()?;
@@ -1416,6 +1421,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .item_id(req.item_id.clone())
             .origin(req.observed_origin.clone())
             .request_id(req.id.clone())
+            .channel(channel.as_str())
             .result("denied")
             .detail_code("owner_denied");
         if self.append(entry).is_err() {
@@ -1527,7 +1533,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     Channel::Ntfy,
                 )
                 .map(|_| ()),
-            ApprovalAction::Deny => self.deny_grant_request(&request_id).map(|_| ()),
+            ApprovalAction::Deny => self
+                .deny_grant_request(&request_id, Channel::Ntfy)
+                .map(|_| ()),
         };
         decided.map_err(|_| TokenGone::Used)?;
         Ok(action)

@@ -8,6 +8,13 @@
 //! (`KHARON_CHROMIUM`, or `google-chrome` / `chromium` on `PATH`).
 //! Set `KHARON_REQUIRE_WEBAUTHN=1` to fail instead of skipping that
 //! case.
+//!
+//! The approvals cases (#131 slice 1) serve the same UI over a test
+//! broker with a real pending request: list, approve and deny need the
+//! passkey session and our `Origin`, decide through the broker's own
+//! approve and deny (the fill then runs), write the CLI's audit
+//! entries on the `web_ui` channel, and fail closed for a request past
+//! its 120 s timeout (REQ-APR-003, #130).
 
 mod api_support;
 
@@ -16,18 +23,28 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api_support::{RawResponse, raw_request};
+use api_support::{
+    CHEAP_FLOOR, FakeAnswer, FakeFill, ITEM_A, RawResponse, RecordingAudit, TestBroker,
+    TestSession, cheap_argon, raw_request,
+};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use ciborium::Value;
 use futures_util::{SinkExt, StreamExt};
+use kharond::api::grant::{Channel, GrantTerms, RequestState};
+use kharond::api::http::ApprovalRedeemer;
+use kharond::api::token::{TokenStore, generate_with};
+use kharond::api::{Broker, Outcome, parse_fill};
 use kharond::config::Config;
 use kharond::daemon;
 use kharond::lock::StaticHardening;
-use kharond::owner_ui::ROUTES;
+use kharond::lock::{Clock, LockController, LockPolicy, ManualClock};
+use kharond::origin::OriginConfig;
+use kharond::owner_ui::{NoAudit, OwnerApprovals, OwnerUi, ROUTES, ShellView, StaticShell};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
@@ -643,13 +660,18 @@ async fn req_apr_005_virtual_authenticator_login() {
 
 /// Enroll a software passkey and sign in. Returns the `Cookie` value.
 async fn enroll_and_sign_in(run: &Running) -> String {
-    let origin = &run.origin;
     let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
     assert_eq!(minted["ok"], json!(true), "{minted}");
     let token = minted["enroll_token"].as_str().unwrap();
+    register_and_sign_in(run.ui, &run.origin, token).await
+}
+
+/// Register a software passkey with the enrollment code `token`, then
+/// sign in with an assertion. Returns the `Cookie` value.
+async fn register_and_sign_in(ui: std::net::SocketAddr, origin: &str, token: &str) -> String {
     let mut auth = VirtAuth::new();
     let opts = http(
-        run.ui,
+        ui,
         origin,
         Http::post("/owner/register/options", None, "").bearer(token),
     )
@@ -662,7 +684,7 @@ async fn enroll_and_sign_in(run: &Running) -> String {
     let reg = auth.registration(challenge, origin, "localhost");
     let body = json!({"ceremony_id": ceremony, "credential": reg}).to_string();
     let registered = http(
-        run.ui,
+        ui,
         origin,
         Http::post("/owner/register/finish", Some("application/json"), &body),
     )
@@ -670,7 +692,7 @@ async fn enroll_and_sign_in(run: &Running) -> String {
     assert_eq!(registered.status, 200, "{}", registered.body);
     assert!(session_cookie(&registered).is_none());
 
-    let login_opts = http(run.ui, origin, Http::post("/owner/login/options", None, "")).await;
+    let login_opts = http(ui, origin, Http::post("/owner/login/options", None, "")).await;
     assert_eq!(login_opts.status, 200, "{}", login_opts.body);
     let login_opts: Json = serde_json::from_str(&login_opts.body).unwrap();
     let ceremony = login_opts["ceremony_id"].as_str().unwrap();
@@ -678,7 +700,7 @@ async fn enroll_and_sign_in(run: &Running) -> String {
     let assertion = auth.assertion(challenge, origin, "localhost");
     let body = json!({"ceremony_id": ceremony, "credential": assertion}).to_string();
     let ok = http(
-        run.ui,
+        ui,
         origin,
         Http::post("/owner/login/finish", Some("application/json"), &body),
     )
@@ -931,22 +953,14 @@ fn is_navigation_race(error: &Json) -> bool {
         || message.contains("No execution context")
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn req_apr_005_chromium_virtual_authenticator() {
-    let Some(bin) = chromium_bin() else {
-        if std::env::var_os("KHARON_REQUIRE_WEBAUTHN").is_some() {
-            panic!("KHARON_REQUIRE_WEBAUTHN is set but no Chromium binary was found");
-        }
-        eprintln!("SKIP req_apr_005_chromium_virtual_authenticator: no Chromium binary");
-        return;
-    };
-    let run = start(true).await;
-    let origin = run.origin.clone();
-    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
-    let token = minted["enroll_token"].as_str().unwrap().to_owned();
-
-    let chromium = launch_chromium(&bin);
-    let mut cdp = Cdp::connect(&chromium.ws).await;
+/// In a fresh tab: add a CTAP2 virtual authenticator, register it
+/// with the enrollment code `token` on `/enroll`, then sign in on `/`.
+/// Returns the tab's CDP session and the authenticator id.
+async fn browser_register_and_sign_in(
+    cdp: &mut Cdp,
+    origin: &str,
+    token: &str,
+) -> (String, String) {
     let session = cdp.open(&format!("{origin}/enroll")).await;
     cdp.call(Some(&session), "WebAuthn.enable", json!({})).await;
     let added = cdp
@@ -1023,6 +1037,26 @@ async fn req_apr_005_chromium_virtual_authenticator() {
         json!(true),
         "virtual authenticator did not sign in"
     );
+    (session, authenticator_id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_chromium_virtual_authenticator() {
+    let Some(bin) = chromium_bin() else {
+        if std::env::var_os("KHARON_REQUIRE_WEBAUTHN").is_some() {
+            panic!("KHARON_REQUIRE_WEBAUTHN is set but no Chromium binary was found");
+        }
+        eprintln!("SKIP req_apr_005_chromium_virtual_authenticator: no Chromium binary");
+        return;
+    };
+    let run = start(true).await;
+    let origin = run.origin.clone();
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let token = minted["enroll_token"].as_str().unwrap().to_owned();
+
+    let chromium = launch_chromium(&bin);
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (session, authenticator_id) = browser_register_and_sign_in(&mut cdp, &origin, &token).await;
 
     let authed = cdp
         .eval(
@@ -1072,4 +1106,445 @@ async fn req_apr_005_chromium_virtual_authenticator() {
     drop(cdp);
     drop(chromium);
     run.shutdown().await;
+}
+
+// ---- #131 slice 1: the approvals queue ----
+
+/// The owner UI over a test broker that has a pending grant request
+/// to decide. The broker backs the approvals routes and the ntfy
+/// redeem paths, as the daemon wires it.
+struct ApprovalsRig {
+    broker: Arc<TestBroker>,
+    clock: Arc<ManualClock>,
+    audit: RecordingAudit,
+    alpha: String,
+    ui: std::net::SocketAddr,
+    owner: Arc<OwnerUi>,
+    origin: String,
+    cookie: String,
+    _data: tempfile::TempDir,
+}
+
+impl ApprovalsRig {
+    async fn new() -> Self {
+        let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
+        let tokens = TokenStore::with_floor([("alpha", ha.as_str())], &CHEAP_FLOOR).unwrap();
+        let clock = Arc::new(ManualClock::new());
+        let mut lock = LockController::new(
+            LockPolicy::default(),
+            clock.clone(),
+            Box::new(StaticHardening::all_ok()),
+        );
+        lock.unlock(|| Ok::<_, ()>(TestSession::fixture())).unwrap();
+        let audit = RecordingAudit::default();
+        let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://login.example.com/");
+        let grant_clock: Arc<dyn Clock> = clock.clone();
+        let broker = Arc::new(
+            Broker::new(
+                tokens,
+                lock,
+                Box::new(audit.clone()),
+                OriginConfig::default(),
+            )
+            .with_grant_clock(grant_clock)
+            .with_fill_backend(Box::new(fake)),
+        );
+
+        let data = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui_addr = listener.local_addr().unwrap();
+        let origin = format!("http://localhost:{}", ui_addr.port());
+        let ui = OwnerUi::open(
+            data.path(),
+            "localhost",
+            origin.clone(),
+            Arc::new(StaticShell(ShellView {
+                locked: false,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            broker.clone() as Arc<dyn OwnerApprovals>,
+        )
+        .unwrap();
+        let token = ui.mint_enroll_token();
+        let redeem: Arc<dyn ApprovalRedeemer> = broker.clone();
+        tokio::spawn(kharond::owner_ui::serve(listener, ui.clone(), redeem));
+        let cookie = register_and_sign_in(ui_addr, &origin, &token).await;
+        Self {
+            broker,
+            clock,
+            audit,
+            alpha: alpha.expose_secret().clone(),
+            ui: ui_addr,
+            owner: ui,
+            origin,
+            cookie,
+            _data: data,
+        }
+    }
+
+    /// A password fill with no grant: returns its fill outcome.
+    async fn fill(&self) -> Json {
+        let req = parse_fill(
+            kharond::api::FillOperation::Fill,
+            json!({
+                "item_id": ITEM_A,
+                "target": {"cdp_target_id": "tab-1", "expected_origin": "https://login.example.com"},
+                "fields": [{"kind": "password"}],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let agent = self.broker.authenticate(&self.alpha).unwrap();
+        match self
+            .broker
+            .fill(&agent, req, tokio::time::Instant::now())
+            .await
+        {
+            Ok(Outcome::Fill(r)) => serde_json::to_value(r).unwrap(),
+            other => panic!("expected a fill outcome, got {other:?}"),
+        }
+    }
+
+    /// A fresh pending request's id.
+    async fn pending_request(&self) -> String {
+        let r = self.fill().await;
+        assert_eq!(r["status"], "pending_approval", "{r}");
+        r["grant_request_id"].as_str().unwrap().to_owned()
+    }
+
+    async fn list(&self) -> RawResponse {
+        http(
+            self.ui,
+            &self.origin,
+            Http::get("/owner/approvals").cookie(&self.cookie),
+        )
+        .await
+    }
+
+    async fn decide(&self, path: &str, body: &Json) -> RawResponse {
+        let body = body.to_string();
+        http(
+            self.ui,
+            &self.origin,
+            Http::post(path, Some("application/json"), &body).cookie(&self.cookie),
+        )
+        .await
+    }
+
+    /// Audit entries about `request_id` (and the grant it issued).
+    fn entries_for(&self, request_id: &str) -> Vec<kharond::audit::Entry> {
+        self.audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.request_id.as_deref() == Some(request_id))
+            .cloned()
+            .collect()
+    }
+
+    fn state(&self, request_id: &str) -> RequestState {
+        self.broker.grant_request(request_id).unwrap().state
+    }
+}
+
+/// An entry with the per-request fields blanked, so a web entry and a
+/// CLI entry for two different requests can be compared.
+fn shape(e: &kharond::audit::Entry) -> Json {
+    let mut v = serde_json::to_value(e).unwrap();
+    let map = v.as_object_mut().unwrap();
+    for k in [
+        "seq",
+        "ts",
+        "prev_hash",
+        "log_id",
+        "request_id",
+        "grant_id",
+        "channel",
+    ] {
+        map.remove(k);
+    }
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_approvals_list_approve_deny_through_the_cli_path() {
+    let rig = ApprovalsRig::new().await;
+    let web = rig.pending_request().await;
+
+    // The queue needs the passkey session.
+    let anon = http(rig.ui, &rig.origin, Http::get("/owner/approvals")).await;
+    assert_eq!(anon.status, 401, "{}", anon.body);
+    let list = rig.list().await;
+    assert_eq!(list.status, 200, "{}", list.body);
+    let rows = list.json()["pending"].clone();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["request_id"], json!(web));
+    assert_eq!(rows[0]["agent_id"], "alpha");
+    assert_eq!(rows[0]["item_id"], ITEM_A);
+    assert_eq!(rows[0]["action"], "fill");
+    assert_eq!(rows[0]["origin"], "https://login.example.com");
+
+    // A cross-site POST carrying the session cookie changes nothing.
+    let forged = http(
+        rig.ui,
+        "https://evil.example",
+        Http::post(
+            "/owner/approvals/approve",
+            Some("application/json"),
+            &json!({"request_id": web}).to_string(),
+        )
+        .cookie(&rig.cookie),
+    )
+    .await;
+    assert_eq!(forged.status, 403, "{}", forged.body);
+    let form = http(
+        rig.ui,
+        &rig.origin,
+        Http::post(
+            "/owner/approvals/approve",
+            Some("application/x-www-form-urlencoded"),
+            &format!("request_id={web}"),
+        )
+        .cookie(&rig.cookie),
+    )
+    .await;
+    assert_eq!(form.status, 400, "{}", form.body);
+    assert_eq!(rig.state(&web), RequestState::Pending);
+
+    // Approve once from the web: the same fill now runs, and the once
+    // grant is spent by it.
+    let approved = rig
+        .decide(
+            "/owner/approvals/approve",
+            &json!({"request_id": web, "kind": "once"}),
+        )
+        .await;
+    assert_eq!(approved.status, 200, "{}", approved.body);
+    let grant_id = approved.json()["grant_id"].as_str().unwrap().to_owned();
+    assert_eq!(rig.state(&web), RequestState::Approved);
+    let r = rig.fill().await;
+    assert_eq!(r["status"], "filled", "{r}");
+    // Deciding it again is refused.
+    let again = rig
+        .decide("/owner/approvals/approve", &json!({"request_id": web}))
+        .await;
+    assert_eq!(again.status, 409, "{}", again.body);
+    assert!(again.body.contains("not_pending"), "{}", again.body);
+
+    // The CLI approves the next request through the same broker call.
+    let cli = rig.pending_request().await;
+    rig.broker
+        .approve_grant_request(&cli, &GrantTerms::once_item(ITEM_A), Channel::Cli)
+        .unwrap();
+    let web_issue: Vec<_> = rig
+        .entries_for(&web)
+        .into_iter()
+        .filter(|e| e.result.as_deref() == Some("issued"))
+        .collect();
+    let cli_issue: Vec<_> = rig
+        .entries_for(&cli)
+        .into_iter()
+        .filter(|e| e.result.as_deref() == Some("issued"))
+        .collect();
+    assert_eq!(web_issue.len(), 1, "{web_issue:?}");
+    assert_eq!(cli_issue.len(), 1, "{cli_issue:?}");
+    assert_eq!(web_issue[0].channel.as_deref(), Some("web_ui"));
+    assert_eq!(web_issue[0].grant_id.as_deref(), Some(grant_id.as_str()));
+    assert_eq!(cli_issue[0].channel.as_deref(), Some("cli"));
+    assert_eq!(shape(&web_issue[0]), shape(&cli_issue[0]));
+}
+
+/// Deny from the web and from the CLI write the same entry, apart
+/// from the channel. (A separate rig: one item's fills are capped at
+/// five per ten minutes, REQ-RL-001.)
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_deny_writes_the_cli_entry_on_the_web_channel() {
+    let rig = ApprovalsRig::new().await;
+    let web_deny = rig.pending_request().await;
+    let denied = rig
+        .decide("/owner/approvals/deny", &json!({"request_id": web_deny}))
+        .await;
+    assert_eq!(denied.status, 200, "{}", denied.body);
+    assert_eq!(rig.state(&web_deny), RequestState::Denied);
+    let cli_deny = rig.pending_request().await;
+    rig.broker
+        .deny_grant_request(&cli_deny, Channel::Cli)
+        .unwrap();
+    let pick = |id: &str| {
+        rig.entries_for(id)
+            .into_iter()
+            .filter(|e| e.result.as_deref() == Some("denied"))
+            .collect::<Vec<_>>()
+    };
+    let (w, c) = (pick(&web_deny), pick(&cli_deny));
+    assert_eq!((w.len(), c.len()), (1, 1), "{w:?} {c:?}");
+    assert_eq!(w[0].detail_code.as_deref(), Some("owner_denied"));
+    assert_eq!(w[0].channel.as_deref(), Some("web_ui"));
+    assert_eq!(c[0].channel.as_deref(), Some("cli"));
+    assert_eq!(shape(&w[0]), shape(&c[0]));
+
+    // The queue is empty again.
+    let list = rig.list().await;
+    assert_eq!(list.json()["pending"], json!([]), "{}", list.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_decision_on_an_aged_request_fails_closed() {
+    let rig = ApprovalsRig::new().await;
+    let aged = rig.pending_request().await;
+    // Past the 120 s timeout, with no agent call since.
+    rig.clock.advance(Duration::from_secs(121));
+    let list = rig.list().await;
+    assert_eq!(list.json()["pending"], json!([]), "{}", list.body);
+    let approved = rig
+        .decide("/owner/approvals/approve", &json!({"request_id": aged}))
+        .await;
+    assert_eq!(approved.status, 409, "{}", approved.body);
+    assert!(approved.body.contains("not_pending"), "{}", approved.body);
+    assert_eq!(rig.state(&aged), RequestState::Denied);
+    let results: Vec<(Option<String>, Option<String>)> = rig
+        .entries_for(&aged)
+        .into_iter()
+        .map(|e| (e.result, e.detail_code))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            (Some("pending".into()), None),
+            (Some("denied".into()), Some("request_timeout".into())),
+        ]
+    );
+    let r = rig.fill().await;
+    assert_eq!(r["status"], "pending_approval", "no grant was issued: {r}");
+
+    // Deny takes the same path: the timeout decides first.
+    let second = r["grant_request_id"].as_str().unwrap().to_owned();
+    rig.clock.advance(Duration::from_secs(121));
+    let denied = rig
+        .decide("/owner/approvals/deny", &json!({"request_id": second}))
+        .await;
+    assert_eq!(denied.status, 409, "{}", denied.body);
+    let details: Vec<Option<String>> = rig
+        .entries_for(&second)
+        .into_iter()
+        .filter(|e| e.result.as_deref() == Some("denied"))
+        .map(|e| e.detail_code)
+        .collect();
+    assert_eq!(details, [Some("request_timeout".to_owned())]);
+
+    // Unknown ids are not found.
+    let unknown = rig
+        .decide("/owner/approvals/deny", &json!({"request_id": "gr_nope"}))
+        .await;
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_approve_rolls_back_when_the_audit_append_fails() {
+    let rig = ApprovalsRig::new().await;
+    let id = rig.pending_request().await;
+    *rig.audit.fail_event.lock().unwrap() = Some("grant_issue");
+    let approved = rig
+        .decide("/owner/approvals/approve", &json!({"request_id": id}))
+        .await;
+    assert_eq!(approved.status, 500, "{}", approved.body);
+    assert!(approved.body.contains("audit_failed"), "{}", approved.body);
+    assert_eq!(rig.state(&id), RequestState::Pending);
+    *rig.audit.fail_event.lock().unwrap() = None;
+    let r = rig.fill().await;
+    assert_eq!(r["status"], "pending_approval", "a grant survived: {r}");
+}
+
+/// The shell page's own buttons, in a real browser: the row shows the
+/// observed origin, and "Approve once" issues the grant over the
+/// `web_ui` channel (the browser's fetch carries our `Origin` and a
+/// JSON body, so it passes the CSRF checks a forged request fails).
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_chromium_approve_click() {
+    let Some(bin) = chromium_bin() else {
+        if std::env::var_os("KHARON_REQUIRE_WEBAUTHN").is_some() {
+            panic!("KHARON_REQUIRE_WEBAUTHN is set but no Chromium binary was found");
+        }
+        eprintln!("SKIP req_apr_005_chromium_approve_click: no Chromium binary");
+        return;
+    };
+    let rig = ApprovalsRig::new().await;
+    let approve = rig.pending_request().await;
+    let token = rig.owner.mint_enroll_token();
+
+    let chromium = launch_chromium(&bin);
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (session, _authenticator) =
+        browser_register_and_sign_in(&mut cdp, &rig.origin, &token).await;
+    let _ = cdp
+        .eval_navigating(&session, &format!("location.assign({:?})", rig.origin))
+        .await;
+    let row = format!(
+        "tr[data-request-id={}]",
+        serde_json::to_string(&approve).unwrap()
+    );
+    let probe = format!(
+        "JSON.stringify((() => {{ const r = document.querySelector({sel}); \
+         return r ? Array.from(r.cells, c => c.textContent) : null; }})())",
+        sel = serde_json::to_string(&row).unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let cells = loop {
+        let got = cdp
+            .eval_navigating(&session, &probe)
+            .await
+            .unwrap_or(Json::Null);
+        let cells: Json = serde_json::from_str(got.as_str().unwrap_or("null")).unwrap();
+        if cells.is_array() {
+            break cells;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queue never showed the request"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(cells[0], "alpha", "{cells}");
+    assert_eq!(cells[1], "fill", "{cells}");
+    assert_eq!(cells[2], "https://login.example.com", "{cells}");
+    assert_eq!(cells[3], ITEM_A, "{cells}");
+
+    let click = format!(
+        "(() => {{ const b = Array.from(document.querySelector({sel}).querySelectorAll('button')) \
+         .find(b => b.textContent === 'Approve once'); b.click(); return true; }})()",
+        sel = serde_json::to_string(&row).unwrap()
+    );
+    assert_eq!(cdp.eval(&session, &click).await, json!(true));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.state(&approve) == RequestState::Pending {
+        assert!(Instant::now() < deadline, "the click never approved");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(rig.state(&approve), RequestState::Approved);
+    let issued: Vec<_> = rig
+        .entries_for(&approve)
+        .into_iter()
+        .filter(|e| e.result.as_deref() == Some("issued"))
+        .collect();
+    assert_eq!(issued.len(), 1, "{issued:?}");
+    assert_eq!(issued[0].channel.as_deref(), Some("web_ui"));
+    assert_eq!(rig.fill().await["status"], "filled");
+
+    // The page refreshed its queue after the decision.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let empty = cdp
+            .eval(&session, "document.getElementById('rows').children.length")
+            .await;
+        if empty == json!(0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the approved row stayed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(cdp);
+    drop(chromium);
 }

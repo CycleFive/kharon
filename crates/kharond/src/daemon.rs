@@ -443,9 +443,13 @@ impl OwnerOps for DaemonOwner {
 
     async fn revoke_grant(&self, grant_id: String) -> Result<bool, OwnerFailure> {
         let broker = Arc::clone(&self.broker);
-        tokio::task::spawn_blocking(move || broker.revoke_grant(&grant_id).map_err(map_grant_error))
-            .await
-            .map_err(|_| OwnerFailure::AuditFailed)?
+        tokio::task::spawn_blocking(move || {
+            broker
+                .revoke_grant(&grant_id, crate::api::grant::Channel::Cli)
+                .map_err(map_grant_error)
+        })
+        .await
+        .map_err(|_| OwnerFailure::AuditFailed)?
     }
 
     async fn revoke_agent(&self, agent_id: String) -> Result<usize, OwnerFailure> {

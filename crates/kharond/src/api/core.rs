@@ -1591,9 +1591,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 
     /// Revoke a grant (REQ-REV-001's broker primitive; effective for
-    /// the next fill). Audited (`grant_revoke`); an audit failure
-    /// restores the grant. `false` when no such grant exists.
-    pub fn revoke_grant(&self, grant_id: &str) -> Result<bool, GrantError> {
+    /// the next fill). Audited (`grant_revoke`, with the owner
+    /// `channel` that asked); an audit failure restores the grant.
+    /// `false` when no such grant exists.
+    pub fn revoke_grant(&self, grant_id: &str, channel: Channel) -> Result<bool, GrantError> {
         let Some(grant) = self
             .grants
             .lock()
@@ -1610,6 +1611,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let entry = Entry::new(Event::GrantRevoke)
             .agent_id(grant.agent_id.clone())
             .grant_id(grant.id.clone())
+            .channel(channel.as_str())
             .result("revoked");
         let entry = match grant_item_id(&grant) {
             Some(id) => entry.item_id(id),
@@ -1814,6 +1816,20 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .unwrap_or_else(|p| p.into_inner())
             .request(request_id)
             .cloned()
+    }
+
+    /// Every live grant, across agents, oldest first, as the status
+    /// view renders one (the owner web UI's grants list, #131 slice
+    /// 2). Unaudited and read-only, like `kharon_status`.
+    pub fn live_grants(&self) -> Vec<GrantView> {
+        let now = self.grant_now();
+        self.grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_grants(now)
+            .iter()
+            .map(|g| g.view(now))
+            .collect()
     }
 
     /// Every pending grant request (the approval channels' queue).

@@ -1,17 +1,18 @@
-//! The owner web UI's approvals queue (#131 slice 1; SPEC §5's web UI
-//! channel, REQ-APR-005).
+//! The owner web UI's approvals queue (#131 slice 1) and grants list
+//! (#131 slice 2; SPEC §5's web UI channel, REQ-APR-005, REQ-REV-001).
 //!
 //! The UI decides requests through the same broker calls the CLI
 //! uses: [`Broker::approve_grant_request`] and
 //! [`Broker::deny_grant_request`], on [`Channel::WebUi`]. Both run the
 //! REQ-APR-003 expiry pass first (#130), so a request past its 120 s
 //! timeout is denied as a timeout and the owner's decision fails
-//! closed as [`DecideError::NotPending`]. The UI adds no grant logic
-//! of its own.
+//! closed as [`DecideError::NotPending`]. A revoke is the owner
+//! socket's [`Broker::revoke_grant`], on the same channel. The UI adds
+//! no grant logic of its own.
 
 use crate::api::Broker;
 use crate::api::VaultView;
-use crate::api::grant::{Channel, GrantError, GrantTerms};
+use crate::api::grant::{Channel, GrantError, GrantTerms, GrantView};
 use crate::config::GrantKind;
 use crate::lock::Clock;
 
@@ -112,6 +113,19 @@ pub trait OwnerApprovals: Send + Sync + 'static {
 
     /// Deny `request_id`.
     fn deny(&self, request_id: &str) -> Result<(), DecideError>;
+
+    /// Every live grant, across agents, oldest first (#131 slice 2).
+    /// Default: none.
+    fn grants(&self) -> Vec<GrantView> {
+        Vec::new()
+    }
+
+    /// Revoke `grant_id` (REQ-REV-001). [`DecideError::NotFound`] when
+    /// there is no such grant. Default: no grant is ever found.
+    fn revoke(&self, grant_id: &str) -> Result<(), DecideError> {
+        let _ = grant_id;
+        Err(DecideError::NotFound)
+    }
 }
 
 /// No approvals backend: an empty queue, and every decision is
@@ -179,5 +193,17 @@ where
         self.deny_grant_request(request_id, Channel::WebUi)
             .map(|_| ())
             .map_err(DecideError::from)
+    }
+
+    fn grants(&self) -> Vec<GrantView> {
+        self.live_grants()
+    }
+
+    fn revoke(&self, grant_id: &str) -> Result<(), DecideError> {
+        match self.revoke_grant(grant_id, Channel::WebUi) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DecideError::NotFound),
+            Err(e) => Err(DecideError::from(e)),
+        }
     }
 }

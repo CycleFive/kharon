@@ -29,16 +29,19 @@
 //! | GET | `/owner/approvals` | Pending grant requests, or 401 |
 //! | POST | `/owner/approvals/approve` | Approve one (`once` or `per-origin`) |
 //! | POST | `/owner/approvals/deny` | Deny one |
+//! | GET | `/owner/grants` | Live grants, or 401 |
+//! | POST | `/owner/grants/revoke` | Revoke one |
 //!
-//! The approvals routes (#131 slice 1) need a live session. The
-//! request id travels in a JSON body, never in the path. The two
-//! decisions are POST-only and refused unless the request carries an
-//! `Origin` header equal to the configured origin (a missing header is
-//! refused too, not only a mismatched one) and a JSON content type, so
-//! a cross-site form cannot reach them even without `SameSite`. They
-//! call the broker's own approve and deny on the `web_ui` channel
-//! ([`approvals`]), so the REQ-APR-003 expiry pass and the audit
-//! entries are the CLI's.
+//! The approvals routes (#131 slice 1) and the grants routes (slice
+//! 2) need a live session. Ids travel in a JSON body, never in the
+//! path. The state-changing calls are POST-only and refused unless
+//! the request carries an `Origin` header equal to the configured
+//! origin (a missing header is refused too, not only a mismatched
+//! one) and a JSON content type, so a cross-site form cannot reach
+//! them even without `SameSite`. They call the broker's own approve,
+//! deny and revoke on the `web_ui` channel ([`approvals`]), so the
+//! REQ-APR-003 expiry pass, the rollbacks and the audit entries are
+//! the CLI's.
 //!
 //! The same listener serves ntfy redeem (REQ-APR-004, REQ-DEP-006,
 //! #136): `GET`/`POST` `/owner/approve/<token>` and
@@ -104,11 +107,13 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/owner/approvals"),
     ("POST", "/owner/approvals/approve"),
     ("POST", "/owner/approvals/deny"),
+    ("GET", "/owner/grants"),
+    ("POST", "/owner/grants/revoke"),
 ];
 
-/// Longest request id the approvals routes accept. Broker ids are
-/// `gr_` plus a short random suffix, well under this.
-const MAX_REQUEST_ID_LEN: usize = 64;
+/// Longest request or grant id the owner routes accept. Broker ids
+/// are `gr_` or `g_` plus a short random suffix, well under this.
+const MAX_ID_LEN: usize = 64;
 
 const MAX_BODY: usize = 16 * 1024;
 const MAX_CEREMONIES: usize = 8;
@@ -355,14 +360,17 @@ impl OwnerUi {
             return respond(StatusCode::FORBIDDEN, "origin", None);
         }
         let allowed = match req.path.as_str() {
-            "/" | "/enroll" | "/owner/session" | "/owner/approvals" => Some(Method::GET),
+            "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants" => {
+                Some(Method::GET)
+            }
             "/owner/login/options"
             | "/owner/login/finish"
             | "/owner/register/options"
             | "/owner/register/finish"
             | "/owner/logout"
             | "/owner/approvals/approve"
-            | "/owner/approvals/deny" => Some(Method::POST),
+            | "/owner/approvals/deny"
+            | "/owner/grants/revoke" => Some(Method::POST),
             _ => None,
         };
         let Some(allowed) = allowed else {
@@ -387,6 +395,8 @@ impl OwnerUi {
             "/owner/approvals" => self.approvals_list(&req),
             "/owner/approvals/approve" => self.approvals_decide(&req, Decision::Approve),
             "/owner/approvals/deny" => self.approvals_decide(&req, Decision::Deny),
+            "/owner/grants" => self.grants_list(&req),
+            "/owner/grants/revoke" => self.grants_revoke(&req),
             _ => unreachable!("path was matched above"),
         }
     }
@@ -438,33 +448,38 @@ impl OwnerUi {
         )
     }
 
-    /// Approve or deny one request. The checks run in this order, and
-    /// each refusal leaves grant state untouched: `Origin` present and
-    /// equal to ours (CSRF), a live session, a JSON body without a
-    /// password key, a well-formed request id and kind. Only then does
-    /// the broker see the call.
-    fn approvals_decide(&self, req: &Incoming, decision: Decision) -> Response {
+    /// The gate in front of every state-changing owner call
+    /// (approve, deny, revoke). The checks run in this order, and each
+    /// refusal leaves broker state untouched: `Origin` present and
+    /// equal to ours (CSRF), a live session, then a non-empty JSON
+    /// body without a password key. The caller then parses its own
+    /// body with unknown keys refused.
+    fn gate_owner_post(&self, req: &Incoming) -> Option<Response> {
         if req.origin.as_deref() != Some(self.origin.as_str()) {
             self.audit.auth_failed("origin");
-            return respond(StatusCode::FORBIDDEN, "origin", None);
+            return Some(respond(StatusCode::FORBIDDEN, "origin", None));
         }
         if !self.session_alive(req.cookie.as_deref()) {
             self.audit.auth_failed("no_session");
-            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+            return Some(respond(StatusCode::UNAUTHORIZED, "unauthenticated", None));
         }
         if req.body.is_empty() {
-            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+            return Some(respond(StatusCode::BAD_REQUEST, "bad_request", None));
         }
-        if let Some(err) = self.precheck_post(req) {
+        self.precheck_post(req)
+    }
+
+    /// Approve or deny one request, behind [`Self::gate_owner_post`]
+    /// and a well-formed request id and kind. Only then does the
+    /// broker see the call.
+    fn approvals_decide(&self, req: &Incoming, decision: Decision) -> Response {
+        if let Some(err) = self.gate_owner_post(req) {
             return err;
         }
         let Ok(body) = serde_json::from_slice::<DecideBody>(&req.body) else {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         };
-        if body.request_id.is_empty()
-            || body.request_id.len() > MAX_REQUEST_ID_LEN
-            || !body.request_id.bytes().all(|b| b.is_ascii_graphic())
-        {
+        if !valid_id(&body.request_id) {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         }
         let result = match decision {
@@ -491,15 +506,40 @@ impl OwnerUi {
         };
         match result {
             Ok(v) => json_body(StatusCode::OK, v.to_string(), None),
-            Err(e) => {
-                let status = match e {
-                    DecideError::NotFound => StatusCode::NOT_FOUND,
-                    DecideError::NotPending => StatusCode::CONFLICT,
-                    DecideError::InvalidTerms => StatusCode::BAD_REQUEST,
-                    DecideError::AuditFailed => StatusCode::INTERNAL_SERVER_ERROR,
-                };
-                respond(status, e.code(), None)
-            }
+            Err(e) => decide_error(e),
+        }
+    }
+
+    /// The live grants, across agents, in the status view's shape
+    /// (SPEC §4 `Grant`). Metadata only; reading it is unaudited, like
+    /// `kharon_status`.
+    fn grants_list(&self, req: &Incoming) -> Response {
+        if !self.session_alive(req.cookie.as_deref()) {
+            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+        }
+        let grants = self.approvals.grants();
+        json_body(
+            StatusCode::OK,
+            json!({"ok": true, "grants": grants}).to_string(),
+            None,
+        )
+    }
+
+    /// Revoke one grant (REQ-REV-001), behind
+    /// [`Self::gate_owner_post`] and a well-formed grant id.
+    fn grants_revoke(&self, req: &Incoming) -> Response {
+        if let Some(err) = self.gate_owner_post(req) {
+            return err;
+        }
+        let Ok(body) = serde_json::from_slice::<RevokeBody>(&req.body) else {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        };
+        if !valid_id(&body.grant_id) {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        }
+        match self.approvals.revoke(&body.grant_id) {
+            Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
+            Err(e) => decide_error(e),
         }
     }
 
@@ -867,6 +907,30 @@ struct DecideBody {
     request_id: String,
     #[serde(default)]
     kind: Option<String>,
+}
+
+/// Body of a revoke call. Unknown keys are refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeBody {
+    grant_id: String,
+}
+
+/// A request or grant id the owner routes pass to the broker:
+/// non-empty, at most [`MAX_ID_LEN`] bytes, ASCII graphic.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_ID_LEN && id.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// A broker refusal as its fixed code and status.
+fn decide_error(e: DecideError) -> Response {
+    let status = match e {
+        DecideError::NotFound => StatusCode::NOT_FOUND,
+        DecideError::NotPending => StatusCode::CONFLICT,
+        DecideError::InvalidTerms => StatusCode::BAD_REQUEST,
+        DecideError::AuditFailed => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    respond(status, e.code(), None)
 }
 
 struct CredParts {
@@ -1248,10 +1312,11 @@ fn shell_page(locked: &str, pending: usize) -> String {
         .replace("{pending}", &pending.to_string())
 }
 
-/// The signed-in shell: broker state and the approvals queue
-/// (#131 slice 1). Rows are built with `textContent` only: the
-/// origin is whatever page the agent's tab was on, so nothing from a
-/// row is ever parsed as markup.
+/// The signed-in shell: broker state, the approvals queue (#131
+/// slice 1) and the live grants (slice 2). Rows are built with
+/// `textContent` only: origins come from agents (the page the tab
+/// was on, or the origin a grant was approved for), so nothing from
+/// a row is ever parsed as markup.
 const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1277,6 +1342,12 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <table id="queue" hidden>
 <thead><tr><th>Agent</th><th>Action</th><th>Origin</th><th>Item</th><th>Age</th><th></th></tr></thead>
 <tbody id="rows"></tbody>
+</table>
+<h2>Grants</h2>
+<p id="grants-empty">No live grants.</p>
+<table id="grants" hidden>
+<thead><tr><th>Agent</th><th>Scope</th><th>Origin</th><th>Actions</th><th>Uses</th><th>Expires</th><th></th></tr></thead>
+<tbody id="grant-rows"></tbody>
 </table>
 <p id="err" class="err" role="alert"></p>
 <button id="signout" type="button">Sign out</button>
@@ -1313,7 +1384,29 @@ function button(label, onClick) {
   return b;
 }
 window.kharonDecide = decide;
+async function refreshGrants() {
+  const r = await fetch("/owner/grants", { credentials: "same-origin" });
+  if (r.status === 401) { location.assign("/"); return; }
+  if (!r.ok) return;
+  const data = await r.json();
+  const rows = document.getElementById("grant-rows");
+  rows.replaceChildren();
+  for (const g of data.grants) {
+    const tr = document.createElement("tr");
+    tr.dataset.grantId = g.id;
+    const scope = g.item_id ? "item " + g.item_id : "collection " + g.collection_id;
+    const uses = g.max_uses === undefined ? String(g.uses) : g.uses + " / " + g.max_uses;
+    tr.append(cell(g.agent_id), cell(scope), cell(g.origin, "origin"), cell(g.actions.join(", ")), cell(uses), cell(g.expires_at));
+    const actions = document.createElement("td");
+    actions.append(button("Revoke", () => decide("/owner/grants/revoke", { grant_id: g.id })));
+    tr.append(actions);
+    rows.append(tr);
+  }
+  document.getElementById("grants").hidden = data.grants.length === 0;
+  document.getElementById("grants-empty").hidden = data.grants.length !== 0;
+}
 window.kharonRefresh = async function () {
+  await refreshGrants();
   const r = await fetch("/owner/approvals", { credentials: "same-origin" });
   if (r.status === 401) { location.assign("/"); return; }
   if (!r.ok) return;
@@ -1529,6 +1622,35 @@ mod tests {
                 return Err(DecideError::NotPending);
             }
             Ok(())
+        }
+
+        fn grants(&self) -> Vec<crate::api::grant::GrantView> {
+            vec![crate::api::grant::GrantView {
+                id: "g_1".into(),
+                agent_id: "alpha".into(),
+                item_id: Some("item-1".into()),
+                collection_id: None,
+                origin: "login.example.com".into(),
+                actions: vec![crate::api::grant::GrantAction::Fill],
+                expires_at: "2026-11-08T02:00:00Z".into(),
+                max_uses: Some(1),
+                uses: 0,
+                created_by_channel: crate::api::grant::Channel::WebUi,
+            }]
+        }
+
+        /// `g_gone` is not found and `g_audit` fails its audit append;
+        /// anything else is revoked.
+        fn revoke(&self, grant_id: &str) -> Result<(), DecideError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("revoke {grant_id}"));
+            match grant_id {
+                "g_gone" => Err(DecideError::NotFound),
+                "g_audit" => Err(DecideError::AuditFailed),
+                _ => Ok(()),
+            }
         }
     }
 
@@ -1761,10 +1883,7 @@ mod tests {
                 );
             }
         }
-        let long = format!(
-            r#"{{"request_id":"{}"}}"#,
-            "a".repeat(MAX_REQUEST_ID_LEN + 1)
-        );
+        let long = format!(r#"{{"request_id":"{}"}}"#, "a".repeat(MAX_ID_LEN + 1));
         let (status, _) = rig.post("/owner/approvals/approve", &long);
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, out) = rig.post(
@@ -1817,6 +1936,157 @@ mod tests {
                 "approve gr_gone Once",
                 "deny gr_gone",
             ]
+        );
+    }
+
+    // ---- #131 slice 2: grants ----
+
+    #[test]
+    fn grants_routes_are_listed() {
+        for route in [("GET", "/owner/grants"), ("POST", "/owner/grants/revoke")] {
+            assert!(ROUTES.contains(&route), "{route:?} missing from ROUTES");
+        }
+        let shell = shell_page("unlocked", 0);
+        assert!(shell.contains("/owner/grants/revoke"), "no revoke button");
+    }
+
+    #[test]
+    fn grants_need_a_session() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/grants", false, None, None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) = rig.send(
+            Method::POST,
+            "/owner/grants/revoke",
+            false,
+            Some(ORIGIN),
+            Some("application/json"),
+            r#"{"grant_id":"g_1"}"#,
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(*rig.audit.0.lock().unwrap(), ["no_session"]);
+        rig.ui.expire_sessions();
+        let (status, _) = rig.post("/owner/grants/revoke", r#"{"grant_id":"g_1"}"#);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = rig.send(Method::GET, "/owner/grants", true, None, None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn grants_list_renders_the_status_view() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/grants", true, None, None, "");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        let g = &v["grants"][0];
+        assert_eq!(g["id"], "g_1");
+        assert_eq!(g["agent_id"], "alpha");
+        assert_eq!(g["item_id"], "item-1");
+        assert!(g.get("collection_id").is_none(), "{g}");
+        assert_eq!(g["origin"], "login.example.com");
+        assert_eq!(g["actions"], json!(["fill"]));
+        assert_eq!(g["max_uses"], 1);
+        assert_eq!(g["uses"], 0);
+        assert_eq!(g["created_by_channel"], "web_ui");
+    }
+
+    #[test]
+    fn grants_revoke_is_post_only_and_the_list_is_get_only() {
+        let rig = ApprovalsRig::new();
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            let (status, _) = rig.send(
+                method.clone(),
+                "/owner/grants/revoke",
+                true,
+                Some(ORIGIN),
+                Some("application/json"),
+                r#"{"grant_id":"g_1"}"#,
+            );
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        }
+        let (status, _) = rig.post("/owner/grants", r#"{"grant_id":"g_1"}"#);
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn grants_revoke_needs_our_origin() {
+        let rig = ApprovalsRig::new();
+        for origin in [
+            None,
+            Some("https://evil.example"),
+            Some("null"),
+            Some("http://localhost:9/"),
+        ] {
+            let (status, body) = rig.send(
+                Method::POST,
+                "/owner/grants/revoke",
+                true,
+                origin,
+                Some("application/json"),
+                r#"{"grant_id":"g_1"}"#,
+            );
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?}: {body}");
+        }
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+        assert!(rig.audit.0.lock().unwrap().iter().all(|c| *c == "origin"));
+    }
+
+    #[test]
+    fn grants_revoke_refuses_form_posts_and_odd_bodies() {
+        let rig = ApprovalsRig::new();
+        let long = format!(r#"{{"grant_id":"{}"}}"#, "a".repeat(MAX_ID_LEN + 1));
+        for (ctype, body) in [
+            (Some("application/x-www-form-urlencoded"), "grant_id=g_1"),
+            (Some("text/plain"), r#"{"grant_id":"g_1"}"#),
+            (Some("multipart/form-data; boundary=x"), "--x--"),
+            (None, r#"{"grant_id":"g_1"}"#),
+            (Some("application/json"), ""),
+            (Some("application/json"), "[]"),
+            (Some("application/json"), r#"{"grant_id":"g_1","extra":1}"#),
+            (Some("application/json"), r#"{"request_id":"g_1"}"#),
+            (Some("application/json"), r#"{"grant_id":""}"#),
+            (Some("application/json"), r#"{"grant_id":"g 1"}"#),
+            (Some("application/json"), long.as_str()),
+        ] {
+            let (status, out) = rig.send(
+                Method::POST,
+                "/owner/grants/revoke",
+                true,
+                Some(ORIGIN),
+                ctype,
+                body,
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{ctype:?} {body:?}: {out}");
+        }
+        let (status, out) = rig.post(
+            "/owner/grants/revoke",
+            r#"{"grant_id":"g_1","password":"hunter2"}"#,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            out.contains("password_rejected") && !out.contains("hunter2"),
+            "{out}"
+        );
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn grants_revoke_reaches_the_backend_and_maps_its_refusals() {
+        let rig = ApprovalsRig::new();
+        let (status, out) = rig.post("/owner/grants/revoke", r#"{"grant_id":"g_1"}"#);
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let (status, out) = rig.post("/owner/grants/revoke", r#"{"grant_id":"g_gone"}"#);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
+        assert!(out.contains("not_found"), "{out}");
+        let (status, out) = rig.post("/owner/grants/revoke", r#"{"grant_id":"g_audit"}"#);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
+        assert!(out.contains("audit_failed"), "{out}");
+        assert_eq!(
+            rig.calls(),
+            ["revoke g_1", "revoke g_gone", "revoke g_audit"]
         );
     }
 }

@@ -38,7 +38,7 @@ use futures_util::{SinkExt, StreamExt};
 use kharond::api::grant::{Channel, GrantTerms, RequestState};
 use kharond::api::http::ApprovalRedeemer;
 use kharond::api::token::{TokenStore, generate_with};
-use kharond::api::{Broker, Outcome, parse_fill};
+use kharond::api::{Broker, Outcome, Request, parse_fill};
 use kharond::config::Config;
 use kharond::daemon;
 use kharond::lock::StaticHardening;
@@ -1248,6 +1248,53 @@ impl ApprovalsRig {
     fn state(&self, request_id: &str) -> RequestState {
         self.broker.grant_request(request_id).unwrap().state
     }
+
+    /// Approve a fresh request as `per-origin` (1 h, unlimited uses)
+    /// over the CLI path. Returns the grant id.
+    async fn per_origin_grant(&self) -> String {
+        let request = self.pending_request().await;
+        let terms = GrantTerms {
+            kind: kharond::config::GrantKind::PerOrigin,
+            ..GrantTerms::once_item(ITEM_A)
+        };
+        self.broker
+            .approve_grant_request(&request, &terms, Channel::Cli)
+            .unwrap()
+            .id
+    }
+
+    async fn grants(&self) -> RawResponse {
+        http(
+            self.ui,
+            &self.origin,
+            Http::get("/owner/grants").cookie(&self.cookie),
+        )
+        .await
+    }
+
+    /// `grant_revoke` entries for `grant_id`.
+    fn revokes_of(&self, grant_id: &str) -> Vec<kharond::audit::Entry> {
+        self.audit
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.event == kharond::audit::Event::GrantRevoke
+                    && e.grant_id.as_deref() == Some(grant_id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The agent's own `kharon_status` grants.
+    fn status_grants(&self) -> Json {
+        let agent = self.broker.authenticate(&self.alpha).unwrap();
+        match self.broker.dispatch(&agent, Request::Status).unwrap() {
+            Outcome::Status(s) => serde_json::to_value(s).unwrap()["grants"].clone(),
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
 }
 
 /// An entry with the per-request fields blanked, so a web entry and a
@@ -1543,6 +1590,192 @@ async fn req_apr_005_chromium_approve_click() {
             break;
         }
         assert!(Instant::now() < deadline, "the approved row stayed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(cdp);
+    drop(chromium);
+}
+
+// ---- #131 slice 2: grants ----
+
+/// Grant views with the wall-clock expiry blanked: two renders a
+/// moment apart can differ by a second.
+fn without_expiry(mut v: Json) -> Json {
+    for g in v.as_array_mut().unwrap() {
+        g.as_object_mut().unwrap().remove("expires_at");
+    }
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_grants_list_and_revoke_through_the_cli_path() {
+    let rig = ApprovalsRig::new().await;
+    let web = rig.per_origin_grant().await;
+
+    // The list needs the passkey session, and shows what the agent's
+    // own status shows.
+    let anon = http(rig.ui, &rig.origin, Http::get("/owner/grants")).await;
+    assert_eq!(anon.status, 401, "{}", anon.body);
+    let list = rig.grants().await;
+    assert_eq!(list.status, 200, "{}", list.body);
+    let grants = list.json()["grants"].clone();
+    assert_eq!(grants.as_array().unwrap().len(), 1, "{grants}");
+    assert_eq!(grants[0]["id"], json!(web));
+    assert_eq!(grants[0]["agent_id"], "alpha");
+    assert_eq!(grants[0]["item_id"], ITEM_A);
+    assert_eq!(grants[0]["actions"], json!(["fill"]));
+    assert_eq!(grants[0]["created_by_channel"], "cli");
+    assert_eq!(
+        without_expiry(grants.clone()),
+        without_expiry(rig.status_grants())
+    );
+
+    // A cross-site POST with the session cookie, and a form post,
+    // change nothing: the grant still fills.
+    let body = json!({"grant_id": web}).to_string();
+    let forged = http(
+        rig.ui,
+        "https://evil.example",
+        Http::post("/owner/grants/revoke", Some("application/json"), &body).cookie(&rig.cookie),
+    )
+    .await;
+    assert_eq!(forged.status, 403, "{}", forged.body);
+    let form = http(
+        rig.ui,
+        &rig.origin,
+        Http::post(
+            "/owner/grants/revoke",
+            Some("application/x-www-form-urlencoded"),
+            &format!("grant_id={web}"),
+        )
+        .cookie(&rig.cookie),
+    )
+    .await;
+    assert_eq!(form.status, 400, "{}", form.body);
+    assert_eq!(rig.fill().await["status"], "filled");
+
+    // A web revoke is effective for the next request (REQ-REV-001).
+    let revoked = rig
+        .decide("/owner/grants/revoke", &json!({"grant_id": web}))
+        .await;
+    assert_eq!(revoked.status, 200, "{}", revoked.body);
+    assert_eq!(rig.grants().await.json()["grants"], json!([]));
+    let r = rig.fill().await;
+    assert_eq!(r["status"], "pending_approval", "{r}");
+    let again = rig
+        .decide("/owner/grants/revoke", &json!({"grant_id": web}))
+        .await;
+    assert_eq!(again.status, 404, "{}", again.body);
+    assert!(again.body.contains("not_found"), "{}", again.body);
+
+    // The CLI revokes the next grant through the same broker call:
+    // the entries match apart from the channel.
+    let cli = rig.per_origin_grant().await;
+    assert!(rig.broker.revoke_grant(&cli, Channel::Cli).unwrap());
+    let (w, c) = (rig.revokes_of(&web), rig.revokes_of(&cli));
+    assert_eq!((w.len(), c.len()), (1, 1), "{w:?} {c:?}");
+    assert_eq!(w[0].channel.as_deref(), Some("web_ui"));
+    assert_eq!(w[0].result.as_deref(), Some("revoked"));
+    assert_eq!(w[0].item_id.as_deref(), Some(ITEM_A));
+    assert_eq!(c[0].channel.as_deref(), Some("cli"));
+    assert_eq!(shape(&w[0]), shape(&c[0]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_web_revoke_keeps_the_grant_when_the_audit_append_fails() {
+    let rig = ApprovalsRig::new().await;
+    let id = rig.per_origin_grant().await;
+    *rig.audit.fail_event.lock().unwrap() = Some("grant_revoke");
+    let revoked = rig
+        .decide("/owner/grants/revoke", &json!({"grant_id": id}))
+        .await;
+    assert_eq!(revoked.status, 500, "{}", revoked.body);
+    assert!(revoked.body.contains("audit_failed"), "{}", revoked.body);
+    *rig.audit.fail_event.lock().unwrap() = None;
+    let grants = rig.grants().await.json()["grants"].clone();
+    assert_eq!(grants[0]["id"], json!(id), "{grants}");
+    assert_eq!(rig.fill().await["status"], "filled");
+}
+
+/// The shell page's Revoke button, in a real browser: the grant row
+/// shows the grant, and the click revokes it over `web_ui`.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_005_chromium_revoke_click() {
+    let Some(bin) = chromium_bin() else {
+        if std::env::var_os("KHARON_REQUIRE_WEBAUTHN").is_some() {
+            panic!("KHARON_REQUIRE_WEBAUTHN is set but no Chromium binary was found");
+        }
+        eprintln!("SKIP req_apr_005_chromium_revoke_click: no Chromium binary");
+        return;
+    };
+    let rig = ApprovalsRig::new().await;
+    let grant = rig.per_origin_grant().await;
+    let token = rig.owner.mint_enroll_token();
+
+    let chromium = launch_chromium(&bin);
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (session, _authenticator) =
+        browser_register_and_sign_in(&mut cdp, &rig.origin, &token).await;
+    let _ = cdp
+        .eval_navigating(&session, &format!("location.assign({:?})", rig.origin))
+        .await;
+    let row = format!(
+        "tr[data-grant-id={}]",
+        serde_json::to_string(&grant).unwrap()
+    );
+    let sel = serde_json::to_string(&row).unwrap();
+    let probe = format!(
+        "JSON.stringify((() => {{ const r = document.querySelector({sel}); \
+         return r ? Array.from(r.cells, c => c.textContent) : null; }})())"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let cells = loop {
+        let got = cdp
+            .eval_navigating(&session, &probe)
+            .await
+            .unwrap_or(Json::Null);
+        let cells: Json = serde_json::from_str(got.as_str().unwrap_or("null")).unwrap();
+        if cells.is_array() {
+            break cells;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the grants list never showed the grant"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(cells[0], "alpha", "{cells}");
+    assert_eq!(cells[1], format!("item {ITEM_A}"), "{cells}");
+    assert_eq!(cells[3], "fill", "{cells}");
+
+    let click = format!(
+        "(() => {{ const b = Array.from(document.querySelector({sel}).querySelectorAll('button')) \
+         .find(b => b.textContent === 'Revoke'); b.click(); return true; }})()"
+    );
+    assert_eq!(cdp.eval(&session, &click).await, json!(true));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.revokes_of(&grant).is_empty() {
+        assert!(Instant::now() < deadline, "the click never revoked");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let revokes = rig.revokes_of(&grant);
+    assert_eq!(revokes.len(), 1, "{revokes:?}");
+    assert_eq!(revokes[0].channel.as_deref(), Some("web_ui"));
+    assert_eq!(rig.fill().await["status"], "pending_approval");
+
+    // The page refreshed its list after the revoke.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let n = cdp
+            .eval(
+                &session,
+                "document.getElementById('grant-rows').children.length",
+            )
+            .await;
+        if n == json!(0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the revoked row stayed");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     drop(cdp);

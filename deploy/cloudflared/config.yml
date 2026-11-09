@@ -27,6 +27,8 @@ originRequest:
   # certificate (the same file as [public_ingress] tls_cert_file), so
   # cloudflared accepts that certificate and nothing else. Its IP SAN
   # must be the address in `service`. Never set noTLSVerify.
+  # <BROKER-TAILNET-IP> below is [public_ingress] listen's address on
+  # your broker; don't copy another host's.
   caPool: /etc/cloudflared/kharon-broker.crt
   noTLSVerify: false
   connectTimeout: 10s
@@ -36,10 +38,10 @@ ingress:
   # The anchored regexes match the path only, not the query.
   - hostname: kharon.twkr.io
     path: ^/mcp$
-    service: https://100.120.48.90:8790
+    service: https://<BROKER-TAILNET-IP>:8790
   - hostname: kharon.twkr.io
     path: ^/connector$
-    service: https://100.120.48.90:8790
+    service: https://<BROKER-TAILNET-IP>:8790
   # Everything else: the owner UI, /v1/*, /healthz, raw CDP, the
   # [connector] port, any other hostname.
   - service: http_status:404

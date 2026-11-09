@@ -424,7 +424,9 @@ fn validate_public_ingress(raw: RawPublicIngress) -> Result<PublicIngressConfig,
 
 /// Two configured addresses contend for one socket when they are equal
 /// with a non-zero port. Port 0 is ephemeral and never collides (the
-/// integration tests bind every listener that way).
+/// integration tests bind every listener that way). Equality is exact:
+/// `127.0.0.1:8790` and `[::ffff:127.0.0.1]:8790` are not caught here,
+/// and the second bind fails at startup instead (`*_bind`).
 fn same_socket(a: SocketAddr, b: SocketAddr) -> bool {
     a.port() != 0 && a == b
 }

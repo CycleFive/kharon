@@ -1051,6 +1051,7 @@ name = "kharon-connector"
 version = "0.0.0"
 dependencies = [
  "base64ct",
+ "futures-util",
  "rcgen",
  "rustls",
  "rustls-pki-types",
@@ -1058,6 +1059,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "zeroize",
 ]
 

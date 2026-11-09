@@ -39,6 +39,25 @@
 //! again. A new authenticated session for the same agent replaces the
 //! previous one; streams on the old session fail.
 //!
+//! # Transport: WebSocket
+//!
+//! The same inner stack (pinned TLS, auth record, frames) can run inside a
+//! WebSocket at `wss://<host>/connector`, so it can pass through a
+//! Cloudflare Tunnel. The edge terminates the outer TLS and sees only
+//! WebSocket messages that carry the inner TLS records: neither the tunnel
+//! credential nor CDP bytes are visible to it.
+//!
+//! - Subprotocol [`WS_SUBPROTOCOL`], exact. No compression is negotiated.
+//! - [`WsByteStream`] turns the WebSocket into a byte stream: binary
+//!   messages in order, one message per write of at most [`MAX_WS_WRITE`]
+//!   bytes, and a limit of [`WS_MAX_MESSAGE`] per inbound message
+//!   ([`ws_config`]). A text message is an error.
+//! - The inner TLS is **TLS 1.3 only** with no early data
+//!   ([`TlsVersions::Tls13Only`]). The raw `:8789` path keeps
+//!   [`TlsVersions::Default`].
+//! - The broker admits at most [`WS_PREAUTH_SLOTS`] sockets that have not
+//!   yet authenticated.
+//!
 //! # Adjusting this
 //!
 //! The constants and the codecs in [`frame`] and [`auth`] are the whole
@@ -53,13 +72,18 @@ mod frame;
 mod mux;
 mod proxy;
 mod tls;
+mod ws;
 
 pub use auth::{read_client_hello, read_server_hello, write_client_hello, write_server_hello};
 pub use client::{AgentParams, run_agent_once};
 pub use frame::{Frame, encode_frame};
 pub use mux::{BrokerSession, MuxIo, OpenError, serve_agent, spawn_broker};
 pub use proxy::{connect_http_proxy, proxy_creds_line};
-pub use tls::{CertSha256, TlsMaterialError, connect_pinned, pin_of_der, server_config_from_pem};
+pub use tls::{
+    CertSha256, TlsMaterialError, TlsVersions, connect_pinned, connect_pinned_stream, pin_of_der,
+    server_config_from_pem, server_config_from_pem_with,
+};
+pub use ws::{WsByteStream, ws_config};
 
 /// Why [`run_agent_once`] stopped. Display text is fixed: it never includes
 /// the tunnel token, the proxy credential, the certificate, or a peer's
@@ -135,3 +159,14 @@ pub const CLOSE_RESET: u8 = 2;
 /// One in-page fill carries the isolated-world script (tens of KiB) plus
 /// the WebSocket framing, so the buffer is well above [`MAX_PAYLOAD`].
 pub const DUPLEX_BYTES: usize = 256 * 1024;
+
+/// The WebSocket subprotocol, exact. The server answers with this or refuses.
+pub const WS_SUBPROTOCOL: &str = "kharon-connector.v1";
+/// Largest inbound WebSocket message and frame.
+pub const WS_MAX_MESSAGE: usize = 64 * 1024;
+/// Largest payload of one outbound WebSocket message: one frame plus the
+/// TLS record overhead.
+pub const MAX_WS_WRITE: usize = 16 * 1024 + 256;
+/// Broker-side cap on WebSocket sockets that have not authenticated yet,
+/// separate from the raw listener's budget.
+pub const WS_PREAUTH_SLOTS: usize = 8;

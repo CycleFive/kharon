@@ -4,10 +4,13 @@
 //! (REQ-DEP-003), hardens the process, assembles the broker **locked**
 //! (REQ-MEM-005) and serves the agent API (REQ-API-002) on `[api]
 //! listen` until SIGTERM or SIGINT. Once bound it prints
-//! `kharond: agent API listening on <addr> (locked)` to stderr.
+//! `kharond: agent API listening on <addr> (locked)` to stderr. With no
+//! `[api]` but a `[public_ingress]` (#210) it prints
+//! `kharond: agent API off (...)` instead and agents use `POST /mcp`
+//! on the public ingress; with neither it refuses (`no_agent_listener`).
 //!
 //! `kharond --check [--config <path>]` runs every config-level startup
-//! check (the loader plus the daemon's own, e.g. a missing `[api]`),
+//! check (the loader plus the daemon's own, e.g. no agent listener),
 //! prints `kharond: config ok (...)`, and exits without hardening,
 //! touching `data_dir`, or binding.
 //!
@@ -59,10 +62,13 @@ fn main() -> ExitCode {
     if check_only {
         return match daemon::check(&cfg) {
             Ok(listen) => {
-                eprintln!(
-                    "kharond: config ok ({} agent(s), agent API on {listen})",
-                    cfg.agents.len()
-                );
+                let n = cfg.agents.len();
+                match listen {
+                    Some(listen) => {
+                        eprintln!("kharond: config ok ({n} agent(s), agent API on {listen})");
+                    }
+                    None => eprintln!("kharond: config ok ({n} agent(s), agent API off)"),
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => startup_error(&e),
@@ -89,34 +95,33 @@ async fn serve(cfg: Config) -> ExitCode {
     };
     drop(cfg);
     match daemon.local_addr() {
-        Ok(addr) => {
+        Some(addr) => {
             eprintln!("kharond: agent API listening on {addr} (locked)");
             if daemon.agent_api_tls() {
                 eprintln!("kharond: agent API TLS enabled");
             }
-            if let Some(connector) = daemon.connector_addr() {
-                eprintln!("kharond: agent connector listening on {connector}");
-            }
-            eprintln!("kharond: owner socket {}", daemon.owner_socket().display());
-            if let Some(ui) = daemon.owner_ui_addr() {
-                let origin = daemon.owner_ui_origin().unwrap_or("");
-                eprintln!(
-                    "kharond: owner UI listening on {ui} (origin {origin}; ntfy approve/deny on this address)"
-                );
-            }
-            if let Some(public) = daemon.public_ingress_addr() {
-                let tls = if daemon.public_ingress_tls() {
-                    "TLS"
-                } else {
-                    "plain HTTP, loopback"
-                };
-                eprintln!("kharond: public ingress listening on {public} ({tls}; POST /mcp only)");
-            }
         }
-        Err(e) => {
-            eprintln!("kharond: cannot read listen address: {}", e.kind());
-            return ExitCode::from(EX_SOFTWARE);
-        }
+        None => eprintln!(
+            "kharond: agent API off (no [api]; agents reach POST /mcp on [public_ingress])"
+        ),
+    }
+    if let Some(connector) = daemon.connector_addr() {
+        eprintln!("kharond: agent connector listening on {connector}");
+    }
+    eprintln!("kharond: owner socket {}", daemon.owner_socket().display());
+    if let Some(ui) = daemon.owner_ui_addr() {
+        let origin = daemon.owner_ui_origin().unwrap_or("");
+        eprintln!(
+            "kharond: owner UI listening on {ui} (origin {origin}; ntfy approve/deny on this address)"
+        );
+    }
+    if let Some(public) = daemon.public_ingress_addr() {
+        let tls = if daemon.public_ingress_tls() {
+            "TLS"
+        } else {
+            "plain HTTP, loopback"
+        };
+        eprintln!("kharond: public ingress listening on {public} ({tls}; POST /mcp only)");
     }
     match daemon.run(shutdown_signal()).await {
         Ok(()) => {

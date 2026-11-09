@@ -55,6 +55,10 @@ require_mlock = false
     )
 }
 
+/// Tests that bind listeners hold this, so the listener-set diff in
+/// `req_dep_006_binary_without_api_serves_public_mcp` sees only its own.
+static LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn listen(addr: &str) -> String {
     format!("[api]\nlisten = \"{addr}\"\n")
 }
@@ -151,19 +155,162 @@ fn req_dep_006_daemon_refuses_wildcard_bind() {
     assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
 }
 
-/// No `[api]`: the daemon refuses rather than pick an address.
+/// Neither `[api]` nor `[public_ingress]`: agents have no way in, so the
+/// daemon refuses (an `[owner_ui]` alone is not an agent listener).
 #[test]
-fn req_dep_006_daemon_refuses_missing_listen() {
+fn req_dep_006_daemon_refuses_no_agent_listener() {
     let data = tempfile::tempdir().unwrap();
-    let text = config(TOKEN_HASH, data.path(), "");
+    let text = config(
+        TOKEN_HASH,
+        data.path(),
+        "[owner_ui]\nlisten = \"127.0.0.1:8788\"\norigin = \"http://localhost:8788\"\n",
+    );
     for args in [&[][..], &["--check"][..]] {
         let (code, stderr) = run(args, &text);
         assert_eq!(code, Some(78), "{args:?}: {stderr}");
         assert!(
-            stderr.contains("startup error [api_listen_missing]"),
+            stderr.contains("startup error [no_agent_listener]"),
             "{stderr}"
         );
     }
+}
+
+fn public(listen: &str) -> String {
+    format!("[public_ingress]\nlisten = \"{listen}\"\n")
+}
+
+/// `[public_ingress]` alone is an agent listener: `--check` passes and
+/// says the agent API is off.
+#[test]
+fn req_dep_006_check_reports_agent_api_off() {
+    let data = tempfile::tempdir().unwrap();
+    let (code, stderr) = run(
+        &["--check"],
+        &config(TOKEN_HASH, data.path(), &public("127.0.0.1:0")),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("config ok (1 agent(s), agent API off)"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+}
+
+/// Path B (`via = "agent_connector"`) with `[connector]` and no `[api]`.
+#[test]
+fn req_dep_006_check_path_b_without_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pin, cert, key) = write_cert(dir.path());
+    let data = dir.path().join("data");
+    let text = path_b_config(
+        TOKEN_HASH,
+        TOKEN_HASH,
+        &data,
+        "127.0.0.1:0",
+        Some((&cert, &key)),
+        "127.0.0.2:0",
+    );
+    // Drop the [api] block entirely: its listen line and its tls keys.
+    let start = text.find("[api]").unwrap();
+    let end = text.find("[connector]").unwrap();
+    let text = format!(
+        "{}{}{}",
+        &text[..start],
+        public("127.0.0.1:0"),
+        &text[end..]
+    );
+    assert!(!text.contains("[api]"), "{text}");
+    let (code, stderr) = run(&["--check"], &text);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("config ok (1 agent(s), agent API off)"),
+        "{stderr}"
+    );
+}
+
+/// Local addresses of every TCP listener on the host.
+fn listeners() -> Vec<String> {
+    let ss = Command::new("ss")
+        .arg("-ltnH")
+        .output()
+        .expect("`ss` (iproute2) is required for this test");
+    assert!(ss.status.success(), "ss failed: {ss:?}");
+    String::from_utf8_lossy(&ss.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(3).map(str::to_owned))
+        .collect()
+}
+
+/// Binary path with no `[api]`: only the public ingress listens, it
+/// serves `/mcp`, and SIGTERM still exits 0 (nothing else awaits the
+/// shutdown future).
+#[tokio::test(flavor = "multi_thread")]
+async fn req_dep_006_binary_without_api_serves_public_mcp() {
+    let _bind_lock = LISTENERS.lock().await;
+    let (token, hash) = generate("assistant");
+    let token = token.expose_secret().clone();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let path = dir.path().join("kharon.toml");
+    std::fs::write(&path, config(&hash, &data, &public("127.0.0.1:0"))).unwrap();
+    let before = listeners();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kharond"))
+        .arg("--config")
+        .arg(&path)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let addr: SocketAddr = tokio::task::spawn_blocking(move || {
+        let mut seen = String::new();
+        loop {
+            let mut line = String::new();
+            assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "exited: {seen}");
+            if let Some(rest) = line.strip_prefix("kharond: public ingress listening on ") {
+                assert!(
+                    seen.contains(
+                        "kharond: agent API off (no [api]; agents reach POST /mcp on [public_ingress])\n"
+                    ),
+                    "{seen}"
+                );
+                assert!(!seen.contains("agent API listening"), "{seen}");
+                let addr = rest.split(" (").next().unwrap();
+                std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+                return addr.parse().unwrap();
+            }
+            seen.push_str(&line);
+        }
+    })
+    .await
+    .unwrap();
+
+    let init = r#"{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let json_ct = ("Content-Type", "application/json");
+    let r = api_support::post_mcp_raw(addr, None, &[json_ct], init).await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    let r = api_support::post_mcp_raw(addr, Some(&token), &[json_ct], init).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    // kharond is non-dumpable (REQ-MEM-001), so `ss -p` cannot name its
+    // sockets; diff the listener set against the baseline instead.
+    let new: Vec<String> = listeners()
+        .into_iter()
+        .filter(|l| !before.contains(l))
+        .collect();
+    assert_eq!(new, vec![addr.to_string()], "new TCP listeners");
+
+    let st = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
 /// Off-host checkpoints (the SPEC default) are served by the ntfy
@@ -203,6 +350,7 @@ fn req_dep_006_check_reports_listen_address() {
 /// `/v1/status`, locked, and only on the configured address.
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_loopback_listen_serves_status() {
+    let _bind_lock = LISTENERS.lock().await;
     let (token, hash) = generate("assistant");
     let token = token.expose_secret().clone();
     let data = tempfile::tempdir().unwrap();
@@ -283,6 +431,7 @@ async fn req_dep_006_hardening_failure_refuses_start() {
 /// 0 on SIGTERM.
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_daemon_binary_serves_status_on_loopback() {
+    let _bind_lock = LISTENERS.lock().await;
     let (token, hash) = generate("assistant");
     let token = token.expose_secret().clone();
     let dir = tempfile::tempdir().unwrap();
@@ -464,6 +613,7 @@ fn req_dep_006_path_b_tls_material_checked_at_startup() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_path_b_agent_api_over_tls() {
+    let _bind_lock = LISTENERS.lock().await;
     let (api_token, api_hash) = generate("assistant");
     let api_token = api_token.expose_secret().clone();
     let (_tunnel, tunnel_hash) = generate_tunnel("assistant");

@@ -55,10 +55,6 @@ require_mlock = false
     )
 }
 
-/// Tests that bind listeners hold this, so the listener-set diff in
-/// `req_dep_006_binary_without_api_serves_public_mcp` sees only its own.
-static LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn listen(addr: &str) -> String {
     format!("[api]\nlisten = \"{addr}\"\n")
 }
@@ -228,17 +224,42 @@ fn req_dep_006_check_path_b_without_api() {
     );
 }
 
-/// Local addresses of every TCP listener on the host.
-fn listeners() -> Vec<String> {
-    let ss = Command::new("ss")
-        .arg("-ltnH")
-        .output()
-        .expect("`ss` (iproute2) is required for this test");
-    assert!(ss.status.success(), "ss failed: {ss:?}");
-    String::from_utf8_lossy(&ss.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().nth(3).map(str::to_owned))
-        .collect()
+/// Kills and reaps a spawned daemon on drop, so a failing assertion
+/// cannot leak it.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn id(&self) -> u32 {
+        self.0.as_ref().unwrap().id()
+    }
+    /// Take the child out of the guard (to wait on it).
+    fn take(&mut self) -> std::process::Child {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// No `[api]`: the daemon records no agent-API address, but does bind
+/// the public ingress on loopback.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_dep_006_start_without_api_binds_no_agent_listener() {
+    let data = tempfile::tempdir().unwrap();
+    let cfg =
+        Config::from_toml_str(&config(TOKEN_HASH, data.path(), &public("127.0.0.1:0"))).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    assert!(daemon.local_addr().is_none());
+    let public = daemon.public_ingress_addr().expect("public ingress bound");
+    assert!(public.ip().is_loopback(), "{public}");
 }
 
 /// Binary path with no `[api]`: only the public ingress listens, it
@@ -246,23 +267,23 @@ fn listeners() -> Vec<String> {
 /// shutdown future).
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_binary_without_api_serves_public_mcp() {
-    let _bind_lock = LISTENERS.lock().await;
     let (token, hash) = generate("assistant");
     let token = token.expose_secret().clone();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let path = dir.path().join("kharon.toml");
     std::fs::write(&path, config(&hash, &data, &public("127.0.0.1:0"))).unwrap();
-    let before = listeners();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kharond"))
-        .arg("--config")
-        .arg(&path)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = ChildGuard(Some(
+        Command::new(env!("CARGO_BIN_EXE_kharond"))
+            .arg("--config")
+            .arg(&path)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
     let pid = child.id();
-    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut stderr = BufReader::new(child.0.as_mut().unwrap().stderr.take().unwrap());
     let addr: SocketAddr = tokio::task::spawn_blocking(move || {
         let mut seen = String::new();
         loop {
@@ -293,21 +314,14 @@ async fn req_dep_006_binary_without_api_serves_public_mcp() {
     let r = api_support::post_mcp_raw(addr, Some(&token), &[json_ct], init).await;
     assert_eq!(r.status, 200, "{}", r.body);
 
-    // kharond is non-dumpable (REQ-MEM-001), so `ss -p` cannot name its
-    // sockets; diff the listener set against the baseline instead.
-    let new: Vec<String> = listeners()
-        .into_iter()
-        .filter(|l| !before.contains(l))
-        .collect();
-    assert_eq!(new, vec![addr.to_string()], "new TCP listeners");
-
     let st = Command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
         .status()
         .unwrap();
     assert!(st.success());
-    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+    let mut exited = child.take();
+    let status = tokio::task::spawn_blocking(move || exited.wait().unwrap())
         .await
         .unwrap();
     assert_eq!(status.code(), Some(0), "{status:?}");
@@ -350,7 +364,6 @@ fn req_dep_006_check_reports_listen_address() {
 /// `/v1/status`, locked, and only on the configured address.
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_loopback_listen_serves_status() {
-    let _bind_lock = LISTENERS.lock().await;
     let (token, hash) = generate("assistant");
     let token = token.expose_secret().clone();
     let data = tempfile::tempdir().unwrap();
@@ -431,7 +444,6 @@ async fn req_dep_006_hardening_failure_refuses_start() {
 /// 0 on SIGTERM.
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_daemon_binary_serves_status_on_loopback() {
-    let _bind_lock = LISTENERS.lock().await;
     let (token, hash) = generate("assistant");
     let token = token.expose_secret().clone();
     let dir = tempfile::tempdir().unwrap();
@@ -613,7 +625,6 @@ fn req_dep_006_path_b_tls_material_checked_at_startup() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_path_b_agent_api_over_tls() {
-    let _bind_lock = LISTENERS.lock().await;
     let (api_token, api_hash) = generate("assistant");
     let api_token = api_token.expose_secret().clone();
     let (_tunnel, tunnel_hash) = generate_tunnel("assistant");

@@ -66,13 +66,15 @@ path B.
   <holder>`, `docker compose up -d --force-recreate holder`): that
   strands kharond and cloudflared in a dead namespace. Restart the
   whole stack (`docker compose restart`) or run `docker compose up -d`.
-- Every kharond listener is on loopback (`[api]` 127.0.0.1:8787,
-  `[public_ingress]` 127.0.0.1:8790), and nothing is published.
+- The base has no `[api]`: the agent API is off, and agents reach
+  `POST /mcp` on `[public_ingress]`. Every kharond listener is on
+  loopback (`[public_ingress]` 127.0.0.1:8790), and nothing is published.
   Only cloudflared, in the same namespace, reaches them: the tunnel's
   routes point at `http://127.0.0.1:8790`. Point routes only there:
   cloudflared shares the loopback, so a route to any other port
-  (`:8787`, `:20241`) bypasses `[public_ingress]`. kharond refuses a wildcard
-  listen address (REQ-DEP-006).
+  bypasses `[public_ingress]`: cloudflared's `:20241`, `vaultwarden:80`
+  with that profile, and `[api]` only if you configured it.
+  kharond refuses a wildcard listen address (REQ-DEP-006).
 - cloudflared's metrics are pinned to `127.0.0.1:20241`. Without
   `--metrics` the container build binds every interface and serves
   `/metrics`, `/config`, `/diag` and pprof.
@@ -84,7 +86,7 @@ path B.
 - Fills need `compose.vpn.yml` until #199: kharond reaches the agent
   host's browser over the `wg` network (holder 10.66.0.1, agent host
   10.66.0.2), and `[api]`/`[connector]` over a VPN bind that address
-  (`listen = "10.66.0.1:8787"`). Swap the network for your real
+  (add `[api]` with `listen = "10.66.0.1:8787"`; the base has none). Swap the network for your real
   tunnel.
 - The owner UI is not published yet. Its loopback address is inside
   the holder's namespace, so no SSH forward reaches it; #208 turns it

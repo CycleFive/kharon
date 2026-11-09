@@ -4,7 +4,10 @@
 # the agent host's Chromium at 10.66.0.2. Swap the network for your
 # real tunnel (docs/deployment.md). Layer it on the base file:
 #   docker compose -f docker-compose.yml -f compose.vpn.yml ...
-# and set [api] listen = "10.66.0.1:8787" in kharon.toml.
+# With this overlay, kharon.toml adds
+#   [api]
+#   listen = "10.66.0.1:8787"
+# for agents that use the HTTP API over the VPN.
 services:
   holder:
     networks:

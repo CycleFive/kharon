@@ -21,6 +21,7 @@ token_hash = "$argon2id$..."
 # Without one, MCP calls, grants and approvals still work.
 # No path: kharond reads the current /devtools/browser/<id> from
 # /json/version on each connect, so a Chromium restart needs no edit.
+# Fills fail without compose.vpn.yml until #199.
 cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # Path (B), egress-shaped agent host: these belong with a VPN or a
 # public address (overlay). See docs/deployment.md.
@@ -31,14 +32,15 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # tls_cert_file = "/etc/kharon/tls.crt"
 # tls_key_file = "/etc/kharon/tls.key"
 
-[api]
-# The daemon needs this section. Loopback, so nothing outside the
-# holder's network namespace reaches it. With compose.vpn.yml, set it to
-# 10.66.0.1:8787 (the wg address; wildcards are refused, REQ-DEP-006).
-listen = "127.0.0.1:8787"
+# No [api] section: the agent API is off in this base. Agents reach
+# POST /mcp on [public_ingress] below. [api] is only for agents on a
+# VPN; with compose.vpn.yml, add (the wg address; wildcards are
+# refused, REQ-DEP-006):
+# [api]
+# listen = "10.66.0.1:8787"   # with compose.vpn.yml
 
 # Public gateway (#198): the origin the Cloudflare Tunnel forwards to.
-# Serves only POST /mcp (and GET /connector once #199 lands);
+# Agents reach POST /mcp here. Serves only POST /mcp (and GET /connector once #199 lands);
 # everything else is 404. Loopback needs no TLS, and only what shares
 # the holder's namespace (cloudflared) reaches it. Tunnel route:
 # http://127.0.0.1:8790. See docs/deployment.md, "Public gateway".

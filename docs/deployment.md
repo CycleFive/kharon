@@ -459,7 +459,8 @@ Two layers hold that line:
    and answers 404 to everything else, whatever the edge forwards.
    This layer applies only to traffic routed to it.
    With a VPN (tailnet or `compose.vpn.yml`) the `[api]` listener is
-   unchanged. Token checks on the
+   unchanged. The compose base has no `[api]`; kharond runs with
+   `[public_ingress]` alone. Token checks on the
    public listener have their own concurrency limit, so a flood of
    bad tokens from the internet cannot slow tailnet agents down.
 
@@ -474,11 +475,12 @@ allow-list holds for those routes alone. When cloudflared runs beside
 kharond it shares kharond's loopback, so a route to any other port
 bypasses it and reaches, with none of the public-side limits:
 
-- base `[api]` on `127.0.0.1:8787` (`/v1/openapi.json` answers 200
-  unauthenticated; `/v1/*` and `/mcp` need a token);
 - cloudflared's own metrics on `127.0.0.1:20241` (`/config`,
   `/diag`, pprof);
-- `vaultwarden:80`, with that profile.
+- `vaultwarden:80`, with that profile;
+- `[api]`, only when you configured it (the compose base has none).
+  `/v1/openapi.json` answers 200 unauthenticated; `/v1/*` and `/mcp`
+  need a token.
 
 Don't set *HTTP Host Header* on a route.
 

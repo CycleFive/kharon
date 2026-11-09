@@ -13,7 +13,7 @@ use std::time::Duration;
 use argon2::Argon2;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::connector::{
-    AgentParams, ClientError, ConnectorEvent, Hub, accept, pin_of_der, run_agent_once,
+    AgentParams, ClientError, ConnectorEvent, Hub, Transport, accept, pin_of_der, run_agent_once,
     server_config_from_pem,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -74,7 +74,7 @@ async fn rig(token_ok: bool) -> Rig {
 
 fn params(rig: &Rig) -> AgentParams {
     AgentParams {
-        broker: rig.broker,
+        transport: Transport::Tls { broker: rig.broker },
         server_name: "127.0.0.1".into(),
         pin: rig.pin,
         agent_id: "assistant".into(),
@@ -83,6 +83,7 @@ fn params(rig: &Rig) -> AgentParams {
         cdp: "127.0.0.1:9".parse().unwrap(),
         proxy: None,
         proxy_creds: None,
+        outer_roots: None,
     }
 }
 

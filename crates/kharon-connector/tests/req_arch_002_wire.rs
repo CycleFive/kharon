@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use kharon_connector::{
     AUTH_OK, AUTH_UNAUTHORIZED, AgentParams, BrokerSession, ClientError, FRAME_OPEN, Frame,
-    encode_frame, pin_of_der, read_client_hello, run_agent_once, serve_agent,
+    Transport, encode_frame, pin_of_der, read_client_hello, run_agent_once, serve_agent,
     server_config_from_pem, spawn_broker, write_server_hello,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -62,7 +62,7 @@ async fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
 
 fn params(broker: SocketAddr, pin: [u8; 32], token: &str, cdp: SocketAddr) -> AgentParams {
     AgentParams {
-        broker,
+        transport: Transport::Tls { broker },
         server_name: "127.0.0.1".into(),
         pin,
         agent_id: "assistant".into(),
@@ -70,6 +70,7 @@ fn params(broker: SocketAddr, pin: [u8; 32], token: &str, cdp: SocketAddr) -> Ag
         cdp,
         proxy: None,
         proxy_creds: None,
+        outer_roots: None,
     }
 }
 

@@ -75,7 +75,9 @@ mod tls;
 mod ws;
 
 pub use auth::{read_client_hello, read_server_hello, write_client_hello, write_server_hello};
-pub use client::{AgentParams, run_agent_once};
+pub use client::{
+    AgentParams, AuthedSession, Leg, Transport, check_once, connect_and_auth, run_agent_once,
+};
 pub use frame::{Frame, encode_frame};
 pub use mux::{BrokerSession, MuxIo, OpenError, serve_agent, spawn_broker};
 pub use proxy::{connect_http_proxy, proxy_creds_line};
@@ -109,12 +111,42 @@ pub enum ClientError {
     /// `cdp` is not a loopback socket. The connector will not dial it.
     #[error("cdp address is not a loopback socket")]
     CdpNotLoopback,
-    /// TCP, proxy, or handshake failure that is not a pin mismatch.
-    #[error("connector transport error ({context})")]
-    Transport {
-        /// `tcp`, `tls`, or `proxy`.
-        context: &'static str,
+    /// The broker host did not resolve.
+    #[error("cannot resolve the broker host")]
+    Dns,
+    /// The TCP connect failed.
+    #[error("tcp connect failed ({kind})")]
+    Tcp {
+        /// The OS error kind, never the peer's text.
+        kind: std::io::ErrorKind,
     },
+    /// The proxy answered CONNECT with this status (0: no HTTP response).
+    #[error("{}", proxy_status_text(*code))]
+    ProxyStatus { code: u16 },
+    /// The outer TLS (to the edge) failed.
+    #[error("outer TLS to the broker host failed")]
+    OuterTls,
+    /// The WebSocket upgrade was answered with this status as received
+    /// (0: no HTTP response; 101: the subprotocol was not echoed).
+    #[error("{}", upgrade_text(*status))]
+    Upgrade { status: u16 },
+    /// The inner TLS handshake failed for a reason other than the pin.
+    #[error("inner TLS handshake failed")]
+    InnerTls,
+}
+
+fn proxy_status_text(code: u16) -> String {
+    match code {
+        0 => "proxy CONNECT got no HTTP response".to_owned(),
+        c => format!("proxy CONNECT answered {c}"),
+    }
+}
+
+fn upgrade_text(status: u16) -> String {
+    match status {
+        0 => "websocket upgrade got no HTTP response".to_owned(),
+        s => format!("websocket upgrade answered {s}"),
+    }
 }
 
 /// ASCII magic at the start of both auth bodies.

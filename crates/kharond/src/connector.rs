@@ -26,7 +26,8 @@ use kharon_connector::{
     spawn_broker, write_server_hello,
 };
 pub use kharon_connector::{
-    AgentParams, ClientError, connect_pinned, pin_of_der, run_agent_once, server_config_from_pem,
+    AgentParams, ClientError, Transport, connect_pinned, pin_of_der, run_agent_once,
+    server_config_from_pem,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};

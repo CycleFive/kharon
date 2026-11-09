@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use kharon_connector::{AgentParams, ClientError, proxy_creds_line, run_agent_once};
+use kharon_connector::{AgentParams, ClientError, Transport, proxy_creds_line, run_agent_once};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -261,7 +261,7 @@ async fn resolve(cfg: &Config) -> Result<AgentParams, String> {
         Some((host, port)) => Some(lookup(host, *port).await?),
     };
     Ok(AgentParams {
-        broker,
+        transport: Transport::Tls { broker },
         server_name: cfg.broker_host.clone(),
         pin: cfg.pin,
         agent_id: cfg.agent_id.clone(),
@@ -269,6 +269,7 @@ async fn resolve(cfg: &Config) -> Result<AgentParams, String> {
         cdp: cfg.cdp,
         proxy,
         proxy_creds: cfg.proxy_creds.clone(),
+        outer_roots: None,
     })
 }
 

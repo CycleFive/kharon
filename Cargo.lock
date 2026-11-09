@@ -1054,6 +1054,7 @@ dependencies = [
  "futures-util",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "sha2",
  "thiserror 2.0.21",

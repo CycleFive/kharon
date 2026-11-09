@@ -143,7 +143,7 @@ fn req_aud_002_check_accepts_offhost_ntfy_config() {
     let (_token, hash) = generate("assistant");
     let cfg = Config::from_toml_str(&config(&hash, data.path(), stub.port, "")).unwrap();
     let listen = daemon::check(&cfg).expect("off-host ntfy config must pass check");
-    assert_eq!(listen.port(), 0);
+    assert_eq!(listen.expect("[api] is configured").port(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

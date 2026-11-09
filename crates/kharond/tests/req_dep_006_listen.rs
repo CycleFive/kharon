@@ -151,19 +151,180 @@ fn req_dep_006_daemon_refuses_wildcard_bind() {
     assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
 }
 
-/// No `[api]`: the daemon refuses rather than pick an address.
+/// Neither `[api]` nor `[public_ingress]`: agents have no way in, so the
+/// daemon refuses (an `[owner_ui]` alone is not an agent listener).
 #[test]
-fn req_dep_006_daemon_refuses_missing_listen() {
+fn req_dep_006_daemon_refuses_no_agent_listener() {
     let data = tempfile::tempdir().unwrap();
-    let text = config(TOKEN_HASH, data.path(), "");
+    let text = config(
+        TOKEN_HASH,
+        data.path(),
+        "[owner_ui]\nlisten = \"127.0.0.1:8788\"\norigin = \"http://localhost:8788\"\n",
+    );
     for args in [&[][..], &["--check"][..]] {
         let (code, stderr) = run(args, &text);
         assert_eq!(code, Some(78), "{args:?}: {stderr}");
         assert!(
-            stderr.contains("startup error [api_listen_missing]"),
+            stderr.contains("startup error [no_agent_listener]"),
             "{stderr}"
         );
     }
+}
+
+fn public(listen: &str) -> String {
+    format!("[public_ingress]\nlisten = \"{listen}\"\n")
+}
+
+/// `[public_ingress]` alone is an agent listener: `--check` passes and
+/// says the agent API is off.
+#[test]
+fn req_dep_006_check_reports_agent_api_off() {
+    let data = tempfile::tempdir().unwrap();
+    let (code, stderr) = run(
+        &["--check"],
+        &config(TOKEN_HASH, data.path(), &public("127.0.0.1:0")),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("config ok (1 agent(s), agent API off, public ingress on 127.0.0.1:0)"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+}
+
+/// Path B (`via = "agent_connector"`) with `[connector]` and no `[api]`.
+#[test]
+fn req_dep_006_check_path_b_without_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pin, cert, key) = write_cert(dir.path());
+    let data = dir.path().join("data");
+    let text = path_b_config(
+        TOKEN_HASH,
+        TOKEN_HASH,
+        &data,
+        "127.0.0.1:0",
+        Some((&cert, &key)),
+        "127.0.0.2:0",
+    );
+    // Drop the [api] block entirely: its listen line and its tls keys.
+    let start = text.find("[api]").unwrap();
+    let end = text.find("[connector]").unwrap();
+    let text = format!(
+        "{}{}{}",
+        &text[..start],
+        public("127.0.0.1:0"),
+        &text[end..]
+    );
+    assert!(!text.contains("[api]"), "{text}");
+    let (code, stderr) = run(&["--check"], &text);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("config ok (1 agent(s), agent API off, public ingress on 127.0.0.1:0)"),
+        "{stderr}"
+    );
+}
+
+/// Kills and reaps a spawned daemon on drop, so a failing assertion
+/// cannot leak it.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn id(&self) -> u32 {
+        self.0.as_ref().unwrap().id()
+    }
+    /// Take the child out of the guard (to wait on it).
+    fn take(&mut self) -> std::process::Child {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// No `[api]`: the daemon records no agent-API address, but does bind
+/// the public ingress on loopback.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_dep_006_start_without_api_binds_no_agent_listener() {
+    let data = tempfile::tempdir().unwrap();
+    let cfg =
+        Config::from_toml_str(&config(TOKEN_HASH, data.path(), &public("127.0.0.1:0"))).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    assert!(daemon.local_addr().is_none());
+    let public = daemon.public_ingress_addr().expect("public ingress bound");
+    assert!(public.ip().is_loopback(), "{public}");
+}
+
+/// Binary path with no `[api]`: it announces agent API off and serves
+/// `/mcp` on the public ingress, and SIGTERM still exits 0 (nothing
+/// else awaits the shutdown future).
+#[tokio::test(flavor = "multi_thread")]
+async fn req_dep_006_binary_without_api_serves_public_mcp() {
+    let (token, hash) = generate("assistant");
+    let token = token.expose_secret().clone();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let path = dir.path().join("kharon.toml");
+    std::fs::write(&path, config(&hash, &data, &public("127.0.0.1:0"))).unwrap();
+
+    let mut child = ChildGuard(Some(
+        Command::new(env!("CARGO_BIN_EXE_kharond"))
+            .arg("--config")
+            .arg(&path)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let pid = child.id();
+    let mut stderr = BufReader::new(child.0.as_mut().unwrap().stderr.take().unwrap());
+    let addr: SocketAddr = tokio::task::spawn_blocking(move || {
+        let mut seen = String::new();
+        loop {
+            let mut line = String::new();
+            assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "exited: {seen}");
+            if let Some(rest) = line.strip_prefix("kharond: public ingress listening on ") {
+                assert!(
+                    seen.contains(
+                        "kharond: agent API off (no [api]; agents reach POST /mcp on [public_ingress])\n"
+                    ),
+                    "{seen}"
+                );
+                assert!(!seen.contains("agent API listening"), "{seen}");
+                let addr = rest.split(" (").next().unwrap();
+                std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+                return addr.parse().unwrap();
+            }
+            seen.push_str(&line);
+        }
+    })
+    .await
+    .unwrap();
+
+    let init = r#"{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let json_ct = ("Content-Type", "application/json");
+    let r = api_support::post_mcp_raw(addr, None, &[json_ct], init).await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    let r = api_support::post_mcp_raw(addr, Some(&token), &[json_ct], init).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    let st = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let mut exited = child.take();
+    let status = tokio::task::spawn_blocking(move || exited.wait().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
 /// Off-host checkpoints (the SPEC default) are served by the ntfy

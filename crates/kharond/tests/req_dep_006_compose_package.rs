@@ -113,7 +113,7 @@ fn n1_example_config_is_loopback_only() {
     let text = raw.replace("\"$argon2id$...\"", &hash);
     let cfg = Config::from_toml_str(&text).expect("example config parses");
 
-    assert_eq!(cfg.api.expect("api").listen.to_string(), "127.0.0.1:8787");
+    assert!(cfg.api.is_none(), "base example has no [api]");
     let ingress = cfg.public_ingress.expect("public_ingress");
     assert_eq!(ingress.listen.to_string(), "127.0.0.1:8790");
     assert!(ingress.tls.is_none());

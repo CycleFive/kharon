@@ -1,12 +1,14 @@
 //! Daemon assembly (#14): config → hardened process → locked broker →
-//! bound agent API listener.
+//! bound agent API and/or public ingress listeners.
 //!
 //! [`start`] does everything that can fail before the first request,
 //! in an order chosen so that a listening socket implies a fully
 //! assembled, locked broker:
 //!
-//! 1. `[api] listen` must be configured (the daemon never picks an
-//!    address; REQ-DEP-006 refused wildcards at config load).
+//! 1. An agent listener must be configured: `[api] listen` (the daemon
+//!    never picks an address; REQ-DEP-006 refused wildcards at config
+//!    load) or `[public_ingress]` (#210: with no `[api]` the daemon
+//!    runs with the agent API off and agents reach `POST /mcp` there).
 //! 2. The audit checkpoint sink must be resolvable: local-only, or
 //!    the off-host ntfy sink when `[approval].ntfy` is configured
 //!    (REQ-AUD-002, #127; the loader already refuses off-host mode
@@ -33,12 +35,14 @@
 //!    ([`crate::owner`]) is bound under `data_dir`. When `[owner_ui]`
 //!    is set, that loopback listener also serves ntfy redeem
 //!    (`/owner/approve/<token>`, `/owner/deny/<token>`; REQ-DEP-006,
-//!    #136). The agent API listener is bound last and leaves those
-//!    paths unrouted.
+//!    #136). The agent API listener (when `[api]` is set) is bound last
+//!    and leaves those paths unrouted; with no `[api]` the public
+//!    ingress is last.
 //! 9. Public ingress (#198), when `[public_ingress]` is set: a
 //!    separate listener for a public edge (cloudflared) that serves
-//!    `POST /mcp` only ([`crate::api::public`]), bound just before the
-//!    agent API.
+//!    `POST /mcp` only ([`crate::api::public`]). It is bound just
+//!    before the agent API, and is the last listener bound when there
+//!    is no `[api]`.
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
@@ -496,9 +500,11 @@ fn map_grant_error(e: GrantError) -> OwnerFailure {
 /// and no message echoes secret material.
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
-    /// No `[api]` section: refuse rather than guess an address.
-    #[error("no `[api] listen` configured; set it to the WireGuard interface address")]
-    ApiListenMissing,
+    /// Neither `[api]` nor `[public_ingress]`: agents would have no way in.
+    #[error(
+        "no agent listener configured; set `[api] listen` (a VPN address) or `[public_ingress] listen` (the edge's loopback)"
+    )]
+    NoAgentListener,
     /// `audit.checkpoint_local_only = false` but no `[approval].ntfy`
     /// channel is configured. The config loader refuses this first
     /// (`audit_no_off_host_sink`); this is defence in depth so the
@@ -615,7 +621,7 @@ impl StartupError {
     /// Stable machine-readable code, printed by the daemon on refusal.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::ApiListenMissing => "api_listen_missing",
+            Self::NoAgentListener => "no_agent_listener",
             Self::OffHostCheckpointNotConfigured => "audit_off_host_not_configured",
             Self::CheckpointSinkSetup { .. } => "audit_checkpoint_sink_setup",
             Self::ApprovalNotifierSetup { .. } => "approval_notifier_setup",
@@ -638,7 +644,7 @@ impl StartupError {
     /// Process exit status (`sysexits.h`).
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::ApiListenMissing
+            Self::NoAgentListener
             | Self::OffHostCheckpointNotConfigured
             | Self::CheckpointSinkSetup { .. }
             | Self::ApprovalNotifierSetup { .. }
@@ -660,8 +666,13 @@ impl StartupError {
 
 /// The config checks [`start`] adds on top of the loader, without
 /// side effects: what `kharond --check` runs after `load_for_startup`.
-pub fn check(cfg: &Config) -> Result<SocketAddr, StartupError> {
-    let api = cfg.api.as_ref().ok_or(StartupError::ApiListenMissing)?;
+///
+/// Returns the configured `[api]` address, or `None` when the agent API
+/// is off and agents arrive only through `[public_ingress]` (#210).
+pub fn check(cfg: &Config) -> Result<Option<SocketAddr>, StartupError> {
+    if cfg.api.is_none() && cfg.public_ingress.is_none() {
+        return Err(StartupError::NoAgentListener);
+    }
     // REQ-AUD-002 (#127): off-host checkpoints are served by the ntfy
     // sink; the loader already guarantees the channel exists in this
     // mode, and `--check` must not read the token file or touch the
@@ -670,12 +681,14 @@ pub fn check(cfg: &Config) -> Result<SocketAddr, StartupError> {
     if !cfg.audit.checkpoint_local_only && cfg.approval.ntfy.is_none() {
         return Err(StartupError::OffHostCheckpointNotConfigured);
     }
-    Ok(api.listen)
+    Ok(cfg.api.as_ref().map(|a| a.listen))
 }
 
-/// An assembled daemon: locked broker plus bound listener.
+/// An assembled daemon: locked broker plus bound listeners.
 pub struct Daemon {
-    listener: TcpListener,
+    /// The agent API listener and its resolved address; `None` when
+    /// there is no `[api]` (#210).
+    listener: Option<(TcpListener, SocketAddr)>,
     /// Set when the agent API speaks TLS (path B, and path A if configured).
     api_tls: Option<Arc<rustls::ServerConfig>>,
     /// Path B accept loop, if any agent uses `via = agent_connector`.
@@ -864,12 +877,18 @@ pub async fn start(
     }
 
     let public_ingress = bind_public_ingress(cfg).await?;
-    let listener = TcpListener::bind(listen)
-        .await
-        .map_err(|e| StartupError::Bind {
-            addr: listen,
-            kind: e.kind().to_string(),
-        })?;
+    let listener = match listen {
+        Some(listen) => {
+            let bind_err = |e: io::Error| StartupError::Bind {
+                addr: listen,
+                kind: e.kind().to_string(),
+            };
+            let tcp = TcpListener::bind(listen).await.map_err(bind_err)?;
+            let addr = tcp.local_addr().map_err(bind_err)?;
+            Some((tcp, addr))
+        }
+        None => None,
+    };
     Ok(Daemon {
         listener,
         api_tls,
@@ -1052,8 +1071,9 @@ impl crate::owner_ui::OwnerUnlock for DaemonUiUnlock {
 
 impl Daemon {
     /// The bound address (resolves a configured port 0).
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+    /// `None` when there is no `[api]` (#210).
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.as_ref().map(|(_, addr)| *addr)
     }
 
     /// Whether the agent API listener speaks TLS.
@@ -1094,7 +1114,8 @@ impl Daemon {
             .is_some_and(|rt| rt.tls.is_some())
     }
 
-    /// Serve the agent API until `shutdown` resolves.
+    /// Serve the agent API (when `[api]` is set) and the public ingress
+    /// until `shutdown` resolves.
     pub async fn run<F>(self, shutdown: F) -> io::Result<()>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -1162,11 +1183,19 @@ impl Daemon {
         });
         let shutdown_broker = Arc::clone(&self.broker);
         let connector_task = self.connector.as_ref().map(|rt| rt.task.abort_handle());
-        let served = match self.api_tls {
-            Some(tls) => {
-                http::serve_tls_with_shutdown(self.listener, tls, self.broker, shutdown).await
+        let served = match (self.listener, self.api_tls) {
+            (Some((listener, _)), Some(tls)) => {
+                http::serve_tls_with_shutdown(listener, tls, self.broker, shutdown).await
             }
-            None => http::serve_with_shutdown(self.listener, self.broker, shutdown).await,
+            (Some((listener, _)), None) => {
+                http::serve_with_shutdown(listener, self.broker, shutdown).await
+            }
+            // No `[api]` (#210): nothing else awaits the shutdown
+            // future, so it drives shutdown directly.
+            (None, _) => {
+                shutdown.await;
+                Ok(())
+            }
         };
         if let Some(task) = connector_task {
             task.abort();

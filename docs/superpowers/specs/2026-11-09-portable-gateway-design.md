@@ -1,9 +1,10 @@
 # Portable gateway: one kharon package, reachable only through Cloudflare
 
 Status: design, 2026-11-09. Owner decisions from a conversation with Lothrop
-the same day. Amends the decision record on #197. Builder: Duet. Reviewed by
-Nyx and Muse on #206; their points are folded in and credited where they
-land.
+the same day, plus his clarifications in `#general` that afternoon on who runs
+the box and whose vault it is. Amends the decision record on #197. Builder:
+Duet. Reviewed by Nyx and Muse on #206; their points are folded in and
+credited where they land.
 
 ## Why
 
@@ -16,23 +17,75 @@ on the tailnet". Tailscale was meant as a quick shim to get one test running.
 It turned into tags, ACL rules and per-port firewall pins, and it ties the
 broker to one network.
 
-The owner wants kharon packaged so it can be **dropped on any machine with
-outbound internet**: their Proxmox, a cloud VM, a VPS. It must be reachable from
-the internet **only through Cloudflare**, and must need **no VPN** in the
-base case.
+Lothrop wants kharon packaged so it can be **dropped on any machine with
+outbound internet**: a cloud VM or VPS we run for a customer, or a
+self-hoster's own Proxmox. It must be reachable from the internet **only
+through Cloudflare**, and must need **no VPN** in the base case.
 
-The same package must serve two deployments:
+The same package must serve two deployments. The managed one is the case
+today:
 
-| | Hosted service (in theory, later) | Self-hosted (the owner's case today) |
+| | Managed (the case today) | Self-hosted (also supported) |
 |---|---|---|
-| Who runs the box | us, for a customer | the owner, on their own hardware |
-| Vault | the customer's **Bitwarden cloud** account | a **self-hosted Vaultwarden**: bundled in the package, or reached over HTTPS |
-| Who approves grants | the customer, from wherever they are | the owner, from wherever they are |
+| Who runs the box | us: **one deploy per customer**, and the customer hosts nothing | the owner, on their own hardware |
+| Vault | the customer's own **Bitwarden Password Manager** (Bitwarden cloud), which kharon doesn't own. The customer unlocks it, and the keys are held only in kharond's memory | the owner's Bitwarden account, or a **self-hosted Vaultwarden**: bundled in the package, or reached over HTTPS |
+| Who approves grants | the customer, from wherever they are, in the published owner UI | the owner, from wherever they are |
 
-Both already differ only in config for the vault (`[bitwarden] server`).
+Multi-tenant (one broker serving many customers) comes later and is not in
+this design. Each deploy has exactly one owner, so wherever this doc says
+**the owner**, the managed case means the customer. **We** are the operator.
+
+The two already differ only in config for the vault (`[bitwarden] server`).
 Bitwarden-cloud compatibility is tested nightly (REQ-DEP-004, `COMPAT.md`).
 What does *not* work for either today is owner access without a VPN or SSH.
+In the managed case the gap is total. The customer has no VPN into our network
+and no shell on our host, so today they couldn't unlock or approve at all.
 That is the gap this design closes.
+
+## What the managed case changes
+
+The rest of this doc works for both deployments. These points are specific to
+the managed one.
+
+- **The operator is on the box.** SPEC §2.1 trusts the broker host as "owner
+  hardware". In the managed case the host is ours, so the customer trusts us
+  with what it holds:
+  - the vault keys in RAM while unlocked;
+  - the owner socket. Its `SO_PEERCRED` check admits anyone who can `docker
+    compose exec` into the deploy, or is root on the host. From the CLI that
+    person can approve, deny and grant without the customer's passkey.
+
+  The master password still never reaches us in the clear (#194), and only the
+  customer can unlock. This design doesn't change that trust. It names it so
+  the #197 amendment and the SPEC threat model can say so, and so N3 can
+  decide whether the operator's CLI keeps owner powers on a managed deploy.
+- **A managed deploy is always published.** Local mode (Decision 7) needs a
+  shell on the host, and the customer has none. The CLI fallback is ours.
+  Re-enrolling a lost passkey goes through us, because the enrollment code
+  comes from the owner socket (`passkey_enroll`).
+- **Provisioning is per customer.** Each deploy needs its own tunnel,
+  hostnames, DNS entries and first passkey enrollment. N1's package is the unit
+  each one is stamped from. Automating the stamping is a non-goal here.
+  Per-customer hostnames stay one label deep, for the same Universal SSL
+  reason as `kharon-owner.twkr.io`.
+- **Connecting is N3, and out of scope here.** Lothrop's intended flow:
+  1. The customer clicks **Connect** on the Muse or Grok dashboard.
+  2. They sign in to their kharon deploy with their passkey.
+  3. They're sent back to the dashboard, connected.
+  4. From then on they approve and deny fills in the published owner UI.
+
+  That is MCP authorization (OAuth 2.1 with PKCE), and it pulls #132 in. It
+  gets its own design. Nothing decided here may rule it out:
+  - The authorization endpoints can live on the owner hostname, where the
+    passkey's RP ID already is. MCP lets the resource (`/mcp`) point clients
+    at a separate authorization server, so Decision 7's single RP ID stands.
+  - N3 adds one path to `kharon.twkr.io`: the protected-resource metadata
+    under `/.well-known/` that names the authorization server. The `^/mcp$` /
+    `^/connector$` allow-list grows by that entry then, not now.
+  - The token endpoint (and any client registration) is called by the
+    dashboard, not by the owner UI's own pages. It can pass neither N2's
+    `Origin` rule nor an Access login. Like the ntfy routes, it will need a
+    named exemption and an Access bypass.
 
 ## Goals
 
@@ -51,9 +104,13 @@ That is the gap this design closes.
 
 ## Non-goals
 
-- A multi-customer broker. **One broker per owner**: the hosted service would
-  run one package per customer (*Duet's call*).
-- Automating per-customer provisioning (tunnels, hostnames, Access apps).
+- A multi-tenant broker. **One deploy per customer**, and each deploy has one
+  owner (*Lothrop's call*, `#general` 11-09). Multi-tenant comes later.
+- Automating per-customer provisioning (tunnels, hostnames, Access apps). N1's
+  package is what each deploy is stamped from. Stamping by hand is fine for
+  now.
+- The Connect flow (MCP OAuth, N3). It gets its own design; see *What the
+  managed case changes* for what this one leaves room for.
 - First-class Tailscale packaging. Wanted eventually; not in this work.
 - Changes to vault sync, crypto or the fill path.
 - Cloudflare-side WAF and rate-limit rules. They stay optional suggestions,
@@ -72,14 +129,24 @@ That is the gap this design closes.
 
 ## Decisions
 
-**Owner (Lothrop), 2026-11-09:**
+**Lothrop (project owner), 2026-11-09:**
 
 1. kharond and cloudflared run **together, wherever the broker runs**, not in
    a separate guest on the owner's Proxmox (amends #197).
 2. The base case needs **no Tailscale/WireGuard**. Supporting Tailscale as an
    option is welcome and expected later.
-3. The broker's one real outside dependency is the vault: Bitwarden cloud, or
-   self-hosted Vaultwarden.
+3. The broker's one real outside dependency is the vault, and **it isn't
+   ours** (clarified in `#general` 11-09).
+   - In the managed case it is the customer's own **Bitwarden Password
+     Manager** on Bitwarden cloud. The dedicated kharon user and organization
+     of SPEC §3.1 live in the customer's account space, not ours.
+   - The customer unlocks it with that user's master password, sealed in the
+     page (#194). kharond keeps the resulting keys only in memory: mlocked,
+     never dumped, zeroized on lock (SPEC §8). It keeps the password not at
+     all.
+   - A self-hoster may use self-hosted Vaultwarden instead.
+   - Bitwarden **Secrets Manager** is at most an optional adapter later. It
+     holds machine secrets, not the customer's logins.
 4. The **owner UI is published** on its own hostname through the same tunnel
    (reverses #197's "owner UI never published; stays on the tailnet").
 5. **Passkey required; Cloudflare Access optional**, recommended for
@@ -100,7 +167,8 @@ That is the gap this design closes.
      Muse's review). The old passkey stops verifying at once, with no grace
      period, and re-enrolling needs the owner socket. An owner who switches
      while away has no web UI until they can reach the host.
-   - A self-hoster without a domain stays in local mode, as today.
+   - A self-hoster without a domain stays in local mode, as today. A managed
+     deploy is always published (*What the managed case changes*).
    - Credentials enrolled under the old RP ID simply stop verifying. Whether
      the CLI also offers a purge is the builder's call.
 
@@ -135,8 +203,8 @@ That is the gap this design closes.
   Access can guard it without ever touching `/mcp` clients. It is one label
   deep, because Cloudflare Universal SSL covers only `*.twkr.io`: ours is
   **`kharon-owner.twkr.io`**.
-- **The bundled Vaultwarden becomes a compose profile.** The Bitwarden-cloud
-  case doesn't need it.
+- **The bundled Vaultwarden becomes a compose profile.** The managed case
+  (the customer's Bitwarden cloud) doesn't need it. It is for self-hosters.
 - **cloudflared is a compose profile too (`edge`)**, and the README's default
   run command turns it on (`COMPOSE_PROFILES=edge`). With the profile on and
   no token file, `docker compose up` fails loudly; that's intended. Without
@@ -178,7 +246,8 @@ That is the gap this design closes.
     fails. That lockout is closed separately (N2 item 5).
 - **N2 starts after #200 merges** and reuses its trusted-proxy helper rather
   than building a second one, so nothing conflicts with Muse's branch.
-- **Who does what.** Duet does all of it:
+- **Who does what.** Nyx cuts the N1–N3 issues from this doc once it merges.
+  Duet does the rest:
   - the kharon-repo work, through the normal process;
   - the issue amendments: a comment on #197 carrying the owner's amendment,
     edits to #201's ACs with a comment saying why, and a comment to Muse on
@@ -249,6 +318,9 @@ supports MCP calls, grants and approvals, but fills still ride a VPN path.
     tampered page *at the real origin* can still mislead the owner into
     approving or denying a real request: deceptive grant text, a fake panic
     state. Name both halves, so REQ-APR-005's ACs inherit the right threat.
+  - In the managed case the broker host is ours. Say what the customer
+    trusts us with: keys in RAM while unlocked, and the owner socket (*What
+    the managed case changes*).
 
   Add the new issues to the checklist.
 - **#200** (Muse, in progress): name the trust root as *placement* (only
@@ -273,6 +345,9 @@ supports MCP calls, grants and approvals, but fills still ride a VPN path.
   - REQ-DEP-006: public listeners are reachable only by the edge, by
     placement.
   - REQ-APR-005: ACs for public exposure (below).
+  - The overview and §2.1 call the broker host "owner(-controlled)
+    hardware". In the managed case it's the operator's, so the threat model
+    gains the operator as an actor.
 
   Requirement numbering is the builder's call.
 
@@ -319,7 +394,9 @@ supports MCP calls, grants and approvals, but fills still ride a VPN path.
      **Except the ntfy redeem routes** (`/owner/approve/<token>`,
      `/owner/deny/<token>`). ntfy's action POSTs carry no `Origin`, which is
      why they skip the check today (`owner_ui/mod.rs`, `serve`). Their
-     single-use, 120-second tokens are what protects them.
+     single-use, 120-second tokens are what protects them. Keep the
+     exemptions in one named list, because N3 will add its token endpoint
+     to it.
 3. **Source address.** Honour `CF-Connecting-IP` for owner-UI requests only
    when a public origin is configured, reusing #200's trusted-proxy helper
    under its contract (see Duet's calls). Owner auth failures are audited
@@ -375,6 +452,13 @@ supports MCP calls, grants and approvals, but fills still ride a VPN path.
    which their single-use, 120-second tokens already protect. That's Duet's
    call; the alternative is notifications that open the page instead.
 
+**N3: connect from the dashboard (MCP OAuth).** Out of scope for this doc,
+named so N1 and N2 leave room for it.
+- It gets its own design first, which Duet brainstorms with Lothrop. Nyx cuts
+  its issues from that design.
+- What N1 and N2 must not rule out is listed under *What the managed case
+  changes*.
+
 ## Our instance (homelab side: Duet, from the homelab repo, each live step confirmed with the owner)
 
 The specifics, so nobody has to rediscover them:
@@ -425,8 +509,8 @@ The specifics, so nobody has to rediscover them:
    tailnet, and approval stays on the owner UI over SSH, as today.
 
    **This exposes `/mcp` before #200's hardening: an interim that ends when
-   #200 merges** (Muse's review; Nyx, as lead, wants step 1 first; the owner
-   confirms on this PR).
+   #200 merges** (Muse's review; Nyx, as lead, wants step 1 first; Lothrop
+   accepted it in `#general`, 11-09).
    - What already holds on master:
      - `POST` only, and any `Origin` is refused.
      - The bearer token is checked **before the body is read**, so a stranger
@@ -442,7 +526,7 @@ The specifics, so nobody has to rediscover them:
 
      Those bear on noise and on what a token holder can do, not on a
      stranger getting in.
-   - If #200 slips, the owner can delete the `kharon.twkr.io` routes in the
+   - If #200 slips, we can delete the `kharon.twkr.io` routes in the
      dashboard, which takes effect at once.
 2. **N1 + the doc/#197/#201 amendments.**
 3. **N2**, then publish `kharon-owner.twkr.io` (+ Access) for our instance.

@@ -1,0 +1,163 @@
+//! Public-ingress listener (#198; decision record on #197).
+//!
+//! The origin a public edge (a Cloudflare Tunnel for `kharon.twkr.io`)
+//! forwards to. It is a separate listener from `[api]`, with a fixed
+//! allow-list, so the daemon itself refuses everything the public may
+//! not reach, whatever the edge's ingress rules say:
+//!
+//! | Request | Answer |
+//! |---|---|
+//! | `POST /mcp` | the MCP transport ([`super::mcp`]), exactly as on `[api]`: same bearer auth, rate limits, audit |
+//! | `GET /connector` | reserved for the agent-connector WebSocket (#199); 404 until that handler is mounted here |
+//! | anything else | 404 `not_found` / `no_such_route` |
+//!
+//! "Anything else" includes `/v1/*` and `/v1/openapi.json` (the tailnet
+//! API), `/owner/*` (the owner UI and ntfy redeem routes live on the
+//! loopback owner listener), `/`, `/healthz`, and other methods on
+//! `/mcp`: a public client has no business reaching any of them, and a
+//! 404 says nothing about which exist on another listener.
+//!
+//! Requests admitted here carry a [`PublicIngress`] extension, so the
+//! MCP handler can tell a public request from a tailnet one (#200 keys
+//! its trusted-proxy and client-IP handling on it). The listener has its
+//! own token-verification semaphore ([`AppState::new`]): a flood of bad
+//! tokens from the internet cannot starve tailnet agents of Argon2id
+//! permits.
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::Method;
+use axum::response::Response;
+use tokio::net::TcpListener;
+
+use super::core::{Broker, VaultView};
+use super::error::{ApiError, Detail, ErrorCode};
+use super::http::{AppState, TlsListener, error};
+use super::mcp::MCP_PATH;
+use crate::lock::Clock;
+
+/// `GET /connector`: the agent-connector WebSocket upgrade (#199).
+pub const CONNECTOR_PATH: &str = "/connector";
+
+/// Request extension: this request arrived on the public-ingress
+/// listener (#198), not the tailnet `[api]` listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicIngress;
+
+/// The public-ingress router over `broker`.
+pub fn router<S, C>(broker: Arc<Broker<S, C>>) -> Router
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    Router::new()
+        .fallback(handle::<S, C>)
+        .with_state(AppState::new(broker))
+}
+
+/// Serve the public-ingress surface on `listener` (plain HTTP: only
+/// for a loopback listener, where the edge runs on the same host).
+pub async fn serve_with_shutdown<S, C, F>(
+    listener: TcpListener,
+    broker: Arc<Broker<S, C>>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, router(broker))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+/// Serve the public-ingress surface over TLS. The edge pins this
+/// certificate (`originRequest.caPool`), so the hop from the edge to
+/// kharond is authenticated without trusting the network in between.
+pub async fn serve_tls_with_shutdown<S, C, F>(
+    listener: TcpListener,
+    tls: Arc<rustls::ServerConfig>,
+    broker: Arc<Broker<S, C>>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(TlsListener::new(listener, tls), router(broker))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+/// Which allow-listed route a request is, if any.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Mcp,
+    /// `GET /connector`, not mounted yet (#199).
+    Connector,
+}
+
+fn admit(method: &Method, path: &str) -> Option<Admit> {
+    match (method, path) {
+        (&Method::POST, MCP_PATH) => Some(Admit::Mcp),
+        (&Method::GET, CONNECTOR_PATH) => Some(Admit::Connector),
+        _ => None,
+    }
+}
+
+async fn handle<S, C>(State(state): State<Arc<AppState<S, C>>>, mut req: Request) -> Response
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    match admit(req.method(), req.uri().path()) {
+        Some(Admit::Mcp) => {
+            req.extensions_mut().insert(PublicIngress);
+            super::mcp::handle(state, req).await
+        }
+        // #199 mounts the WebSocket upgrade here. Until then the route
+        // is indistinguishable from an unknown one.
+        Some(Admit::Connector) | None => not_found(),
+    }
+}
+
+fn not_found() -> Response {
+    error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_post_mcp_and_get_connector_are_admitted() {
+        assert_eq!(admit(&Method::POST, "/mcp"), Some(Admit::Mcp));
+        assert_eq!(admit(&Method::GET, "/connector"), Some(Admit::Connector));
+        for (method, path) in [
+            (Method::GET, "/mcp"),
+            (Method::DELETE, "/mcp"),
+            (Method::OPTIONS, "/mcp"),
+            (Method::POST, "/mcp/"),
+            (Method::POST, "/MCP"),
+            (Method::POST, "//mcp"),
+            (Method::POST, "/connector"),
+            (Method::GET, "/connector/"),
+            (Method::GET, "/"),
+            (Method::GET, "/ui"),
+            (Method::GET, "/healthz"),
+            (Method::GET, "/v1/status"),
+            (Method::GET, "/v1/items"),
+            (Method::GET, "/v1/openapi.json"),
+            (Method::POST, "/v1/fill"),
+            (Method::POST, "/v1/grants"),
+            (Method::GET, "/owner/session"),
+            (Method::GET, "/owner/approve/x"),
+        ] {
+            assert_eq!(admit(&method, path), None, "{method} {path}");
+        }
+    }
+}

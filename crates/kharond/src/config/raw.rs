@@ -11,8 +11,8 @@ use url::Url;
 use super::{
     AgentConfig, ApiConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config, ConfigError,
     ConnectorConfig, DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind,
-    MemoryConfig, NtfyConfig, OwnerUiConfig, PolicyConfig, Redacted, Source, TlsMaterial,
-    parse_duration, tunnel_from_config,
+    MemoryConfig, NtfyConfig, OwnerUiConfig, PolicyConfig, PublicIngressConfig, Redacted, Source,
+    TlsMaterial, parse_duration, tunnel_from_config,
 };
 use crate::api::token::{HashProblem, ParamFloor, check_token_hash};
 use crate::cdp::{CdpEndpoint, CertSha256};
@@ -57,6 +57,7 @@ struct RawConfig {
     connector: Option<RawConnector>,
     data_dir: Option<PathBuf>,
     owner_ui: Option<RawOwnerUi>,
+    public_ingress: Option<RawPublicIngress>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +76,16 @@ struct RawConnector {
     listen: String,
     tls_cert_file: PathBuf,
     tls_key_file: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublicIngress {
+    listen: String,
+    #[serde(default)]
+    tls_cert_file: Option<PathBuf>,
+    #[serde(default)]
+    tls_key_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -351,6 +362,24 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         return Err(ConfigError::ConnectorListenConflict);
     }
     let owner_ui = raw.owner_ui.map(validate_owner_ui).transpose()?;
+    let public_ingress = raw
+        .public_ingress
+        .map(validate_public_ingress)
+        .transpose()?;
+    if let Some(public) = &public_ingress {
+        let taken = [
+            api.as_ref().map(|a| a.listen),
+            connector.as_ref().map(|c| c.listen),
+            owner_ui.as_ref().map(|u| u.listen),
+        ];
+        if taken
+            .into_iter()
+            .flatten()
+            .any(|addr| same_socket(addr, public.listen))
+        {
+            return Err(ConfigError::PublicIngressListenConflict);
+        }
+    }
     let data_dir = raw
         .data_dir
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
@@ -371,7 +400,33 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         connector,
         data_dir,
         owner_ui,
+        public_ingress,
     })
+}
+
+/// #198: the listener a public edge forwards to. Same address rules as
+/// `[api]` (REQ-DEP-006), and TLS whenever the hop leaves the host.
+fn validate_public_ingress(raw: RawPublicIngress) -> Result<PublicIngressConfig, ConfigError> {
+    let listen: SocketAddr = raw
+        .listen
+        .parse()
+        .map_err(|_| ConfigError::PublicIngressListenInvalid)?;
+    check_listen_ip(listen.ip()).map_err(|problem| match problem {
+        ListenProblem::Wildcard => ConfigError::PublicIngressWildcardBind,
+        ListenProblem::NotUnicast => ConfigError::PublicIngressListenNotUnicast,
+    })?;
+    let tls = optional_tls("public_ingress", raw.tls_cert_file, raw.tls_key_file)?;
+    if !listen.ip().is_loopback() && tls.is_none() {
+        return Err(ConfigError::PublicIngressPlainHttpNonLoopback);
+    }
+    Ok(PublicIngressConfig { listen, tls })
+}
+
+/// Two configured addresses contend for one socket when they are equal
+/// with a non-zero port. Port 0 is ephemeral and never collides (the
+/// integration tests bind every listener that way).
+fn same_socket(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0 && a == b
 }
 
 /// REQ-DEP-006: the agent API binds one specific unicast address.

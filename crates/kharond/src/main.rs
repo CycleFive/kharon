@@ -104,6 +104,14 @@ async fn serve(cfg: Config) -> ExitCode {
                     "kharond: owner UI listening on {ui} (origin {origin}; ntfy approve/deny on this address)"
                 );
             }
+            if let Some(public) = daemon.public_ingress_addr() {
+                let tls = if daemon.public_ingress_tls() {
+                    "TLS"
+                } else {
+                    "plain HTTP, loopback"
+                };
+                eprintln!("kharond: public ingress listening on {public} ({tls}; POST /mcp only)");
+            }
         }
         Err(e) => {
             eprintln!("kharond: cannot read listen address: {}", e.kind());

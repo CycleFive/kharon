@@ -35,6 +35,10 @@
 //!    (`/owner/approve/<token>`, `/owner/deny/<token>`; REQ-DEP-006,
 //!    #136). The agent API listener is bound last and leaves those
 //!    paths unrouted.
+//! 9. Public ingress (#198), when `[public_ingress]` is set: a
+//!    separate listener for a public edge (cloudflared) that serves
+//!    `POST /mcp` only ([`crate::api::public`]), bound just before the
+//!    agent API.
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
@@ -590,6 +594,14 @@ pub enum StartupError {
         /// `std::io::ErrorKind` rendering.
         kind: String,
     },
+    /// The public-ingress listen address could not be bound (#198).
+    #[error("cannot bind public ingress on {addr}: {kind}")]
+    PublicIngressBind {
+        /// Configured address.
+        addr: SocketAddr,
+        /// `std::io::ErrorKind` rendering.
+        kind: String,
+    },
 }
 
 /// Path B accept task plus the hub the CDP backend dials through.
@@ -619,6 +631,7 @@ impl StartupError {
             Self::OwnerUiStore { .. } => "owner_ui_store",
             Self::TlsMaterial { .. } => "tls_material",
             Self::ConnectorBind { .. } => "connector_bind",
+            Self::PublicIngressBind { .. } => "public_ingress_bind",
         }
     }
 
@@ -636,9 +649,10 @@ impl StartupError {
             | Self::Audit(_)
             | Self::OwnerBind { .. }
             | Self::OwnerUiStore { .. } => EX_CANTCREAT,
-            Self::Bind { .. } | Self::OwnerUiBind { .. } | Self::ConnectorBind { .. } => {
-                EX_UNAVAILABLE
-            }
+            Self::Bind { .. }
+            | Self::OwnerUiBind { .. }
+            | Self::ConnectorBind { .. }
+            | Self::PublicIngressBind { .. } => EX_UNAVAILABLE,
             Self::TlsMaterial { .. } => EX_CONFIG,
         }
     }
@@ -675,6 +689,16 @@ pub struct Daemon {
     owner_ui: Option<(TcpListener, Arc<crate::owner_ui::OwnerUi>)>,
     owner_ui_addr: Option<SocketAddr>,
     owner_ui_origin: Option<String>,
+    /// Bound public-ingress listener, when `[public_ingress]` is set
+    /// (#198), with its TLS config when it speaks TLS.
+    public_ingress: Option<PublicIngressRuntime>,
+}
+
+/// `[public_ingress]` bound at startup (#198).
+struct PublicIngressRuntime {
+    listener: TcpListener,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    addr: SocketAddr,
 }
 
 /// Assemble the daemon (see the module docs for the order). Must run
@@ -839,6 +863,7 @@ pub async fn start(
         }));
     }
 
+    let public_ingress = bind_public_ingress(cfg).await?;
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|e| StartupError::Bind {
@@ -857,7 +882,30 @@ pub async fn start(
         owner_ui,
         owner_ui_addr,
         owner_ui_origin,
+        public_ingress,
     })
+}
+
+/// Bind `[public_ingress]` when it is configured (#198).
+async fn bind_public_ingress(cfg: &Config) -> Result<Option<PublicIngressRuntime>, StartupError> {
+    let Some(public) = &cfg.public_ingress else {
+        return Ok(None);
+    };
+    let tls = match &public.tls {
+        Some(material) => Some(load_tls_material(material)?),
+        None => None,
+    };
+    let bind_err = |e: io::Error| StartupError::PublicIngressBind {
+        addr: public.listen,
+        kind: e.kind().to_string(),
+    };
+    let listener = TcpListener::bind(public.listen).await.map_err(bind_err)?;
+    let addr = listener.local_addr().map_err(bind_err)?;
+    Ok(Some(PublicIngressRuntime {
+        listener,
+        tls,
+        addr,
+    }))
 }
 
 fn load_tls_material(
@@ -1033,6 +1081,19 @@ impl Daemon {
         self.owner_ui_origin.as_deref()
     }
 
+    /// The public-ingress listener's bound address, when
+    /// `[public_ingress]` is set (#198).
+    pub fn public_ingress_addr(&self) -> Option<SocketAddr> {
+        self.public_ingress.as_ref().map(|rt| rt.addr)
+    }
+
+    /// Whether the public-ingress listener speaks TLS.
+    pub fn public_ingress_tls(&self) -> bool {
+        self.public_ingress
+            .as_ref()
+            .is_some_and(|rt| rt.tls.is_some())
+    }
+
     /// Serve the agent API until `shutdown` resolves.
     pub async fn run<F>(self, shutdown: F) -> io::Result<()>
     where
@@ -1074,6 +1135,30 @@ impl Daemon {
                 let _ = crate::owner_ui::serve(listener, ui, redeem).await;
             })
         });
+        // #198: the public-ingress listener stops with the agent API.
+        let (public_stop, public_stopped) = tokio::sync::oneshot::channel::<()>();
+        let public_ingress = self.public_ingress.map(|rt| {
+            let broker = Arc::clone(&self.broker);
+            let stopped = async move {
+                let _ = public_stopped.await;
+            };
+            tokio::spawn(async move {
+                let _ = match rt.tls {
+                    Some(tls) => {
+                        crate::api::public::serve_tls_with_shutdown(
+                            rt.listener,
+                            tls,
+                            broker,
+                            stopped,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::api::public::serve_with_shutdown(rt.listener, broker, stopped).await
+                    }
+                };
+            })
+        });
         let shutdown_broker = Arc::clone(&self.broker);
         let connector_task = self.connector.as_ref().map(|rt| rt.task.abort_handle());
         let served = match self.api_tls {
@@ -1084,6 +1169,10 @@ impl Daemon {
         };
         if let Some(task) = connector_task {
             task.abort();
+        }
+        let _ = public_stop.send(());
+        if let Some(task) = public_ingress {
+            let _ = task.await;
         }
         checkpoint_timer.abort();
         request_expiry.abort();

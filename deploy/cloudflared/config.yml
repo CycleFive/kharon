@@ -1,0 +1,45 @@
+# cloudflared config for the kharon public gateway (#198, design #197).
+#
+# An example, with no secrets in it. docs/deployment.md, "Public
+# gateway", walks through creating the tunnel and installing this.
+# Cloudflare-side changes (the tunnel, its DNS record, WAF and rate
+# limit rules) are applied by the owner, not by implementers.
+#
+# Only two paths reach kharond: POST /mcp (the MCP transport) and
+# GET /connector (the agent-connector WebSocket, #199). Every other
+# request gets 404 from the edge. kharond's [public_ingress] listener
+# keeps the same allow-list itself, so a mistake in this file still
+# reaches nothing else.
+#
+# Check the rules before (re)starting the tunnel:
+#   cloudflared --config /etc/cloudflared/config.yml tunnel ingress validate
+#   cloudflared --config /etc/cloudflared/config.yml tunnel ingress rule https://kharon.twkr.io/v1/status
+
+tunnel: <TUNNEL-UUID>
+# Written by `cloudflared tunnel create`. Mode 0400, owned by the
+# cloudflared user, never committed.
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+# Applies to every service below.
+originRequest:
+  # The origin is kharond's [public_ingress] listener on the broker's
+  # tailnet address, over TLS. caPool holds the broker's own
+  # certificate (the same file as [public_ingress] tls_cert_file), so
+  # cloudflared accepts that certificate and nothing else. Its IP SAN
+  # must be the address in `service`. Never set noTLSVerify.
+  caPool: /etc/cloudflared/kharon-broker.crt
+  noTLSVerify: false
+  connectTimeout: 10s
+  tlsTimeout: 10s
+
+ingress:
+  # The anchored regexes match the path only, not the query.
+  - hostname: kharon.twkr.io
+    path: ^/mcp$
+    service: https://100.120.48.90:8790
+  - hostname: kharon.twkr.io
+    path: ^/connector$
+    service: https://100.120.48.90:8790
+  # Everything else: the owner UI, /v1/*, /healthz, raw CDP, the
+  # [connector] port, any other hostname.
+  - service: http_status:404

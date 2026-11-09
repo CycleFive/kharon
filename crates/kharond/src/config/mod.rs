@@ -427,6 +427,26 @@ pub enum ConfigError {
     /// `owner_ui.rp_id` is not a domain name.
     #[error("`owner_ui.rp_id` must be a domain name (not an IP address)")]
     OwnerUiRpId,
+    /// `public_ingress.listen` is not `<ip>:<port>` with an IP literal.
+    #[error("`public_ingress.listen` must be an IP literal and port, e.g. \"100.64.0.1:8790\"")]
+    PublicIngressListenInvalid,
+    /// `public_ingress.listen` is a wildcard address (REQ-DEP-006).
+    #[error("`public_ingress.listen` is a wildcard address; bind the address cloudflared dials")]
+    PublicIngressWildcardBind,
+    /// `public_ingress.listen` is a multicast or broadcast address.
+    #[error("`public_ingress.listen` must be a unicast address")]
+    PublicIngressListenNotUnicast,
+    /// The public-ingress listener is plain HTTP off loopback (#198):
+    /// the hop from cloudflared must be TLS with a pinned cert.
+    #[error(
+        "`public_ingress.listen` is plain HTTP on a non-loopback address; set public_ingress.tls_cert_file and public_ingress.tls_key_file"
+    )]
+    PublicIngressPlainHttpNonLoopback,
+    /// The public-ingress listener shares an address with another listener.
+    #[error(
+        "[public_ingress].listen must differ from [api].listen, [connector].listen and [owner_ui].listen"
+    )]
+    PublicIngressListenConflict,
 }
 
 impl ConfigError {
@@ -499,6 +519,11 @@ impl ConfigError {
             Self::OwnerUiOrigin => "owner_ui_origin",
             Self::OwnerUiOriginPort => "owner_ui_origin_port",
             Self::OwnerUiRpId => "owner_ui_rp_id",
+            Self::PublicIngressListenInvalid => "public_ingress_listen_invalid",
+            Self::PublicIngressWildcardBind => "public_ingress_wildcard_bind",
+            Self::PublicIngressListenNotUnicast => "public_ingress_listen_not_unicast",
+            Self::PublicIngressPlainHttpNonLoopback => "public_ingress_plain_http_non_loopback",
+            Self::PublicIngressListenConflict => "public_ingress_listen_conflict",
         }
     }
 }
@@ -838,6 +863,10 @@ pub struct Config {
     /// `[owner_ui]`: the WebAuthn owner UI (REQ-APR-005). `None` =
     /// not configured; the daemon serves the owner socket only.
     pub owner_ui: Option<OwnerUiConfig>,
+    /// `[public_ingress]`: the listener a public edge (cloudflared,
+    /// #198) forwards to. Serves `POST /mcp` only (and `/connector`
+    /// once #199 mounts it); `None` = not configured.
+    pub public_ingress: Option<PublicIngressConfig>,
 }
 
 /// `[owner_ui]` (REQ-APR-005). Loopback only. `origin` is what the
@@ -896,6 +925,20 @@ pub struct ConnectorConfig {
     pub tls: TlsMaterial,
 }
 
+/// `[public_ingress]` (#198; decision record on #197): the origin a
+/// public edge such as a Cloudflare Tunnel forwards `kharon.twkr.io`
+/// to. A separate listener from `[api]` with a fixed allow-list, so a
+/// misconfigured edge cannot reach `/v1/*`, the owner UI or anything
+/// else. TLS is required off loopback: the edge pins this certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicIngressConfig {
+    /// Specific unicast address. Never a wildcard; port 0 is ephemeral.
+    pub listen: SocketAddr,
+    /// Certificate the edge pins (`originRequest.caPool`). Required
+    /// unless `listen` is loopback.
+    pub tls: Option<TlsMaterial>,
+}
+
 /// `[api]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiConfig {
@@ -945,6 +988,11 @@ impl Config {
         }
         if let Some(connector) = &self.connector {
             load_tls(&connector.tls)?;
+        }
+        if let Some(public) = &self.public_ingress
+            && let Some(tls) = &public.tls
+        {
+            load_tls(tls)?;
         }
         if let Source::Export(exp) = &self.source {
             // REQ-EXP-002: the export file must classify as a

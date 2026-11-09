@@ -2,7 +2,7 @@
 
 Status: draft, 2026-10-30. Repo: `CycleFive/kharon`. Name decided: kharon. Language: Rust.
 
-kharon is a broker that runs beside Vaultwarden on owner-controlled hardware. It decrypts a dedicated Bitwarden collection client-side and fills credentials into a browser tab over CDP. Agents get metadata and fill status. They never get plaintext.
+kharon is a broker that runs on owner-controlled hardware, in front of a Bitwarden account it does not own: the owner's Bitwarden cloud Password Manager, or a self-hosted Vaultwarden. It decrypts a dedicated Bitwarden collection client-side and fills credentials into a browser tab over CDP. Agents get metadata and fill status. They never get plaintext.
 
 Requirement IDs are `REQ-<AREA>-NNN`. Each has one testable acceptance criterion (AC). Areas: GOAL, CRY, EXP, ARCH, API, APR, ORG, AUD, RL, REV, MEM, DEP.
 
@@ -345,26 +345,41 @@ Revoke-first (#135): when a sync invalidates grants (REQ-REV-003), they are remo
 
 ## 9. Deployment
 
+The shape of [`deploy/compose`](deploy/compose/README.md) (#207), which is the working version:
+
 ```yaml
 services:
-  vaultwarden: { image: vaultwarden/server:latest, networks: [vw] }
+  holder:                        # owns the network namespace kharond and cloudflared share
+    image: registry.k8s.io/pause:3.10@sha256:...
+    read_only: true
+    cap_drop: [ALL]
   kharon:
     image: ghcr.io/cyclefive/kharon:0.1
+    network_mode: "service:holder"   # every listener on 127.0.0.1; no published port
     user: "10001:10001"
     read_only: true
     cap_drop: [ALL]
     cap_add: [IPC_LOCK]
     ulimits: { memlock: -1, core: 0 }
     security_opt: ["no-new-privileges:true", "seccomp=./kharon-seccomp.json"]
-    volumes: ["./kharon/data:/data", "./kharon/kharon.toml:/etc/kharon.toml:ro"]
+    volumes: ["kharon-data:/data", "./kharon.toml:/etc/kharon.toml:ro"]
     secrets: [kharon_bw_api_key]
-    networks: [vw, wg]       # wg: to agent-host tunnel
-    ports: ["127.0.0.1:8787:8787"]  # owner UI behind reverse proxy; agent API on wg iface only
+  cloudflared:                   # profile edge: the public gateway, from a tunnel token
+    image: cloudflare/cloudflared:2026.10.4@sha256:...
+    profiles: [edge]
+    network_mode: "service:holder"
+    command: ["tunnel", "--metrics", "127.0.0.1:20241", "run", "--token-file", "/run/secrets/cloudflared_tunnel_token"]
+    secrets: [cloudflared_tunnel_token]
+  vaultwarden:                   # profile vaultwarden: self-hosters only
+    image: vaultwarden/server:1.33.0
+    profiles: [vaultwarden]
+# compose.vpn.yml (optional) puts the holder on a WireGuard network, for
+# [api]/[connector] over a VPN and, until #199, for fills.
 ```
 
 ```toml
 [bitwarden]
-server = "http://vaultwarden:80"          # or https://vault.bitwarden.com / self-hosted
+server = "https://vault.bitwarden.com"    # the owner's account; or .eu, or http://vaultwarden:80 / self-hosted
 email = "kharon@example.net"
 api_key_file = "/run/secrets/kharon_bw_api_key"
 organization_id = "uuid"
@@ -382,6 +397,10 @@ default_grant = "once"
 allow_standing = false
 [approval]
 ntfy = { url = "https://ntfy.example.net", topic = "kharon", token_file = "/run/secrets/ntfy" }
+[api]
+listen = "127.0.0.1:8787"                 # with a VPN: the WireGuard address (path A)
+[public_ingress]
+listen = "127.0.0.1:8790"                 # reached only by the edge, which shares kharond's namespace
 ```
 
 Compatibility: v1 uses only the endpoints official clients use: `/identity/accounts/prelogin`, `/identity/connect/token`, `/api/sync`. Requests send `Device-Type`, `Bitwarden-Client-Name`, and `Bitwarden-Client-Version` headers. Official cloud may enforce new-device verification and client-version checks. Behavior for API-key logins is unverified (OQ-11).
@@ -389,10 +408,10 @@ Compatibility: v1 uses only the endpoints official clients use: `/identity/accou
 | ID | Requirement | AC |
 |---|---|---|
 | REQ-DEP-001 | Distroless/static image, non-root, read-only rootfs. | `docker run --read-only` works. Trivy reports 0 high/critical. Image < 30 MB. |
-| REQ-DEP-002 | Compose example runs E2E against Vaultwarden. | CI job: compose up, then a seeded fixture fills a test page through headless Chromium. |
+| REQ-DEP-002 | Compose example runs E2E against Vaultwarden. The edge's path to kharond survives kharond restarting. | CI job: compose up, then a seeded fixture fills a test page through headless Chromium. A stand-in edge in kharond's network namespace reaches the loopback listeners after `restart` and after `up --force-recreate` of kharond (holder and edge untouched) and after a full-stack restart, with all three sharing one namespace each time. |
 | REQ-DEP-003 | Config validated at startup. Unsafe combos refused (non-loopback plain CDP, standing grants without flag, missing mlock). | Table of bad configs → each exits non-zero with a specific error. |
 | REQ-DEP-004 | Official Bitwarden compatibility tested. | A manual or nightly job against a cloud test account passes REQ-CRY-005. Result recorded in `COMPAT.md`. |
-| REQ-DEP-006 | Agent API bind rules by transport class. **(A)** When `cdp.via` is WireGuard/mTLS, the agent API binds only to the configured WireGuard (or tunnel) interface address. **(B)** When `cdp.via = "agent_connector"`, the agent API binds to a configured TLS-capable listen address reached by the agent over outbound HTTPS (bearer agent token); plain-HTTP non-loopback listens are refused. Owner API binds to loopback or a unix socket in both classes. Wildcard binds (`0.0.0.0` / `::`) are refused. | Config with `0.0.0.0` → startup error. Path (A) E2E: `ss -ltn` shows only the WG address for the agent API. Path (B) E2E: agent reaches API over TLS with a valid token; wrong token / plain HTTP to non-loopback fails. |
+| REQ-DEP-006 | Agent API bind rules by transport class. **(A)** When `cdp.via` is WireGuard/mTLS, the agent API binds only to the configured WireGuard (or tunnel) interface address. **(B)** When `cdp.via = "agent_connector"`, the agent API binds to a configured TLS-capable listen address reached by the agent over outbound HTTPS (bearer agent token); plain-HTTP non-loopback listens are refused. Owner API binds to loopback or a unix socket in both classes. Wildcard binds (`0.0.0.0` / `::`) are refused. **Public edge (#197, #207):** the edge (cloudflared) reaches kharond's loopback listeners, `[public_ingress]` among them, **by placement**: it shares kharond's network namespace. Under compose, both join a do-nothing holder container. On a host-networked deployment, they share the host's namespace, which is acceptable on a single-purpose host. Nothing in that namespace listens on a non-loopback address except a configured VPN address. Plain HTTP is allowed only on loopback. | Config with `0.0.0.0` → startup error. Path (A) E2E: `ss -ltn` shows only the WG address for the agent API. Path (B) E2E: agent reaches API over TLS with a valid token; wrong token / plain HTTP to non-loopback fails. Compose E2E: `ss -ltn` in kharond's namespace shows only loopback listeners plus the configured WG address; the compose config publishes no port. |
 | REQ-DEP-007 | The kharon account master password is generated with ≥ 128 bits of entropy and stored by the owner outside the kharon org. The API-key file plus server access reduces to an offline attack on it. | Guide documents it. `kharon init` generates the password and prints it once to the tty. |
 | REQ-DEP-008 | `api_key_file` should be owned by kharond's effective uid with mode 0400 or 0600. Startup fails (exit 78, `EX_CONFIG`) if it is not a regular file or is group- or world-writable. If it is group- or world-readable or owned by another uid, kharond logs a warning and continues; this accommodates Docker secrets mounted 0444 inside a single-purpose container. | Tempfile tests: 0600/0400 → ok; 0444 → warning; 0620/0602 → exit 78 `api_key_file`; directory → exit 78; foreign owner → warning. |
 | REQ-DEP-005 | Agent-host guide covers both transport classes: Chromium as `browser` user, `ptrace_scope=1`, password manager disabled; **(A)** WireGuard peer + cdp-relay, or **(B)** agent-connector install (outbound TLS dial to broker, no `wg0`, no UDP 51820 listen). | The doc exists. Path (A) snippet tested in a VM (existing). Path (B) snippet tested in CI or a VM with no UDP egress. |

@@ -6,7 +6,7 @@ kharon is built by three agents plus the owner. The spec ([`SPEC.md`](SPEC.md)) 
 |---|---|---|
 | Nyx (lead) | `cycle-five-nyx[bot]` | `nyx/` |
 | Muse | `cycle-five-muse[bot]` | `muse/` |
-| Nix | `cycle-five-nix[bot]` | `kimi/` |
+| Claude Duet | `cycle-five-duet[bot]` | `duet/` |
 | Owner | `cycle-five` (Lothrop) | — |
 
 ## Agent GitHub Apps
@@ -41,7 +41,7 @@ Current grants for `cycle-five-muse` (2026-10-30): contents, issues, pull_reques
 
 GitHub Apps can't be requested reviewers: the API and the PR sidebar accept only users and teams. Instead:
 
-- Put a line in the PR body naming the reviewers, e.g. `Review: @cycle-five-muse @cycle-five-nix`, and add the matching `review:<agent>` label(s) (`review:nyx`, `review:muse`, `review:nix`).
+- Put a line in the PR body naming the reviewers, e.g. `Review: @cycle-five-nyx @cycle-five-muse`, and add the matching `review:<agent>` label(s) (`review:nyx`, `review:muse`, `review:duet`).
 - Agents watch for their label and for mentions.
 - Every PR needs one approving review from an agent other than the author.
 - Changes to `SPEC.md` need approving reviews from both non-author agents.

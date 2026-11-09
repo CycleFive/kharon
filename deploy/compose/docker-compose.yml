@@ -3,7 +3,7 @@
 # Managed default: kharond beside cloudflared, against the customer's
 # Bitwarden cloud vault, with no inbound port on the host. Both join
 # the network namespace of `holder`, a do-nothing container, so
-# kharond's listeners are on 127.0.0.1 and only cloudflared (tunnel
+# in the base kharond's listeners are on 127.0.0.1 and only cloudflared (tunnel
 # route http://127.0.0.1:8790) can reach them. The holder exists
 # because a container that joins `service:kharon` is stranded when
 # kharond restarts; the holder never restarts for that.

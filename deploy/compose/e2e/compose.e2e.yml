@@ -28,6 +28,7 @@ services:
     container_name: kharon-e2e-fake-edge
     restart: "no"
     network_mode: "service:holder"
+    init: true
     entrypoint: ["sleep", "infinity"]
 
   vaultwarden:

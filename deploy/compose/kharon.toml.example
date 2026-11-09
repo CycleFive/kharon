@@ -33,7 +33,7 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 
 [api]
 # The daemon needs this section. Loopback, so nothing outside the
-# holder's network namespace reaches it. compose.vpn.yml moves it to
+# holder's network namespace reaches it. With compose.vpn.yml, set it to
 # 10.66.0.1:8787 (the wg address; wildcards are refused, REQ-DEP-006).
 listen = "127.0.0.1:8787"
 

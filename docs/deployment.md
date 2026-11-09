@@ -450,14 +450,16 @@ cannot join the tailnet can still reach the broker:
 
 Nothing else is reachable through the hostname: not the owner UI,
 not `/v1/*` or `/healthz`, not raw CDP, not the `[connector]` port.
-Two layers hold that line, and each holds it alone:
+Two layers hold that line:
 
 1. **The edge.** The tunnel's ingress rules route only `^/mcp$` and
    `^/connector$`. The last rule is `http_status:404`.
 2. **kharond.** The tunnel's origin is a listener of its own,
    `[public_ingress]`, that serves `POST /mcp` and `GET /connector`
    and answers 404 to everything else, whatever the edge forwards.
-   The tailnet `[api]` listener is unchanged. Token checks on the
+   This layer applies only to traffic routed to it.
+   With a VPN (tailnet or `compose.vpn.yml`) the `[api]` listener is
+   unchanged. Token checks on the
    public listener have their own concurrency limit, so a flood of
    bad tokens from the internet cannot slow tailnet agents down.
 
@@ -465,8 +467,19 @@ Cloudflare TLS ends at the edge. By default cloudflared runs beside
 kharond and the hop to it is loopback, so there is no TLS on it. The
 broker has no WAN port forward.
 
-With a token-managed tunnel the Cloudflare dashboard is the only
-edge allow-list, so kharond's own allow-list is the line that holds.
+With a token-managed tunnel the Cloudflare dashboard route list is
+the edge allow-list. Point routes only at `http://127.0.0.1:8790`
+(and `http://127.0.0.1:8788` after #208). `[public_ingress]`'s
+allow-list holds for those routes alone. When cloudflared runs beside
+kharond it shares kharond's loopback, so a route to any other port
+bypasses it and reaches, with none of the public-side limits:
+
+- base `[api]` on `127.0.0.1:8787` (`/v1/openapi.json` answers 200
+  unauthenticated; `/v1/*` and `/mcp` need a token);
+- cloudflared's own metrics on `127.0.0.1:20241` (`/config`,
+  `/diag`, pprof);
+- `vaultwarden:80`, with that profile.
+
 Don't set *HTTP Host Header* on a route.
 
 **Cloudflare-side changes (the tunnel, its DNS record, WAF and rate
@@ -619,15 +632,15 @@ refused for want of a token. A tool call with a real agent token
 then behaves as it does on `[api]`.
 
 Then the origin on its own, bypassing the edge. This is the second
-layer: kharond's own 404, with the JSON body
-`{"error":"not_found","detail":"no such route"}`. From the compose
-holder's namespace:
+layer: kharond's own 404. From the compose holder's namespace, run
+from `deploy/compose`:
 
 ```sh
 docker run --rm --network "container:$(docker compose ps -q holder)" alpine:3.22 wget -qSO- http://127.0.0.1:8790/v1/status
 ```
 
-That gets a 404 with the JSON body; `POST /mcp` gets 401. On a
+That prints `HTTP/1.1 404 Not Found` and exits 1, which is expected
+(busybox `wget` prints no body on a 404). `POST /mcp` gets 401. On a
 host-networked kharond, run `curl` against `http://127.0.0.1:8790`
 on the host.
 
@@ -740,8 +753,8 @@ cloudflared tunnel delete kharon
 ```
 
 and delete the `kharon.twkr.io` CNAME in the zone's DNS. The tailnet
-`[api]` listener is untouched throughout, so tailnet agents keep
-working.
+`[api]` listener is untouched throughout (with a VPN: tailnet or
+`compose.vpn.yml`), so VPN agents keep working.
 
 ## Agent host (REQ-DEP-005)
 

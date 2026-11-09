@@ -24,7 +24,7 @@ sudo chown 10001:10001 secrets/kharon_bw_api_key.json   # kharond's uid; see bel
 sudo chmod 0400 secrets/kharon_bw_api_key.json
 # the tunnel token, from a token-managed tunnel: not echoed, not in argv
 ( umask 077; cloudflared tunnel token kharon > secrets/cloudflared_tunnel_token )
-# or: read -rs T; printf '%s' "$T" > secrets/cloudflared_tunnel_token; unset T
+# or: read -rs T; ( umask 077; printf '%s' "$T" > secrets/cloudflared_tunnel_token ); unset T
 sudo chown 65532:65532 secrets/cloudflared_tunnel_token  # cloudflared's uid
 sudo chmod 0400 secrets/cloudflared_tunnel_token
 docker compose up -d
@@ -62,10 +62,16 @@ path B.
   `network_mode: "service:holder"`. A container that joined
   `service:kharon` would be stranded whenever kharond restarts; the
   holder never restarts for that, so the tunnel keeps its namespace.
+  Don't restart or recreate the holder alone (`docker restart
+  <holder>`, `docker compose up -d --force-recreate holder`): that
+  strands kharond and cloudflared in a dead namespace. Restart the
+  whole stack (`docker compose restart`) or run `docker compose up -d`.
 - Every kharond listener is on loopback (`[api]` 127.0.0.1:8787,
   `[public_ingress]` 127.0.0.1:8790), and nothing is published.
   Only cloudflared, in the same namespace, reaches them: the tunnel's
-  routes point at `http://127.0.0.1:8790`. kharond refuses a wildcard
+  routes point at `http://127.0.0.1:8790`. Point routes only there:
+  cloudflared shares the loopback, so a route to any other port
+  (`:8787`, `:20241`) bypasses `[public_ingress]`. kharond refuses a wildcard
   listen address (REQ-DEP-006).
 - cloudflared's metrics are pinned to `127.0.0.1:20241`. Without
   `--metrics` the container build binds every interface and serves

@@ -1,7 +1,11 @@
 # CI overlay for the compose example (issue #24, REQ-DEP-002 E2E):
 #
 #   docker compose -f deploy/compose/docker-compose.yml \
-#     -f deploy/compose/e2e/compose.e2e.yml -p kharon-e2e ...
+#     -f deploy/compose/compose.vpn.yml \
+#     -f deploy/compose/e2e/compose.e2e.yml -p kharon-e2e \
+#     --profile vaultwarden ...
+#
+# (file order: base, VPN overlay (defines the wg network), this one)
 #
 # - vaultwarden becomes the seeded loopback fixture (same pinned image
 #   and settings as the fixture harness; its TLS cert also names
@@ -9,10 +13,23 @@
 # - kharon takes the config and API key the E2E test writes to
 #   e2e/run/ (gitignored) and trusts the fixture CA;
 # - agent-host is a Chromium-only stand-in for the agent host on the
-#   wg network (10.66.0.2), with CDP relayed from its loopback.
+#   wg network (10.66.0.2), with CDP relayed from its loopback;
+# - fake-edge joins the holder's network namespace, as cloudflared does,
+#   and probes kharond's loopback listeners with socat across restarts.
 #
 # Relative paths resolve against deploy/compose (the first file).
 services:
+  holder:
+    container_name: kharon-e2e-holder
+    restart: "no"
+
+  fake-edge:
+    image: kharon-e2e-agent-host:local
+    container_name: kharon-e2e-fake-edge
+    restart: "no"
+    network_mode: "service:holder"
+    entrypoint: ["sleep", "infinity"]
+
   vaultwarden:
     extends:
       file: ../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/docker-compose.yml

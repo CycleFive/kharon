@@ -30,6 +30,15 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # The wg address only; wildcards are refused (REQ-DEP-006).
 listen = "10.66.0.1:8787"
 
+# Public gateway (#198): the origin a Cloudflare Tunnel forwards
+# kharon.twkr.io to. Serves only POST /mcp (and GET /connector once
+# #199 lands); everything else is 404. TLS is required unless the
+# address is loopback. See docs/deployment.md, "Public gateway".
+# [public_ingress]
+# listen = "100.120.48.90:8790"
+# tls_cert_file = "/etc/kharon/tls.crt"
+# tls_key_file = "/etc/kharon/tls.key"
+
 [approval]
 # ntfy is both the approval-prompt channel (REQ-APR-004) and the
 # off-host audit checkpoint sink (REQ-AUD-002): kharond publishes a

@@ -9,6 +9,8 @@
 //! - [`http`]: the `/v1/*` HTTP transport and its OpenAPI document.
 //! - [`mcp`]: the MCP transport (`POST /mcp`, REQ-API-001), a second
 //!   adapter over [`core`] on the same listener.
+//! - [`public`]: the public-ingress listener a public edge forwards to
+//!   (`POST /mcp` only, `/connector` reserved; #198).
 //! - [`surface`]: every tool/route and its response schema
 //!   (REQ-GOAL-001).
 //! - [`grant`]: the grant model and request lifecycle (SPEC §5,
@@ -29,6 +31,7 @@ pub mod http;
 pub mod mcp;
 pub mod meta;
 pub mod notify;
+pub mod public;
 pub mod rate;
 pub mod rollback;
 pub mod surface;

@@ -72,17 +72,27 @@ pub(super) struct AppState<S: VaultView, C: Clock> {
     auth_permits: Semaphore,
 }
 
+impl<S: VaultView, C: Clock> AppState<S, C> {
+    /// Per-listener state: each listener gets its own token-verification
+    /// semaphore, so a flood of bad tokens on one listener (the public
+    /// ingress, #198) cannot starve another (the tailnet `[api]`).
+    pub(super) fn new(broker: Arc<Broker<S, C>>) -> Arc<Self> {
+        Arc::new(Self {
+            broker,
+            auth_permits: Semaphore::new(MAX_CONCURRENT_AUTH),
+        })
+    }
+}
+
 /// The `/v1` router over `broker`.
 pub fn router<S, C>(broker: Arc<Broker<S, C>>) -> Router
 where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
-    let state = Arc::new(AppState {
-        broker,
-        auth_permits: Semaphore::new(MAX_CONCURRENT_AUTH),
-    });
-    Router::new().fallback(handle::<S, C>).with_state(state)
+    Router::new()
+        .fallback(handle::<S, C>)
+        .with_state(AppState::new(broker))
 }
 
 /// Serve the API on `listener` until the future is dropped.
@@ -130,13 +140,13 @@ where
 }
 
 /// TCP listener that completes a TLS handshake before axum sees the stream.
-struct TlsListener {
+pub(super) struct TlsListener {
     tcp: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
 }
 
 impl TlsListener {
-    fn new(tcp: TcpListener, tls: Arc<rustls::ServerConfig>) -> Self {
+    pub(super) fn new(tcp: TcpListener, tls: Arc<rustls::ServerConfig>) -> Self {
         Self {
             tcp,
             acceptor: tokio_rustls::TlsAcceptor::from(tls),

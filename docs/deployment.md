@@ -312,8 +312,9 @@ host. The bearer token still guards the API, but the "only through
 the tunnel" layer is gone. Whether you have to close it depends on
 where kharond binds:
 
-- **kharond in a container on a Docker bridge** (the Compose
-  example's `wg` network): Docker Engine 28 and later already drop
+- **kharond in a container on a Docker bridge** (the VPN overlay's
+  `wg` network, `compose.vpn.yml`; the base Compose example binds
+  loopback inside the holder's namespace and needs no filter): Docker Engine 28 and later already drop
   packets for a container address that arrive on any other interface,
   with one `raw` PREROUTING rule per container
   (`ip daddr <container> iifname != "<bridge>" drop`). Nothing to add.
@@ -386,11 +387,15 @@ gets an HTTP answer (`401` without a token).
 
 ### ntfy approve and deny (REQ-APR-004, REQ-DEP-006)
 
+Under the Compose package this waits for #208: the owner UI's
+loopback is inside the holder's namespace and is not reachable until
+#208 publishes it, so the owner uses the CLI meanwhile. What follows
+applies to a host-networked kharond.
+
 `GET` and `POST` on `/owner/approve/<token>` and `/owner/deny/<token>`
 are served on the owner UI listener, `[owner_ui] listen` (loopback).
 Configure `[owner_ui]` or kharond has no HTTP listener for them. The
-agent API (`[api] listen`, the WireGuard address) leaves those paths
-unrouted.
+agent API (`[api] listen`) leaves those paths unrouted.
 
 An ntfy `http` action is the POST the ntfy client sends when the owner
 taps it. The action URL's host is that owner listen address:
@@ -404,13 +409,14 @@ http://127.0.0.1:8788/owner/deny/<token>
 the broker host: open the ntfy web app there, or forward the owner port
 to the device that taps the action (an SSH local forward to the broker
 host's owner port). Publish that port on the broker host's loopback
-when a forward needs it. The `wg` address is the agent API; the action
-URL uses the owner listen address instead.
+when a forward needs it. The agent API address (`[api] listen`, which
+is the `wg` address only with the VPN overlay) is not the owner
+address; the action URL uses the owner listen address.
 
-Inside Compose the process binds `127.0.0.1` in the container. A
-published host port does not reach a container loopback bind. Run
-kharond on the host network, or forward into the container's loopback,
-and keep the action URL on that owner address.
+Inside Compose the process binds `127.0.0.1` in the holder's
+namespace. A published host port does not reach it, and neither does
+an SSH forward on the host. Run kharond on the host network until
+#208, and keep the action URL on that owner address.
 
 The owner unix socket remains the CLI channel (`kharon unlock`,
 `kharon approve`). It does not speak this HTTP.

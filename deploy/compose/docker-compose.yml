@@ -1,29 +1,59 @@
-# kharon compose example (SPEC §9, issue #24 / REQ-DEP-001, 002, 006).
+# kharon compose package (SPEC §9; issues #24, #207; REQ-DEP-001, 002, 006).
 #
-# kharond on owner hardware next to Vaultwarden. Copy
-# kharon.toml.example to kharon.toml and fill it in, put the kharon
-# account's personal API key JSON at secrets/kharon_bw_api_key.json,
-# owned by uid 10001 with mode 0400 (README: Compose keeps the host
-# file's owner and mode), then:
+# Managed default: kharond beside cloudflared, against the customer's
+# Bitwarden cloud vault, with no inbound port on the host. Both join
+# the network namespace of `holder`, a do-nothing container, so
+# kharond's listeners are on 127.0.0.1 and only cloudflared (tunnel
+# route http://127.0.0.1:8790) can reach them. The holder exists
+# because a container that joins `service:kharon` is stranded when
+# kharond restarts; the holder never restarts for that.
 #
-#   docker compose up -d --build
+# Copy kharon.toml.example to kharon.toml and fill it in. Secrets
+# (README: Compose keeps the host file's owner and mode):
+#   secrets/kharon_bw_api_key.json        uid 10001, mode 0400
+#   secrets/cloudflared_tunnel_token      uid 65532, mode 0400
+#
+#   docker compose --profile edge up -d --build
 #   docker compose exec kharon kharon unlock     # master password, once
 #
-# The `wg` network stands for the WireGuard link to the agent host:
-# kharond's agent API binds only its address there (10.66.0.1,
-# REQ-DEP-006) and reaches the agent host's Chromium at 10.66.0.2.
-# Swap it for your real tunnel (docs/deployment.md). The same
-# file runs in CI with e2e/compose.e2e.yml layered on top, which adds
-# the fixture Vaultwarden and an agent-host container
-# (.github/workflows/image.yml).
+# Profiles: `edge` is cloudflared; `vaultwarden` is a self-hosted
+# vault (set [bitwarden] server = "http://vaultwarden:80").
+# compose.vpn.yml adds the `wg` network (holder 10.66.0.1, agent host
+# 10.66.0.2) for a WireGuard link to the agent host's browser.
+# CI layers: -f docker-compose.yml -f compose.vpn.yml
+# -f e2e/compose.e2e.yml (.github/workflows/image.yml).
 name: kharon
 
 services:
+  holder:
+    image: registry.k8s.io/pause:3.10@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Mapping form so overlays can add networks (compose.vpn.yml).
+    networks: { default: {} }
+    # No published ports: nothing listens beyond the namespace.
+
   vaultwarden:
     image: vaultwarden/server:1.33.0
+    profiles: [vaultwarden]
     restart: unless-stopped
-    networks: [vw]
     volumes: ["vaultwarden-data:/data"]
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.4@sha256:c6c7ae1d5dfdcb094ad344ed68ccffc26635c9c6be80965664c33baf064b0515
+    profiles: [edge]
+    restart: unless-stopped
+    network_mode: "service:holder"
+    # --metrics keeps the metrics listener on loopback (it would
+    # otherwise bind 0.0.0.0). The token is a secret file, never argv
+    # or environment.
+    command: ["tunnel", "--metrics", "127.0.0.1:20241", "run", "--token-file", "/run/secrets/cloudflared_tunnel_token"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    secrets: [cloudflared_tunnel_token]
 
   kharon:
     build: { context: ../.. }
@@ -46,23 +76,15 @@ services:
       - "kharon-data:/data"
       - "./kharon.toml:/etc/kharon.toml:ro"
     secrets: [kharon_bw_api_key]
-    networks:
-      vw: {}
-      wg: { ipv4_address: 10.66.0.1 }
-    # No published ports: the agent API is on the wg address only, and
-    # the owner talks to the unix socket in /data (`kharon` CLI above).
+    network_mode: "service:holder"
+    # No published ports: the owner talks to the unix socket in /data
+    # (`kharon` CLI above).
 
 secrets:
   kharon_bw_api_key:
     file: ./secrets/kharon_bw_api_key.json
-
-networks:
-  vw: {}
-  wg:
-    ipam:
-      config:
-        - subnet: 10.66.0.0/24
-          gateway: 10.66.0.254
+  cloudflared_tunnel_token:
+    file: ./secrets/cloudflared_tunnel_token
 
 volumes:
   vaultwarden-data: {}

@@ -1,0 +1,18 @@
+# VPN overlay: puts the holder (and so kharond) on the `wg` network
+# that stands for the WireGuard link to the agent host (REQ-DEP-006).
+# kharond's agent API binds only the wg address (10.66.0.1) and reaches
+# the agent host's Chromium at 10.66.0.2. Swap the network for your
+# real tunnel (docs/deployment.md). Layer it on the base file:
+#   docker compose -f docker-compose.yml -f compose.vpn.yml ...
+# and set [api] listen = "10.66.0.1:8787" in kharon.toml.
+services:
+  holder:
+    networks:
+      wg: { ipv4_address: 10.66.0.1 }
+
+networks:
+  wg:
+    ipam:
+      config:
+        - subnet: 10.66.0.0/24
+          gateway: 10.66.0.254

@@ -8,7 +8,12 @@
 //! with `kh_tunnel_` is refused before any dial, so an agent API token
 //! left in the file by mistake is not sent to the broker.
 //!
-//! Reconnects with backoff until SIGINT or SIGTERM. v1 wire constants
+//! Two transports: `transport = "tls"` (default) dials `broker` over raw
+//! pinned TLS; `transport = "ws"` dials `broker_url` (`wss://host[:port]/path`)
+//! and runs the same pinned TLS inside a WebSocket, so it can pass an
+//! HTTPS-only edge. `--check` walks the legs once and exits.
+//!
+//! Reconnects with jittered backoff until SIGINT or SIGTERM. v1 wire constants
 //! live in `kharon-connector` (SPEC OQ-14).
 //!
 //! An optional HTTP CONNECT proxy is `http://host:port` with no
@@ -20,12 +25,18 @@
 
 #![forbid(unsafe_code)]
 
+mod backoff;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kharon_connector::{AgentParams, ClientError, Transport, proxy_creds_line, run_agent_once};
+use backoff::{Backoff, Outage, is_fixed_wait, leg_line};
+use kharon_connector::{
+    AgentParams, ClientError, Leg, Transport, check_once, connect_and_auth, proxy_creds_line,
+};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -34,11 +45,35 @@ const EX_CONFIG: u8 = 78;
 /// `sysexits.h` `EX_UNAVAILABLE` — could not resolve the broker or proxy.
 const EX_UNAVAILABLE: u8 = 69;
 
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+enum TransportKind {
+    #[default]
+    Tls,
+    Ws,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    broker: String,
+    #[serde(default)]
+    transport: TransportKind,
+    /// `host:port` of the raw listener. `transport = "tls"` only.
+    #[serde(default)]
+    broker: Option<String>,
+    /// `wss://host[:port][/path]`. `transport = "ws"` only.
+    #[serde(default)]
+    broker_url: Option<String>,
+    /// Inner TLS name. Defaults to the broker host.
+    #[serde(default)]
+    server_name: Option<String>,
     broker_pin: String,
+    /// For tests and private edges only: a PEM CA that is the *only* root
+    /// for the outer TLS of a `ws` transport (the system roots are not
+    /// used then). Refused with `transport = "tls"`. Outer verification
+    /// is never switched off.
+    #[serde(default)]
+    outer_ca_file: Option<PathBuf>,
     agent_id: String,
     token_file: PathBuf,
     cdp: String,
@@ -50,9 +85,22 @@ struct RawConfig {
     proxy_creds_file: Option<PathBuf>,
 }
 
+enum Dest {
+    Tls {
+        host: String,
+        port: u16,
+    },
+    Ws {
+        host: String,
+        port: u16,
+        path: String,
+    },
+}
+
 struct Config {
-    broker_host: String,
-    broker_port: u16,
+    dest: Dest,
+    server_name: String,
+    outer_roots: Option<Arc<rustls::RootCertStore>>,
     pin: kharon_connector::CertSha256,
     agent_id: String,
     token: Zeroizing<String>,
@@ -64,6 +112,7 @@ struct Config {
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let mut path = PathBuf::from("/etc/kharon-connector/connector.toml");
+    let mut check = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => match args.next() {
@@ -73,8 +122,11 @@ fn main() -> ExitCode {
                     return ExitCode::from(EX_CONFIG);
                 }
             },
+            "--check" => check = true,
             "--help" | "-h" => {
-                eprintln!("kharon-agent-connector --config /etc/kharon-connector/connector.toml");
+                eprintln!(
+                    "kharon-agent-connector [--check] --config /etc/kharon-connector/connector.toml"
+                );
                 return ExitCode::SUCCESS;
             }
             _ => {
@@ -108,6 +160,9 @@ fn main() -> ExitCode {
                 return ExitCode::from(EX_UNAVAILABLE);
             }
         };
+        if check {
+            return run_check(&params).await;
+        }
         run_until_signal(params).await;
         ExitCode::SUCCESS
     })
@@ -116,8 +171,55 @@ fn main() -> ExitCode {
 fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|_| "cannot read config".to_owned())?;
     let raw: RawConfig = toml::from_str(&text).map_err(|_| "config parse error".to_owned())?;
-    let (broker_host, broker_port) =
-        split_host_port(&raw.broker).ok_or_else(|| "broker must be host:port".to_owned())?;
+    let (dest, default_name) = match raw.transport {
+        TransportKind::Tls => {
+            if raw.broker_url.is_some() {
+                return Err("broker_url requires transport = \"ws\"".to_owned());
+            }
+            if raw.outer_ca_file.is_some() {
+                return Err("outer_ca_file requires transport = \"ws\"".to_owned());
+            }
+            let broker = raw
+                .broker
+                .as_deref()
+                .ok_or_else(|| "broker must be host:port".to_owned())?;
+            let (host, port) =
+                split_host_port(broker).ok_or_else(|| "broker must be host:port".to_owned())?;
+            (
+                Dest::Tls {
+                    host: host.to_owned(),
+                    port,
+                },
+                host.to_owned(),
+            )
+        }
+        TransportKind::Ws => {
+            if raw.broker.is_some() {
+                return Err("broker requires transport = \"tls\"; use broker_url".to_owned());
+            }
+            let url = raw.broker_url.as_deref().ok_or_else(|| {
+                "broker_url must be wss://host[:port][/path] with transport = \"ws\"".to_owned()
+            })?;
+            let (host, port, path) = parse_wss_url(url)?;
+            (
+                Dest::Ws {
+                    host: host.clone(),
+                    port,
+                    path,
+                },
+                host,
+            )
+        }
+    };
+    let server_name = match raw.server_name {
+        Some(n) if n.trim().is_empty() => return Err("server_name must not be empty".to_owned()),
+        Some(n) => n,
+        None => default_name,
+    };
+    let outer_roots = match &raw.outer_ca_file {
+        None => None,
+        Some(p) => Some(read_outer_ca(p)?),
+    };
     if !valid_agent_id(&raw.agent_id) {
         return Err("agent_id must match [a-z0-9-]{1,64}".to_owned());
     }
@@ -144,8 +246,9 @@ fn load(path: &Path) -> Result<Config, String> {
     };
     let token = read_token(&raw.token_file)?;
     Ok(Config {
-        broker_host: broker_host.to_owned(),
-        broker_port,
+        dest,
+        server_name,
+        outer_roots,
         pin,
         agent_id: raw.agent_id,
         token,
@@ -153,6 +256,63 @@ fn load(path: &Path) -> Result<Config, String> {
         proxy,
         proxy_creds,
     })
+}
+
+/// `wss://host[:port][/path]` -> (host, port, path). Only `wss`; no
+/// userinfo, query or fragment. Port defaults to 443, path to `/connector`.
+fn parse_wss_url(raw: &str) -> Result<(String, u16, String), String> {
+    const BAD: &str = "broker_url must be wss://host[:port][/path]";
+    let rest = raw.strip_prefix("wss://").ok_or_else(|| BAD.to_owned())?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/connector"),
+    };
+    if authority.is_empty()
+        || authority.contains('@')
+        || path.contains(['?', '#'])
+        || path
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(BAD.to_owned());
+    }
+    let (host, port) = if authority.starts_with('[') {
+        match authority.rsplit_once("]:") {
+            Some(_) => split_host_port(authority).ok_or_else(|| BAD.to_owned())?,
+            None => {
+                let h = authority
+                    .strip_prefix('[')
+                    .and_then(|a| a.strip_suffix(']'))
+                    .filter(|h| !h.is_empty())
+                    .ok_or_else(|| BAD.to_owned())?;
+                (h, 443)
+            }
+        }
+    } else if authority.contains(':') {
+        split_host_port(authority).ok_or_else(|| BAD.to_owned())?
+    } else {
+        (authority, 443)
+    };
+    if port == 0 {
+        return Err(BAD.to_owned());
+    }
+    Ok((host.to_owned(), port, path.to_owned()))
+}
+
+fn read_outer_ca(path: &Path) -> Result<Arc<rustls::RootCertStore>, String> {
+    use rustls_pki_types::{CertificateDer, pem::PemObject};
+    let pem = std::fs::read(path).map_err(|_| "cannot read outer_ca_file".to_owned())?;
+    let mut store = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        let cert = cert.map_err(|_| "outer_ca_file is not valid PEM".to_owned())?;
+        store
+            .add(cert)
+            .map_err(|_| "outer_ca_file holds an unusable certificate".to_owned())?;
+    }
+    if store.is_empty() {
+        return Err("outer_ca_file holds no certificate".to_owned());
+    }
+    Ok(Arc::new(store))
 }
 
 fn read_proxy_creds(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -255,21 +415,33 @@ fn valid_agent_id(id: &str) -> bool {
 }
 
 async fn resolve(cfg: &Config) -> Result<AgentParams, String> {
-    let broker = lookup(&cfg.broker_host, cfg.broker_port).await?;
     let proxy = match &cfg.proxy {
         None => None,
         Some((host, port)) => Some(lookup(host, *port).await?),
     };
+    // Through a proxy the proxy resolves the broker host; with `ws` the
+    // dial resolves it, so there is nothing to look up here.
+    let transport = match &cfg.dest {
+        Dest::Tls { host, port } => Transport::Tls {
+            broker: lookup(host, *port).await?,
+        },
+        Dest::Ws { host, port, path } => Transport::Ws {
+            host: host.clone(),
+            port: *port,
+            path: path.clone(),
+            outer_tls: true,
+        },
+    };
     Ok(AgentParams {
-        transport: Transport::Tls { broker },
-        server_name: cfg.broker_host.clone(),
+        transport,
+        server_name: cfg.server_name.clone(),
         pin: cfg.pin,
         agent_id: cfg.agent_id.clone(),
         token: cfg.token.clone(),
         cdp: cfg.cdp,
         proxy,
         proxy_creds: cfg.proxy_creds.clone(),
-        outer_roots: None,
+        outer_roots: cfg.outer_roots.clone(),
     })
 }
 
@@ -280,70 +452,101 @@ async fn lookup(host: &str, port: u16) -> Result<SocketAddr, String> {
     it.next().ok_or_else(|| "cannot resolve host".to_owned())
 }
 
+/// `--check`: one pass over the legs. Exit 0 only when auth succeeded.
+async fn run_check(params: &AgentParams) -> ExitCode {
+    let legs = check_once(params).await;
+    let mut authed = false;
+    for (leg, result) in &legs {
+        match result {
+            Ok(()) => {
+                println!("ok {}", leg_label(*leg));
+                authed |= *leg == Leg::Auth;
+            }
+            Err(e) => println!("fail {}: {e}", leg_label(*leg)),
+        }
+    }
+    if authed {
+        println!("check: ok");
+        ExitCode::SUCCESS
+    } else {
+        println!("check: failed");
+        ExitCode::from(EX_UNAVAILABLE)
+    }
+}
+
+fn leg_label(leg: Leg) -> &'static str {
+    match leg {
+        Leg::Dns => "dns",
+        Leg::Tcp => "tcp",
+        Leg::Proxy => "proxy",
+        Leg::OuterTls => "outer-tls",
+        Leg::Upgrade => "upgrade",
+        Leg::InnerTls => "inner-tls",
+        Leg::Auth => "auth",
+    }
+}
+
+/// One connection: dial, auth, then serve. `authed_at` is set once
+/// `AUTH_OK` arrived.
+async fn session(
+    params: &AgentParams,
+    outage: &mut Outage,
+    authed_at: &mut Option<Instant>,
+) -> Result<(), ClientError> {
+    let sess = connect_and_auth(params).await?;
+    outage.on_auth();
+    *authed_at = Some(Instant::now());
+    eprintln!("kharon-agent-connector: authenticated");
+    sess.serve().await
+}
+
 async fn run_until_signal(params: AgentParams) {
-    let mut delay = Duration::from_secs(1);
+    let mut backoff = Backoff::default();
+    let mut outage = Outage::default();
+    let mut rng = rand::thread_rng();
     loop {
-        let started = Instant::now();
-        tokio::select! {
+        let mut authed_at = None;
+        let result = tokio::select! {
             _ = shutdown() => {
                 eprintln!("kharon-agent-connector: shutting down");
                 return;
             }
-            result = run_agent_once(&params) => {
-                let lived = started.elapsed() >= Duration::from_secs(10);
-                match result {
-                    Err(ClientError::Unauthorized) => {
-                        eprintln!(
-                            "kharon-agent-connector: tunnel credentials refused; retrying in 60s"
-                        );
-                        if sleep_or_shutdown(Duration::from_secs(60)).await {
-                            return;
-                        }
+            r = session(&params, &mut outage, &mut authed_at) => r,
+        };
+        let lived = authed_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(10));
+        let wait = match result {
+            Err(ClientError::CdpNotLoopback) => {
+                eprintln!("kharon-agent-connector: cdp is not a loopback socket");
+                return;
+            }
+            Ok(()) | Err(ClientError::Disconnected) => {
+                eprintln!("kharon-agent-connector: connection ended; reconnecting");
+                if lived {
+                    backoff.reset();
+                }
+                backoff.next(&mut rng)
+            }
+            Err(e) => {
+                eprintln!("kharon-agent-connector: {}", leg_line(&e));
+                if authed_at.is_some() {
+                    // Authenticated, then failed mid-session: the outage
+                    // clock was just reset by `on_auth`.
+                    if lived {
+                        backoff.reset();
                     }
-                    Err(ClientError::ProxyAuth) => {
-                        eprintln!(
-                            "kharon-agent-connector: proxy authentication was refused; retrying in 60s"
-                        );
-                        if sleep_or_shutdown(Duration::from_secs(60)).await {
-                            return;
-                        }
-                    }
-                    Err(ClientError::BadCert) => {
-                        eprintln!(
-                            "kharon-agent-connector: broker certificate did not match broker_pin"
-                        );
-                        if sleep_or_shutdown(delay).await {
-                            return;
-                        }
-                        delay = (delay * 2).min(Duration::from_secs(30));
-                    }
-                    Err(ClientError::CdpNotLoopback) => {
-                        eprintln!("kharon-agent-connector: cdp is not a loopback socket");
-                        return;
-                    }
-                    Ok(()) => {
-                        eprintln!("kharon-agent-connector: connection ended; reconnecting");
-                        delay = Duration::from_secs(1);
-                        if sleep_or_shutdown(delay).await {
-                            return;
-                        }
-                    }
-                    Err(_) if lived => {
-                        eprintln!("kharon-agent-connector: connection ended; reconnecting");
-                        delay = Duration::from_secs(1);
-                        if sleep_or_shutdown(delay).await {
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        eprintln!("kharon-agent-connector: connection failed; reconnecting");
-                        if sleep_or_shutdown(delay).await {
-                            return;
-                        }
-                        delay = (delay * 2).min(Duration::from_secs(30));
-                    }
+                } else if let Some(line) = outage.on_failure(Instant::now(), &e) {
+                    eprintln!("{line}");
+                }
+                if is_fixed_wait(&e) {
+                    eprintln!("kharon-agent-connector: retrying in 60s");
+                    Duration::from_secs(60)
+                } else {
+                    backoff.next(&mut rng)
                 }
             }
+        };
+        if sleep_or_shutdown(wait).await {
+            return;
         }
     }
 }
@@ -376,7 +579,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{load, parse_proxy};
+    use super::{load, parse_proxy, parse_wss_url};
 
     const SECRET: &str = "leaked-user:leaked-pass";
 
@@ -398,6 +601,23 @@ mod tests {
             let path = self.0.join(name);
             std::fs::write(&path, bytes).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        }
+
+        /// A config body with no `broker` line: the test supplies the transport keys.
+        fn config_raw(&self, keys: &str) -> PathBuf {
+            let token = self.file("token", b"kh_tunnel_assistant_testtoken\n", 0o600);
+            let path = self.0.join("connector.toml");
+            let text = format!(
+                "broker_pin = \"{pin}\"\n\
+                 agent_id = \"assistant\"\n\
+                 token_file = \"{token}\"\n\
+                 cdp = \"127.0.0.1:9222\"\n\
+                 {keys}\n",
+                pin = "00".repeat(32),
+                token = token.display(),
+            );
+            std::fs::write(&path, text).unwrap();
             path
         }
 
@@ -510,5 +730,65 @@ mod tests {
         ))));
         assert!(err.contains("user:password"));
         assert!(!err.contains("leaked-pass-without-colon"), "{err}");
+    }
+
+    #[test]
+    fn config_ws_requires_wss_url() {
+        let scratch = Scratch::new();
+        for keys in [
+            "transport = \"ws\"",
+            "transport = \"ws\"\nbroker_url = \"https://h.example/connector\"",
+            "transport = \"ws\"\nbroker_url = \"ws://h.example/connector\"",
+            "transport = \"ws\"\nbroker_url = \"wss://u:p@h.example/connector\"",
+        ] {
+            let err = expect_err(load(&scratch.config_raw(keys)));
+            assert!(err.contains("broker_url"), "{err}");
+            assert_secret_absent(&err);
+        }
+        let cfg = load(&scratch.config_raw(
+            "transport = \"ws\"\nbroker_url = \"wss://h.example:8443/x/y\"\nserver_name = \"n.example\"",
+        ))
+        .unwrap();
+        assert_eq!(cfg.server_name, "n.example");
+        match cfg.dest {
+            super::Dest::Ws { host, port, path } => {
+                assert_eq!(
+                    (host.as_str(), port, path.as_str()),
+                    ("h.example", 8443, "/x/y")
+                );
+            }
+            super::Dest::Tls { .. } => panic!("expected ws"),
+        }
+        assert_eq!(
+            parse_wss_url("wss://h.example").unwrap(),
+            ("h.example".to_owned(), 443, "/connector".to_owned())
+        );
+        assert_eq!(
+            parse_wss_url("wss://[::1]:9/c").unwrap(),
+            ("::1".to_owned(), 9, "/c".to_owned())
+        );
+        assert!(parse_wss_url("wss://h.example/p?q=1").is_err());
+    }
+
+    #[test]
+    fn config_ws_refuses_broker_key() {
+        let scratch = Scratch::new();
+        let err = expect_err(load(&scratch.config_raw(
+            "transport = \"ws\"\nbroker = \"127.0.0.1:8789\"\nbroker_url = \"wss://h.example/connector\"",
+        )));
+        assert!(err.contains("broker"), "{err}");
+    }
+
+    #[test]
+    fn config_tls_refuses_broker_url() {
+        let scratch = Scratch::new();
+        let err = expect_err(load(&scratch.config_raw(
+            "broker = \"127.0.0.1:8789\"\nbroker_url = \"wss://h.example/connector\"",
+        )));
+        assert!(err.contains("broker_url"), "{err}");
+        let err = expect_err(load(&scratch.config_raw(
+            "transport = \"tls\"\nbroker = \"127.0.0.1:8789\"\nouter_ca_file = \"/nonexistent\"",
+        )));
+        assert!(err.contains("outer_ca_file"), "{err}");
     }
 }

@@ -1005,8 +1005,14 @@ name = "kharon-agent-connector"
 version = "0.0.0"
 dependencies = [
  "kharon-connector",
+ "rand",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "toml",
  "zeroize",
 ]

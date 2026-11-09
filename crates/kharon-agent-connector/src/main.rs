@@ -155,6 +155,11 @@ fn main() -> ExitCode {
     rt.block_on(async move {
         let params = match resolve(&cfg).await {
             Ok(p) => p,
+            Err(msg) if check => {
+                println!("fail dns: {msg}");
+                println!("check: failed");
+                return ExitCode::from(EX_UNAVAILABLE);
+            }
             Err(msg) => {
                 eprintln!("kharon-agent-connector: {msg}");
                 return ExitCode::from(EX_UNAVAILABLE);
@@ -514,6 +519,17 @@ async fn run_until_signal(params: AgentParams) {
             r = session(&params, &mut outage, &mut authed_at) => r,
         };
         let lived = authed_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(10));
+        // Anything that ends without an authenticated session counts toward
+        // the outage summary, whatever the variant.
+        if authed_at.is_none()
+            && !matches!(result, Err(ClientError::CdpNotLoopback))
+            && let Some(line) = outage.on_failure(
+                Instant::now(),
+                result.as_ref().err().unwrap_or(&ClientError::Disconnected),
+            )
+        {
+            eprintln!("{line}");
+        }
         let wait = match result {
             Err(ClientError::CdpNotLoopback) => {
                 eprintln!("kharon-agent-connector: cdp is not a loopback socket");
@@ -534,8 +550,6 @@ async fn run_until_signal(params: AgentParams) {
                     if lived {
                         backoff.reset();
                     }
-                } else if let Some(line) = outage.on_failure(Instant::now(), &e) {
-                    eprintln!("{line}");
                 }
                 if is_fixed_wait(&e) {
                     eprintln!("kharon-agent-connector: retrying in 60s");

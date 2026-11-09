@@ -20,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
+static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const TOKEN: &str = "kh_tunnel_assistant_checktoken";
 
 struct Out {
@@ -30,6 +31,11 @@ struct Out {
 
 /// Start the broker, write a config, run `--check`, return the outcome.
 async fn run_check(upgrade_status: Option<u16>) -> Out {
+    run_check_to(upgrade_status, None).await
+}
+
+/// `url_override` replaces the `broker_url` (the server still starts).
+async fn run_check_to(upgrade_status: Option<u16>, url_override: Option<&str>) -> Out {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -107,7 +113,7 @@ async fn run_check(upgrade_status: Option<u16>) -> Out {
     let dir: PathBuf = std::env::temp_dir().join(format!(
         "kharon-check-{}-{}",
         std::process::id(),
-        upgrade_status.unwrap_or(0)
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let token = dir.join("token");
@@ -121,12 +127,15 @@ async fn run_check(upgrade_status: Option<u16>) -> Out {
         &cfg,
         format!(
             "transport = \"ws\"\n\
-             broker_url = \"wss://127.0.0.1:{port}/connector\"\n\
+             broker_url = \"{url}\"\n\
              broker_pin = \"{hex}\"\n\
              outer_ca_file = \"{ca}\"\n\
              agent_id = \"assistant\"\n\
              token_file = \"{token}\"\n\
              cdp = \"127.0.0.1:9\"\n",
+            url = url_override
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("wss://127.0.0.1:{port}/connector")),
             ca = ca_file.display(),
             token = token.display(),
         ),
@@ -178,4 +187,16 @@ async fn check_exits_69_and_names_upgrade_on_502() {
         out.stdout
     );
     assert!(out.stdout.ends_with("check: failed\n"), "{}", out.stdout);
+    assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
+}
+
+/// ws without a proxy resolves inside `check_once`, so this exercises the
+/// client's own Dns leg.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_exits_69_and_names_dns_on_unresolvable_host() {
+    let out = run_check_to(None, Some("wss://kharon.invalid/connector")).await;
+    assert_eq!(out.code, Some(69), "{} / {}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("fail dns: "), "{}", out.stdout);
+    assert!(out.stdout.ends_with("check: failed\n"), "{}", out.stdout);
+    assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
 }

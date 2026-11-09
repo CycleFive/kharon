@@ -205,3 +205,38 @@ fn n1_vpn_overlay_puts_the_holder_on_wg() {
         Some("service:holder")
     );
 }
+
+#[test]
+fn n1_tunnel_routes_in_docs_use_127_0_0_1() {
+    let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let read =
+        |p: &str| std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let files = [
+        "docs/deployment.md",
+        "deploy/compose/README.md",
+        "deploy/cloudflared/config.yml",
+        "deploy/compose/docker-compose.yml",
+        "deploy/compose/kharon.toml.example",
+    ];
+    for f in files {
+        for line in read(f).lines() {
+            assert!(
+                !(line.contains("localhost") && line.contains("8790")),
+                "{f}: tunnel origin uses localhost: {line}"
+            );
+            assert!(
+                !((line.contains("service:") || line.contains('→') || line.contains("route"))
+                    && line.contains("localhost")),
+                "{f}: route or service line uses localhost: {line}"
+            );
+        }
+    }
+    let readme = read("deploy/compose/README.md");
+    for needle in ["COMPOSE_PROFILES=edge", "65532:65532", "compose.vpn.yml"] {
+        assert!(readme.contains(needle), "compose README lacks {needle}");
+    }
+    let guide = read("docs/deployment.md");
+    for needle in ["http://127.0.0.1:8790", "--token-file"] {
+        assert!(guide.contains(needle), "deployment guide lacks {needle}");
+    }
+}

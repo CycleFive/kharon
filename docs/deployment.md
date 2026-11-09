@@ -45,10 +45,13 @@ what the agent should not read back from the page).
 
 Start from the Compose example in
 [`deploy/compose`](../deploy/compose/README.md). It runs kharond
-from this repository's image next to Vaultwarden. Under path (A) the
-agent API binds to the WireGuard address only; under path (B) it
-binds to a TLS-capable listen address the agent reaches over outbound
-HTTPS (REQ-DEP-006).
+from this repository's image beside cloudflared, with the vault the
+customer already has: their own Bitwarden Password Manager on
+Bitwarden cloud, unlocked by the customer, with the keys held only in
+memory. A self-hoster can add the `vaultwarden` profile instead. Under
+path (A) the agent API binds to the WireGuard address only; under
+path (B) it binds to a TLS-capable listen address the agent reaches
+over outbound HTTPS (REQ-DEP-006).
 
 ### Audit checkpoints off-host (REQ-AUD-002)
 
@@ -62,7 +65,9 @@ bearer token when the topic requires one, and startup refuses to
 run if a configured token file cannot be read. The checkpoint
 stream is one JSON checkpoint per ntfy message — save it (ntfy
 server logs or a subscriber) and feed it to
-`kharon audit verify --checkpoints <file>`.
+`kharon audit verify --data <data_dir>/audit --checkpoints <file>`.
+`--data` takes the audit directory (it holds `audit.jsonl` and
+`keys/`), not `<data_dir>`.
 
 Setting `[audit] checkpoint_local_only = true` instead keeps
 checkpoints in `<data_dir>/audit/checkpoints.jsonl` and logs a
@@ -450,9 +455,13 @@ Two layers hold that line, and each holds it alone:
    public listener have their own concurrency limit, so a flood of
    bad tokens from the internet cannot slow tailnet agents down.
 
-Cloudflare TLS ends at the edge. The hop from cloudflared to kharond
-is TLS again, pinned to the broker's certificate, and runs over the
-tailnet or loopback. The broker has no WAN port forward.
+Cloudflare TLS ends at the edge. By default cloudflared runs beside
+kharond and the hop to it is loopback, so there is no TLS on it. The
+broker has no WAN port forward.
+
+With a token-managed tunnel the Cloudflare dashboard is the only
+edge allow-list, so kharond's own allow-list is the line that holds.
+Don't set *HTTP Host Header* on a route.
 
 **Cloudflare-side changes (the tunnel, its DNS record, WAF and rate
 limit rules) are applied by the owner, not by implementers.**
@@ -461,34 +470,36 @@ limit rules) are applied by the owner, not by implementers.**
 
 The listener follows the same rules as the others (REQ-DEP-006): an
 IP literal, never `0.0.0.0` or `::`, a port of its own. TLS is
-required on any address but loopback.
-
-```toml
-# cloudflared reaches kharond over the tailnet.
-[public_ingress]
-listen = "100.64.0.10:8790"
-tls_cert_file = "/etc/kharon/tls.crt"
-tls_key_file = "/etc/kharon/tls.key"
-```
-
-`100.64.0.10` stands for the broker's own tailnet address, here and
-below; use yours. The same certificate as `[api]` is fine. It must
-carry the listen address as an IP SAN, because cloudflared checks it against the
-address in the tunnel's `service` URL. When cloudflared runs on the
-broker host itself, a loopback listener may skip TLS:
+required on any address but loopback. The default is loopback, with
+cloudflared beside kharond:
 
 ```toml
 [public_ingress]
 listen = "127.0.0.1:8790"
 ```
 
+The TLS variant is for the alternative with cloudflared on a separate
+guest, which reaches kharond over the tailnet:
+
+```toml
+[public_ingress]
+listen = "100.64.0.10:8790"
+tls_cert_file = "/etc/kharon/tls.crt"
+tls_key_file = "/etc/kharon/tls.key"
+```
+
+`100.64.0.10` stands for the broker's own tailnet address; use yours.
+The same certificate as `[api]` is fine. It must carry the listen
+address as an IP SAN, because cloudflared checks it against the
+address in the tunnel's `service` URL.
+
 At start kharond prints which one it bound:
 
 ```text
-kharond: public ingress listening on 100.64.0.10:8790 (TLS; POST /mcp only)
+kharond: public ingress listening on 127.0.0.1:8790 (plain; POST /mcp only)
 ```
 
-If the listen address is a host address, the input filter in
+On a host address, the input filter in
 [Tunnel-only listeners](#tunnel-only-listeners-req-dep-006) already
 covers it when it shares an address with `[api]`. Otherwise add one
 line for it, with the interface cloudflared arrives on (for example
@@ -496,62 +507,72 @@ line for it, with the interface cloudflared arrives on (for example
 
 ### Where cloudflared runs
 
-Run cloudflared in its own LXC container (or VM) on the same Proxmox
-host, joined to the tailnet. It needs outbound HTTPS to Cloudflare
-and a route to `100.64.0.10:8790`, nothing else, and it holds no
-kharon secret. The example config,
-[`deploy/cloudflared/config.yml`](../deploy/cloudflared/config.yml),
-assumes this shape. Running it on the broker host instead, against a
-loopback `[public_ingress]`, also works; change `service` to
-`http://127.0.0.1:8790` and drop `caPool`.
+1. **Compose `edge` profile (default).** cloudflared joins the
+   holder container's network namespace, next to kharond. Both see
+   the same `127.0.0.1`, and nothing is published. See
+   [`deploy/compose`](../deploy/compose/README.md).
+2. **Host-networked, beside a host-networked kharond.** One namespace,
+   so every local process shares the loopback and can reach
+   `[public_ingress]`. That is acceptable on a single-purpose host.
+   The kharon pilot broker is this shape: kharond and cloudflared
+   `2026.10.4` both on the host network, started from a tunnel token,
+   `[public_ingress]` on `127.0.0.1:8790`.
+3. **Alternative: a separate guest over the tailnet.** An LXC
+   container or VM on the same Proxmox host, joined to the tailnet,
+   with outbound HTTPS to Cloudflare and a route to
+   `100.64.0.10:8790`. It uses the TLS `[public_ingress]` above and
+   holds no kharon secret. The locally managed
+   [`deploy/cloudflared/config.yml`](../deploy/cloudflared/config.yml)
+   assumes this shape; see
+   [the locally managed alternative](#alternative-a-locally-managed-tunnel).
 
 ### Creating the tunnel (owner)
 
-On a machine where you can sign in to Cloudflare:
+In the Cloudflare dashboard (Zero Trust, Networks, Tunnels), create a
+dashboard-managed tunnel. Add public-hostname routes for
+`kharon.twkr.io`:
 
-```sh
-cloudflared tunnel login                   # writes ~/.cloudflared/cert.pem
-cloudflared tunnel create kharon           # prints the tunnel UUID and writes <UUID>.json
-cloudflared tunnel route dns kharon kharon.twkr.io
-```
+| Path | Service |
+|---|---|
+| `^/mcp$` | `http://127.0.0.1:8790` |
+| `^/connector$` | `http://127.0.0.1:8790` |
+| (catch-all) | `HTTP Status: 404` |
 
-The last command creates a proxied CNAME, `kharon.twkr.io` to
-`<UUID>.cfargotunnel.com`. Then, on the cloudflared container:
+The dashboard creates the proxied DNS record. Copy the tunnel token
+into the secret file without echoing it or putting it in argv, as in
+the [compose README](../deploy/compose/README.md#run-it): `umask 077`,
+then `cloudflared tunnel token <name> > secrets/cloudflared_tunnel_token`
+(or `read -rs`), owned `65532:65532`, mode `0400`. For a host unit,
+the file is `/etc/cloudflared/kharon.token`, owned by the
+`cloudflared` user, mode `0400`. The token is the tunnel's secret: it
+never goes in this repository, a config template or a container
+image.
 
-```sh
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin cloudflared
-sudo install -d -o root -g cloudflared -m 0750 /etc/cloudflared
-sudo install -o cloudflared -g cloudflared -m 0400 <UUID>.json /etc/cloudflared/
-sudo install -o root -g cloudflared -m 0640 deploy/cloudflared/config.yml /etc/cloudflared/config.yml
-sudo install -o root -g cloudflared -m 0644 /etc/kharon/tls.crt /etc/cloudflared/kharon-broker.crt
-```
+### Running it
 
-Replace `<TUNNEL-UUID>` in `config.yml` with the UUID and
-`<BROKER-TAILNET-IP>` with the `[public_ingress]` listen address. The
-credentials file is the tunnel's secret: it never goes in this
-repository, a config template or a container image. `cert.pem` is
-needed only to create, route or delete tunnels; keep it off the
-cloudflared container, and delete it where you made the tunnel once
-you are done. `kharon-broker.crt` is the broker's public certificate
-(not its key), copied from the broker host.
+In Compose, put `COMPOSE_PROFILES=edge` in `.env` (or
+`edge,vaultwarden`), then `docker compose up -d`. The cloudflared
+command is `tunnel --metrics 127.0.0.1:20241 run --token-file
+/run/secrets/cloudflared_tunnel_token`.
 
-Never set `noTLSVerify: true`. If cloudflared logs
-`x509: certificate is valid for ...`, the certificate's IP SAN does
-not match the `service` address; fix the certificate or the address.
+`--metrics 127.0.0.1:20241` matters. With no `--metrics`, the
+cloudflared container build binds its metrics server to every
+interface, and that server serves `/metrics`, `/ready`, `/config`,
+`/diag` and Go pprof under `/debug/pprof` to the LAN and tailnet.
 
-### The cloudflared unit
+For the host-networked shape, a systemd unit:
 
 ```ini
 # /etc/systemd/system/cloudflared-kharon.service
 [Unit]
 Description=cloudflared tunnel for kharon.twkr.io (#198)
-After=network-online.target tailscaled.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=cloudflared
 Group=cloudflared
-ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /etc/cloudflared/config.yml tunnel run
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel --metrics 127.0.0.1:20241 run --token-file /etc/cloudflared/kharon.token
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=yes
@@ -567,29 +588,15 @@ WantedBy=multi-user.target
 ```
 
 ```sh
-cloudflared --config /etc/cloudflared/config.yml tunnel ingress validate
 sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared-kharon.service
 ```
 
-Update cloudflared through the container's package manager or by
-replacing the binary; `--no-autoupdate` keeps it from rewriting
-itself.
+`--no-autoupdate` keeps cloudflared from rewriting itself; update it
+by replacing the binary or the pinned image.
 
 ### Verifying
 
-First the edge rules, offline, on the cloudflared container. Each
-line names the rule that would answer:
-
-```sh
-for p in /mcp /connector / /ui /healthz /v1/status /v1/openapi.json /owner/session; do
-  cloudflared --config /etc/cloudflared/config.yml tunnel ingress rule "https://kharon.twkr.io$p"
-done
-```
-
-Only `/mcp` and `/connector` may match rules 1 and 2; every other
-path must match the last rule (`http_status:404`).
-
-Then from the internet, off the tailnet:
+From the internet, off the tailnet:
 
 ```sh
 for p in / /ui /healthz /v1/status /v1/items /v1/openapi.json /owner/session /owner/approve/x /json/version; do
@@ -605,13 +612,83 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://kharon.twkr.io/mcp \
 refused for want of a token. A tool call with a real agent token
 then behaves as it does on `[api]`.
 
-Last, the origin on its own, from a tailnet host, bypassing the
-edge. This is the second layer: kharond's own 404, with the JSON
-body `{"error":"not_found","detail":"no such route"}`.
+Then the origin on its own, bypassing the edge. This is the second
+layer: kharond's own 404, with the JSON body
+`{"error":"not_found","detail":"no such route"}`. From the compose
+holder's namespace:
+
+```sh
+docker run --rm --network "container:$(docker compose ps -q holder)" alpine:3.22 wget -qSO- http://127.0.0.1:8790/v1/status
+```
+
+That gets a 404 with the JSON body; `POST /mcp` gets 401. On a
+host-networked kharond, run `curl` against `http://127.0.0.1:8790`
+on the host.
+
+### Owner hostname
+
+`kharon-owner.twkr.io` pointing at `http://127.0.0.1:8788` comes
+with #208, which adds the public origin, Host and Origin checks,
+throttling and optional Cloudflare Access. Until then, don't route
+it. The MCP authorization work (N3) adds routes later, such as
+`/.well-known/oauth-protected-resource` and the token endpoint.
+
+### Alternative: a locally managed tunnel
+
+For cloudflared on a separate guest, over TLS, use
+[`deploy/cloudflared/config.yml`](../deploy/cloudflared/config.yml)
+with a credentials file instead of a token. On a machine where you
+can sign in to Cloudflare:
+
+```sh
+cloudflared tunnel login                   # writes ~/.cloudflared/cert.pem
+cloudflared tunnel create kharon           # prints the tunnel UUID and writes <UUID>.json
+cloudflared tunnel route dns kharon kharon.twkr.io
+```
+
+The last command creates a proxied CNAME, `kharon.twkr.io` to
+`<UUID>.cfargotunnel.com`. Then, on the cloudflared guest:
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin cloudflared
+sudo install -d -o root -g cloudflared -m 0750 /etc/cloudflared
+sudo install -o cloudflared -g cloudflared -m 0400 <UUID>.json /etc/cloudflared/
+sudo install -o root -g cloudflared -m 0640 deploy/cloudflared/config.yml /etc/cloudflared/config.yml
+sudo install -o root -g cloudflared -m 0644 /etc/kharon/tls.crt /etc/cloudflared/kharon-broker.crt
+```
+
+Replace `<TUNNEL-UUID>` in `config.yml` with the UUID and
+`<BROKER-TAILNET-IP>` with the `[public_ingress]` listen address. The
+credentials file is the tunnel's secret and `cert.pem` is needed only
+to create, route or delete tunnels; keep it off the guest and delete
+it where you made the tunnel. `kharon-broker.crt` is the broker's
+public certificate (not its key). Never set `noTLSVerify: true`; if
+cloudflared logs `x509: certificate is valid for ...`, the
+certificate's IP SAN does not match the `service` address.
+
+The unit is the one above with this `ExecStart` (the config file
+carries `metrics: 127.0.0.1:20241`, so the server stays on loopback):
+
+```ini
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /etc/cloudflared/config.yml tunnel run
+```
+
+Check the rules offline before (re)starting, on the guest. Each line
+names the rule that would answer:
+
+```sh
+cloudflared --config /etc/cloudflared/config.yml tunnel ingress validate
+for p in /mcp /connector / /ui /healthz /v1/status /v1/openapi.json /owner/session; do
+  cloudflared --config /etc/cloudflared/config.yml tunnel ingress rule "https://kharon.twkr.io$p"
+done
+```
+
+Only `/mcp` and `/connector` may match rules 1 and 2; every other
+path must match the last rule (`http_status:404`). The origin check
+from a tailnet host:
 
 ```sh
 curl -s --cacert /etc/kharon/tls.crt https://100.64.0.10:8790/v1/status   # 404, JSON body
-curl -s --cacert /etc/kharon/tls.crt https://100.64.0.10:8790/            # 404, JSON body
 curl -s -o /dev/null -w '%{http_code}\n' --cacert /etc/kharon/tls.crt \
   -X POST https://100.64.0.10:8790/mcp -H 'Content-Type: application/json' -d '{}'   # 401
 ```
@@ -642,12 +719,15 @@ client's address.
 Take the public path away in either order; each step alone closes it.
 
 ```sh
-# On the cloudflared container: stop serving the hostname.
+# Compose: stop serving the hostname, and drop `edge` from .env.
+docker compose stop cloudflared
+# Host-networked or guest:
 sudo systemctl disable --now cloudflared-kharon.service
 # On the broker: remove [public_ingress] from the config, then restart kharond.
 ```
 
-To remove the tunnel for good (owner, where `cert.pem` is):
+To remove the tunnel for good, delete it in the dashboard, or (owner,
+for a locally managed tunnel, where `cert.pem` is):
 
 ```sh
 cloudflared tunnel delete kharon

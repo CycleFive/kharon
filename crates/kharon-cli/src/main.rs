@@ -201,7 +201,8 @@ enum RevokeCommand {
 enum AuditCommand {
     /// Verify the hash-chained audit log against the off-host checkpoint stream.
     Verify {
-        /// Data directory holding `audit.jsonl` and `keys/`.
+        /// The audit directory, `<data_dir>/audit` (it holds `audit.jsonl` and
+        /// `keys/`), for example `/data/audit` in the compose example.
         #[arg(long)]
         data: PathBuf,
         /// Off-host checkpoint stream (JSONL, one checkpoint per line). This

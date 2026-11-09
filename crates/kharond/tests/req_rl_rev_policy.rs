@@ -17,7 +17,7 @@ use kharond::api::grant::{Channel, GrantAction, GrantError, GrantScope, GrantTer
 use kharond::api::rate::RatePolicy;
 use kharond::api::token::{TokenStore, generate_with};
 use kharond::api::{Broker, FillOperation, Outcome, VaultView, parse_fill};
-use kharond::audit::Event;
+use kharond::audit::{Event, UnresolvedRequest, unresolved_grant_requests};
 use kharond::config::GrantKind;
 use kharond::lock::{Clock, LockController, LockPolicy, LockReason, ManualClock, StaticHardening};
 use kharond::origin::OriginConfig;
@@ -981,4 +981,123 @@ async fn req_mem_007_lock_dominates_even_under_rate_pressure() {
         .await
         .unwrap_err();
     assert_eq!(err, kharond::api::ApiError::LOCKED);
+}
+
+// #196 (REQ-AUD-003): panic and agent revoke drop pending grant
+// requests. Each must end with exactly one terminal entry at the
+// moment it is dropped, not an `abandoned` at the next start (#130).
+
+/// A fill that stops at `pending_approval`; its grant request id.
+async fn pending_request(rig: &Rig, item: &str, origin: &str) -> String {
+    let r = rig.fill_password(item, origin).await.unwrap();
+    assert_eq!(r["status"], "pending_approval", "{r}");
+    r["grant_request_id"].as_str().unwrap().to_owned()
+}
+
+/// Approve `request_id` with a short per-origin grant.
+fn approve(rig: &Rig, request_id: &str, item: &str) {
+    rig.broker
+        .approve_grant_request(
+            request_id,
+            &GrantTerms {
+                scope: GrantScope::Item(item.to_owned()),
+                kind: GrantKind::PerOrigin,
+                ttl: Some(Duration::from_secs(3600)),
+                max_uses: Some(10),
+            },
+            Channel::Cli,
+        )
+        .unwrap();
+}
+
+/// `(result, detail_code)` of every `grant_request` entry for
+/// `request_id` other than its `pending` creation.
+fn request_endings(rig: &Rig, request_id: &str) -> Vec<(Option<String>, Option<String>)> {
+    rig.audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.event == Event::GrantRequest)
+        .filter(|e| e.request_id.as_deref() == Some(request_id))
+        .filter(|e| e.result.as_deref() != Some("pending"))
+        .map(|e| (e.result.clone(), e.detail_code.clone()))
+        .collect()
+}
+
+/// The requests the next daemon start would audit as `abandoned`
+/// (#130), read from what the rig has recorded so far.
+fn abandoned_on_next_start(rig: &Rig) -> Vec<UnresolvedRequest> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let mut log = String::new();
+    for entry in rig.audit.entries.lock().unwrap().iter() {
+        log.push_str(&serde_json::to_string(entry).unwrap());
+        log.push('\n');
+    }
+    std::fs::write(&path, log).unwrap();
+    unresolved_grant_requests(&path).unwrap()
+}
+
+fn denied(detail: &str) -> Vec<(Option<String>, Option<String>)> {
+    vec![(Some("denied".to_owned()), Some(detail.to_owned()))]
+}
+
+#[tokio::test]
+async fn req_aud_003_panic_ends_each_pending_request_with_one_denial() {
+    let rig = Rig::new("https://login.example.com/");
+    let approved = pending_request(&rig, ITEM_A, "https://login.example.com").await;
+    approve(&rig, &approved, ITEM_A);
+    let pending = pending_request(&rig, api_support::HOST_CLONE, "https://login.example.com").await;
+
+    rig.broker.wire_lock_audit();
+    rig.broker.panic_lock().unwrap();
+
+    assert_eq!(request_endings(&rig, &pending), denied("panic"));
+    // Already resolved by its grant_issue: no second ending.
+    assert_eq!(request_endings(&rig, &approved), []);
+    assert_eq!(abandoned_on_next_start(&rig), []);
+}
+
+#[tokio::test]
+async fn req_aud_003_agent_revoke_ends_each_pending_request_with_one_denial() {
+    let rig = Rig::new("https://login.example.com/");
+    let approved = pending_request(&rig, ITEM_A, "https://login.example.com").await;
+    approve(&rig, &approved, ITEM_A);
+    let pending = pending_request(&rig, api_support::HOST_CLONE, "https://login.example.com").await;
+
+    rig.broker.revoke_agent("alpha").unwrap();
+
+    assert_eq!(request_endings(&rig, &pending), denied("agent_revoked"));
+    assert_eq!(request_endings(&rig, &approved), []);
+    assert_eq!(abandoned_on_next_start(&rig), []);
+}
+
+#[tokio::test]
+async fn req_aud_003_agent_revoke_failed_denial_append_does_not_restore_the_request() {
+    let rig = Rig::new("https://login.example.com/");
+    let pending = pending_request(&rig, api_support::HOST_CLONE, "https://login.example.com").await;
+    *rig.audit.fail_event.lock().unwrap() = Some("grant_request");
+
+    assert_eq!(
+        rig.broker.revoke_agent("alpha"),
+        Err(GrantError::AuditFailed)
+    );
+
+    // Not put back: a pending request for a revoked token could only
+    // be approved into a grant nobody can use. It falls back to
+    // `abandoned` at the next start, as before #196.
+    assert_eq!(
+        rig.broker
+            .grant_store()
+            .lock()
+            .unwrap()
+            .pending_count("alpha"),
+        0
+    );
+    assert!(rig.broker.authenticate(&rig.alpha).is_err());
+    assert_eq!(request_endings(&rig, &pending), []);
+    let left = abandoned_on_next_start(&rig);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].request_id, pending);
 }

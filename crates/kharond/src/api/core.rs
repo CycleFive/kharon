@@ -444,6 +444,20 @@ fn grant_item_id(grant: &Grant) -> Option<String> {
     }
 }
 
+/// The terminal `grant_request` denial for a pending request that a
+/// panic or agent revoke drops (#196, REQ-AUD-003). It is shaped like
+/// the timeout and owner denials, so the start-up scan (#130) counts
+/// the request as resolved and has nothing to mark `abandoned`.
+fn dropped_request_entry(req: &GrantRequest, detail: &'static str) -> Entry {
+    Entry::new(Event::GrantRequest)
+        .agent_id(req.agent_id.clone())
+        .item_id(req.item_id.clone())
+        .origin(req.observed_origin.clone())
+        .request_id(req.id.clone())
+        .result("denied")
+        .detail_code(detail)
+}
+
 /// Owns a resolved [`FillPlan`] for the rest of [`Broker::fill`]. On
 /// drop, on every path (normal return, `?`, or the handler future being
 /// dropped mid-fill), the plan's values are zeroized and the wipe hook
@@ -1660,7 +1674,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// is in-memory; [`Self::unsuspend_agent`] does not clear it,
     /// and there is no un-revoke op. The token hash stays in the
     /// store, so a restart accepts the token again. Audited as
-    /// `token_revoke` + per-grant `grant_revoke`.
+    /// `token_revoke` + per-grant `grant_revoke` + a `grant_request`
+    /// denial (detail `agent_revoked`) per dropped pending request
+    /// (#196).
     pub fn revoke_agent(&self, agent_id: &str) -> Result<usize, GrantError> {
         let removed = self
             .grants
@@ -1671,7 +1687,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .revoke_agent(agent_id);
-        for grant in &removed {
+        for grant in &removed.grants {
             let entry = Entry::new(Event::GrantRevoke)
                 .agent_id(grant.agent_id.clone())
                 .grant_id(grant.id.clone())
@@ -1691,11 +1707,19 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 return Err(GrantError::AuditFailed);
             }
         }
+        for req in &removed.pending {
+            // Not put back on failure: a pending request for a revoked
+            // token could only be approved into a grant nobody can
+            // use. Unended, it is audited `abandoned` at the next
+            // start (#130).
+            self.append(dropped_request_entry(req, "agent_revoked"))
+                .map_err(|_| GrantError::AuditFailed)?;
+        }
         let entry = Entry::new(Event::TokenRevoke)
             .agent_id(agent_id.to_owned())
             .result("revoked");
         self.append(entry).map_err(|_| GrantError::AuditFailed)?;
-        Ok(removed.len())
+        Ok(removed.grants.len())
     }
 
     /// Clear an agent's suspension (REQ-RL-002 owner reset). Does
@@ -1715,8 +1739,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         .map_err(|_| GrantError::AuditFailed)
     }
 
-    /// `kharon panic` (REQ-REV-002): revoke every grant, then lock
-    /// (zeroize + CDP close via the lock hook). The single `panic`
+    /// `kharon panic` (REQ-REV-002): revoke every grant and end every
+    /// pending request with a `grant_request` denial (detail `panic`,
+    /// #196), then lock (zeroize + CDP close via the lock hook). Those
+    /// appends are best effort: panic must not fail. The single `panic`
     /// audit entry is that lock ([`LockReason::Panic`] through
     /// [`Self::wire_lock_audit`]); appending it here as well would
     /// record the transition twice (REQ-AUD-003). The approval
@@ -1729,7 +1755,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .revoke_all();
-        for grant in &removed {
+        for grant in &removed.grants {
             let entry = Entry::new(Event::GrantRevoke)
                 .agent_id(grant.agent_id.clone())
                 .grant_id(grant.id.clone())
@@ -1740,6 +1766,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 None => entry,
             };
             let _ = self.append(entry);
+        }
+        for req in &removed.pending {
+            let _ = self.append(dropped_request_entry(req, "panic"));
         }
         self.rollback
             .lock()

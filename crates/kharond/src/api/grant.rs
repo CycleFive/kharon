@@ -482,6 +482,30 @@ impl GrantRequest {
     }
 }
 
+/// What a bulk revoke ([`GrantStore::revoke_agent`],
+/// [`GrantStore::revoke_all`]) removed. `pending` holds only the
+/// dropped requests that were still pending. An approved or denied
+/// request already has its terminal audit entry, so the broker audits
+/// a denial for each pending one and nothing for the rest (#196,
+/// REQ-AUD-003).
+#[derive(Debug)]
+pub struct Revoked {
+    /// The revoked grants.
+    pub grants: Vec<Grant>,
+    /// The dropped requests that were still pending.
+    pub pending: Vec<GrantRequest>,
+}
+
+impl Revoked {
+    fn new(grants: Vec<Grant>, dropped: Vec<GrantRequest>) -> Self {
+        let pending = dropped
+            .into_iter()
+            .filter(|r| r.state == RequestState::Pending)
+            .collect();
+        Self { grants, pending }
+    }
+}
+
 /// The grants and requests the broker holds. Pure state: every
 /// method takes the clock reading, and the broker owns the audit
 /// side effects of the transitions it drives.
@@ -593,21 +617,25 @@ impl GrantStore {
     }
 
     /// Revoke every grant (and drop every request) for `agent_id`
-    /// (REQ-REV-001 `revoke agent`). Returns how many grants were
-    /// removed.
-    pub fn revoke_agent(&mut self, agent_id: &str) -> Vec<Grant> {
-        let (keep, removed): (Vec<_>, Vec<_>) =
+    /// (REQ-REV-001 `revoke agent`).
+    pub fn revoke_agent(&mut self, agent_id: &str) -> Revoked {
+        let (keep, grants): (Vec<_>, Vec<_>) =
             self.grants.drain(..).partition(|g| g.agent_id != agent_id);
         self.grants = keep;
-        self.requests.retain(|r| r.agent_id != agent_id);
-        removed
+        let (keep, dropped): (Vec<_>, Vec<_>) = self
+            .requests
+            .drain(..)
+            .partition(|r| r.agent_id != agent_id);
+        self.requests = keep;
+        Revoked::new(grants, dropped)
     }
 
     /// Revoke every grant and drop every request (REQ-REV-002 panic).
-    pub fn revoke_all(&mut self) -> Vec<Grant> {
-        let removed = std::mem::take(&mut self.grants);
-        self.requests.clear();
-        removed
+    pub fn revoke_all(&mut self) -> Revoked {
+        Revoked::new(
+            std::mem::take(&mut self.grants),
+            std::mem::take(&mut self.requests),
+        )
     }
 
     /// Pending request count for `agent` (REQ-RL-003).

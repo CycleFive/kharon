@@ -63,11 +63,16 @@ fn main() -> ExitCode {
         return match daemon::check(&cfg) {
             Ok(listen) => {
                 let n = cfg.agents.len();
-                match listen {
-                    Some(listen) => {
-                        eprintln!("kharond: config ok ({n} agent(s), agent API on {listen})");
-                    }
-                    None => eprintln!("kharond: config ok ({n} agent(s), agent API off)"),
+                let api = match listen {
+                    Some(listen) => format!("agent API on {listen}"),
+                    None => "agent API off".to_owned(),
+                };
+                match &cfg.public_ingress {
+                    Some(p) => eprintln!(
+                        "kharond: config ok ({n} agent(s), {api}, public ingress on {})",
+                        p.listen
+                    ),
+                    None => eprintln!("kharond: config ok ({n} agent(s), {api})"),
                 }
                 ExitCode::SUCCESS
             }

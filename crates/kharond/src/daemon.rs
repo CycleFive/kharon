@@ -1,5 +1,5 @@
 //! Daemon assembly (#14): config → hardened process → locked broker →
-//! bound agent API listener.
+//! bound agent API and/or public ingress listeners.
 //!
 //! [`start`] does everything that can fail before the first request,
 //! in an order chosen so that a listening socket implies a fully
@@ -35,12 +35,14 @@
 //!    ([`crate::owner`]) is bound under `data_dir`. When `[owner_ui]`
 //!    is set, that loopback listener also serves ntfy redeem
 //!    (`/owner/approve/<token>`, `/owner/deny/<token>`; REQ-DEP-006,
-//!    #136). The agent API listener is bound last and leaves those
-//!    paths unrouted.
+//!    #136). The agent API listener (when `[api]` is set) is bound last
+//!    and leaves those paths unrouted; with no `[api]` the public
+//!    ingress is last.
 //! 9. Public ingress (#198), when `[public_ingress]` is set: a
 //!    separate listener for a public edge (cloudflared) that serves
-//!    `POST /mcp` only ([`crate::api::public`]), bound just before the
-//!    agent API.
+//!    `POST /mcp` only ([`crate::api::public`]). It is bound just
+//!    before the agent API, and is the last listener bound when there
+//!    is no `[api]`.
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
@@ -682,7 +684,7 @@ pub fn check(cfg: &Config) -> Result<Option<SocketAddr>, StartupError> {
     Ok(cfg.api.as_ref().map(|a| a.listen))
 }
 
-/// An assembled daemon: locked broker plus bound listener.
+/// An assembled daemon: locked broker plus bound listeners.
 pub struct Daemon {
     /// The agent API listener and its resolved address; `None` when
     /// there is no `[api]` (#210).
@@ -1112,7 +1114,8 @@ impl Daemon {
             .is_some_and(|rt| rt.tls.is_some())
     }
 
-    /// Serve the agent API until `shutdown` resolves.
+    /// Serve the agent API (when `[api]` is set) and the public ingress
+    /// until `shutdown` resolves.
     pub async fn run<F>(self, shutdown: F) -> io::Result<()>
     where
         F: Future<Output = ()> + Send + 'static,

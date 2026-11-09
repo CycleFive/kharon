@@ -186,7 +186,7 @@ fn req_dep_006_check_reports_agent_api_off() {
     );
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
-        stderr.contains("config ok (1 agent(s), agent API off)"),
+        stderr.contains("config ok (1 agent(s), agent API off, public ingress on 127.0.0.1:0)"),
         "{stderr}"
     );
     assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
@@ -219,7 +219,7 @@ fn req_dep_006_check_path_b_without_api() {
     let (code, stderr) = run(&["--check"], &text);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
-        stderr.contains("config ok (1 agent(s), agent API off)"),
+        stderr.contains("config ok (1 agent(s), agent API off, public ingress on 127.0.0.1:0)"),
         "{stderr}"
     );
 }
@@ -262,9 +262,9 @@ async fn req_dep_006_start_without_api_binds_no_agent_listener() {
     assert!(public.ip().is_loopback(), "{public}");
 }
 
-/// Binary path with no `[api]`: only the public ingress listens, it
-/// serves `/mcp`, and SIGTERM still exits 0 (nothing else awaits the
-/// shutdown future).
+/// Binary path with no `[api]`: it announces agent API off and serves
+/// `/mcp` on the public ingress, and SIGTERM still exits 0 (nothing
+/// else awaits the shutdown future).
 #[tokio::test(flavor = "multi_thread")]
 async fn req_dep_006_binary_without_api_serves_public_mcp() {
     let (token, hash) = generate("assistant");

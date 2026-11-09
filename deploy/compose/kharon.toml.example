@@ -35,7 +35,7 @@ listen = "10.66.0.1:8787"
 # #199 lands); everything else is 404. TLS is required unless the
 # address is loopback. See docs/deployment.md, "Public gateway".
 # [public_ingress]
-# listen = "100.120.48.90:8790"
+# listen = "<broker tailnet IP>:8790"   # its cert needs this IP SAN
 # tls_cert_file = "/etc/kharon/tls.crt"
 # tls_key_file = "/etc/kharon/tls.key"
 

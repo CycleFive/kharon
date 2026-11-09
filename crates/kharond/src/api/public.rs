@@ -19,7 +19,9 @@
 //!
 //! Requests admitted here carry a [`PublicIngress`] extension, so the
 //! MCP handler can tell a public request from a tailnet one (#200 keys
-//! its trusted-proxy and client-IP handling on it). The listener has its
+//! its trusted-proxy and client-IP handling on it). The extension is the
+//! only such signal: the TCP peer here is always the edge, so it says
+//! nothing about the client. The listener has its
 //! own token-verification semaphore ([`AppState::new`]): a flood of bad
 //! tokens from the internet cannot starve tailnet agents of Argon2id
 //! permits.

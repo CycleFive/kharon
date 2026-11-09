@@ -466,13 +466,14 @@ required on any address but loopback.
 ```toml
 # cloudflared reaches kharond over the tailnet.
 [public_ingress]
-listen = "100.120.48.90:8790"
+listen = "100.64.0.10:8790"
 tls_cert_file = "/etc/kharon/tls.crt"
 tls_key_file = "/etc/kharon/tls.key"
 ```
 
-The same certificate as `[api]` is fine. It must carry the listen
-address as an IP SAN, because cloudflared checks it against the
+`100.64.0.10` stands for the broker's own tailnet address, here and
+below; use yours. The same certificate as `[api]` is fine. It must
+carry the listen address as an IP SAN, because cloudflared checks it against the
 address in the tunnel's `service` URL. When cloudflared runs on the
 broker host itself, a loopback listener may skip TLS:
 
@@ -484,7 +485,7 @@ listen = "127.0.0.1:8790"
 At start kharond prints which one it bound:
 
 ```text
-kharond: public ingress listening on 100.120.48.90:8790 (TLS; POST /mcp only)
+kharond: public ingress listening on 100.64.0.10:8790 (TLS; POST /mcp only)
 ```
 
 If the listen address is a host address, the input filter in
@@ -497,7 +498,7 @@ line for it, with the interface cloudflared arrives on (for example
 
 Run cloudflared in its own LXC container (or VM) on the same Proxmox
 host, joined to the tailnet. It needs outbound HTTPS to Cloudflare
-and a route to `100.120.48.90:8790`, nothing else, and it holds no
+and a route to `100.64.0.10:8790`, nothing else, and it holds no
 kharon secret. The example config,
 [`deploy/cloudflared/config.yml`](../deploy/cloudflared/config.yml),
 assumes this shape. Running it on the broker host instead, against a
@@ -525,7 +526,8 @@ sudo install -o root -g cloudflared -m 0640 deploy/cloudflared/config.yml /etc/c
 sudo install -o root -g cloudflared -m 0644 /etc/kharon/tls.crt /etc/cloudflared/kharon-broker.crt
 ```
 
-Replace `<TUNNEL-UUID>` in `config.yml` with the UUID. The
+Replace `<TUNNEL-UUID>` in `config.yml` with the UUID and
+`<BROKER-TAILNET-IP>` with the `[public_ingress]` listen address. The
 credentials file is the tunnel's secret: it never goes in this
 repository, a config template or a container image. `cert.pem` is
 needed only to create, route or delete tunnels; keep it off the
@@ -608,10 +610,10 @@ edge. This is the second layer: kharond's own 404, with the JSON
 body `{"error":"not_found","detail":"no such route"}`.
 
 ```sh
-curl -s --cacert /etc/kharon/tls.crt https://100.120.48.90:8790/v1/status   # 404, JSON body
-curl -s --cacert /etc/kharon/tls.crt https://100.120.48.90:8790/            # 404, JSON body
+curl -s --cacert /etc/kharon/tls.crt https://100.64.0.10:8790/v1/status   # 404, JSON body
+curl -s --cacert /etc/kharon/tls.crt https://100.64.0.10:8790/            # 404, JSON body
 curl -s -o /dev/null -w '%{http_code}\n' --cacert /etc/kharon/tls.crt \
-  -X POST https://100.120.48.90:8790/mcp -H 'Content-Type: application/json' -d '{}'   # 401
+  -X POST https://100.64.0.10:8790/mcp -H 'Content-Type: application/json' -d '{}'   # 401
 ```
 
 ### Optional: WAF and rate limits for `/mcp`

@@ -323,6 +323,45 @@ async fn public_ingress_daemon_serves_mcp_over_pinned_tls_and_nothing_else() {
     server.await.unwrap().unwrap();
 }
 
+/// A public client that never finishes its request (and, after #199, a
+/// WebSocket that never closes) cannot hold daemon shutdown open: the
+/// public listener gets [`daemon::PUBLIC_INGRESS_DRAIN`] to drain, then
+/// it is aborted.
+#[tokio::test(flavor = "multi_thread")]
+async fn public_ingress_open_connection_cannot_stall_shutdown() {
+    let (_token, hash) = generate("assistant");
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let text = config(&hash, &data, &public("127.0.0.3:0", None));
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    let public_addr = daemon.public_ingress_addr().expect("public ingress bound");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(daemon.run(async {
+        let _ = stopped.await;
+    }));
+
+    // Headers that never end: hyper keeps waiting for the rest.
+    let mut held = tokio::net::TcpStream::connect(public_addr).await.unwrap();
+    held.write_all(b"POST /mcp HTTP/1.1\r\nHost: kharon.twkr.io\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    stop.send(()).unwrap();
+    let budget = daemon::PUBLIC_INGRESS_DRAIN + std::time::Duration::from_secs(5);
+    tokio::time::timeout(budget, server)
+        .await
+        .expect("daemon shutdown waited on an open public connection")
+        .unwrap()
+        .unwrap();
+    assert!(started.elapsed() >= daemon::PUBLIC_INGRESS_DRAIN / 2);
+    drop(held);
+}
+
 /// What is wrong with a cloudflared config's ingress, if anything: a
 /// line-based read of the shape `deploy/cloudflared/config.yml` uses
 /// (each rule starts with `- `; keys `hostname`, `path`, `service`).
@@ -404,7 +443,7 @@ fn cloudflared_example_routes_only_mcp_and_connector() {
             "route after the 404",
         ),
         (
-            yml.replace("  - service: http_status:404\n", "  - hostname: kharon.twkr.io\n    service: https://100.120.48.90:8787\n  - service: http_status:404\n"),
+            yml.replace("  - service: http_status:404\n", "  - hostname: kharon.twkr.io\n    service: https://<BROKER-TAILNET-IP>:8787\n  - service: http_status:404\n"),
             "whole-host route",
         ),
     ] {

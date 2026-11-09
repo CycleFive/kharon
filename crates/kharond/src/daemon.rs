@@ -1135,7 +1135,8 @@ impl Daemon {
                 let _ = crate::owner_ui::serve(listener, ui, redeem).await;
             })
         });
-        // #198: the public-ingress listener stops with the agent API.
+        // #198: the public-ingress listener stops with the agent API,
+        // after at most PUBLIC_INGRESS_DRAIN of graceful drain.
         let (public_stop, public_stopped) = tokio::sync::oneshot::channel::<()>();
         let public_ingress = self.public_ingress.map(|rt| {
             let broker = Arc::clone(&self.broker);
@@ -1170,9 +1171,15 @@ impl Daemon {
         if let Some(task) = connector_task {
             task.abort();
         }
+        // Graceful drain, bounded: an open public connection must not
+        // hold shutdown (#198 review; #199 puts a WebSocket here).
         let _ = public_stop.send(());
-        if let Some(task) = public_ingress {
-            let _ = task.await;
+        if let Some(mut task) = public_ingress
+            && tokio::time::timeout(PUBLIC_INGRESS_DRAIN, &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
         }
         checkpoint_timer.abort();
         request_expiry.abort();
@@ -1193,6 +1200,12 @@ impl Daemon {
         served
     }
 }
+
+/// How long the public-ingress listener (#198) may drain open
+/// connections at shutdown before it is aborted. A public client that
+/// never finishes a request, or a WebSocket on `/connector` (#199) that
+/// never closes, cannot hold daemon shutdown open past this.
+pub const PUBLIC_INGRESS_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the daemon's checkpoint timer wakes to ask the audit log
 /// whether its 10-minute checkpoint is due (REQ-AUD-002, #127). The

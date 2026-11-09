@@ -137,7 +137,7 @@ pub enum ClientError {
 
 fn proxy_status_text(code: u16) -> String {
     match code {
-        0 => "proxy CONNECT got no HTTP response".to_owned(),
+        0 => "proxy CONNECT got no answer".to_owned(),
         c => format!("proxy CONNECT answered {c}"),
     }
 }

@@ -435,3 +435,146 @@ async fn raw_tls_transport_still_works() {
     session.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
 }
+
+// ---- through an HTTP CONNECT proxy ----
+
+struct Proxy {
+    addr: SocketAddr,
+    head: Arc<Mutex<Vec<u8>>>,
+    forwarded: Arc<Mutex<Vec<u8>>>,
+}
+
+/// `answer`: `Some(code)` replies that status and closes; `None` tunnels to
+/// `upstream`; `Never` accepts and stays silent.
+enum ProxyMode {
+    Tunnel(SocketAddr),
+    Status(u16),
+    Silent,
+}
+
+async fn start_proxy(mode: ProxyMode) -> Proxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let head = Arc::new(Mutex::new(Vec::new()));
+    let forwarded = Arc::new(Mutex::new(Vec::new()));
+    let (h2, f2) = (Arc::clone(&head), Arc::clone(&forwarded));
+    tokio::spawn(async move {
+        let Ok((mut c, _)) = listener.accept().await else {
+            return;
+        };
+        if matches!(mode, ProxyMode::Silent) {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return;
+        }
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            if c.read(&mut b).await.unwrap_or(0) == 0 {
+                return;
+            }
+            buf.push(b[0]);
+        }
+        *h2.lock().unwrap() = buf;
+        match mode {
+            ProxyMode::Status(code) => {
+                let _ = c
+                    .write_all(format!("HTTP/1.1 {code} X\r\n\r\n").as_bytes())
+                    .await;
+            }
+            ProxyMode::Tunnel(up) => {
+                let Ok(mut u) = tokio::net::TcpStream::connect(up).await else {
+                    return;
+                };
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+                let (mut cr, mut cw) = c.split();
+                let (mut ur, mut uw) = u.split();
+                let up_copy = async {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = cr.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        f2.lock().unwrap().extend_from_slice(&chunk[..n]);
+                        if uw.write_all(&chunk[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let down_copy = async {
+                    let _ = tokio::io::copy(&mut ur, &mut cw).await;
+                };
+                tokio::select! { _ = up_copy => {}, _ = down_copy => {} }
+            }
+            ProxyMode::Silent => {}
+        }
+    });
+    Proxy {
+        addr,
+        head,
+        forwarded,
+    }
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[tokio::test]
+async fn ws_dial_through_proxy_authenticates() {
+    let (cdp, _) = echo_stub().await;
+    let srv = start_server(Mode::Full).await;
+    let proxy = start_proxy(ProxyMode::Tunnel(srv.addr)).await;
+    let mut p = ws_params(&srv, srv.inner_pin, cdp);
+    p.proxy = Some(proxy.addr);
+    p.proxy_creds = Some(Zeroizing::new(b"user:s3cretpw".to_vec()));
+    let legs = check_once(&p).await;
+    assert!(legs.iter().all(|(_, r)| r.is_ok()), "{legs:?}");
+    assert_eq!(legs.last().unwrap().0, Leg::Auth);
+    let head = String::from_utf8(proxy.head.lock().unwrap().clone()).unwrap();
+    assert!(
+        head.starts_with(&format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\n",
+            srv.addr.port()
+        )),
+        "{head}"
+    );
+    assert!(head.contains("Proxy-Authorization: Basic "));
+    let fwd = proxy.forwarded.lock().unwrap().clone();
+    assert!(!fwd.is_empty());
+    assert!(!contains(&fwd, b"s3cretpw"));
+    assert!(!contains(&fwd, b"Proxy-Authorization"));
+    assert!(!contains(&fwd, b"dXNlcjpzM2NyZXRwdw"));
+}
+
+#[tokio::test]
+async fn ws_proxy_403_is_proxy_status() {
+    let (cdp, _) = echo_stub().await;
+    let srv = start_server(Mode::Full).await;
+    let proxy = start_proxy(ProxyMode::Status(403)).await;
+    let mut p = ws_params(&srv, srv.inner_pin, cdp);
+    p.proxy = Some(proxy.addr);
+    let legs = check_once(&p).await;
+    assert_eq!(
+        legs.last().unwrap(),
+        &(Leg::Proxy, Err(ClientError::ProxyStatus { code: 403 }))
+    );
+}
+
+/// Runs the real 10 s leg timeout: `LEG_TIMEOUT` is a const.
+#[tokio::test]
+async fn ws_proxy_that_never_answers_times_out() {
+    let (cdp, _) = echo_stub().await;
+    let srv = start_server(Mode::Full).await;
+    let proxy = start_proxy(ProxyMode::Silent).await;
+    let mut p = ws_params(&srv, srv.inner_pin, cdp);
+    p.proxy = Some(proxy.addr);
+    let legs = tokio::time::timeout(Duration::from_secs(20), check_once(&p))
+        .await
+        .expect("check_once hung");
+    let (leg, err) = legs.last().unwrap();
+    assert_eq!(*leg, Leg::Proxy);
+    let err = err.unwrap_err();
+    assert_eq!(err, ClientError::ProxyStatus { code: 0 });
+    assert_eq!(err.to_string(), "proxy CONNECT got no answer");
+}

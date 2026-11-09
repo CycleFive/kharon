@@ -167,15 +167,20 @@ async fn tcp_leg(
             Target::Addr(a) => (params.server_name.as_str(), a.port()),
             Target::Host(h, p) => (h, p),
         };
-        return match connect_http_proxy(
-            proxy,
-            name,
-            port,
-            params.proxy_creds.as_deref().map(Vec::as_slice),
+        let attempt = tokio::time::timeout(
+            LEG_TIMEOUT,
+            connect_http_proxy(
+                proxy,
+                name,
+                port,
+                params.proxy_creds.as_deref().map(Vec::as_slice),
+            ),
         )
         .await
-        {
+        .unwrap_or(Err(ClientError::ProxyStatus { code: 0 }));
+        return match attempt {
             Ok(s) => {
+                let _ = s.set_nodelay(true);
                 note(legs, Leg::Tcp, Ok(()));
                 note(legs, Leg::Proxy, Ok(()));
                 Ok(s)
@@ -213,6 +218,7 @@ async fn tcp_leg(
     for addr in addrs {
         match tokio::time::timeout(LEG_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(s)) => {
+                let _ = s.set_nodelay(true);
                 note(legs, Leg::Tcp, Ok(()));
                 return Ok(s);
             }
@@ -379,12 +385,18 @@ async fn auth<S>(params: &AgentParams, tls: &mut S) -> Result<(), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    write_client_hello(tls, &params.agent_id, params.token.as_str())
-        .await
-        .map_err(|_| ClientError::Protocol)?;
-    let status = match tokio::time::timeout(LEG_TIMEOUT, read_server_hello(tls)).await {
+    let exchange = async {
+        write_client_hello(tls, &params.agent_id, params.token.as_str())
+            .await
+            .map_err(|_| ClientError::Protocol)?;
+        match read_server_hello(tls).await {
+            Ok(status) => Ok(status),
+            Err(_) => Err(ClientError::Protocol),
+        }
+    };
+    let status = match tokio::time::timeout(LEG_TIMEOUT, exchange).await {
         Ok(Ok(status)) => status,
-        Ok(Err(_)) => return Err(ClientError::Protocol),
+        Ok(Err(e)) => return Err(e),
         Err(_) => return Err(ClientError::InnerTls),
     };
     match status {
@@ -392,5 +404,31 @@ where
         AUTH_UNAUTHORIZED => Err(ClientError::Unauthorized),
         AUTH_PROTOCOL => Err(ClientError::Protocol),
         _ => Err(ClientError::Protocol),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_tcp_leg_sets_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broker = listener.local_addr().unwrap();
+        let params = AgentParams {
+            transport: Transport::Tls { broker },
+            server_name: "127.0.0.1".into(),
+            pin: [0; 32],
+            agent_id: "a".into(),
+            token: Zeroizing::new(String::new()),
+            cdp: "127.0.0.1:9".parse().unwrap(),
+            proxy: None,
+            proxy_creds: None,
+            outer_roots: None,
+        };
+        let tcp = tcp_leg(&params, &mut Vec::new(), Target::Addr(broker))
+            .await
+            .unwrap();
+        assert!(tcp.nodelay().unwrap());
     }
 }

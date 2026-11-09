@@ -4,7 +4,9 @@
 #   docker compose run --rm kharon --check --config /etc/kharon.toml
 
 [bitwarden]
-server = "http://vaultwarden:80"
+# "https://vault.bitwarden.eu" for EU accounts, or "http://vaultwarden:80"
+# with the `vaultwarden` compose profile.
+server = "https://vault.bitwarden.com"
 email = "kharon@example.net"
 api_key_file = "/run/secrets/kharon_bw_api_key"
 organization_id = "00000000-0000-0000-0000-000000000001"
@@ -14,11 +16,14 @@ collection_ids = ["00000000-0000-0000-0000-000000000002"]
 # `kharon token mint assistant` prints the token once (terminal only)
 # and this hash on stdout. Paste the hash here; never put the token here.
 token_hash = "$argon2id$..."
-# The agent host's Chromium (CDP), reached over the WireGuard link.
+# The agent host's Chromium (CDP). Fills need a path to the agent's
+# browser; until #199 that path is a VPN (compose.vpn.yml, WireGuard).
+# Without one, MCP calls, grants and approvals still work.
 # No path: kharond reads the current /devtools/browser/<id> from
 # /json/version on each connect, so a Chromium restart needs no edit.
 cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
-# Path (B), egress-shaped agent host. See docs/deployment.md.
+# Path (B), egress-shaped agent host: these belong with a VPN or a
+# public address (overlay). See docs/deployment.md.
 # connector_token_hash comes from `kharon tunnel mint`, not `kharon token mint`.
 # cdp = { endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }
 # [connector]
@@ -27,17 +32,18 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # tls_key_file = "/etc/kharon/tls.key"
 
 [api]
-# The wg address only; wildcards are refused (REQ-DEP-006).
-listen = "10.66.0.1:8787"
+# The daemon needs this section. Loopback, so nothing outside the
+# holder's network namespace reaches it. With compose.vpn.yml, set it to
+# 10.66.0.1:8787 (the wg address; wildcards are refused, REQ-DEP-006).
+listen = "127.0.0.1:8787"
 
-# Public gateway (#198): the origin a Cloudflare Tunnel forwards
-# kharon.twkr.io to. Serves only POST /mcp (and GET /connector once
-# #199 lands); everything else is 404. TLS is required unless the
-# address is loopback. See docs/deployment.md, "Public gateway".
-# [public_ingress]
-# listen = "<broker tailnet IP>:8790"   # its cert needs this IP SAN
-# tls_cert_file = "/etc/kharon/tls.crt"
-# tls_key_file = "/etc/kharon/tls.key"
+# Public gateway (#198): the origin the Cloudflare Tunnel forwards to.
+# Serves only POST /mcp (and GET /connector once #199 lands);
+# everything else is 404. Loopback needs no TLS, and only what shares
+# the holder's namespace (cloudflared) reaches it. Tunnel route:
+# http://127.0.0.1:8790. See docs/deployment.md, "Public gateway".
+[public_ingress]
+listen = "127.0.0.1:8790"
 
 [approval]
 # ntfy is both the approval-prompt channel (REQ-APR-004) and the
@@ -49,14 +55,12 @@ listen = "10.66.0.1:8787"
 ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit" }
 # token_file = "/run/secrets/ntfy_token"   # if the topic needs auth
 
-# Owner web UI (REQ-APR-005). Loopback only; sign-in is a passkey.
-# ntfy http actions (REQ-APR-004) POST here, for example
-# http://127.0.0.1:8788/owner/approve/<token> (and /owner/deny/...).
-# That is the owner listen address. The WireGuard agent address in
-# [api] listen leaves those paths unrouted (REQ-DEP-006).
-# Follow-up #128: the publisher must emit this owner host.
-# Browse the origin below (localhost, not the listen IP). Enroll with
-# `kharon passkey-enroll` — that code is not a password.
+# Owner web UI (REQ-APR-005). Left off under compose: its loopback is
+# inside the holder's network namespace, out of reach of an SSH
+# forward. Use the CLI (`docker compose exec kharon kharon ...`).
+# Publishing it behind the edge is #208. Sign-in would be a passkey
+# (`kharon passkey-enroll`); ntfy http actions (REQ-APR-004) POST to
+# its listen address, e.g. http://127.0.0.1:8788/owner/approve/<token>.
 # [owner_ui]
 # listen = "127.0.0.1:8788"
 # rp_id = "localhost"

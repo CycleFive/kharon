@@ -1,18 +1,19 @@
 //! The compose E2E (issue #24): the compose example
-//! (`deploy/compose/docker-compose.yml`) with the CI overlay
-//! (`deploy/compose/e2e/compose.e2e.yml`) runs kharond from the
+//! (`deploy/compose/docker-compose.yml`, plus `compose.vpn.yml`) with
+//! the CI overlay (`deploy/compose/e2e/compose.e2e.yml`) runs kharond from the
 //! built image against the seeded Vaultwarden fixture, and fills a
 //! test page through the agent host's headless Chromium.
 //!
-//! One shared run (`run()`, set up once per test binary) backs four
+//! One shared run (`run()`, set up once per test binary) backs five
 //! tests, one per acceptance criterion:
 //!
 //! - **REQ-DEP-002**: compose up, then a seeded item fills a test page
 //!   through headless Chromium; here 10 times, each fill followed by
 //!   a real form submit (a POST the page server checks).
 //! - **REQ-DEP-006**: `ss -ltn` in kharond's network namespace shows
-//!   only the configured wg address (10.66.0.1:8787) for kharond, and
-//!   the owner API is a unix socket.
+//!   only the configured wg address (10.66.0.1:8787) and the two
+//!   loopback listeners (public ingress 127.0.0.1:8790, owner UI
+//!   127.0.0.1:8788) for kharond, and the owner API is a unix socket.
 //! - **REQ-ARCH-004**: after the 10 fills, the agent-host profile's
 //!   `Login Data` has 0 rows, and Chromium reports the password
 //!   manager and autofill saving off by managed policy. The fills run
@@ -24,6 +25,14 @@
 //!   `/proc`, and `/sys`, whose files hold no stored data and can
 //!   block) and the browser profile finds it nowhere, ASCII or
 //!   UTF-16LE, both while Chromium runs and after it shuts down.
+//! - **N1 (#207)**: kharond shares the `holder` container's network
+//!   namespace, so a `fake-edge` container joined to the holder (a
+//!   stand-in for cloudflared, with socat) reaches kharond's two
+//!   loopback listeners: `POST /mcp` on the public ingress answers 401
+//!   and `GET /` on the owner UI answers 200. It does so at the start
+//!   and after `restart kharon`, `up --force-recreate kharon` (kharond
+//!   really replaced, holder and fake-edge not) and a whole-stack
+//!   `restart`.
 //!
 //! The run, in order:
 //!
@@ -34,7 +43,7 @@
 //!    the environment, never argv).
 //! 3. The agent host starts with the test page's certificate SPKI;
 //!    its Chromium is reachable at 10.66.0.2:9222 on the wg network.
-//! 4. The test writes `kharon.toml` and the API key to
+//! 4. The fake edge starts in the holder's namespace. The test writes `kharon.toml` and the API key to
 //!    `deploy/compose/e2e/run/` and starts `kharon`, which binds its
 //!    agent API on 10.66.0.1:8787 only. The owner unlocks with
 //!    `docker exec -it kharon unlock`, typing the master password at
@@ -83,12 +92,18 @@ const FIXTURE_DIR: &str = concat!(
 const PROJECT: &str = "kharon-e2e";
 const KHAROND: &str = "kharon-e2e-kharond";
 const AGENT_HOST: &str = "kharon-e2e-agent-host";
+/// The network-namespace holder and the stand-in for cloudflared.
+const HOLDER: &str = "kharon-e2e-holder";
+const FAKE_EDGE: &str = "kharon-e2e-fake-edge";
 /// The agent-host image (compose.e2e.yml): Debian + socat, which
 /// the owner-approve helper below borrows for its socket client.
 const AGENT_HOST_IMAGE: &str = "kharon-e2e-agent-host:local";
 
 /// Addresses on the compose `wg` network (stand-in for the tunnel).
 const AGENT_API: &str = "10.66.0.1:8787";
+/// kharond's loopback listeners, in the holder's namespace.
+const PUBLIC_INGRESS: &str = "127.0.0.1:8790";
+const OWNER_UI: &str = "127.0.0.1:8788";
 const AGENT_HOST_CDP: &str = "10.66.0.2:9222";
 /// The docker host's address on `wg`, where the test page is served.
 const PAGE_ADDR: &str = "10.66.0.254";
@@ -132,9 +147,13 @@ fn compose(args: &[&str]) -> String {
         "-f",
         &format!("{COMPOSE_DIR}/docker-compose.yml"),
         "-f",
+        &format!("{COMPOSE_DIR}/compose.vpn.yml"),
+        "-f",
         &format!("{COMPOSE_DIR}/e2e/compose.e2e.yml"),
         "-p",
         PROJECT,
+        "--profile",
+        "vaultwarden",
     ]
     .map(String::from);
     let all: Vec<&str> = base
@@ -182,6 +201,13 @@ checkpoint_local_only = true
 
 [api]
 listen = "{AGENT_API}"
+
+[public_ingress]
+listen = "{PUBLIC_INGRESS}"
+
+[owner_ui]
+listen = "{OWNER_UI}"
+origin = "http://localhost:8788"
 "#
     )
 }
@@ -205,6 +231,36 @@ struct Run {
     /// Positive control: profile files holding a marker visited in the
     /// default (persistent) context.
     control_hits: Vec<String>,
+    /// The fake edge's probes of kharond's loopback listeners, at the
+    /// start and after each restart (N1, #207).
+    edge: Vec<EdgeCheck>,
+}
+
+/// HTTP statuses the fake edge got from kharond's two loopback
+/// listeners; 0 means no HTTP status line came back.
+#[derive(Debug, PartialEq)]
+struct EdgeProbe {
+    /// `POST /mcp` without credentials, on the public ingress.
+    mcp: u16,
+    /// `GET /` on the owner UI, signed out.
+    owner_home: u16,
+}
+
+/// One probe, and what survived the step that preceded it.
+struct EdgeCheck {
+    after: &'static str,
+    probe: EdgeProbe,
+    /// Holder / fake-edge identity unchanged. `None` where the step
+    /// does not compare identities (start; whole-stack restart, which
+    /// restarts both); `shared_netns` covers those.
+    holder_kept: Option<bool>,
+    edge_kept: Option<bool>,
+    /// kharond's container ID changed.
+    kharond_replaced: bool,
+    /// kharond's ID or start time changed.
+    kharond_restarted: bool,
+    /// Holder, kharond and fake-edge are in one network namespace.
+    shared_netns: bool,
 }
 
 static RUN: Mutex<Option<Result<Arc<Run>, String>>> = Mutex::new(None);
@@ -235,6 +291,77 @@ fn run() -> Arc<Run> {
         Ok(run) => run.clone(),
         Err(msg) => panic!("compose E2E setup failed: {msg}"),
     }
+}
+
+/// Sends `request` to `addr` from the fake edge (socat in the holder's
+/// namespace) and returns the status of the reply's first line.
+fn edge_status(addr: &str, request: &str) -> u16 {
+    let out = docker_raw(
+        &[
+            "exec",
+            "-i",
+            FAKE_EDGE,
+            "socat",
+            "-t",
+            "5",
+            "-",
+            // shut-none: socat's default half-close on stdin EOF makes
+            // hyper abort before it answers (measured 8/40 vs 40/40).
+            &format!("TCP:{addr},shut-none"),
+        ],
+        Some(request.as_bytes()),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut parts = stdout.lines().next().unwrap_or("").split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(version), Some(code)) if version.starts_with("HTTP/") => code.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn edge_probe() -> EdgeProbe {
+    EdgeProbe {
+        mcp: edge_status(
+            PUBLIC_INGRESS,
+            "POST /mcp HTTP/1.1\r\nHost: kharon.twkr.io\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        ),
+        owner_home: edge_status(
+            OWNER_UI,
+            "GET / HTTP/1.1\r\nHost: localhost:8788\r\nConnection: close\r\n\r\n",
+        ),
+    }
+}
+
+/// Polls [`edge_probe`] until both listeners answer as expected (401,
+/// 200), or 60 s pass; either way, returns the last probe.
+fn wait_edge() -> EdgeProbe {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let probe = edge_probe();
+        if probe
+            == (EdgeProbe {
+                mcp: 401,
+                owner_home: 200,
+            })
+            || Instant::now() >= deadline
+        {
+            return probe;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// A container's ID and start time: changes if it was restarted or
+/// recreated.
+fn identity(container: &str) -> String {
+    docker(&["inspect", "-f", "{{.Id}} {{.State.StartedAt}}", container])
+        .trim()
+        .to_owned()
+}
+
+/// The container ID part of an `identity` string.
+fn id_of(identity: &str) -> &str {
+    identity.split(' ').next().unwrap_or("")
 }
 
 /// 32 random bytes, hex-encoded: the REQ-GOAL-002 canary.
@@ -580,6 +707,36 @@ fn agent_host_files_containing(needle: &str) -> Vec<String> {
     hits
 }
 
+/// The network namespace of `container`, read from the host
+/// (`/proc/<pid>/ns/net`).
+fn netns(container: &str) -> String {
+    let pid = docker(&["inspect", "--format", "{{.State.Pid}}", container]);
+    let pid = pid.trim();
+    let mut cmd = if rustix::process::geteuid().is_root() {
+        Command::new("readlink")
+    } else {
+        let mut c = Command::new("sudo");
+        c.args(["-n", "readlink"]);
+        c
+    };
+    let out = cmd
+        .arg(format!("/proc/{pid}/ns/net"))
+        .output()
+        .expect("readlink");
+    assert!(
+        out.status.success(),
+        "readlink netns of {container}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Holder, kharond and the fake edge share one network namespace.
+fn shared_netns() -> bool {
+    let holder = netns(HOLDER);
+    holder == netns(KHAROND) && holder == netns(FAKE_EDGE)
+}
+
 /// `ss <args>` inside the network namespace of `container`.
 fn ss_in(container: &str, args: &str) -> String {
     let pid = docker(&["inspect", "--format", "{{.State.Pid}}", container]);
@@ -712,6 +869,7 @@ async fn setup() -> Run {
     );
     write_public(&run_dir.join("kharon.toml"), toml.as_bytes());
     compose(&["up", "-d", "--no-build", "kharon"]);
+    compose(&["up", "-d", "--no-build", "fake-edge"]);
     wait_for_log(
         KHAROND,
         &format!("agent API listening on {AGENT_API} (locked)"),
@@ -907,6 +1065,45 @@ async fn setup() -> Run {
     let lock = docker_raw(&["exec", KHAROND, "kharon", "lock"], None);
     assert!(lock.status.success(), "kharon lock");
 
+    // N1 (#207): the edge keeps reaching kharond's loopback listeners
+    // while kharond restarts around the holder.
+    let mut edge = vec![EdgeCheck {
+        after: "start",
+        probe: wait_edge(),
+        holder_kept: None,
+        edge_kept: None,
+        kharond_replaced: false,
+        kharond_restarted: false,
+        shared_netns: shared_netns(),
+    }];
+    let holder0 = identity(HOLDER);
+    let edge0 = identity(FAKE_EDGE);
+    for (after, args) in [
+        ("restart kharon", &["restart", "kharon"][..]),
+        (
+            "up --force-recreate kharon",
+            &["up", "-d", "--no-build", "--force-recreate", "kharon"][..],
+        ),
+        ("restart (whole stack)", &["restart"][..]),
+    ] {
+        let kharond_before = identity(KHAROND);
+        compose(args);
+        let probe = wait_edge();
+        let whole = args == ["restart"];
+        let kharond_after = identity(KHAROND);
+        // Identities are compared against the start only on the steps
+        // that leave holder and fake-edge running.
+        edge.push(EdgeCheck {
+            after,
+            probe,
+            holder_kept: (!whole).then(|| identity(HOLDER) == holder0),
+            edge_kept: (!whole).then(|| identity(FAKE_EDGE) == edge0),
+            kharond_replaced: id_of(&kharond_after) != id_of(&kharond_before),
+            kharond_restarted: kharond_after != kharond_before,
+            shared_netns: shared_netns(),
+        });
+    }
+
     Run {
         ss_tcp,
         ss_unix,
@@ -915,6 +1112,7 @@ async fn setup() -> Run {
         hits_running,
         hits_after_close,
         control_hits,
+        edge,
     }
 }
 
@@ -949,6 +1147,11 @@ fn compose_harness_fill_budget_covers_arch_004_and_leaves_other_defaults() {
     assert_eq!(cfg.policy.fill_deadline, production.fill_deadline);
     assert_eq!(cfg.policy.default_grant, production.default_grant);
     assert!(!cfg.policy.allow_standing);
+    assert_eq!(
+        cfg.public_ingress.as_ref().unwrap().listen.to_string(),
+        PUBLIC_INGRESS
+    );
+    assert_eq!(cfg.owner_ui.as_ref().unwrap().listen.to_string(), OWNER_UI);
 }
 
 #[test]
@@ -962,7 +1165,7 @@ fn req_dep_002_compose_up_seeded_fixture_fills_test_page_through_headless_chromi
 
 #[test]
 #[ignore = "needs the compose E2E stack (image.yml)"]
-fn req_dep_006_ss_ltn_shows_only_the_wg_listen_address() {
+fn req_dep_006_ss_ltn_shows_only_wg_and_loopback_listeners() {
     let r = run();
     eprintln!("ss -ltnp:\n{}", r.ss_tcp);
     let mut kharond = Vec::new();
@@ -980,7 +1183,10 @@ fn req_dep_006_ss_ltn_shows_only_the_wg_listen_address() {
             );
         }
     }
-    assert_eq!(kharond, vec![AGENT_API.to_owned()], "{}", r.ss_tcp);
+    kharond.sort();
+    let mut want = vec![AGENT_API, OWNER_UI, PUBLIC_INGRESS];
+    want.sort();
+    assert_eq!(kharond, want, "{}", r.ss_tcp);
     // The owner API is the unix socket in /data, not a TCP port.
     assert!(
         r.ss_unix
@@ -988,6 +1194,52 @@ fn req_dep_006_ss_ltn_shows_only_the_wg_listen_address() {
             .any(|l| l.contains("/data/owner.sock") && l.contains("\"kharond\"")),
         "no kharond owner socket in ss -lx:\n{}",
         r.ss_unix
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn n1_edge_reaches_both_loopback_listeners_across_kharond_restarts() {
+    let r = run();
+    let steps: Vec<&str> = r.edge.iter().map(|c| c.after).collect();
+    assert_eq!(
+        steps,
+        [
+            "start",
+            "restart kharon",
+            "up --force-recreate kharon",
+            "restart (whole stack)"
+        ]
+    );
+    for c in &r.edge {
+        assert_eq!(
+            c.probe,
+            EdgeProbe {
+                mcp: 401,
+                owner_home: 200
+            },
+            "edge probe after {}",
+            c.after
+        );
+    }
+    for c in &r.edge[1..3] {
+        assert_eq!(c.holder_kept, Some(true), "holder replaced by {}", c.after);
+        assert_eq!(c.edge_kept, Some(true), "fake-edge replaced by {}", c.after);
+    }
+    for c in &r.edge {
+        assert!(
+            c.shared_netns,
+            "holder, kharond and fake-edge do not share a netns after {}",
+            c.after
+        );
+    }
+    assert!(
+        r.edge[1].kharond_restarted && !r.edge[1].kharond_replaced,
+        "restart kharon must restart the same container"
+    );
+    assert!(
+        r.edge[2].kharond_replaced,
+        "--force-recreate did not replace kharond"
     );
 }
 

@@ -20,6 +20,7 @@ on:
       - "crates/kharond/tests/docker_support/**"
       - "crates/kharond/tests/req_dep_001_image.rs"
       - "crates/kharond/tests/req_dep_002_compose_e2e.rs"
+      - "crates/kharond/tests/req_dep_006_compose_package.rs"
       - "crates/kharon-bwcrypto/tests/fixtures/vaultwarden/**"
       - ".github/workflows/image.yml"
 permissions: { contents: read }
@@ -50,7 +51,9 @@ jobs:
     env:
       COMPOSE: >-
         docker compose -f deploy/compose/docker-compose.yml
+        -f deploy/compose/compose.vpn.yml
         -f deploy/compose/e2e/compose.e2e.yml -p kharon-e2e
+        --profile vaultwarden
       FIXTURE: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +73,8 @@ jobs:
             --ca-cert "$PWD/$FIXTURE/tls/ca.pem" \
             --out "${{ runner.temp }}/sync.live.json" \
             --api-key-out "${{ runner.temp }}/api-key.json"
+      - name: N1 compose package (REQ-DEP-006)
+        run: cargo test -p kharond --test req_dep_006_compose_package -- --ignored
       - name: Compose E2E (REQ-DEP-002, REQ-DEP-006, REQ-ARCH-004, REQ-GOAL-002)
         env:
           KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222

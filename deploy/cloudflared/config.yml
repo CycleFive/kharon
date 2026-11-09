@@ -1,5 +1,10 @@
 # cloudflared config for the kharon public gateway (#198, design #197).
 #
+# This file is the locally managed ALTERNATIVE, for cloudflared on a
+# separate guest that reaches kharond over the tailnet with TLS. The
+# default is a token-managed tunnel beside kharond (deploy/compose,
+# profile `edge`), whose routes point at http://127.0.0.1:8790.
+#
 # An example, with no secrets in it. docs/deployment.md, "Public
 # gateway", walks through creating the tunnel and installing this.
 # Cloudflare-side changes (the tunnel, its DNS record, WAF and rate
@@ -14,6 +19,10 @@
 # Check the rules before (re)starting the tunnel:
 #   cloudflared --config /etc/cloudflared/config.yml tunnel ingress validate
 #   cloudflared --config /etc/cloudflared/config.yml tunnel ingress rule https://kharon.twkr.io/v1/status
+
+# Keep the metrics server (/metrics, /config, /diag, pprof) on
+# loopback; cloudflared otherwise binds it to every interface.
+metrics: 127.0.0.1:20241
 
 tunnel: <TUNNEL-UUID>
 # Written by `cloudflared tunnel create`. Mode 0400, owned by the

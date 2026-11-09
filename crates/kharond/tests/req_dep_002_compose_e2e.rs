@@ -250,9 +250,17 @@ struct EdgeProbe {
 struct EdgeCheck {
     after: &'static str,
     probe: EdgeProbe,
-    holder_kept: bool,
-    edge_kept: bool,
+    /// Holder / fake-edge identity unchanged. `None` where the step
+    /// does not compare identities (start; whole-stack restart, which
+    /// restarts both); `shared_netns` covers those.
+    holder_kept: Option<bool>,
+    edge_kept: Option<bool>,
+    /// kharond's container ID changed.
     kharond_replaced: bool,
+    /// kharond's ID or start time changed.
+    kharond_restarted: bool,
+    /// Holder, kharond and fake-edge are in one network namespace.
+    shared_netns: bool,
 }
 
 static RUN: Mutex<Option<Result<Arc<Run>, String>>> = Mutex::new(None);
@@ -297,7 +305,9 @@ fn edge_status(addr: &str, request: &str) -> u16 {
             "-t",
             "5",
             "-",
-            &format!("TCP:{addr}"),
+            // shut-none: socat's default half-close on stdin EOF makes
+            // hyper abort before it answers (measured 8/40 vs 40/40).
+            &format!("TCP:{addr},shut-none"),
         ],
         Some(request.as_bytes()),
     );
@@ -349,10 +359,9 @@ fn identity(container: &str) -> String {
         .to_owned()
 }
 
-fn container_id(container: &str) -> String {
-    docker(&["inspect", "-f", "{{.Id}}", container])
-        .trim()
-        .to_owned()
+/// The container ID part of an `identity` string.
+fn id_of(identity: &str) -> &str {
+    identity.split(' ').next().unwrap_or("")
 }
 
 /// 32 random bytes, hex-encoded: the REQ-GOAL-002 canary.
@@ -698,6 +707,36 @@ fn agent_host_files_containing(needle: &str) -> Vec<String> {
     hits
 }
 
+/// The network namespace of `container`, read from the host
+/// (`/proc/<pid>/ns/net`).
+fn netns(container: &str) -> String {
+    let pid = docker(&["inspect", "--format", "{{.State.Pid}}", container]);
+    let pid = pid.trim();
+    let mut cmd = if rustix::process::geteuid().is_root() {
+        Command::new("readlink")
+    } else {
+        let mut c = Command::new("sudo");
+        c.args(["-n", "readlink"]);
+        c
+    };
+    let out = cmd
+        .arg(format!("/proc/{pid}/ns/net"))
+        .output()
+        .expect("readlink");
+    assert!(
+        out.status.success(),
+        "readlink netns of {container}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Holder, kharond and the fake edge share one network namespace.
+fn shared_netns() -> bool {
+    let holder = netns(HOLDER);
+    holder == netns(KHAROND) && holder == netns(FAKE_EDGE)
+}
+
 /// `ss <args>` inside the network namespace of `container`.
 fn ss_in(container: &str, args: &str) -> String {
     let pid = docker(&["inspect", "--format", "{{.State.Pid}}", container]);
@@ -1031,13 +1070,14 @@ async fn setup() -> Run {
     let mut edge = vec![EdgeCheck {
         after: "start",
         probe: wait_edge(),
-        holder_kept: true,
-        edge_kept: true,
+        holder_kept: None,
+        edge_kept: None,
         kharond_replaced: false,
+        kharond_restarted: false,
+        shared_netns: shared_netns(),
     }];
     let holder0 = identity(HOLDER);
     let edge0 = identity(FAKE_EDGE);
-    let kharond0 = container_id(KHAROND);
     for (after, args) in [
         ("restart kharon", &["restart", "kharon"][..]),
         (
@@ -1046,15 +1086,21 @@ async fn setup() -> Run {
         ),
         ("restart (whole stack)", &["restart"][..]),
     ] {
+        let kharond_before = identity(KHAROND);
         compose(args);
         let probe = wait_edge();
         let whole = args == ["restart"];
+        let kharond_after = identity(KHAROND);
+        // Identities are compared against the start only on the steps
+        // that leave holder and fake-edge running.
         edge.push(EdgeCheck {
             after,
             probe,
-            holder_kept: whole || identity(HOLDER) == holder0,
-            edge_kept: whole || identity(FAKE_EDGE) == edge0,
-            kharond_replaced: container_id(KHAROND) != kharond0,
+            holder_kept: (!whole).then(|| identity(HOLDER) == holder0),
+            edge_kept: (!whole).then(|| identity(FAKE_EDGE) == edge0),
+            kharond_replaced: id_of(&kharond_after) != id_of(&kharond_before),
+            kharond_restarted: kharond_after != kharond_before,
+            shared_netns: shared_netns(),
         });
     }
 
@@ -1177,9 +1223,20 @@ fn n1_edge_reaches_both_loopback_listeners_across_kharond_restarts() {
         );
     }
     for c in &r.edge[1..3] {
-        assert!(c.holder_kept, "holder was replaced by {}", c.after);
-        assert!(c.edge_kept, "fake-edge was replaced by {}", c.after);
+        assert_eq!(c.holder_kept, Some(true), "holder replaced by {}", c.after);
+        assert_eq!(c.edge_kept, Some(true), "fake-edge replaced by {}", c.after);
     }
+    for c in &r.edge {
+        assert!(
+            c.shared_netns,
+            "holder, kharond and fake-edge do not share a netns after {}",
+            c.after
+        );
+    }
+    assert!(
+        r.edge[1].kharond_restarted && !r.edge[1].kharond_replaced,
+        "restart kharon must restart the same container"
+    );
     assert!(
         r.edge[2].kharond_replaced,
         "--force-recreate did not replace kharond"

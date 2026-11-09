@@ -496,7 +496,7 @@ address in the tunnel's `service` URL.
 At start kharond prints which one it bound:
 
 ```text
-kharond: public ingress listening on 127.0.0.1:8790 (plain; POST /mcp only)
+kharond: public ingress listening on 127.0.0.1:8790 (plain HTTP, loopback; POST /mcp only)
 ```
 
 On a host address, the input filter in

@@ -86,8 +86,14 @@ path B.
 - Fills need `compose.vpn.yml` until #199: kharond reaches the agent
   host's browser over the `wg` network (holder 10.66.0.1, agent host
   10.66.0.2), and `[api]`/`[connector]` over a VPN bind that address
-  (add `[api]` with `listen = "10.66.0.1:8787"`; the base has none). Swap the network for your real
-  tunnel.
+  (add `[api]` with `listen = "10.66.0.1:8787"`; the base has none).
+  Swap the network for your real tunnel.
+- If you copied the N1 example (#211) before #210, your `kharon.toml`
+  still has `[api] listen = "127.0.0.1:8787"`. Delete that block: a
+  dashboard mis-route could reach it. For liveness use
+  `docker compose exec kharon kharon status`, or expect `401` from
+  `POST /mcp` on `127.0.0.1:8790` inside the namespace. Nothing
+  listens on 8787 now.
 - The owner UI is not published yet. Its loopback address is inside
   the holder's namespace, so no SSH forward reaches it; #208 turns it
   on. Until then the owner works through the CLI, below.

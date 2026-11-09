@@ -48,10 +48,11 @@ Start from the Compose example in
 from this repository's image beside cloudflared, with the vault the
 customer already has: their own Bitwarden Password Manager on
 Bitwarden cloud, unlocked by the customer, with the keys held only in
-memory. A self-hoster can add the `vaultwarden` profile instead. Under
-path (A) the agent API binds to the WireGuard address only; under
-path (B) it binds to a TLS-capable listen address the agent reaches
-over outbound HTTPS (REQ-DEP-006).
+memory. A self-hoster can add the `vaultwarden` profile instead. The
+agent API exists only when `[api]` is configured. Under path (A) it
+binds to the WireGuard address only; under path (B) it binds to a
+TLS-capable listen address the agent reaches over outbound HTTPS
+(REQ-DEP-006).
 
 ### Audit checkpoints off-host (REQ-AUD-002)
 
@@ -747,6 +748,15 @@ sudo systemctl disable --now cloudflared-kharon.service
 # On the broker: remove [public_ingress] from the config, then restart kharond.
 ```
 
+If `[public_ingress]` is the only agent listener (the compose base has no
+`[api]`), removing it leaves kharond with none, and it refuses to start
+(`no_agent_listener`, exit 78). `restart: unless-stopped` then crash-loops
+it, and `docker compose exec kharon kharon status` or `panic` fails
+because the owner socket is gone. In that case stop it instead:
+`docker compose stop kharon`, or `docker compose stop cloudflared` to
+close only the edge. Or add `[api]` on a VPN address first, then remove
+`[public_ingress]`.
+
 To remove the tunnel for good, delete it in the dashboard, or (owner,
 for a locally managed tunnel, where `cert.pem` is):
 
@@ -755,8 +765,8 @@ cloudflared tunnel delete kharon
 ```
 
 and delete the `kharon.twkr.io` CNAME in the zone's DNS. The tailnet
-`[api]` listener is untouched throughout (with a VPN: tailnet or
-`compose.vpn.yml`), so VPN agents keep working.
+`[api]` listener, when configured, is untouched throughout (with a VPN:
+tailnet or `compose.vpn.yml`), so VPN agents keep working.
 
 ## Agent host (REQ-DEP-005)
 

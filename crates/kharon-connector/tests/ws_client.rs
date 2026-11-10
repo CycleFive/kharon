@@ -357,9 +357,16 @@ async fn hello_timeout_is_an_auth_leg_error() {
 
 /// True if the resolver gives `host` any address.
 async fn resolver_answers(host: &str) -> bool {
-    match tokio::net::lookup_host((host, 443)).await {
-        Ok(mut addrs) => addrs.next().is_some(),
-        Err(_) => false,
+    // A broken resolver is no reason to skip: a timeout counts as "does not
+    // answer", and the test runs as in production.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host((host, 443)),
+    )
+    .await
+    {
+        Ok(Ok(mut addrs)) => addrs.next().is_some(),
+        _ => false,
     }
 }
 

@@ -267,9 +267,16 @@ async fn check_exits_69_and_names_upgrade_on_502() {
 /// A resolver that answers a reserved `.invalid` name (RFC 6761) defeats the
 /// dns-leg tests; they skip themselves there. CI's resolver conforms.
 async fn resolver_answers(host: &str) -> bool {
-    match tokio::net::lookup_host((host, 443)).await {
-        Ok(mut addrs) => addrs.next().is_some(),
-        Err(_) => false,
+    // A broken resolver is no reason to skip: a timeout counts as "does not
+    // answer", and the test runs as in production.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host((host, 443)),
+    )
+    .await
+    {
+        Ok(Ok(mut addrs)) => addrs.next().is_some(),
+        _ => false,
     }
 }
 

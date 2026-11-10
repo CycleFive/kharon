@@ -250,9 +250,17 @@ fn n1_tunnel_routes_in_docs_use_127_0_0_1() {
         "replaces this agent's live broker session",
         "websocket upgrade answered 101 without the kharon-connector.v1 subprotocol",
         "closes idle WebSockets after a period it does not publish",
+        "suppressed_only",
+        "2 Argon2id",
+        "credential check did not start in time",
     ] {
         assert!(guide.contains(needle), "deployment guide lacks {needle}");
     }
+    assert!(
+        guide.contains("`Origin`")
+            && (guide.contains("Worker") || guide.contains("Transform Rule")),
+        "deployment guide does not warn against adding an Origin header"
+    );
     for stale in ["about 100 seconds", "websocket upgrades in the last 60s"] {
         assert!(
             !guide.contains(stale),

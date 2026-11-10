@@ -343,9 +343,22 @@ The upgrade is accepted only for `GET /connector` with
 missing or wrong item gets 400, any `Origin` header gets 403, and a
 full pre-auth budget (8 sockets that have not authenticated yet,
 separate from the raw listener's) gets 503. Compression is never
-negotiated. The inner TLS handshake and the hello each get 5 seconds,
-and the first inner bytes must look like a TLS ClientHello or the
-socket is closed.
+negotiated. The first inner bytes must look like a TLS ClientHello or
+the socket is closed.
+
+A socket has one pre-auth deadline: 10 seconds from the moment it takes
+a pre-auth slot (before the 101) to the start of its credential check,
+covering the upgrade, the inner TLS handshake and the hello; a raw
+listener socket gets 15 seconds from accept. At most 2 Argon2id
+credential checks run at once, counted across both transports. A check
+that cannot start before the deadline closes the socket with no
+answer, so a legitimate agent sees a disconnect and retries with
+jitter. On the WebSocket path it is counted as `auth`; the raw listener
+prints `agent connector busy: credential check did not start in time`
+(not audited, because no credential was refused).
+
+A Cloudflare Worker or Transform Rule must not add an `Origin` header
+to `/connector`, or every upgrade gets 403.
 
 kharond writes log lines, not one per stranger:
 
@@ -378,6 +391,12 @@ covers them), each at most once per agent per minute, with a
   out your own `kharon-agent-connector --check`: a successful check
   authenticates, so it replaces the running connector's session (a fill
   in flight fails) and writes one `connector_replaced`.
+
+When a window closes with refusals still folded in and no later event
+arrives, kharond writes a summary entry for them: the same event with
+`agent_id`, `suppressed` and `result = "suppressed_only"`, and no
+`transport`, `detail_code` or `old_session_secs`. Closed windows are
+flushed every 15 seconds and at shutdown.
 
 Both appends are best effort; a failed append is logged and never
 blocks authentication.
@@ -825,8 +844,8 @@ rules:
   connector dials once and holds the socket; even a flapping one backs
   off to 30-second retries. kharond's pre-auth budget (8 sockets, shared by
   everyone) is global, so a stranger who keeps it full can delay a
-  *reconnecting* agent; this rule is what keeps strangers from doing
-  that. Live sessions are untouched.
+  *reconnecting* agent; this rule is what protects those 8 pre-auth
+  slots from starvation. Live sessions are untouched.
 - **Bot Fight Mode and "I'm Under Attack":** keep them off for this
   hostname. MCP clients and the connector cannot answer a browser
   challenge.

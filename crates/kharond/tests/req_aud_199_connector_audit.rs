@@ -453,7 +453,8 @@ async fn flush_all_writes_pending_of_open_windows() {
     );
 }
 
-/// Review Focus 5: a failing sink must not make the flush hang or panic.
+/// Review Focus 5: a failing sink must not make the flush panic, and
+/// leaves the maps cleared.
 #[tokio::test(start_paused = true)]
 async fn flush_with_failing_sink_returns() {
     let sink = Sink {
@@ -466,11 +467,72 @@ async fn flush_with_failing_sink_returns() {
     for _ in 0..3 {
         hub.audit_auth_fail("assistant", SessionTransport::Tls);
     }
-    tokio::time::timeout(Duration::from_secs(1), async {
-        hub.flush_audit(tokio::time::Instant::now() + Duration::from_secs(60));
-        hub.flush_audit_all();
-    })
-    .await
-    .expect("flush returned");
+    hub.flush_audit(tokio::time::Instant::now() + Duration::from_secs(60));
+    hub.flush_audit_all();
     assert!(sink.all().is_empty());
+}
+
+/// The sink runs after the `limits` lock is released: a sink that calls
+/// back into the hub would deadlock otherwise. Run on a thread so a hang
+/// fails the test instead of stalling it.
+#[test]
+fn flush_does_not_hold_the_lock_across_the_sink() {
+    let (store, _) = store();
+    let hub = Arc::new(Hub::with_events(store, Arc::new(|_| {})));
+    let inner = Arc::clone(&hub);
+    let calls = Arc::new(Mutex::new(0usize));
+    let seen = Arc::clone(&calls);
+    hub.set_audit(Arc::new(move |_| {
+        *seen.lock().unwrap() += 1;
+        // Re-entrant: touches the same limiter the flush just drained.
+        inner.audit_auth_fail("assistant", SessionTransport::Tls);
+        Ok(())
+    }));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runner = Arc::clone(&hub);
+    std::thread::spawn(move || {
+        runner.audit_auth_fail("assistant", SessionTransport::Tls);
+        runner.audit_auth_fail("assistant", SessionTransport::Tls);
+        runner.flush_audit(tokio::time::Instant::now() + Duration::from_secs(61));
+        runner.audit_auth_fail("assistant", SessionTransport::Tls);
+        runner.flush_audit_all();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("flush deadlocked: the sink ran under the limits lock");
+    assert!(*calls.lock().unwrap() >= 2);
+}
+
+/// I1 (#219 AC3): a burst, then silence, while the daemon keeps running.
+/// The periodic task alone writes the summary.
+#[tokio::test(start_paused = true)]
+async fn housekeeping_flushes_a_burst_followed_by_silence() {
+    let sink = Sink::default();
+    let (store, _) = store();
+    let hub = Arc::new(Hub::with_events(store, Arc::new(|_| {})));
+    hub.set_audit(sink.audit());
+    let task = tokio::spawn(kharond::daemon::connector_housekeeping(
+        Arc::clone(&hub),
+        None,
+    ));
+    for _ in 0..3 {
+        hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    }
+    assert_eq!(sink.of(Event::ConnectorAuthFail).len(), 1);
+
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    // The flush runs on the blocking pool.
+    for _ in 0..200 {
+        if sink.of(Event::ConnectorAuthFail).len() > 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 2, "exactly one summary: {all:?}");
+    assert_eq!(all[1].suppressed, Some(2));
+    assert_eq!(all[1].result.as_deref(), Some("suppressed_only"));
+    task.abort();
 }

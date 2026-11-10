@@ -151,8 +151,9 @@ pub struct Hub {
     argon: Arc<Semaphore>,
     /// WebSocket connections refused after the ClientHello gate, since the
     /// last per-minute line: the inner TLS handshake failed or timed out
-    /// (`tls`), and the hello was malformed, timed out or carried a refused
-    /// credential (`auth`). Counted, never reported per event (#199).
+    /// (`tls`), and the hello was malformed, timed out, carried a refused
+    /// credential, or waited out the deadline for an Argon2id permit
+    /// (`auth`). Counted, never reported per event (#199).
     ws_refused_tls: AtomicU64,
     ws_refused_auth: AtomicU64,
     next: AtomicU64,
@@ -315,28 +316,18 @@ impl Hub {
     /// writes at once. Without this a burst followed by silence would never
     /// reach the log. The sink runs after the `limits` lock is released.
     pub fn flush_audit(&self, now: Instant) {
-        let mut out = Vec::new();
-        {
-            let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
-            let Limits {
-                auth_fail,
-                replaced,
-            } = &mut *limits;
-            drain_windows(auth_fail, Event::ConnectorAuthFail, &mut out, |w| {
-                now.saturating_duration_since(w.start) >= AUDIT_WINDOW
-            });
-            drain_windows(replaced, Event::ConnectorReplaced, &mut out, |w| {
-                now.saturating_duration_since(w.start) >= AUDIT_WINDOW
-            });
-        }
-        for entry in out {
-            self.emit(entry);
-        }
+        self.flush_where(|w| now.saturating_duration_since(w.start) >= AUDIT_WINDOW);
     }
 
     /// Shutdown: a summary entry for every window with a pending count,
     /// open or not, then forget all windows (#219).
     pub fn flush_audit_all(&self) {
+        self.flush_where(|_| true);
+    }
+
+    /// Drain the windows `expired` selects under the lock, then write the
+    /// summaries with it released.
+    fn flush_where(&self, expired: impl Fn(&Window) -> bool) {
         let mut out = Vec::new();
         {
             let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
@@ -344,8 +335,8 @@ impl Hub {
                 auth_fail,
                 replaced,
             } = &mut *limits;
-            drain_windows(auth_fail, Event::ConnectorAuthFail, &mut out, |_| true);
-            drain_windows(replaced, Event::ConnectorReplaced, &mut out, |_| true);
+            drain_windows(auth_fail, Event::ConnectorAuthFail, &mut out, &expired);
+            drain_windows(replaced, Event::ConnectorReplaced, &mut out, &expired);
         }
         for entry in out {
             self.emit(entry);
@@ -746,6 +737,10 @@ mod tests {
         assert_eq!(entries.lock().unwrap().len(), 1);
         hub.flush_audit(t0 + AUDIT_WINDOW);
         assert_eq!(entries.lock().unwrap().len(), 1, "nothing was pending");
+        assert!(
+            hub.limits.lock().unwrap().replaced.is_empty(),
+            "the expired window was dropped"
+        );
         replaced_event(
             &hub,
             "assistant",

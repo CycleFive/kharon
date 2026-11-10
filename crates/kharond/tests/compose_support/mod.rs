@@ -520,6 +520,23 @@ pub async fn mcp_tool_tls<A: serde::Serialize>(
     tool: &str,
     arguments: &A,
 ) -> Result<String, String> {
+    // One overall bound, so a stalled relay cannot hang the job.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        mcp_tool_tls_inner(addr, sni, ca_pem, token, tool, arguments),
+    )
+    .await
+    .map_err(|_| format!("{tool}: no complete reply from {addr} within 30 s"))?
+}
+
+async fn mcp_tool_tls_inner<A: serde::Serialize>(
+    addr: std::net::SocketAddr,
+    sni: &str,
+    ca_pem: &str,
+    token: &str,
+    tool: &str,
+    arguments: &A,
+) -> Result<String, String> {
     const VERSION: &str = "2026-07-28";
     let body = serde_json::to_string(&McpRequest {
         jsonrpc: "2.0",
@@ -555,11 +572,13 @@ pub async fn mcp_tool_tls<A: serde::Serialize>(
     // The edge may close without a TLS close_notify: keep what arrived.
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    while let Ok(n) = tls.read(&mut chunk).await {
-        if n == 0 {
-            break;
+    loop {
+        match tls.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("read from {addr}: {e}")),
         }
-        buf.extend_from_slice(&chunk[..n]);
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (resp_head, resp_body) = text

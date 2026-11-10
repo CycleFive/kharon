@@ -200,10 +200,37 @@ struct FillRecord {
     fields_filled: Vec<String>,
 }
 
+/// One `docker exec fake-edge socat ...` attempt: exit code and stderr.
+struct SocatProbe {
+    code: Option<i32>,
+    stderr: String,
+}
+
 struct ProbeNegative {
-    /// `socat` exited 0 (it reached the CDP port).
-    connected: bool,
-    detail: String,
+    /// Control: the same invocation to kharond's own ingress, in the
+    /// same netns. Must succeed, proving exec, binary and netns work.
+    control: SocatProbe,
+    /// The browser's CDP port across the harness network.
+    target: SocatProbe,
+}
+
+fn socat_probe(addr: &str) -> SocatProbe {
+    let out = docker_raw(
+        &[
+            "exec",
+            FAKE_EDGE,
+            "socat",
+            "-T",
+            "3",
+            "-",
+            &format!("TCP:{addr},connect-timeout=3"),
+        ],
+        None,
+    );
+    SocatProbe {
+        code: out.status.code(),
+        stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+    }
 }
 
 // ------------------------------------------------------------ MCP
@@ -261,6 +288,7 @@ struct CloseTarget<'a> {
 
 /// One MCP tool call through the fake edge, the result text parsed as `R`.
 async fn mcp<A: serde::Serialize, R: serde::de::DeserializeOwned>(
+    canary: &str,
     edge_ca: &str,
     token: &str,
     tool: &str,
@@ -276,6 +304,12 @@ async fn mcp<A: serde::Serialize, R: serde::de::DeserializeOwned>(
     )
     .await
     .unwrap_or_else(|e| panic!("{tool} through the fake edge: {e}"));
+    // REQ-GOAL-002: no reply carries the canary, raw or hex.
+    assert!(
+        !text.contains(canary) && !text.contains(&hex::encode(canary.as_bytes())),
+        "the canary is in a {tool} reply"
+    );
+    api_support::assert_no_canary(&text);
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool} reply ({e}): {text}"))
 }
 
@@ -389,12 +423,21 @@ async fn fill_phase(
     edge_ca: String,
     agent_token: String,
     item_name: String,
+    canary: String,
     browser_ws: String,
     page_port: u16,
     submits: Arc<Mutex<Vec<bool>>>,
 ) -> Vec<FillRecord> {
-    let ctx: ContextReply = mcp(&edge_ca, &agent_token, "kharon_context", &NoArgs {}).await;
+    let ctx: ContextReply = mcp(
+        &canary,
+        &edge_ca,
+        &agent_token,
+        "kharon_context",
+        &NoArgs {},
+    )
+    .await;
     let items: Vec<ItemMeta> = mcp(
+        &canary,
         &edge_ca,
         &agent_token,
         "kharon_search",
@@ -418,6 +461,12 @@ async fn fill_phase(
             serde_json::to_string(&url).unwrap()
         );
         let (target, session) = cdp.open(Some(&ctx.browser_context_id), &url, &ready).await;
+        let secure = cdp.eval(&session, "window.isSecureContext").await;
+        assert_eq!(
+            secure,
+            serde_json::Value::Bool(true),
+            "test page must be a secure context"
+        );
         let args = FillArgs {
             item_id: &item_id,
             target: FillTarget {
@@ -431,7 +480,7 @@ async fn fill_phase(
             submit: true,
         };
         let mut statuses = Vec::new();
-        let mut reply: FillReply = mcp(&edge_ca, &agent_token, "kharon_fill", &args).await;
+        let mut reply: FillReply = mcp(&canary, &edge_ca, &agent_token, "kharon_fill", &args).await;
         statuses.push(reply.status.clone());
         if reply.status == "pending_approval" {
             let grid = reply
@@ -439,11 +488,15 @@ async fn fill_phase(
                 .clone()
                 .unwrap_or_else(|| panic!("pending_approval without a grant_request_id"));
             owner_approve(&data_volume_of(KHAROND), AGENT_HOST_IMAGE, &grid);
-            reply = mcp(&edge_ca, &agent_token, "kharon_fill", &args).await;
+            reply = mcp(&canary, &edge_ca, &agent_token, "kharon_fill", &args).await;
             statuses.push(reply.status.clone());
         }
         let deadline = Instant::now() + Duration::from_secs(30);
-        while submits.lock().unwrap().len() < n + 1 && Instant::now() < deadline {
+        while submits.lock().unwrap().len() < n + 1 {
+            assert!(
+                Instant::now() < deadline,
+                "fill {n}: the form never posted (fill statuses {statuses:?})"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         fills.push(FillRecord {
@@ -637,6 +690,7 @@ async fn setup() -> Run {
         edge_ca.clone(),
         agent_token.clone(),
         item_name.clone(),
+        canary.clone(),
         browser_ws,
         page_port,
         submits.clone(),
@@ -654,25 +708,9 @@ async fn setup() -> Run {
 
     // 13. Routes: the holder's netns (where kharond lives) must have no
     // path to the browser's CDP port; the host must (positive control).
-    let neg = docker_raw(
-        &[
-            "exec",
-            FAKE_EDGE,
-            "socat",
-            "-T",
-            "3",
-            "-",
-            "TCP:10.68.0.2:9222,connect-timeout=3",
-        ],
-        None,
-    );
     let probe_negative = ProbeNegative {
-        connected: neg.status.success(),
-        detail: format!(
-            "exit {:?}, stderr: {}",
-            neg.status.code(),
-            String::from_utf8_lossy(&neg.stderr).trim()
-        ),
+        control: socat_probe(PUBLIC_INGRESS),
+        target: socat_probe("10.68.0.2:9222"),
     };
     let probe_positive = cdp_http_status().await;
 
@@ -871,6 +909,10 @@ fn req_dep_006_compose_ws_kharond_listens_on_loopback_only() {
             assert!(line.contains("socat"), "{EDGE_ADDR} is not socat: {line}");
             continue;
         }
+        assert!(
+            line.contains("kharond"),
+            "listener {local} is not owned by kharond: {line}"
+        );
         kharond_listeners.push(local.to_owned());
     }
     kharond_listeners.sort();
@@ -889,11 +931,44 @@ fn req_dep_006_compose_ws_kharond_listens_on_loopback_only() {
 #[ignore = "needs the compose E2E stack (image.yml)"]
 fn req_arch_002_compose_ws_kharond_has_no_direct_route_to_cdp() {
     let r = run();
-    assert!(
-        !r.probe_negative.connected,
+    let c = &r.probe_negative.control;
+    assert_eq!(
+        c.code,
+        Some(0),
+        "negative probe CONTROL failed: socat from the fake-edge container to kharond's own \
+         ingress {PUBLIC_INGRESS} (same netns) did not succeed, so the exec, the binary or \
+         the netns is broken and the CDP probe proves nothing; exit {:?}, stderr: {}",
+        c.code,
+        c.stderr
+    );
+    let t = &r.probe_negative.target;
+    assert_ne!(
+        t.code,
+        Some(0),
         "negative probe: the holder's netns (kharond) reached the browser's CDP port \
-         10.68.0.2:9222 directly; {}",
-        r.probe_negative.detail
+         10.68.0.2:9222 directly"
+    );
+    assert!(
+        !t.stderr.contains("Connection refused"),
+        "negative probe: the CDP port was reachable (connection refused is an answer from \
+         the host, not a missing route); exit {:?}, stderr: {}",
+        t.code,
+        t.stderr
+    );
+    assert_eq!(
+        t.code,
+        Some(1),
+        "negative probe: socat did not fail as a connect failure (exit 125/126 is a dead \
+         container or exec); exit {:?}, stderr: {}",
+        t.code,
+        t.stderr
+    );
+    assert!(
+        ["timed out", "No route to host", "Network is unreachable"]
+            .iter()
+            .any(|m| t.stderr.contains(m)),
+        "negative probe: socat failed, but not with a routing failure; stderr: {}",
+        t.stderr
     );
     assert_eq!(
         r.probe_positive,

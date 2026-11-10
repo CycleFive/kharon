@@ -857,6 +857,13 @@ fn slower() -> argon2::Argon2<'static> {
     argon(65536, 200)
 }
 
+/// Each verify takes about 2.6 s here (64 MiB, 80 passes): the holders of
+/// the shutdown-waiter test, which only have to outlast one waiter's ws
+/// connect, inner TLS, hello and slot release (tens of milliseconds).
+fn middling() -> argon2::Argon2<'static> {
+    argon(65536, 80)
+}
+
 /// A raw (pinned TLS) hello; `hello_sent` counts the hellos written and
 /// flushed. Then wait for the server hello.
 async fn raw_hello_then_wait(rig: &Rig, token: String, hello_sent: Arc<AtomicUsize>) -> u8 {
@@ -885,9 +892,14 @@ async fn hold_both_permits(rig: &Arc<Rig>) -> Vec<tokio::task::JoinHandle<u8>> {
 }
 
 async fn all_ok(handles: Vec<tokio::task::JoinHandle<u8>>) {
+    all_ok_within(handles, Duration::from_secs(30)).await;
+}
+
+/// [`all_ok`] with a budget per handle, for slow runners.
+async fn all_ok_within(handles: Vec<tokio::task::JoinHandle<u8>>, budget: Duration) {
     for h in handles {
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(30), h)
+            tokio::time::timeout(budget, h)
                 .await
                 .expect("finished")
                 .unwrap(),
@@ -1025,7 +1037,7 @@ async fn raw_hello_gets_a_permit_behind_queued_ws_hellos() {
 async fn argon_permit_released_after_wait_timeout_and_shutdown() {
     // The wait-timeout half is `argon_wait_timeout_...`, which ends on
     // `argon_in_flight() == 0`. Here: a waiter cancelled by shutdown.
-    let rig = Arc::new(rig_with(slower()).await);
+    let rig = Arc::new(rig_with(middling()).await);
     let holders = hold_both_permits(&rig).await;
     let ws_sent = Arc::new(AtomicUsize::new(0));
     let waiter = {
@@ -1057,7 +1069,7 @@ async fn argon_permit_released_after_wait_timeout_and_shutdown() {
     .await;
     assert_eq!(rig.hub.argon_in_flight(), 2, "only the waiter was dropped");
     assert!(waiter.await.unwrap().is_err());
-    all_ok(holders).await;
+    all_ok_within(holders, Duration::from_secs(120)).await;
     eventually("permits back to zero", || rig.hub.argon_in_flight() == 0).await;
     assert_eq!(
         rig.hub.argon_in_flight(),

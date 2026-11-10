@@ -59,11 +59,6 @@ pub fn leg_name(err: &ClientError) -> &'static str {
     }
 }
 
-/// `<leg>: <fixed error text>`. Never holds a token, credential or peer body.
-pub fn leg_line(err: &ClientError) -> String {
-    format!("{}: {err}", leg_name(err))
-}
-
 /// Where this process dials, for the failure lines that name a host or an
 /// address. Taken from the binary's own config, never from the peer.
 #[derive(Debug, Clone)]
@@ -88,7 +83,8 @@ pub fn err_text(err: &ClientError, at: &At) -> String {
     }
 }
 
-/// Like [`leg_line`], with the host or address named.
+/// `<leg>: <fixed error text>`, naming the host or address. Never holds a
+/// token, credential or peer body.
 pub fn leg_line_at(err: &ClientError, at: &At) -> String {
     format!("{}: {}", leg_name(err), err_text(err, at))
 }
@@ -109,7 +105,7 @@ pub struct Outage {
 impl Outage {
     /// Record a failed attempt. Returns the summary line when one is due:
     /// first at 2 min after the outage began, then every 10 min.
-    pub fn on_failure(&mut self, now: Instant, err: &ClientError) -> Option<String> {
+    pub fn on_failure(&mut self, now: Instant, err: &ClientError, at: &At) -> Option<String> {
         let since = *self.since.get_or_insert(now);
         self.attempts += 1;
         let due = *self.next_summary.get_or_insert(since + SUMMARY_FIRST);
@@ -121,7 +117,7 @@ impl Outage {
             "kharon-agent-connector: no broker session for {} ({} attempts); last failure: {}",
             fmt_dur(now.duration_since(since)),
             self.attempts,
-            leg_line(err)
+            leg_line_at(err, at)
         ))
     }
 
@@ -149,6 +145,14 @@ mod tests {
 
     use super::*;
 
+    fn at() -> At {
+        At {
+            host: "broker.example.net".into(),
+            broker: "broker.example.net:7443".into(),
+            proxy: None,
+        }
+    }
+
     #[test]
     fn backoff_is_full_jitter_and_caps_at_30s() {
         let mut rng = StdRng::seed_from_u64(7);
@@ -174,18 +178,47 @@ mod tests {
         let t0 = Instant::now();
         let e = ClientError::Upgrade { status: 502 };
         let mut o = Outage::default();
-        assert!(o.on_failure(t0, &e).is_none());
-        assert!(o.on_failure(t0 + Duration::from_secs(119), &e).is_none());
-        let line = o.on_failure(t0 + Duration::from_secs(120), &e).unwrap();
+        assert!(o.on_failure(t0, &e, &at()).is_none());
+        assert!(
+            o.on_failure(t0 + Duration::from_secs(119), &e, &at())
+                .is_none()
+        );
+        let line = o
+            .on_failure(t0 + Duration::from_secs(120), &e, &at())
+            .unwrap();
         assert_eq!(
             line,
             "kharon-agent-connector: no broker session for 2m0s (3 attempts); \
              last failure: upgrade: websocket upgrade answered 502"
         );
-        assert!(o.on_failure(t0 + Duration::from_secs(400), &e).is_none());
-        assert!(o.on_failure(t0 + Duration::from_secs(719), &e).is_none());
-        let line = o.on_failure(t0 + Duration::from_secs(720), &e).unwrap();
+        assert!(
+            o.on_failure(t0 + Duration::from_secs(400), &e, &at())
+                .is_none()
+        );
+        assert!(
+            o.on_failure(t0 + Duration::from_secs(719), &e, &at())
+                .is_none()
+        );
+        let line = o
+            .on_failure(t0 + Duration::from_secs(720), &e, &at())
+            .unwrap();
         assert!(line.contains("12m0s (6 attempts)"), "{line}");
+    }
+
+    #[test]
+    fn outage_summary_names_the_host_on_dns_failure() {
+        let t0 = Instant::now();
+        let e = ClientError::Dns;
+        let mut o = Outage::default();
+        o.on_failure(t0, &e, &at());
+        let line = o
+            .on_failure(t0 + Duration::from_secs(120), &e, &at())
+            .unwrap();
+        assert_eq!(
+            line,
+            "kharon-agent-connector: no broker session for 2m0s (2 attempts); \
+             last failure: dns: cannot resolve the broker host (broker.example.net)"
+        );
     }
 
     #[test]
@@ -193,13 +226,21 @@ mod tests {
         let t0 = Instant::now();
         let e = ClientError::Dns;
         let mut o = Outage::default();
-        o.on_failure(t0, &e);
-        assert!(o.on_failure(t0 + Duration::from_secs(130), &e).is_some());
+        o.on_failure(t0, &e, &at());
+        assert!(
+            o.on_failure(t0 + Duration::from_secs(130), &e, &at())
+                .is_some()
+        );
         o.on_auth();
         let t1 = t0 + Duration::from_secs(200);
-        assert!(o.on_failure(t1, &e).is_none());
-        assert!(o.on_failure(t1 + Duration::from_secs(119), &e).is_none());
-        let line = o.on_failure(t1 + Duration::from_secs(120), &e).unwrap();
+        assert!(o.on_failure(t1, &e, &at()).is_none());
+        assert!(
+            o.on_failure(t1 + Duration::from_secs(119), &e, &at())
+                .is_none()
+        );
+        let line = o
+            .on_failure(t1 + Duration::from_secs(120), &e, &at())
+            .unwrap();
         assert!(line.contains("(3 attempts)"), "{line}");
     }
 }

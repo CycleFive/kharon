@@ -172,6 +172,12 @@ pub struct Rig {
 
 /// `hash_argon` hashes the tunnel token (and so prices each verify).
 pub async fn rig_with(hash_argon: Argon2<'static>) -> Rig {
+    rig_with_deadline(hash_argon, None).await
+}
+
+/// [`rig_with`], with the WebSocket entry's pre-auth deadline set to
+/// `deadline` (the production constant when `None`).
+pub async fn rig_with_deadline(hash_argon: Argon2<'static>, deadline: Option<Duration>) -> Rig {
     let (cdp, received) = cdp_stub().await;
     let (secret, hash) = generate_tunnel_with(&hash_argon, "assistant");
     let token = secret.expose_secret().clone();
@@ -191,7 +197,10 @@ pub async fn rig_with(hash_argon: Argon2<'static>) -> Rig {
         kharon_connector::TlsVersions::Tls13Only,
     )
     .unwrap();
-    let ws = WsEntry::new(Arc::clone(&hub), ws_tls);
+    let ws = match deadline {
+        Some(d) => WsEntry::with_preauth_deadline(Arc::clone(&hub), ws_tls, d),
+        None => WsEntry::new(Arc::clone(&hub), ws_tls),
+    };
 
     let raw_tls =
         server_config_from_pem(cert.pem_cert.as_bytes(), cert.pem_key.as_bytes()).unwrap();

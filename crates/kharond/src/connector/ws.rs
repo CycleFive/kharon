@@ -25,16 +25,13 @@ use hyper_util::rt::TokioIo;
 use kharon_connector::{WS_SUBPROTOCOL, WsByteStream, ws_config};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, OwnedSemaphorePermit, watch};
+use tokio::time::{Instant, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-use super::{Hub, SessionTransport, authenticate_and_serve, stopped};
-
-/// The inner TLS handshake and the hello each get this long on the
-/// WebSocket path (the raw listener allows 10 s for the handshake).
-const WS_DEADLINE: Duration = Duration::from_secs(5);
+use super::{Hub, SessionTransport, WS_PREAUTH_DEADLINE, authenticate_and_serve, stopped};
 
 /// Refusals since the last [`WsEntry::take_refusal_line`].
 #[derive(Default)]
@@ -48,6 +45,8 @@ struct Refusals {
 pub struct WsEntry {
     acceptor: TlsAcceptor,
     hub: Arc<Hub>,
+    /// How long a socket may stay pre-auth, from the slot (#219).
+    deadline: Duration,
     refusals: Refusals,
     stop: watch::Sender<bool>,
     live: AtomicUsize,
@@ -67,11 +66,22 @@ impl Drop for SessionGuard {
 
 impl WsEntry {
     /// `tls` is the inner server config, TLS 1.3 only. The pre-auth
-    /// budget is the hub's.
+    /// budget is the hub's, and the deadline is [`WS_PREAUTH_DEADLINE`].
     pub fn new(hub: Arc<Hub>, tls: Arc<rustls::ServerConfig>) -> Arc<Self> {
+        Self::with_preauth_deadline(hub, tls, WS_PREAUTH_DEADLINE)
+    }
+
+    /// Like [`WsEntry::new`], with the pre-auth `deadline` set: one budget
+    /// from the slot to the start of the Argon2id check.
+    pub fn with_preauth_deadline(
+        hub: Arc<Hub>,
+        tls: Arc<rustls::ServerConfig>,
+        deadline: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             acceptor: TlsAcceptor::from(tls),
             hub,
+            deadline,
             refusals: Refusals::default(),
             stop: watch::channel(false).0,
             live: AtomicUsize::new(0),
@@ -129,6 +139,9 @@ impl WsEntry {
             self.refusals.budget.fetch_add(1, Ordering::Relaxed);
             return refusal(StatusCode::SERVICE_UNAVAILABLE);
         };
+        // One deadline for the whole pre-auth stretch: upgrade, ClientHello
+        // gate, inner TLS, hello, and the wait for an Argon2id permit.
+        let deadline = Instant::now() + self.deadline;
         self.live.fetch_add(1, Ordering::SeqCst);
         let guard = SessionGuard(Arc::clone(self));
         if *self.stop.borrow() {
@@ -136,7 +149,11 @@ impl WsEntry {
         }
         let on_upgrade = hyper::upgrade::on(&mut req);
         let entry = Arc::clone(self);
-        tokio::spawn(async move { entry.session(on_upgrade, peer, permit, guard).await });
+        tokio::spawn(async move {
+            entry
+                .session(on_upgrade, peer, deadline, permit, guard)
+                .await
+        });
         Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
             .header(header::UPGRADE, "websocket")
@@ -154,21 +171,28 @@ impl WsEntry {
         self: Arc<Self>,
         on_upgrade: OnUpgrade,
         peer: SocketAddr,
+        deadline: Instant,
         permit: OwnedSemaphorePermit,
         _guard: SessionGuard,
     ) {
-        let Ok(upgraded) = on_upgrade.await else {
+        let Ok(Ok(upgraded)) = timeout_at(deadline, on_upgrade).await else {
             return;
         };
-        let ws = WebSocketStream::from_raw_socket(
-            TokioIo::new(upgraded),
-            Role::Server,
-            Some(ws_config()),
+        let Ok(ws) = timeout_at(
+            deadline,
+            WebSocketStream::from_raw_socket(
+                TokioIo::new(upgraded),
+                Role::Server,
+                Some(ws_config()),
+            ),
         )
-        .await;
+        .await
+        else {
+            return;
+        };
         let mut stop = Some(self.stop.subscribe());
         let gated = tokio::select! {
-            g = tokio::time::timeout(WS_DEADLINE, ClientHelloGate::check(WsByteStream::new(ws))) => g,
+            g = timeout_at(deadline, ClientHelloGate::check(WsByteStream::new(ws))) => g,
             () = stopped(&mut stop) => return,
         };
         let stream = match gated {
@@ -185,7 +209,7 @@ impl WsEntry {
             SessionTransport::Ws,
             self.acceptor.clone(),
             Arc::clone(&self.hub),
-            WS_DEADLINE,
+            deadline,
             permit,
             stop,
         )

@@ -11,7 +11,7 @@ mod connector_support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use connector_support::*;
@@ -20,7 +20,7 @@ use kharon_connector::Transport as Dial;
 use kharon_connector::WsByteStream;
 use kharond::config::Config;
 use kharond::connector::{
-    AgentParams, ClientError, ConnectorEvent, SessionTransport, run_agent_once,
+    AgentParams, ClientError, ConnectorEvent, SessionTransport, connect_pinned, run_agent_once,
 };
 use kharond::daemon::{self, PUBLIC_INGRESS_DRAIN};
 use kharond::lock::StaticHardening;
@@ -362,12 +362,14 @@ async fn hello_then_wait(rig: &Rig, token: String, hello_sent: Arc<AtomicUsize>)
 }
 
 /// The window is the Argon2id verify: every token here costs about this
-/// much, so eight of them stay in flight while the ninth knocks.
+/// much, so eight of them stay in flight while the ninth knocks. At most
+/// two verify at once (#219), so the eight finish in four rounds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_preauth_budget_is_8_including_argon2() {
-    // 64 MiB, 16 passes: well over a second a verify, and eight run at
-    // once on the blocking pool.
-    let rig = Arc::new(rig_with(argon(65536, 16)).await);
+    // 64 MiB, 28 passes: about 0.9 s a verify, four rounds of two (3-5 s),
+    // well inside the 10 s deadline, and the first slots free up no sooner
+    // than the first round ends.
+    let rig = Arc::new(rig_with(argon(65536, 28)).await);
     let hello_sent = Arc::new(AtomicUsize::new(0));
     let mut clients = Vec::new();
     for _ in 0..8 {
@@ -378,8 +380,8 @@ async fn ws_preauth_budget_is_8_including_argon2() {
             hello_then_wait(&rig_ref, token, hello_sent).await
         }));
     }
-    // Every hello is on the wire, and each verify takes over a second:
-    // the 8 slots are held through the Argon2id phase.
+    // Every hello is on the wire, and the first round of verifies is still
+    // running: the 8 slots are held through the Argon2id phase.
     eventually("8 hellos sent", || hello_sent.load(Ordering::SeqCst) == 8).await;
     assert_eq!(rig.hub.ws_preauth_in_flight(), 8);
 
@@ -708,6 +710,80 @@ async fn daemon_audits_a_refused_ws_credential() {
     let _ = tokio::time::timeout(PUBLIC_INGRESS_DRAIN + Duration::from_secs(2), server).await;
 }
 
+/// Counts swallowed by the rate limit reach `audit.jsonl` at shutdown, and
+/// the chain still verifies (#219).
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_shutdown_flushes_pending_audit_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = cert();
+    let (text, _token) = daemon_config(dir.path(), &cert, "websocket = true");
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    let public = daemon.public_ingress_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(daemon.run(async {
+        let _ = stopped.await;
+    }));
+
+    for _ in 0..2 {
+        let wrong = kharond::api::token::generate_tunnel("assistant")
+            .0
+            .expose_secret()
+            .clone();
+        let params = AgentParams {
+            transport: Dial::Ws {
+                host: "127.0.0.1".into(),
+                port: public.port(),
+                path: "/connector".into(),
+                outer_tls: false,
+            },
+            server_name: "127.0.0.1".into(),
+            pin: cert.pin,
+            agent_id: "assistant".into(),
+            token: Zeroizing::new(wrong),
+            cdp: "127.0.0.1:9".parse().unwrap(),
+            proxy: None,
+            proxy_creds: None,
+            outer_roots: None,
+        };
+        assert_eq!(
+            kharon_connector::connect_and_auth(&params).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+    }
+
+    let _ = stop.send(());
+    tokio::time::timeout(PUBLIC_INGRESS_DRAIN + Duration::from_secs(2), server)
+        .await
+        .expect("run() did not return")
+        .unwrap()
+        .unwrap();
+
+    let log = dir.path().join("data/audit/audit.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"connector_auth_fail""#))
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains(r#""suppressed":0"#), "{}", lines[0]);
+    assert!(lines[1].contains(r#""suppressed":1"#), "{}", lines[1]);
+    assert!(
+        lines[1].contains(r#""result":"suppressed_only""#),
+        "{}",
+        lines[1]
+    );
+    assert!(!lines[1].contains(r#""transport""#), "{}", lines[1]);
+    let keys =
+        kharond::audit::AuditKeys::load_or_generate(&dir.path().join("data/audit/keys")).unwrap();
+    assert!(matches!(
+        kharond::audit::verify(&log, &[], &keys.verifying_key()).unwrap(),
+        kharond::audit::VerifyOutcome::Ok { .. }
+    ));
+}
+
 /// A held-open, authenticated session ends when the daemon stops, inside
 /// the drain bound, and `run()` returns.
 #[tokio::test(flavor = "multi_thread")]
@@ -766,5 +842,356 @@ async fn ws_session_ends_at_shutdown() {
         started.elapsed() < PUBLIC_INGRESS_DRAIN,
         "the session ended by the abort, not by tracking: {:?}",
         started.elapsed()
+    );
+}
+
+// ---- #219: the shared Argon2id cap and one pre-auth deadline ----------
+
+/// Each verify takes about 1.3 s here (64 MiB, 40 passes).
+fn slow() -> argon2::Argon2<'static> {
+    argon(65536, 40)
+}
+
+/// Each verify takes about 6 s: it outlasts a 2 s deadline by far.
+fn slower() -> argon2::Argon2<'static> {
+    argon(65536, 200)
+}
+
+/// A raw (pinned TLS) hello; `hello_sent` counts the hellos written and
+/// flushed. Then wait for the server hello.
+async fn raw_hello_then_wait(rig: &Rig, token: String, hello_sent: Arc<AtomicUsize>) -> u8 {
+    let tcp = TcpStream::connect(rig.raw).await.unwrap();
+    let mut tls = connect_pinned("127.0.0.1", rig.pin, tcp).await.unwrap();
+    kharon_connector::write_client_hello(&mut tls, "assistant", &token)
+        .await
+        .unwrap();
+    tls.flush().await.unwrap();
+    hello_sent.fetch_add(1, Ordering::SeqCst);
+    kharon_connector::read_server_hello(&mut tls).await.unwrap()
+}
+
+/// Two raw hellos, started and verifying: both Argon2id permits are held.
+async fn hold_both_permits(rig: &Arc<Rig>) -> Vec<tokio::task::JoinHandle<u8>> {
+    let sent = Arc::new(AtomicUsize::new(0));
+    let holders: Vec<_> = (0..2)
+        .map(|_| {
+            let rig = Arc::clone(rig);
+            let sent = Arc::clone(&sent);
+            tokio::spawn(async move { raw_hello_then_wait(&rig, rig.token.clone(), sent).await })
+        })
+        .collect();
+    eventually("both permits held", || rig.hub.argon_in_flight() == 2).await;
+    holders
+}
+
+async fn all_ok(handles: Vec<tokio::task::JoinHandle<u8>>) {
+    for h in handles {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .expect("finished")
+                .unwrap(),
+            0,
+            "AUTH_OK"
+        );
+    }
+}
+
+/// Two raw hellos take both permits; a ws hello behind them waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn argon2_runs_at_most_two_at_once_across_transports() {
+    let rig = Arc::new(rig_with(slow()).await);
+    let raw_done = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let raws: Vec<_> = (0..2)
+        .map(|_| {
+            let rig = Arc::clone(&rig);
+            let sent = Arc::clone(&sent);
+            let raw_done = Arc::clone(&raw_done);
+            tokio::spawn(async move {
+                let r = raw_hello_then_wait(&rig, rig.token.clone(), sent).await;
+                raw_done.store(true, Ordering::SeqCst);
+                r
+            })
+        })
+        .collect();
+    eventually("both permits held", || rig.hub.argon_in_flight() == 2).await;
+
+    let ws_sent = Arc::new(AtomicUsize::new(0));
+    let ws_done_after_raw = Arc::new(AtomicBool::new(false));
+    let ws = {
+        let rig = Arc::clone(&rig);
+        let ws_sent = Arc::clone(&ws_sent);
+        let raw_done = Arc::clone(&raw_done);
+        let flag = Arc::clone(&ws_done_after_raw);
+        tokio::spawn(async move {
+            let r = hello_then_wait(&rig, rig.token.clone(), ws_sent).await;
+            flag.store(raw_done.load(Ordering::SeqCst), Ordering::SeqCst);
+            r
+        })
+    };
+    eventually("ws hello sent", || ws_sent.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(rig.hub.ws_preauth_in_flight(), 1);
+    // The ws hello waits: the count never passes two.
+    let until = tokio::time::Instant::now() + Duration::from_millis(400);
+    while tokio::time::Instant::now() < until {
+        assert_eq!(rig.hub.argon_in_flight(), 2, "capped at two, both held");
+        assert_eq!(rig.hub.ws_preauth_in_flight(), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    all_ok(raws).await;
+    all_ok(vec![ws]).await;
+    assert!(
+        ws_done_after_raw.load(Ordering::SeqCst),
+        "the ws verify started only after a raw verify finished"
+    );
+    eventually("permits released", || rig.hub.argon_in_flight() == 0).await;
+}
+
+/// The waiter's deadline passes while both permits are held: it gets no
+/// server hello, is counted as `auth`, and is not audited. Review Focus 2
+/// (no leak after the wait times out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn argon_wait_timeout_counts_auth_and_sends_no_server_hello() {
+    let rig = Arc::new(rig_with_deadline(slower(), Some(Duration::from_secs(2))).await);
+    let audited = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&audited);
+    rig.hub.set_audit(Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }));
+    let holders = hold_both_permits(&rig).await;
+
+    let ws = raw_ws(rig.public).await;
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = inner_client(&rig, &[&rustls::version::TLS13])
+        .connect(name, WsByteStream::new(ws))
+        .await
+        .expect("inner TLS 1.3");
+    kharon_connector::write_client_hello(&mut tls, "assistant", &rig.token)
+        .await
+        .unwrap();
+    tls.flush().await.unwrap();
+    let hello = tokio::time::timeout(
+        Duration::from_secs(5),
+        kharon_connector::read_server_hello(&mut tls),
+    )
+    .await
+    .expect("closed within the deadline, not held to the end of the hash");
+    assert!(hello.is_err(), "no server hello before EOF: {hello:?}");
+    eventually("slot released", || rig.hub.ws_preauth_in_flight() == 0).await;
+    assert!(
+        rig.hub.argon_in_flight() >= 1,
+        "the waiter's deadline fell inside the holders' hashes"
+    );
+    let line = rig.ws.take_refusal_line().expect("counted");
+    assert!(line.ends_with("hello 0, tls 0, auth 1)"), "{line}");
+    assert_eq!(audited.load(Ordering::SeqCst), 0, "not audited");
+    all_ok(holders).await;
+    eventually("permits released", || rig.hub.argon_in_flight() == 0).await;
+    assert_eq!(audited.load(Ordering::SeqCst), 0);
+}
+
+/// Review Focus 1: the semaphore is FIFO, so a raw hello behind queued ws
+/// hellos still starts within its own deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_hello_gets_a_permit_behind_queued_ws_hellos() {
+    let rig = Arc::new(rig_with(argon(65536, 16)).await);
+    let ws_sent = Arc::new(AtomicUsize::new(0));
+    let ws: Vec<_> = (0..8)
+        .map(|_| {
+            let rig = Arc::clone(&rig);
+            let ws_sent = Arc::clone(&ws_sent);
+            tokio::spawn(async move { hello_then_wait(&rig, rig.token.clone(), ws_sent).await })
+        })
+        .collect();
+    eventually("8 ws hellos sent", || ws_sent.load(Ordering::SeqCst) == 8).await;
+    assert_eq!(rig.hub.ws_preauth_in_flight(), 8);
+    let raw_sent = Arc::new(AtomicUsize::new(0));
+    let started = tokio::time::Instant::now();
+    let raw = tokio::time::timeout(
+        kharond::connector::RAW_PREAUTH_DEADLINE,
+        raw_hello_then_wait(&rig, rig.token.clone(), raw_sent),
+    )
+    .await
+    .expect("the raw hello started within RAW_PREAUTH_DEADLINE");
+    assert_eq!(raw, 0, "AUTH_OK after {:?}", started.elapsed());
+    all_ok(ws).await;
+    eventually("permits released", || rig.hub.argon_in_flight() == 0).await;
+}
+
+/// Review Focus 2: a permit is not leaked when shutdown cancels a waiter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn argon_permit_released_after_wait_timeout_and_shutdown() {
+    // The wait-timeout half is `argon_wait_timeout_...`, which ends on
+    // `argon_in_flight() == 0`. Here: a waiter cancelled by shutdown.
+    let rig = Arc::new(rig_with(slower()).await);
+    let holders = hold_both_permits(&rig).await;
+    let ws_sent = Arc::new(AtomicUsize::new(0));
+    let waiter = {
+        let rig = Arc::clone(&rig);
+        let ws_sent = Arc::clone(&ws_sent);
+        tokio::spawn(async move {
+            // The server closes it at shutdown, so this errors or EOFs.
+            let ws = raw_ws(rig.public).await;
+            let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+            let mut tls = inner_client(&rig, &[&rustls::version::TLS13])
+                .connect(name, WsByteStream::new(ws))
+                .await
+                .expect("inner TLS 1.3");
+            kharon_connector::write_client_hello(&mut tls, "assistant", &rig.token)
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            ws_sent.fetch_add(1, Ordering::SeqCst);
+            kharon_connector::read_server_hello(&mut tls).await
+        })
+    };
+    eventually("waiter hello sent", || ws_sent.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(rig.hub.ws_preauth_in_flight(), 1);
+    assert_eq!(rig.hub.argon_in_flight(), 2);
+    rig.ws.begin_shutdown();
+    eventually("waiter's slot released", || {
+        rig.hub.ws_preauth_in_flight() == 0
+    })
+    .await;
+    assert_eq!(rig.hub.argon_in_flight(), 2, "only the waiter was dropped");
+    assert!(waiter.await.unwrap().is_err());
+    all_ok(holders).await;
+    eventually("permits back to zero", || rig.hub.argon_in_flight() == 0).await;
+    assert_eq!(
+        rig.hub.argon_in_flight(),
+        0,
+        "no permit leaked by the cancelled waiter"
+    );
+}
+
+/// Review Focus 3: a client that hangs up mid-hash does not free the
+/// permit early.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn argon_permit_held_until_the_hash_finishes() {
+    let rig = Arc::new(rig_with(slow()).await);
+    {
+        let tcp = TcpStream::connect(rig.raw).await.unwrap();
+        let mut tls = connect_pinned("127.0.0.1", rig.pin, tcp).await.unwrap();
+        kharon_connector::write_client_hello(&mut tls, "assistant", &rig.token)
+            .await
+            .unwrap();
+        tls.flush().await.unwrap();
+    } // dropped: the socket closes
+    eventually("hash started", || rig.hub.argon_in_flight() == 1).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        rig.hub.argon_in_flight(),
+        1,
+        "the hash is still running, so the permit is still held"
+    );
+    eventually("hash finished", || rig.hub.argon_in_flight() == 0).await;
+}
+
+/// Review Focus 4: one deadline for the whole pre-auth stretch. The client
+/// spends 0.6 s before its ClientHello and then sits on its hello; the
+/// per-phase timers of old would have let it through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_slow_client_cannot_chain_phase_timers() {
+    let rig = rig_with_deadline(argon(8, 1), Some(Duration::from_millis(1500))).await;
+    let started = tokio::time::Instant::now();
+    let ws = raw_ws(rig.public).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = inner_client(&rig, &[&rustls::version::TLS13])
+        .connect(name, WsByteStream::new(ws))
+        .await;
+    // The hello is due at 2.0 s; the 1.5 s deadline has passed by 1.7 s.
+    tokio::time::sleep_until(started + Duration::from_millis(1700)).await;
+    assert_eq!(
+        rig.hub.ws_preauth_in_flight(),
+        0,
+        "the slot is released at the deadline, not after the client's pacing"
+    );
+    let outcome = match tls {
+        Ok(mut tls) => {
+            let wrote = kharon_connector::write_client_hello(&mut tls, "assistant", &rig.token)
+                .await
+                .is_ok()
+                && tls.flush().await.is_ok();
+            if wrote {
+                kharon_connector::read_server_hello(&mut tls).await.ok()
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    assert_ne!(outcome, Some(0), "a slow client never reaches AUTH_OK");
+}
+
+/// #219 AC2, phase gate: a socket that upgrades and then sends nothing is
+/// freed by the one deadline, and counted as a `hello` refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_stall_in_the_gate_frees_the_slot_by_the_deadline() {
+    let rig = rig_with_deadline(argon(8, 1), Some(Duration::from_millis(1500))).await;
+    let started = tokio::time::Instant::now();
+    let _ws = raw_ws(rig.public).await;
+    eventually("slot taken", || rig.hub.ws_preauth_in_flight() == 1).await;
+    tokio::time::sleep_until(started + Duration::from_millis(1800)).await;
+    assert_eq!(rig.hub.ws_preauth_in_flight(), 0, "freed by the deadline");
+    let line = rig.ws.take_refusal_line().expect("counted");
+    assert!(line.contains("hello 1,"), "{line}");
+}
+
+/// #219 AC2, phase inner TLS: a ClientHello record header that passes the
+/// gate, a truncated body, then silence. The deadline is not restarted by
+/// the gate having finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_stall_in_inner_tls_frees_the_slot_by_the_deadline() {
+    let rig = rig_with_deadline(argon(8, 1), Some(Duration::from_millis(1500))).await;
+    let started = tokio::time::Instant::now();
+    let mut ws = raw_ws(rig.public).await;
+    // A late start: a fresh timer for this phase would run to 2.1 s.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Handshake record, TLS 1.0 legacy version, length 0x0100, ClientHello.
+    ws.send(Message::Binary(vec![0x16, 0x03, 0x01, 0x01, 0x00, 0x01]))
+        .await
+        .unwrap();
+    tokio::time::sleep_until(started + Duration::from_millis(1800)).await;
+    assert_eq!(rig.hub.ws_preauth_in_flight(), 0, "freed by the deadline");
+    let line = rig.ws.take_refusal_line().expect("counted");
+    assert!(line.contains("tls 1,"), "{line}");
+    assert!(line.contains("hello 0,"), "{line}");
+}
+
+/// The permit lives in the blocking task, not in the connection future:
+/// shutdown drops the future mid-hash and the cap still counts the hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn argon_permit_held_after_the_connection_future_is_cancelled() {
+    let rig = Arc::new(rig_with(slow()).await);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let client = {
+        let rig = Arc::clone(&rig);
+        let sent = Arc::clone(&sent);
+        tokio::spawn(async move { hello_then_wait(&rig, rig.token.clone(), sent).await })
+    };
+    eventually("hash started", || rig.hub.argon_in_flight() == 1).await;
+    rig.ws.begin_shutdown();
+    eventually("connection future dropped", || {
+        rig.hub.ws_preauth_in_flight() == 0
+    })
+    .await;
+    assert_eq!(
+        rig.hub.argon_in_flight(),
+        1,
+        "the hash is still running after its connection was cancelled"
+    );
+    eventually("hash finished", || rig.hub.argon_in_flight() == 0).await;
+    let _ = client.await;
+}
+
+#[test]
+fn busy_event_text_is_pinned() {
+    let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    assert_eq!(
+        ConnectorEvent::Busy { peer }.to_string(),
+        "agent connector busy: credential check did not start in time"
     );
 }

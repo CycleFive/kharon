@@ -385,3 +385,174 @@ async fn audit_append_failure_does_not_block_auth() {
     rig.hub.disconnect("assistant");
     let _ = tokio::time::timeout(Duration::from_secs(5), second).await;
 }
+
+// ---- #219: suppressed counts are flushed, not left in memory ----------
+
+/// A closed window with swallowed events writes one summary entry on the
+/// flush, and the next event opens a fresh window with `suppressed = 0`.
+#[tokio::test(start_paused = true)]
+async fn flush_writes_a_summary_for_a_closed_window() {
+    let sink = Sink::default();
+    let (store, _) = store();
+    let hub = Hub::with_events(store, Arc::new(|_| {}));
+    hub.set_audit(sink.audit());
+    let fail = |hub: &Hub| hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    let t0 = tokio::time::Instant::now();
+
+    fail(&hub);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    for _ in 0..3 {
+        fail(&hub);
+    }
+    assert_eq!(sink.of(Event::ConnectorAuthFail).len(), 1);
+
+    hub.flush_audit(t0 + Duration::from_secs(59));
+    assert_eq!(sink.of(Event::ConnectorAuthFail).len(), 1, "window is open");
+
+    hub.flush_audit(t0 + Duration::from_secs(60));
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 2);
+    let summary = &all[1];
+    assert_eq!(summary.suppressed, Some(3));
+    assert_eq!(summary.result.as_deref(), Some("suppressed_only"));
+    assert_eq!(summary.agent_id.as_deref(), Some("assistant"));
+    assert_eq!(summary.transport, None);
+    assert_eq!(summary.detail_code, None);
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    fail(&hub);
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 3, "the next event writes at once");
+    assert_eq!(all[2].suppressed, Some(0));
+    assert_eq!(all[2].result, None);
+}
+
+/// Shutdown flushes an open window's pending count.
+#[tokio::test(start_paused = true)]
+async fn flush_all_writes_pending_of_open_windows() {
+    let sink = Sink::default();
+    let (store, _) = store();
+    let hub = Hub::with_events(store, Arc::new(|_| {}));
+    hub.set_audit(sink.audit());
+    hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    hub.audit_auth_fail("assistant", SessionTransport::Tls);
+
+    hub.flush_audit_all();
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[1].suppressed, Some(2));
+    assert_eq!(all[1].result.as_deref(), Some("suppressed_only"));
+
+    hub.flush_audit_all();
+    assert_eq!(
+        sink.of(Event::ConnectorAuthFail).len(),
+        2,
+        "maps were cleared"
+    );
+}
+
+/// Review Focus 5: a failing sink must not make the flush panic, and
+/// leaves the maps cleared.
+#[tokio::test(start_paused = true)]
+async fn flush_with_failing_sink_returns() {
+    let sink = Sink {
+        fail: true,
+        ..Sink::default()
+    };
+    let (store, _) = store();
+    let hub = Hub::with_events(store, Arc::new(|_| {}));
+    hub.set_audit(sink.audit());
+    for _ in 0..3 {
+        hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    }
+    hub.flush_audit(tokio::time::Instant::now() + Duration::from_secs(60));
+    hub.flush_audit_all();
+    assert!(sink.all().is_empty());
+}
+
+/// The sink runs after the `limits` lock is released: a sink that calls
+/// back into the hub would deadlock otherwise. Run on a thread so a hang
+/// fails the test instead of stalling it.
+#[test]
+fn flush_does_not_hold_the_lock_across_the_sink() {
+    let (store, _) = store();
+    let hub = Arc::new(Hub::with_events(store, Arc::new(|_| {})));
+    let inner = Arc::clone(&hub);
+    let calls = Arc::new(Mutex::new(0usize));
+    let seen = Arc::clone(&calls);
+    hub.set_audit(Arc::new(move |_| {
+        *seen.lock().unwrap() += 1;
+        // Re-entrant: touches the same limiter the flush just drained.
+        inner.audit_auth_fail("assistant", SessionTransport::Tls);
+        Ok(())
+    }));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runner = Arc::clone(&hub);
+    std::thread::spawn(move || {
+        runner.audit_auth_fail("assistant", SessionTransport::Tls);
+        runner.audit_auth_fail("assistant", SessionTransport::Tls);
+        runner.flush_audit(tokio::time::Instant::now() + Duration::from_secs(61));
+        runner.audit_auth_fail("assistant", SessionTransport::Tls);
+        runner.flush_audit_all();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("flush deadlocked: the sink ran under the limits lock");
+    assert!(*calls.lock().unwrap() >= 2);
+}
+
+/// I1 (#219 AC3): a burst, then silence, while the daemon keeps running.
+/// The periodic task alone writes the summary.
+#[tokio::test(start_paused = true)]
+async fn housekeeping_flushes_a_burst_followed_by_silence() {
+    let sink = Sink::default();
+    let (store, _) = store();
+    let hub = Arc::new(Hub::with_events(store, Arc::new(|_| {})));
+    hub.set_audit(sink.audit());
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(kharond::daemon::connector_housekeeping(
+        Arc::clone(&hub),
+        None,
+        stop_rx,
+    ));
+    for _ in 0..3 {
+        hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    }
+    assert_eq!(sink.of(Event::ConnectorAuthFail).len(), 1);
+
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    // The flush runs on the blocking pool.
+    for _ in 0..200 {
+        if sink.of(Event::ConnectorAuthFail).len() > 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 2, "exactly one summary: {all:?}");
+    assert_eq!(all[1].suppressed, Some(2));
+    assert_eq!(all[1].result.as_deref(), Some("suppressed_only"));
+    let _ = stop.send(true);
+    let _ = task.await;
+}
+
+/// Shutdown stops the housekeeping task with a signal rather than an
+/// abort, so a flush already on the blocking pool finishes before the task
+/// returns, and the daemon's final flush and exit checkpoint come after it.
+#[tokio::test]
+async fn housekeeping_returns_when_stopped() {
+    let (store, _) = store();
+    let hub = Arc::new(Hub::with_events(store, Arc::new(|_| {})));
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(kharond::daemon::connector_housekeeping(hub, None, stop_rx));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = stop.send(true);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("housekeeping returns once stopped")
+        .expect("housekeeping task did not panic");
+}

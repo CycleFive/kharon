@@ -5,6 +5,11 @@
 //! CDP streams on that session. A failed credential never reaches the
 //! mux. A new session for the same agent replaces the previous one.
 //!
+//! At most [`ARGON2_CONCURRENCY`] Argon2id evaluations run at once, counted
+//! across both transports, and each socket has one absolute pre-auth
+//! deadline (#219): [`WS_PREAUTH_DEADLINE`] from its slot on the WebSocket
+//! path, [`RAW_PREAUTH_DEADLINE`] from accept on the raw one.
+//!
 //! Framing, the pin, and reconnect live in `kharon-connector` so a review
 //! of OQ-14 can change them in one place.
 //!
@@ -35,7 +40,7 @@ pub use kharon_connector::{
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 use tokio_rustls::TlsAcceptor;
 
 use crate::api::token::TokenStore;
@@ -70,6 +75,9 @@ pub enum ConnectorEvent {
     /// The tunnel credential was refused. The claimed agent id is not
     /// reported: it is unauthenticated input.
     Refused { peer: SocketAddr },
+    /// The Argon2id check did not start before the pre-auth deadline. No
+    /// credential was refused.
+    Busy { peer: SocketAddr },
 }
 
 impl fmt::Display for ConnectorEvent {
@@ -102,6 +110,9 @@ impl fmt::Display for ConnectorEvent {
                 Ok(())
             }
             Self::Refused { .. } => f.write_str("agent connector refused a credential"),
+            Self::Busy { .. } => {
+                f.write_str("agent connector busy: credential check did not start in time")
+            }
         }
     }
 }
@@ -117,6 +128,15 @@ fn stderr_sink() -> EventSink {
 /// append. Best effort: an `Err` is logged and changes nothing else.
 pub type ConnectorAudit = Arc<dyn Fn(Entry) -> Result<(), ()> + Send + Sync>;
 
+/// Argon2id evaluations allowed at once, across both transports (#219).
+pub const ARGON2_CONCURRENCY: usize = 2;
+/// Pre-auth time of a WebSocket socket, from its slot to the start of the
+/// Argon2id check. A hash already running is bounded by its parameters.
+pub const WS_PREAUTH_DEADLINE: Duration = Duration::from_secs(10);
+/// Pre-auth time of a raw socket, from accept to the start of the Argon2id
+/// check: the old 10 s TLS plus 5 s hello maximum.
+pub const RAW_PREAUTH_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Accepted connector sessions, keyed by agent id.
 pub struct Hub {
     tokens: TokenStore,
@@ -125,10 +145,15 @@ pub struct Hub {
     auth: Arc<Semaphore>,
     /// Pre-auth budget of the WebSocket path, separate from `auth` (#199).
     ws_auth: Arc<Semaphore>,
+    /// Argon2id evaluations at once, shared by both transports (#219). A
+    /// permit moves into the blocking task, so it is held for as long as
+    /// the hash runs, whatever happens to the connection.
+    argon: Arc<Semaphore>,
     /// WebSocket connections refused after the ClientHello gate, since the
     /// last per-minute line: the inner TLS handshake failed or timed out
-    /// (`tls`), and the hello was malformed, timed out or carried a refused
-    /// credential (`auth`). Counted, never reported per event (#199).
+    /// (`tls`), and the hello was malformed, timed out, carried a refused
+    /// credential, or waited out the deadline for an Argon2id permit
+    /// (`auth`). Counted, never reported per event (#199).
     ws_refused_tls: AtomicU64,
     ws_refused_auth: AtomicU64,
     next: AtomicU64,
@@ -184,6 +209,30 @@ fn admit(windows: &mut HashMap<String, Window>, agent: &str, now: Instant) -> Op
     }
 }
 
+/// Remove every window `expired` selects from `windows`, pushing a summary
+/// entry onto `out` for each one that has a pending count.
+fn drain_windows(
+    windows: &mut HashMap<String, Window>,
+    event: Event,
+    out: &mut Vec<Entry>,
+    expired: impl Fn(&Window) -> bool,
+) {
+    windows.retain(|agent, w| {
+        if !expired(w) {
+            return true;
+        }
+        if w.pending > 0 {
+            out.push(
+                Entry::new(event.clone())
+                    .agent_id(agent.as_str())
+                    .suppressed(w.pending)
+                    .result("suppressed_only"),
+            );
+        }
+        false
+    });
+}
+
 struct Live {
     id: u64,
     session: BrokerSession,
@@ -208,6 +257,7 @@ impl Hub {
             changed: Notify::new(),
             auth: Arc::new(Semaphore::new(4)),
             ws_auth: Arc::new(Semaphore::new(WS_PREAUTH_SLOTS)),
+            argon: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
             ws_refused_tls: AtomicU64::new(0),
             ws_refused_auth: AtomicU64::new(0),
             next: AtomicU64::new(1),
@@ -260,10 +310,49 @@ impl Hub {
         }
     }
 
+    /// Write the counts the rate limiter swallowed (#219). For every window
+    /// older than [`AUDIT_WINDOW`] at `now`, a summary entry when anything
+    /// is pending; the window is then dropped, so the agent's next event
+    /// writes at once. Without this a burst followed by silence would never
+    /// reach the log. The sink runs after the `limits` lock is released.
+    pub fn flush_audit(&self, now: Instant) {
+        self.flush_where(|w| now.saturating_duration_since(w.start) >= AUDIT_WINDOW);
+    }
+
+    /// Shutdown: a summary entry for every window with a pending count,
+    /// open or not, then forget all windows (#219).
+    pub fn flush_audit_all(&self) {
+        self.flush_where(|_| true);
+    }
+
+    /// Drain the windows `expired` selects under the lock, then write the
+    /// summaries with it released.
+    fn flush_where(&self, expired: impl Fn(&Window) -> bool) {
+        let mut out = Vec::new();
+        {
+            let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+            let Limits {
+                auth_fail,
+                replaced,
+            } = &mut *limits;
+            drain_windows(auth_fail, Event::ConnectorAuthFail, &mut out, &expired);
+            drain_windows(replaced, Event::ConnectorReplaced, &mut out, &expired);
+        }
+        for entry in out {
+            self.emit(entry);
+        }
+    }
+
     /// WebSocket sockets that are past the upgrade but have not finished
     /// the Argon2id check. At most [`WS_PREAUTH_SLOTS`].
     pub fn ws_preauth_in_flight(&self) -> usize {
         WS_PREAUTH_SLOTS.saturating_sub(self.ws_auth.available_permits())
+    }
+
+    /// Argon2id evaluations running now, across both transports. At most
+    /// [`ARGON2_CONCURRENCY`].
+    pub fn argon_in_flight(&self) -> usize {
+        ARGON2_CONCURRENCY.saturating_sub(self.argon.available_permits())
     }
 
     fn report(&self, event: ConnectorEvent) {
@@ -393,13 +482,14 @@ pub async fn accept(listener: TcpListener, tls: Arc<rustls::ServerConfig>, hub: 
             let Ok(permit) = hub.auth.clone().try_acquire_owned() else {
                 return;
             };
+            let deadline = Instant::now() + RAW_PREAUTH_DEADLINE;
             authenticate_and_serve(
                 tcp,
                 peer,
                 SessionTransport::Tls,
                 acceptor,
                 hub,
-                Duration::from_secs(10),
+                deadline,
                 permit,
                 None,
             )
@@ -419,41 +509,57 @@ async fn stopped(stop: &mut Option<watch::Receiver<bool>>) {
     std::future::pending::<()>().await;
 }
 
-/// The pre-auth half: inner TLS, hello, Argon2id. `permit` is dropped as
-/// soon as the Argon2id result is known.
+/// The pre-auth half: inner TLS, hello, Argon2id. All of it, up to the
+/// start of the hash, must finish by `deadline`. `permit` (the pre-auth
+/// slot) is dropped as soon as the Argon2id result is known.
 async fn authenticate<S>(
     stream: S,
     peer: SocketAddr,
     transport: SessionTransport,
     acceptor: TlsAcceptor,
     hub: &Arc<Hub>,
-    deadline: Duration,
+    deadline: Instant,
     permit: OwnedSemaphorePermit,
 ) -> Option<(tokio_rustls::server::TlsStream<S>, String)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Ok(Ok(mut tls)) = tokio::time::timeout(deadline, acceptor.accept(stream)).await else {
+    let Ok(Ok(mut tls)) = timeout_at(deadline, acceptor.accept(stream)).await else {
         if transport == SessionTransport::Ws {
             hub.ws_refused_tls.fetch_add(1, Ordering::Relaxed);
         }
         return None;
     };
-    let hello =
-        match tokio::time::timeout(Duration::from_secs(5), read_client_hello(&mut tls)).await {
-            Ok(Ok(hello)) => hello,
-            _ => {
-                if transport == SessionTransport::Ws {
-                    hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
-                }
-                let _ = write_server_hello(&mut tls, AUTH_PROTOCOL).await;
-                return None;
+    let hello = match timeout_at(deadline, read_client_hello(&mut tls)).await {
+        Ok(Ok(hello)) => hello,
+        _ => {
+            if transport == SessionTransport::Ws {
+                hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
             }
-        };
+            let _ = write_server_hello(&mut tls, AUTH_PROTOCOL).await;
+            return None;
+        }
+    };
+    // At most `ARGON2_CONCURRENCY` evaluations run at once, across both
+    // transports. The wait is bounded by the socket's deadline; running out
+    // of time here writes no server hello, so a legitimate client sees a
+    // disconnect and retries with jitter instead of the 60 s refusal wait.
+    let Ok(Ok(argon)) = timeout_at(deadline, hub.argon.clone().acquire_owned()).await else {
+        if transport == SessionTransport::Ws {
+            hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            hub.report(ConnectorEvent::Busy { peer });
+        }
+        return None;
+    };
     let agent_id = hello.agent_id.clone();
     let token = hello.token.clone();
     let tokens_hub = Arc::clone(hub);
+    // The Argon2id permit moves into the blocking task: it is released when
+    // the hash returns, even if this future was dropped meanwhile. A hash
+    // that has started is not bounded by the deadline; the Argon2 params are.
     let authed = tokio::task::spawn_blocking(move || {
+        let _argon = argon;
         tokens_hub
             .tokens
             .authenticate_for(&agent_id, token.as_str())
@@ -489,7 +595,7 @@ async fn authenticate_and_serve<S>(
     transport: SessionTransport,
     acceptor: TlsAcceptor,
     hub: Arc<Hub>,
-    deadline: Duration,
+    deadline: Instant,
     permit: OwnedSemaphorePermit,
     mut stop: Option<watch::Receiver<bool>>,
 ) where
@@ -524,4 +630,141 @@ async fn authenticate_and_serve<S>(
         secs: since.elapsed().as_secs(),
         replaced: replaced.load(Ordering::SeqCst),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
+    use std::sync::Mutex;
+
+    fn hub() -> (Hub, Arc<Mutex<Vec<Entry>>>) {
+        let floor = ParamFloor {
+            m_cost: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let argon = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(8, 1, 1, None).unwrap(),
+        );
+        let (_, a) = generate_tunnel_with(&argon, "assistant");
+        let (_, b) = generate_tunnel_with(&argon, "other");
+        let store = TokenStore::with_floor_and_prefix(
+            [("assistant", a.as_str()), ("other", b.as_str())],
+            &floor,
+            TUNNEL_PREFIX,
+        )
+        .unwrap();
+        let hub = Hub::with_events(store, Arc::new(|_| {}));
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&entries);
+        hub.set_audit(Arc::new(move |e| {
+            sink.lock().unwrap().push(e);
+            Ok(())
+        }));
+        (hub, entries)
+    }
+
+    /// Count one `replaced` event for `agent` the way `insert` does.
+    fn replaced_event(hub: &Hub, agent: &str, now: Instant) {
+        let due = {
+            let mut limits = hub.limits.lock().unwrap();
+            admit(&mut limits.replaced, agent, now)
+        };
+        if let Some(suppressed) = due {
+            hub.emit(
+                Entry::new(Event::ConnectorReplaced)
+                    .agent_id(agent)
+                    .suppressed(suppressed),
+            );
+        }
+    }
+
+    fn summaries(entries: &Mutex<Vec<Entry>>, event: Event, agent: &str) -> Vec<Entry> {
+        entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.event == event
+                    && e.agent_id.as_deref() == Some(agent)
+                    && e.result.as_deref() == Some("suppressed_only")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Both windows of one agent and one window of another flush on their
+    /// own: one summary each where something is pending, none elsewhere.
+    #[tokio::test(start_paused = true)]
+    async fn flush_is_per_agent_and_event() {
+        let (hub, entries) = hub();
+        let t0 = Instant::now();
+        // assistant: auth_fail pending 2, replaced pending 1.
+        for _ in 0..3 {
+            hub.audit_auth_fail("assistant", SessionTransport::Tls);
+        }
+        replaced_event(&hub, "assistant", t0);
+        replaced_event(&hub, "assistant", t0);
+        // other: auth_fail pending 0, replaced pending 4.
+        hub.audit_auth_fail("other", SessionTransport::Tls);
+        for _ in 0..5 {
+            replaced_event(&hub, "other", t0);
+        }
+        hub.flush_audit(t0 + AUDIT_WINDOW);
+        let a = summaries(&entries, Event::ConnectorAuthFail, "assistant");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].suppressed, Some(2));
+        let r = summaries(&entries, Event::ConnectorReplaced, "assistant");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].suppressed, Some(1));
+        assert!(summaries(&entries, Event::ConnectorAuthFail, "other").is_empty());
+        let r = summaries(&entries, Event::ConnectorReplaced, "other");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].suppressed, Some(4));
+        assert!(r[0].transport.is_none() && r[0].old_session_secs.is_none());
+    }
+
+    /// A window that expires with nothing pending writes nothing and is
+    /// dropped, so the next event is a fresh first event.
+    #[tokio::test(start_paused = true)]
+    async fn expired_empty_window_writes_nothing() {
+        let (hub, entries) = hub();
+        let t0 = Instant::now();
+        replaced_event(&hub, "assistant", t0);
+        assert_eq!(entries.lock().unwrap().len(), 1);
+        hub.flush_audit(t0 + AUDIT_WINDOW);
+        assert_eq!(entries.lock().unwrap().len(), 1, "nothing was pending");
+        assert!(
+            hub.limits.lock().unwrap().replaced.is_empty(),
+            "the expired window was dropped"
+        );
+        replaced_event(
+            &hub,
+            "assistant",
+            t0 + AUDIT_WINDOW + Duration::from_secs(1),
+        );
+        let all = entries.lock().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].suppressed, Some(0));
+    }
+
+    /// Open windows with pending counts are written by `flush_audit_all`
+    /// and both maps are cleared.
+    #[tokio::test(start_paused = true)]
+    async fn flush_all_covers_replaced_and_clears() {
+        let (hub, entries) = hub();
+        let t0 = Instant::now();
+        replaced_event(&hub, "assistant", t0);
+        replaced_event(&hub, "assistant", t0);
+        replaced_event(&hub, "assistant", t0);
+        hub.flush_audit_all();
+        let r = summaries(&entries, Event::ConnectorReplaced, "assistant");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].suppressed, Some(2));
+        let limits = hub.limits.lock().unwrap();
+        assert!(limits.auth_fail.is_empty() && limits.replaced.is_empty());
+    }
 }

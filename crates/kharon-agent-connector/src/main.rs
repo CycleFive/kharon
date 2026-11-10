@@ -558,6 +558,7 @@ async fn run_until_signal(params: AgentParams, at: At) {
             && let Some(line) = outage.on_failure(
                 Instant::now(),
                 result.as_ref().err().unwrap_or(&ClientError::Disconnected),
+                &at,
             )
         {
             eprintln!("{line}");

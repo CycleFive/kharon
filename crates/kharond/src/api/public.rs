@@ -41,6 +41,7 @@ use super::core::{Broker, VaultView};
 use super::error::{ApiError, Detail, ErrorCode};
 use super::http::{AppState, TlsListener, error};
 use super::mcp::MCP_PATH;
+use super::transport::ClientIp;
 use crate::connector::WsEntry;
 use crate::lock::Clock;
 
@@ -198,6 +199,11 @@ where
     match admit(req.method(), req.uri().path()) {
         Some(Admit::Mcp) => {
             req.extensions_mut().insert(PublicIngress);
+            // This listener is the trusted-proxy trust root (#200):
+            // only here may CF-Connecting-IP name the client. No
+            // usable header value: the edge peer is the key.
+            let ip = client_ip(req.headers(), true).unwrap_or_else(|| peer.ip());
+            req.extensions_mut().insert(ClientIp(ip));
             super::mcp::handle(state, req).await
         }
         // Without `[connector] websocket = true` the route is

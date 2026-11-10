@@ -68,6 +68,7 @@ use super::notify::ApprovalNotifier;
 use super::rate::{FillBacking, RateDenied, RateLimiter, RatePolicy};
 use super::rollback::RollbackGuard;
 use super::token::TokenStore;
+use super::transport::TransportLimits;
 use crate::audit::{AuditLog, Entry, Event};
 use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin, ValuesSent};
 use crate::lock::{AuditError, Clock, LockController, LockEvent, LockReason, SystemClock};
@@ -413,6 +414,11 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// REQ-REV-001). Separate from the lock controller so owner
     /// revoke/panic never needs the session.
     rates: Mutex<RateLimiter>,
+    /// Transport-level `/mcp` budgets (#200): per client IP before
+    /// auth, per agent after. On the broker because both `/mcp`
+    /// listeners (tailnet `[api]`, `[public_ingress]`) share it, so
+    /// an agent's budget is one budget across both.
+    transport: TransportLimits,
     /// Sync rollback high-water marks since unlock (REQ-REV-004).
     rollback: Mutex<RollbackGuard>,
 }
@@ -572,6 +578,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             approval_tokens: Mutex::new(ApprovalTokenStore::new()),
             approval_notifier: None,
             rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
+            transport: TransportLimits::new(),
             rollback: Mutex::new(RollbackGuard::new()),
         }
     }
@@ -786,6 +793,20 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             return Err(ApiError::INVALID_TOKEN);
         }
         Ok(AgentId(id))
+    }
+
+    /// Transport budget for one `/mcp` request from client `ip`,
+    /// checked *before* [`Self::authenticate`] so a bad-token flood
+    /// is refused before it costs an Argon2id evaluation (#200).
+    /// `ip` is the effective client address (see
+    /// [`super::transport::client_ip`]): a throttle key only.
+    pub fn transport_ip_admit(&self, ip: std::net::IpAddr, now: Instant) -> bool {
+        self.transport.check_ip(ip, now)
+    }
+
+    /// Transport budget for one authenticated `/mcp` request (#200).
+    pub fn transport_agent_admit(&self, agent: &AgentId, now: Instant) -> bool {
+        self.transport.check_agent(&agent.0, now)
     }
 
     /// Run `req` for `agent`.

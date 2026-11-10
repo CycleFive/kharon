@@ -43,9 +43,11 @@
 //!
 //! Order per request: method (405, `Allow: POST`), `Origin` (403 — a
 //! browser page must not drive the broker, MCP's DNS-rebinding rule
-//! taken to its strict form), bearer token (401, the same Argon2id
-//! path and semaphore as `/v1/*`), content type and size (400), then
-//! JSON-RPC. Everything before JSON-RPC answers with the `/v1/*` error
+//! taken to its strict form), the per-IP transport window (429, #200:
+//! charged before auth so bad tokens cost no Argon2id), bearer token
+//! (401, the same Argon2id path and semaphore as `/v1/*`), the
+//! per-agent transport window (429, #200), content type and size
+//! (400; 413 past the caps), then JSON-RPC. Everything before JSON-RPC answers with the `/v1/*` error
 //! body. JSON-RPC protocol errors use fixed messages ([`RpcError`]);
 //! tool errors are results with `isError: true` whose text is the
 //! [`ApiError`] body. No response here interpolates request data,
@@ -75,6 +77,7 @@ use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillArgs, FillOperation, FillTotpArgs, parse_fill};
 use super::grant::{GrantArgs, parse_grant};
 use super::http::{AppState, authenticate, bearer_token, error, json_response};
+use super::transport::ClientIp;
 use crate::lock::Clock;
 use tokio::time::Instant;
 
@@ -834,12 +837,26 @@ where
             Detail::BrowserOriginRefused,
         ));
     }
+    // Transport budgets (#200): the per-IP window is charged before
+    // auth, so a bad-token flood is refused before it costs an
+    // Argon2id evaluation; the per-agent window after. The client IP
+    // is the admitting listener's call (see api::transport's
+    // contract); a handler invoked without one skips the IP window.
+    let client_ip = req.extensions().get::<ClientIp>().map(|c| c.0);
+    if let Some(ip) = client_ip
+        && !state.broker.transport_ip_admit(ip, received)
+    {
+        return error(ApiError::RATE_LIMITED);
+    }
     let token = bearer_token(&req);
     let (parts, body) = req.into_parts();
     let agent = match authenticate(&state, token).await {
         Ok(a) => a,
         Err(e) => return error(e),
     };
+    if !state.broker.transport_agent_admit(&agent, received) {
+        return error(ApiError::RATE_LIMITED);
+    }
     if !is_json(&parts.headers) {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
     }

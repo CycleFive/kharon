@@ -125,6 +125,12 @@ pub struct Hub {
     auth: Arc<Semaphore>,
     /// Pre-auth budget of the WebSocket path, separate from `auth` (#199).
     ws_auth: Arc<Semaphore>,
+    /// WebSocket connections refused after the ClientHello gate, since the
+    /// last per-minute line: the inner TLS handshake failed or timed out
+    /// (`tls`), and the hello was malformed, timed out or carried a refused
+    /// credential (`auth`). Counted, never reported per event (#199).
+    ws_refused_tls: AtomicU64,
+    ws_refused_auth: AtomicU64,
     next: AtomicU64,
     events: EventSink,
     /// Audit sink; unset means the connector writes no audit entries.
@@ -202,6 +208,8 @@ impl Hub {
             changed: Notify::new(),
             auth: Arc::new(Semaphore::new(4)),
             ws_auth: Arc::new(Semaphore::new(WS_PREAUTH_SLOTS)),
+            ws_refused_tls: AtomicU64::new(0),
+            ws_refused_auth: AtomicU64::new(0),
             next: AtomicU64::new(1),
             events,
             audit: OnceLock::new(),
@@ -426,12 +434,18 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let Ok(Ok(mut tls)) = tokio::time::timeout(deadline, acceptor.accept(stream)).await else {
+        if transport == SessionTransport::Ws {
+            hub.ws_refused_tls.fetch_add(1, Ordering::Relaxed);
+        }
         return None;
     };
     let hello =
         match tokio::time::timeout(Duration::from_secs(5), read_client_hello(&mut tls)).await {
             Ok(Ok(hello)) => hello,
             _ => {
+                if transport == SessionTransport::Ws {
+                    hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
+                }
                 let _ = write_server_hello(&mut tls, AUTH_PROTOCOL).await;
                 return None;
             }
@@ -452,7 +466,13 @@ where
         }
         Some((tls, hello.agent_id))
     } else {
-        hub.report(ConnectorEvent::Refused { peer });
+        // The raw listener logs each refusal (#150). On the public path any
+        // stranger can reach this, so a refusal is only counted.
+        if transport == SessionTransport::Ws {
+            hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            hub.report(ConnectorEvent::Refused { peer });
+        }
         hub.audit_auth_fail(&hello.agent_id, transport);
         let _ = write_server_hello(&mut tls, AUTH_UNAUTHORIZED).await;
         None

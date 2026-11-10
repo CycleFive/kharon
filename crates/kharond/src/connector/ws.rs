@@ -103,11 +103,13 @@ impl WsEntry {
         let budget = self.refusals.budget.swap(0, Ordering::Relaxed);
         let protocol = self.refusals.protocol.swap(0, Ordering::Relaxed);
         let hello = self.refusals.hello.swap(0, Ordering::Relaxed);
-        let total = budget + protocol + hello;
+        let tls = self.hub.ws_refused_tls.swap(0, Ordering::Relaxed);
+        let auth = self.hub.ws_refused_auth.swap(0, Ordering::Relaxed);
+        let total = budget + protocol + hello + tls + auth;
         (total > 0).then(|| {
             format!(
-                "connector: refused {total} websocket upgrades in the last 60s \
-                 (budget {budget}, protocol {protocol}, hello {hello})"
+                "connector: refused {total} websocket connections in the last 60s \
+                 (budget {budget}, protocol {protocol}, hello {hello}, tls {tls}, auth {auth})"
             )
         })
     }

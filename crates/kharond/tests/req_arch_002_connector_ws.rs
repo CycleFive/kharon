@@ -315,7 +315,9 @@ async fn ws_non_clienthello_first_record_closes_before_rustls() {
     eventually("hello refusals counted", || {
         if let Some(line) = rig.ws.take_refusal_line() {
             assert!(line.contains("budget 0, protocol 0"), "{line}");
-            let n = line.rsplit("hello ").next().unwrap().trim_end_matches(')');
+            assert!(line.contains("tls 0, auth 0)"), "{line}");
+            let n = line.split("hello ").nth(1).unwrap();
+            let n = n.split(',').next().unwrap();
             counted += n.parse::<u32>().unwrap();
         }
         counted == 4
@@ -444,8 +446,83 @@ async fn ws_inner_tls12_refused() {
     .expect("handshake hung");
     assert!(result.is_err(), "a TLS 1.2 handshake must not complete");
     eventually("slot released", || rig.hub.ws_preauth_in_flight() == 0).await;
-    // A ClientHello passes the gate: this was a version refusal.
-    assert_eq!(rig.ws.take_refusal_line(), None);
+    // A ClientHello passes the gate: this was a failed inner handshake,
+    // counted under `tls`.
+    let line = rig.ws.take_refusal_line().expect("the failure is counted");
+    assert_eq!(
+        line,
+        "connector: refused 1 websocket connections in the last 60s \
+         (budget 0, protocol 0, hello 0, tls 1, auth 0)"
+    );
+}
+
+/// A refused credential on the public path is counted, never reported per
+/// event: any stranger who completes inner TLS can produce one (#199).
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_refused_credential_is_counted_not_logged() {
+    let rig = rig().await;
+    for _ in 0..3 {
+        let bad = ws_dial(&rig, &format!("{}nope", rig.token));
+        let err = kharon_connector::connect_and_auth(&bad).await.err();
+        assert_eq!(err, Some(ClientError::Unauthorized));
+    }
+    eventually("slots released", || rig.hub.ws_preauth_in_flight() == 0).await;
+    assert!(
+        !rig.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ConnectorEvent::Refused { .. })),
+        "no per-event line on the websocket path"
+    );
+    let line = rig.ws.take_refusal_line().expect("refusals are counted");
+    assert_eq!(
+        line,
+        "connector: refused 3 websocket connections in the last 60s \
+         (budget 0, protocol 0, hello 0, tls 0, auth 3)"
+    );
+
+    // The raw listener keeps its #150 line.
+    let raw = AgentParams {
+        token: Zeroizing::new(format!("{}nope", rig.token)),
+        ..raw_dial(&rig)
+    };
+    assert_eq!(
+        kharon_connector::connect_and_auth(&raw).await.err(),
+        Some(ClientError::Unauthorized)
+    );
+    eventually("raw refusal logged", || {
+        rig.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ConnectorEvent::Refused { .. }))
+    })
+    .await;
+    assert_eq!(
+        rig.ws.take_refusal_line(),
+        None,
+        "the raw path is not counted"
+    );
+}
+
+/// A malformed hello after the inner handshake counts under `auth`.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_malformed_hello_counts_as_auth() {
+    let rig = rig().await;
+    let ws = raw_ws(rig.public).await;
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = inner_client(&rig, &[&rustls::version::TLS13])
+        .connect(name, WsByteStream::new(ws))
+        .await
+        .expect("inner TLS 1.3");
+    tls.write_all(b"not a hello record\n").await.unwrap();
+    tls.flush().await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf)).await;
+    eventually("slot released", || rig.hub.ws_preauth_in_flight() == 0).await;
+    let line = rig.ws.take_refusal_line().expect("counted");
+    assert!(line.ends_with("hello 0, tls 0, auth 1)"), "{line}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

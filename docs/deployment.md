@@ -313,12 +313,15 @@ its TLS version set.
 
 ```toml
 [connector]
-tls_cert_file = "/etc/kharon/connector.crt"   # the pinned key, both transports
-tls_key_file  = "/etc/kharon/connector.key"
+tls_cert_file = "/etc/kharon/tls.crt"         # the pinned key, both transports
+tls_key_file  = "/etc/kharon/tls.key"
 websocket = true                               # serve GET /connector on [public_ingress]
 # listen = "100.64.0.10:8789"                  # optional: also keep the raw pinned-TLS listener
 ```
 
+- With the Compose example nothing is mounted at `/etc/kharon/tls.crt`
+  and `tls.key`: bind-mount them with the `docker-compose.override.yml`
+  shown under Path (B) above (read-only, key `0400`, uid 10001).
 - `websocket = true` requires `[public_ingress]`; kharond refuses to
   start without it (`connector_websocket_needs_public_ingress`).
 - `listen` is optional. Set at least one of `listen` and
@@ -349,22 +352,32 @@ kharond writes log lines, not one per stranger:
 ```text
 agent connector attached: agent=assistant transport=ws peer=127.0.0.1:41822
 agent connector detached: agent=assistant transport=ws peer=127.0.0.1:41822 after=3600s
-connector: refused 37 websocket upgrades in the last 60s (budget 12, protocol 20, hello 5)
+connector: refused 37 websocket connections in the last 60s (budget 12, protocol 10, hello 5, tls 4, auth 6)
 ```
 
 The last line appears at most once a minute, and only when something
-was refused. Two events are audit entries (`kharon audit verify`
+was refused. A refusal on the WebSocket path is counted, never logged
+one by one: `budget` is a full pre-auth budget (503), `protocol` a bad
+upgrade request, `hello` a first inner record that is not a TLS
+ClientHello, `tls` an inner TLS handshake that failed or timed out, and
+`auth` a hello record that was malformed or timed out, or a tunnel
+credential that was refused. (The raw `[connector].listen` listener still
+logs `agent connector refused a credential` once per refusal.) Two events are audit entries (`kharon audit verify`
 covers them), each at most once per agent per minute, with a
 `suppressed` count for the refusals folded into the next entry:
 
 - `connector_auth_fail`: a hello named a configured agent id and the
   tunnel credential was refused. Fields: `agent_id`, `transport`
   (`tls` or `ws`), `detail_code` (`unauthorized`) and `suppressed`.
-  Unknown agent ids and junk are only counted in the log line above.
+  Unknown agent ids and junk are only counted in the log line above
+  (`auth`).
 - `connector_replaced`: a new session evicted a live one for the same
   agent. Fields: `agent_id`, the new session's `transport`,
   `old_session_secs` and `suppressed`. Unexpected replacement means
-  someone else holds the tunnel credential: mint a new one.
+  someone else holds the tunnel credential: mint a new one. First rule
+  out your own `kharon-agent-connector --check`: a successful check
+  authenticates, so it replaces the running connector's session (a fill
+  in flight fails) and writes one `connector_replaced`.
 
 Both appends are best effort; a failed append is logged and never
 blocks authentication.
@@ -555,9 +568,11 @@ bypasses it and reaches, with none of the public-side limits:
 Don't set *HTTP Host Header* on a route.
 
 `/connector` is a WebSocket, so the zone's **Network → WebSockets**
-setting must be on (it is by default). Cloudflare closes an idle
-proxied WebSocket after about 100 seconds; the connector's mux pings
-every 20 seconds, which keeps it open. Cloudflare also drops long-lived
+setting must be on (it is by default: Cloudflare supports proxied
+WebSocket connections without additional configuration). Cloudflare
+closes idle WebSockets after a period it does not publish; the
+connector's mux pings every 20 seconds, which keeps the connection
+busy. Cloudflare also drops long-lived
 WebSockets during edge restarts, and the connector reconnects.
 
 **Cloudflare-side changes (the tunnel, its DNS record, WAF and rate
@@ -950,7 +965,9 @@ listen`) and `BROKER_URL` (`wss://broker.example.net/connector`, the
 public gateway; see
 [Over WebSocket](#over-websocket-through-the-public-gateway-199)).
 The script refuses both or neither, and refuses a `BROKER_URL` that
-does not start with `wss://`. With `BROKER_URL` it writes
+does not start with `wss://` or that contains `?`, `#` or `@` (a
+query, a fragment or userinfo, which the connector's own `broker_url`
+parser refuses too). With `BROKER_URL` it writes
 `transport = "ws"` and `broker_url` to the connector config instead
 of `broker`. `BROKER_PIN` is required either way.
 
@@ -1039,10 +1056,34 @@ fail upgrade: websocket upgrade answered 502
 check: failed
 ```
 
+A successful check ends with a fixed note:
+
+```text
+ok auth
+note: a successful check replaces this agent's live broker session
+check: ok
+```
+
+`--check` authenticates for real, and the broker keeps one session per
+agent. A successful check therefore replaces the running connector's
+session on that broker: a fill in flight fails, the running connector
+reconnects by itself, and the broker writes one `connector_replaced`
+audit entry (see above). Run `--check` while the service is stopped, or
+accept the reconnect. Do not put it in a health probe.
+
 Exit codes: 0 when auth succeeded, 69 when a leg failed, 78 for a
 config error. The legs are `dns`, `tcp`, `proxy`, `outer-tls`,
 `upgrade`, `inner-tls` and `auth`. Log lines are fixed text and never
-carry the token, a proxy credential or a peer's response body.
+carry the token, a proxy credential or a peer's response body. The
+`dns` line names the host that did not resolve
+(`cannot resolve the broker host (broker.example.net)`, or `the proxy
+host`), the `tcp` line names the address dialed (the proxy's when one
+is configured), and the `outer-tls` line names a certificate class:
+`untrusted issuer`, `name mismatch`, `expired or not yet valid`,
+`other certificate error` or `handshake failed`. A name lookup that
+takes longer than 10 seconds is reported as the `dns` leg. When the
+service ends a session it logs `session ended after <duration>;
+reconnecting`.
 
 The service retries with exponential backoff and full jitter, from 1
 second to a 30-second cap. A rejected tunnel credential and a proxy
@@ -1062,6 +1103,7 @@ When the failing leg is `upgrade`, the status is printed as received:
 | `websocket upgrade answered 502` | the origin is down (kharond or cloudflared); also 52x from Cloudflare |
 | `websocket upgrade answered 503` | kharond's pre-auth budget is full; retry, and see the rate-limit rule |
 | `websocket upgrade answered 400` / `403` | the request was malformed, or something added an `Origin` header |
+| `websocket upgrade answered 101 without the kharon-connector.v1 subprotocol` | the upgrade succeeded, but whatever answered is not kharond's `/connector` (or is an older build): check the route |
 
 Point the agent harness at `https://203.0.113.4:8787` with its agent
 API token, and trust the broker certificate there. The connector does

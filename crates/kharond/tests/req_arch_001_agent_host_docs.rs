@@ -515,4 +515,48 @@ fn req_dep_005_connector_script_takes_broker_url_for_the_websocket_transport() {
     let section = agent_host_section(&guide).unwrap();
     assert!(section.contains("BROKER_URL"));
     assert!(section.contains("wss://"));
+    assert!(
+        section.contains("`?`, `#` or `@`"),
+        "the guide does not mention the BROKER_URL charset refusal"
+    );
+}
+
+/// The script's `BROKER_URL` charset refuses what the binary's own
+/// `broker_url` parser refuses: `?`, `#` and `@` (query, fragment,
+/// userinfo). Runs the script's own `case` pattern in bash.
+#[test]
+fn req_dep_005_connector_script_refuses_query_fragment_and_userinfo() {
+    let script = repo_file("deploy/agent-host/provision-connector.sh");
+    let pattern = script
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("*[!") && l.ends_with("*)"))
+        .and_then(|l| l.strip_suffix(')'))
+        .expect("the BROKER_URL charset pattern");
+    let verdict = |url: &str| {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "case \"$1\" in {pattern}) echo refused;; *) echo allowed;; esac"
+            ))
+            .arg("bash")
+            .arg(url)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    assert_eq!(
+        verdict("wss://broker.example.net:8443/connector"),
+        "allowed"
+    );
+    assert_eq!(verdict("wss://broker.example.net/a-b_c.d~e%20f"), "allowed");
+    for bad in [
+        "wss://u:p@broker.example.net/connector",
+        "wss://broker.example.net/connector?x=1",
+        "wss://broker.example.net/connector#frag",
+        "wss://broker.example.net/con nector",
+        "wss://broker.example.net/\"connector",
+    ] {
+        assert_eq!(verdict(bad), "refused", "{bad}");
+    }
 }

@@ -76,8 +76,8 @@ if [ -z "$BROKER_ADDR" ] && [ -z "$BROKER_URL" ]; then
 fi
 if [ -n "$BROKER_URL" ]; then
     case "$BROKER_URL" in
-        *[!A-Za-z0-9._~:/?#@%+=\&,-]*)
-            echo "provision-connector.sh: BROKER_URL has characters a URL does not need" >&2
+        *[!A-Za-z0-9._~:/%+=\&,-]*)
+            echo "provision-connector.sh: BROKER_URL has characters the connector refuses (no ?, # or @)" >&2
             exit 1
             ;;
         wss://*) ;;

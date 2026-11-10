@@ -26,16 +26,19 @@ token_hash = "$argon2id$..."
 # on each connect, so a Chromium restart needs no edit.
 cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # Path (B) over WebSocket, egress-shaped agent host, no VPN. See
-# docs/deployment.md, "Over WebSocket". connector_token_hash comes from
-# `kharon tunnel mint`, not `kharon token mint`. [connector] needs
+# docs/deployment.md, "Over WebSocket". connector_token_hash comes
+# from `kharon tunnel mint`, not `kharon token mint`. [connector] needs
 # [public_ingress] below. `listen` is left out on purpose: behind the
 # tunnel nothing needs a raw port (set it only to also keep the raw
 # pinned-TLS listener, on a VPN address, never a wildcard).
 # cdp = { endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }
+# The compose base mounts nothing at these paths: bind-mount the cert
+# and key with the docker-compose.override.yml in docs/deployment.md
+# (Path (B) broker), read-only, key mode 0400 for uid 10001.
 # [connector]
 # websocket = true
-# tls_cert_file = "/etc/kharon/connector.crt"
-# tls_key_file = "/etc/kharon/connector.key"
+# tls_cert_file = "/etc/kharon/tls.crt"
+# tls_key_file = "/etc/kharon/tls.key"
 
 # No [api] section: the agent API is off in this base. With
 # compose.vpn.yml, add (the wg address; wildcards are refused,
@@ -45,9 +48,9 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 
 # Public gateway (#198): the origin the Cloudflare Tunnel forwards to.
 # Agents reach POST /mcp here. Serves only POST /mcp (and GET
-# /connector with `[connector] websocket = true`); everything else is 404. Loopback needs
-# no TLS, and only what shares the holder's namespace (cloudflared)
-# reaches it. Tunnel route: http://127.0.0.1:8790. See
+# /connector with `[connector] websocket = true`); everything else
+# is 404. Loopback needs no TLS, and only what shares the holder's
+# namespace (cloudflared) reaches it. Tunnel route: http://127.0.0.1:8790. See
 # docs/deployment.md, "Public gateway".
 [public_ingress]
 listen = "127.0.0.1:8790"

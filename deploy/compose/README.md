@@ -87,7 +87,10 @@ path B.
   WebSocket needs no VPN: set `[connector] websocket = true` (with
   `[public_ingress]`, no `listen`), and the agent host dials
   `wss://<public host>/connector` through the tunnel (see "Over
-  WebSocket" in `docs/deployment.md`). `via = "wireguard"` still needs
+  WebSocket" in `docs/deployment.md`). The certificate and key it
+  names are not mounted by the compose base: add the read-only
+  bind-mount from the `docker-compose.override.yml` shown under "Path
+  (B) broker" in that guide. `via = "wireguard"` still needs
   `compose.vpn.yml`: kharond reaches the browser over the `wg` network
   (holder 10.66.0.1, agent host 10.66.0.2), and `[api]` over a VPN
   binds that address (add `[api]` with `listen = "10.66.0.1:8787"`; the

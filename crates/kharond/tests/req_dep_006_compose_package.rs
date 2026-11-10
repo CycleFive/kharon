@@ -245,8 +245,16 @@ fn n1_tunnel_routes_in_docs_use_127_0_0_1() {
         "connector_auth_fail",
         "connector_replaced",
         "websocket upgrade answered 503",
+        "refused 37 websocket connections in the last 60s",
+        "tls 4, auth 6)",
+        "replaces this agent's live broker session",
+        "websocket upgrade answered 101 without the kharon-connector.v1 subprotocol",
+        "closes idle WebSockets after a period it does not publish",
     ] {
         assert!(guide.contains(needle), "deployment guide lacks {needle}");
+    }
+    for stale in ["about 100 seconds", "websocket upgrades in the last 60s"] {
+        assert!(!guide.contains(stale), "deployment guide still says {stale}");
     }
     assert!(
         !guide.contains("404 until it lands"),

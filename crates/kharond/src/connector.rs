@@ -40,7 +40,7 @@ pub use kharon_connector::{
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 
 use crate::api::token::TokenStore;
@@ -136,6 +136,11 @@ pub const WS_PREAUTH_DEADLINE: Duration = Duration::from_secs(10);
 /// Pre-auth time of a raw socket, from accept to the start of the Argon2id
 /// check: the old 10 s TLS plus 5 s hello maximum.
 pub const RAW_PREAUTH_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The bound on a server-hello write that only tells a refused or
+/// malformed peer why it is being closed. A peer that never reads must not
+/// hold a pre-auth slot past the deadline for it (#220).
+const TRAILING_HELLO_WRITE: Duration = Duration::from_secs(1);
 
 /// Accepted connector sessions, keyed by agent id.
 pub struct Hub {
@@ -536,7 +541,11 @@ where
             if transport == SessionTransport::Ws {
                 hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
             }
-            let _ = write_server_hello(&mut tls, AUTH_PROTOCOL).await;
+            let _ = timeout(
+                TRAILING_HELLO_WRITE,
+                write_server_hello(&mut tls, AUTH_PROTOCOL),
+            )
+            .await;
             return None;
         }
     };
@@ -580,7 +589,11 @@ where
             hub.report(ConnectorEvent::Refused { peer });
         }
         hub.audit_auth_fail(&hello.agent_id, transport);
-        let _ = write_server_hello(&mut tls, AUTH_UNAUTHORIZED).await;
+        let _ = timeout(
+            TRAILING_HELLO_WRITE,
+            write_server_hello(&mut tls, AUTH_UNAUTHORIZED),
+        )
+        .await;
         None
     }
 }
@@ -766,5 +779,171 @@ mod tests {
         assert_eq!(r[0].suppressed, Some(2));
         let limits = hub.limits.lock().unwrap();
         assert!(limits.auth_fail.is_empty() && limits.replaced.is_empty());
+    }
+
+    /// A server-side stream that passes everything through until armed, then
+    /// never completes a write or flush: a peer that has stopped reading.
+    struct Stall<S> {
+        inner: S,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Stall<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Stall<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.armed.load(Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.armed.load(Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Drive `authenticate` over an in-memory stream whose server side stops
+    /// accepting writes right after the TLS handshake, send `hello_record`
+    /// (a whole length-prefixed record) and never read. Returns how long
+    /// `authenticate` took after the hello was sent; asserts it returned
+    /// `None`, released the slot, and never took the TLS-failure branch.
+    async fn stalled_refusal(hello_record: Vec<u8>) -> Duration {
+        use kharon_connector::{TlsVersions, connect_pinned_stream, server_config_from_pem_with};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let pin = kharon_connector::pin_of_der(certified.cert.der());
+        let server_cfg = server_config_from_pem_with(
+            certified.cert.pem().as_bytes(),
+            certified.key_pair.serialize_pem().as_bytes(),
+            TlsVersions::Tls13Only,
+        )
+        .unwrap();
+        let (hub, _entries) = hub();
+        let hub = Arc::new(hub);
+        let permit = hub.ws_auth.clone().try_acquire_owned().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = Stall {
+            inner: server_io,
+            armed: Arc::clone(&armed),
+        };
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // The pre-auth deadline is far past the 3 s ceiling below, so only
+        // the trailing-write bound can end `authenticate` in time.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let task = tokio::spawn({
+            let hub = Arc::clone(&hub);
+            async move {
+                authenticate(
+                    server,
+                    peer,
+                    SessionTransport::Ws,
+                    TlsAcceptor::from(server_cfg),
+                    &hub,
+                    deadline,
+                    permit,
+                )
+                .await
+                .is_none()
+            }
+        });
+        let mut client = connect_pinned_stream("localhost", pin, client_io, TlsVersions::Tls13Only)
+            .await
+            .unwrap();
+        // A TLS 1.3 server sends session tickets after the client's
+        // Finished, possibly after `connect` returned. Reading until quiet
+        // takes them in; the server's `accept` cannot complete before the
+        // client has sent everything it owes, so arming now can only stall
+        // the write that follows the hello.
+        let mut sink = [0u8; 1024];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(300), client.read(&mut sink)).await
+        {
+            assert!(n > 0, "server closed during the handshake");
+        }
+        armed.store(true, Ordering::SeqCst);
+        let sent = std::time::Instant::now();
+        client.write_all(&hello_record).await.unwrap();
+        client.flush().await.unwrap();
+        let none = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("authenticate did not return: the trailing write is unbounded")
+            .unwrap();
+        let took = sent.elapsed();
+        assert!(none, "authenticate refused the peer");
+        assert_eq!(
+            hub.ws_auth.available_permits(),
+            WS_PREAUTH_SLOTS,
+            "the pre-auth slot was released"
+        );
+        assert_eq!(
+            hub.ws_refused_tls.load(Ordering::Relaxed),
+            0,
+            "the stall landed in the TLS handshake, not the trailing write"
+        );
+        drop(client);
+        took
+    }
+
+    fn assert_bounded(took: Duration) {
+        assert!(
+            took >= Duration::from_millis(900),
+            "returned in {took:?}: the write was never stalled"
+        );
+        assert!(took < Duration::from_secs(3), "took {took:?}");
+    }
+
+    /// A malformed hello is answered with `AUTH_PROTOCOL`; a peer that never
+    /// reads cannot hold the slot past the 1 s write bound.
+    #[tokio::test]
+    async fn trailing_protocol_hello_write_is_bounded() {
+        // Length 0 is a protocol error.
+        let took = stalled_refusal(vec![0, 0, 0, 0]).await;
+        assert_bounded(took);
+    }
+
+    /// A well-formed hello with a wrong token is answered with
+    /// `AUTH_UNAUTHORIZED`; the same bound applies.
+    #[tokio::test]
+    async fn trailing_unauthorized_hello_write_is_bounded() {
+        let token = "kh_tunnel_assistant_00";
+        let mut body = Vec::new();
+        body.extend_from_slice(kharon_connector::MAGIC);
+        body.push(kharon_connector::WIRE_VERSION);
+        body.extend_from_slice(&(9u16).to_be_bytes());
+        body.extend_from_slice(b"assistant");
+        body.extend_from_slice(&(token.len() as u16).to_be_bytes());
+        body.extend_from_slice(token.as_bytes());
+        let mut record = (body.len() as u32).to_be_bytes().to_vec();
+        record.extend_from_slice(&body);
+        let took = stalled_refusal(record).await;
+        assert_bounded(took);
     }
 }

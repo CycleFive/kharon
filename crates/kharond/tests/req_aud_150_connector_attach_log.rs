@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use argon2::Argon2;
+use kharon_connector::Transport as Dial;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::connector::{
-    AgentParams, ClientError, ConnectorEvent, Dial, Hub, Transport, accept, pin_of_der,
-    run_agent_once, server_config_from_pem,
+    AgentParams, ClientError, ConnectorEvent, Hub, Transport, accept, pin_of_der, run_agent_once,
+    server_config_from_pem,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tokio::net::TcpListener;

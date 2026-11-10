@@ -197,15 +197,22 @@ fn refusal(status: StatusCode) -> Response {
     resp
 }
 
-/// Whether any value of `name` lists `token` (comma separated, ASCII
-/// case-insensitive).
-fn lists(headers: &HeaderMap, name: header::HeaderName, token: &str) -> bool {
+/// Whether any value of `name` lists `token` (comma separated; ASCII
+/// case-insensitive unless `exact`).
+fn lists(headers: &HeaderMap, name: header::HeaderName, token: &str, exact: bool) -> bool {
     headers
         .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .any(|t| t.trim().eq_ignore_ascii_case(token))
+        .map(str::trim)
+        .any(|t| {
+            if exact {
+                t == token
+            } else {
+                t.eq_ignore_ascii_case(token)
+            }
+        })
 }
 
 /// The upgrade checks. `Ok` holds the `Sec-WebSocket-Key`. A browser
@@ -224,10 +231,15 @@ fn check_upgrade(headers: &HeaderMap) -> Result<String, StatusCode> {
         .filter(|k| Base64::decode_vec(k).is_ok_and(|raw| raw.len() == 16));
     match key {
         Some(key)
-            if lists(headers, header::UPGRADE, "websocket")
-                && lists(headers, header::CONNECTION, "upgrade")
+            if lists(headers, header::UPGRADE, "websocket", false)
+                && lists(headers, header::CONNECTION, "upgrade", false)
                 && version_ok
-                && lists(headers, header::SEC_WEBSOCKET_PROTOCOL, WS_SUBPROTOCOL) =>
+                && lists(
+                    headers,
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    WS_SUBPROTOCOL,
+                    true,
+                ) =>
         {
             Ok(key.to_owned())
         }

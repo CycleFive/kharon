@@ -16,6 +16,7 @@ use std::time::Duration;
 use api_support::Harness;
 use argon2::Argon2;
 use futures_util::{SinkExt, StreamExt};
+use kharon_connector::Transport as Dial;
 use kharon_connector::WsByteStream;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::cdp::{
@@ -24,7 +25,7 @@ use kharond::cdp::{
 };
 use kharond::config::Config;
 use kharond::connector::{
-    AgentParams, ClientError, ConnectorEvent, Dial, Hub, Transport, WsEntry, accept, pin_of_der,
+    AgentParams, ClientError, ConnectorEvent, Hub, Transport, WsEntry, accept, pin_of_der,
     run_agent_once, server_config_from_pem,
 };
 use kharond::daemon::{self, PUBLIC_INGRESS_DRAIN};
@@ -420,7 +421,7 @@ async fn ws_upgrade_refusals() {
     )));
     assert!(lower.contains(&format!("sec-websocket-protocol: {SUBPROTOCOL}")));
 
-    let cases: [(&str, Edit, u16); 9] = [
+    let cases: [(&str, Edit, u16); 10] = [
         (
             "no subprotocol",
             Box::new(|l| l.retain(|h| !h.starts_with("Sec-WebSocket-Protocol"))),
@@ -432,6 +433,17 @@ async fn ws_upgrade_refusals() {
                 for h in l.iter_mut() {
                     if h.starts_with("Sec-WebSocket-Protocol") {
                         *h = "Sec-WebSocket-Protocol: other.v1".into();
+                    }
+                }
+            }),
+            400,
+        ),
+        (
+            "subprotocol in another case",
+            Box::new(|l| {
+                for h in l.iter_mut() {
+                    if h.starts_with("Sec-WebSocket-Protocol") {
+                        *h = "Sec-WebSocket-Protocol: Kharon-Connector.V1".into();
                     }
                 }
             }),
@@ -572,38 +584,69 @@ async fn ws_non_clienthello_first_record_closes_before_rustls() {
     eventually("slots released", || rig.hub.ws_preauth_in_flight() == 0).await;
 }
 
+fn inner_client(
+    rig: &Rig,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> tokio_rustls::TlsConnector {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(rig.cert_der.clone()))
+        .unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(versions)
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(client))
+}
+
+/// Upgrade, inner TLS 1.3, hello; `hello_sent` counts the hellos that
+/// are written and flushed. Then wait for the server hello.
+async fn hello_then_wait(rig: &Rig, token: String, hello_sent: Arc<AtomicUsize>) -> u8 {
+    let ws = raw_ws(rig.public).await;
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = inner_client(rig, &[&rustls::version::TLS13])
+        .connect(name, WsByteStream::new(ws))
+        .await
+        .expect("inner TLS 1.3");
+    kharon_connector::write_client_hello(&mut tls, "assistant", &token)
+        .await
+        .unwrap();
+    tls.flush().await.unwrap();
+    hello_sent.fetch_add(1, Ordering::SeqCst);
+    kharon_connector::read_server_hello(&mut tls).await.unwrap()
+}
+
 /// The window is the Argon2id verify: every token here costs about this
 /// much, so eight of them stay in flight while the ninth knocks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_preauth_budget_is_8_including_argon2() {
     // 64 MiB, 16 passes: well over a second a verify, and eight run at
     // once on the blocking pool.
-    let rig = rig_with(argon(65536, 16)).await;
-    let done = Arc::new(AtomicUsize::new(0));
+    let rig = Arc::new(rig_with(argon(65536, 16)).await);
+    let hello_sent = Arc::new(AtomicUsize::new(0));
     let mut clients = Vec::new();
     for _ in 0..8 {
-        let params = ws_dial(&rig, &rig.token);
-        let done = Arc::clone(&done);
+        let hello_sent = Arc::clone(&hello_sent);
+        let token = rig.token.clone();
+        let rig_ref = Arc::clone(&rig);
         clients.push(tokio::spawn(async move {
-            let session = kharon_connector::connect_and_auth(&params).await;
-            done.fetch_add(1, Ordering::SeqCst);
-            session.map(|_| ())
+            hello_then_wait(&rig_ref, token, hello_sent).await
         }));
     }
-    eventually("8 in flight", || rig.hub.ws_preauth_in_flight() == 8).await;
-    // Long enough for 8 local TLS handshakes and hello records, short of
-    // one verify: what is left in flight is in the Argon2id phase.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(done.load(Ordering::SeqCst), 0, "a verify finished early");
+    // Every hello is on the wire, and each verify takes over a second:
+    // the 8 slots are held through the Argon2id phase.
+    eventually("8 hellos sent", || hello_sent.load(Ordering::SeqCst) == 8).await;
     assert_eq!(rig.hub.ws_preauth_in_flight(), 8);
 
     let ninth = http(rig.public, &upgrade_request(|_| {})).await;
     assert_eq!(status(&ninth), 503, "{ninth}");
     assert_eq!(rig.hub.ws_preauth_in_flight(), 8, "the 503 took no slot");
-    assert_eq!(done.load(Ordering::SeqCst), 0, "a verify finished early");
 
     for client in clients {
-        client.await.unwrap().expect("authenticated");
+        assert_eq!(client.await.unwrap(), 0, "AUTH_OK");
     }
     eventually("slots released", || rig.hub.ws_preauth_in_flight() == 0).await;
     let line = rig.ws.take_refusal_line().unwrap();
@@ -630,6 +673,11 @@ async fn ws_slot_released_on_failure() {
         let mut ws = raw_ws(rig.public).await;
         ws.send(Message::Text("x".into())).await.unwrap();
         expect_close_without_bytes(&mut ws).await;
+        // Passes the gate, fails the handshake (TLS 1.2 only).
+        let ws = raw_ws(rig.public).await;
+        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let tls12 = inner_client(&rig, &[&rustls::version::TLS12]);
+        assert!(tls12.connect(name, WsByteStream::new(ws)).await.is_err());
         // Upgraded and abandoned.
         drop(raw_ws(rig.public).await);
     }
@@ -646,25 +694,18 @@ async fn ws_slot_released_on_failure() {
 async fn ws_inner_tls12_refused() {
     let rig = rig().await;
     let ws = raw_ws(rig.public).await;
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(rustls_pki_types::CertificateDer::from(rig.cert_der.clone()))
-        .unwrap();
-    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS12])
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
     let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
-    let stream = WsByteStream::new(ws);
-    let result = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, stream))
-        .await
-        .expect("handshake hung");
+    let connector = inner_client(&rig, &[&rustls::version::TLS12]);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(name, WsByteStream::new(ws)),
+    )
+    .await
+    .expect("handshake hung");
     assert!(result.is_err(), "a TLS 1.2 handshake must not complete");
     eventually("slot released", || rig.hub.ws_preauth_in_flight() == 0).await;
+    // A ClientHello passes the gate: this was a version refusal.
+    assert_eq!(rig.ws.take_refusal_line(), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -700,14 +741,11 @@ async fn raw_and_ws_sessions_replace_each_other() {
     let _ = tokio::time::timeout(Duration::from_secs(5), raw_task).await;
 }
 
-/// A held-open, authenticated session ends when the daemon stops, inside
-/// the drain bound, and `run()` returns.
-#[tokio::test(flavor = "multi_thread")]
-async fn ws_session_ends_at_shutdown() {
-    let dir = tempfile::tempdir().unwrap();
-    let cert = cert();
-    std::fs::write(dir.path().join("tls.crt"), &cert.pem_cert).unwrap();
-    std::fs::write(dir.path().join("tls.key"), &cert.pem_key).unwrap();
+/// A path-B daemon config on loopback ports: `[public_ingress]` plus the
+/// given `[connector]` lines. Returns the config text and the tunnel token.
+fn daemon_config(dir: &std::path::Path, cert: &Cert, connector: &str) -> (String, String) {
+    std::fs::write(dir.join("tls.crt"), &cert.pem_cert).unwrap();
+    std::fs::write(dir.join("tls.key"), &cert.pem_key).unwrap();
     let (secret, hash) = kharond::api::token::generate_tunnel("assistant");
     let token = secret.expose_secret().clone();
     let text = format!(
@@ -732,18 +770,75 @@ require_mlock = false
 listen = "127.0.0.1:0"
 
 [connector]
-websocket = true
+{connector}
 tls_cert_file = "{crt}"
 tls_key_file = "{key}"
 "#,
-        data = dir.path().join("data").display(),
+        data = dir.join("data").display(),
         export = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/export/password_protected.json"
         ),
-        crt = dir.path().join("tls.crt").display(),
-        key = dir.path().join("tls.key").display(),
+        crt = dir.join("tls.crt").display(),
+        key = dir.join("tls.key").display(),
     );
+    (text, token)
+}
+
+/// The raw listener of a started daemon keeps the default version set:
+/// a TLS 1.2-only client still completes the inner handshake there.
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_listener_still_accepts_tls12() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = cert();
+    let (text, _token) = daemon_config(
+        dir.path(),
+        &cert,
+        "listen = \"127.0.0.1:0\"\nwebsocket = true",
+    );
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    let raw = daemon.connector_addr().expect("raw listener");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(daemon.run(async {
+        let _ = stopped.await;
+    }));
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(cert.der.clone()))
+        .unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS12])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let tcp = TcpStream::connect(raw).await.unwrap();
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(name, tcp)
+        .await
+        .expect("TLS 1.2 on the raw listener");
+    assert_eq!(
+        tls.get_ref().1.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_2)
+    );
+    drop(tls);
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(PUBLIC_INGRESS_DRAIN + Duration::from_secs(2), server).await;
+}
+
+/// A held-open, authenticated session ends when the daemon stops, inside
+/// the drain bound, and `run()` returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_session_ends_at_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = cert();
+    let (text, token) = daemon_config(dir.path(), &cert, "websocket = true");
     let cfg = Config::from_toml_str(&text).unwrap();
     let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
         .await

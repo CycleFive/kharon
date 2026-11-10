@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use argon2::Argon2;
 use futures_util::{SinkExt, StreamExt};
+use kharon_connector::Transport as Dial;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::cdp::{
     Browser, CdpClient, CdpDial, CdpEndpoint, FieldFill, FieldKind, FillEngine, FillPlan,
     LiveOrigin, Tunnel, ValuesSent,
 };
 use kharond::connector::{
-    AgentParams, ClientError, Dial, Hub, accept, pin_of_der, run_agent_once, server_config_from_pem,
+    AgentParams, ClientError, Hub, accept, pin_of_der, run_agent_once, server_config_from_pem,
 };
 use kharond::origin::{OriginConfig, OriginMatcher};
 use rcgen::{CertifiedKey, generate_simple_self_signed};

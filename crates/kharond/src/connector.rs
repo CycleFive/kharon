@@ -25,11 +25,8 @@ use kharon_connector::{
     AUTH_OK, AUTH_PROTOCOL, AUTH_UNAUTHORIZED, BrokerSession, MuxIo, WS_PREAUTH_SLOTS,
     read_client_hello, spawn_broker, write_server_hello,
 };
-/// `Dial` is the agent-side dial enum (raw TLS or WebSocket); [`Transport`]
-/// is the broker-side label of a session.
 pub use kharon_connector::{
-    AgentParams, ClientError, Transport as Dial, connect_pinned, pin_of_der, run_agent_once,
-    server_config_from_pem,
+    AgentParams, ClientError, connect_pinned, pin_of_der, run_agent_once, server_config_from_pem,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;

@@ -18,6 +18,7 @@ on:
       - "crates/kharond/src/**"
       - "crates/kharon-cli/src/**"
       - "crates/kharond/tests/docker_support/**"
+      - "crates/kharond/tests/compose_support/**"
       - "crates/kharond/tests/req_dep_001_image.rs"
       - "crates/kharond/tests/req_dep_002_compose_e2e.rs"
       - "crates/kharond/tests/req_dep_006_compose_package.rs"

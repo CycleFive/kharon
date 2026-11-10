@@ -15,8 +15,15 @@
 #
 # Inputs (environment):
 #   CONNECTOR_BIN       required: path to the kharon-agent-connector binary
-#   BROKER_ADDR         required: host:port of the broker's connector listen
-#   BROKER_PIN          required: 64 hex chars, SHA-256 of the broker cert DER
+#   BROKER_ADDR         host:port of the broker's raw `[connector].listen`
+#                       (transport "tls"). Set exactly one of BROKER_ADDR
+#                       and BROKER_URL.
+#   BROKER_URL          wss://host[:port]/connector, the broker's public
+#                       gateway (transport "ws", through the Cloudflare
+#                       Tunnel; no VPN, no open inbound port). Must start
+#                       with wss://.
+#   BROKER_PIN          required with either: 64 hex chars, SHA-256 of the
+#                       broker's [connector] cert DER (the inner TLS)
 #   AGENT_ID            required: [a-z0-9-]{1,64}
 #   TUNNEL_TOKEN_FILE   required: file whose contents are the tunnel credential
 #   CDP_PORT            optional, default 9222
@@ -34,7 +41,8 @@
 set -euo pipefail
 
 : "${CONNECTOR_BIN:?set CONNECTOR_BIN to the connector binary}"
-: "${BROKER_ADDR:?set BROKER_ADDR to host:port of the broker connector listen}"
+BROKER_ADDR="${BROKER_ADDR:-}"
+BROKER_URL="${BROKER_URL:-}"
 : "${BROKER_PIN:?set BROKER_PIN to the SHA-256 hex of the broker certificate DER}"
 : "${AGENT_ID:?set AGENT_ID to the [agents.<id>] table name}"
 : "${TUNNEL_TOKEN_FILE:?set TUNNEL_TOKEN_FILE to the tunnel credential file}"
@@ -57,6 +65,27 @@ fi
 if [ ! -f "$TUNNEL_TOKEN_FILE" ]; then
     echo "provision-connector.sh: TUNNEL_TOKEN_FILE is not a file" >&2
     exit 1
+fi
+if [ -n "$BROKER_ADDR" ] && [ -n "$BROKER_URL" ]; then
+    echo "provision-connector.sh: set exactly one of BROKER_ADDR and BROKER_URL, not both" >&2
+    exit 1
+fi
+if [ -z "$BROKER_ADDR" ] && [ -z "$BROKER_URL" ]; then
+    echo "provision-connector.sh: set exactly one of BROKER_ADDR (host:port) and BROKER_URL (wss://...)" >&2
+    exit 1
+fi
+if [ -n "$BROKER_URL" ]; then
+    case "$BROKER_URL" in
+        *[!A-Za-z0-9._~:/%+=\&,-]*)
+            echo "provision-connector.sh: BROKER_URL has characters the connector refuses (no ?, # or @)" >&2
+            exit 1
+            ;;
+        wss://*) ;;
+        *)
+            echo "provision-connector.sh: BROKER_URL must start with wss://" >&2
+            exit 1
+            ;;
+    esac
 fi
 case "$AGENT_ID" in
     *[!a-z0-9-]*)
@@ -174,7 +203,12 @@ else
 fi
 
 {
-    printf 'broker = "%s"\n' "$BROKER_ADDR"
+    if [ -n "$BROKER_URL" ]; then
+        printf 'transport = "ws"\n'
+        printf 'broker_url = "%s"\n' "$BROKER_URL"
+    else
+        printf 'broker = "%s"\n' "$BROKER_ADDR"
+    fi
     printf 'broker_pin = "%s"\n' "$BROKER_PIN"
     printf 'agent_id = "%s"\n' "$AGENT_ID"
     printf 'token_file = "/etc/kharon-connector/token"\n'
@@ -213,4 +247,4 @@ systemctl daemon-reload
 systemctl enable -q browser.service kharon-agent-connector.service
 systemctl restart browser.service kharon-agent-connector.service
 
-echo "Agent connector ready. It dials ${BROKER_ADDR} and relays to 127.0.0.1:${CDP_PORT}."
+echo "Agent connector ready. It dials ${BROKER_URL:-$BROKER_ADDR} and relays to 127.0.0.1:${CDP_PORT}."

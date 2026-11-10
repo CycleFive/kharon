@@ -1005,8 +1005,14 @@ name = "kharon-agent-connector"
 version = "0.0.0"
 dependencies = [
  "kharon-connector",
+ "rand",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "toml",
  "zeroize",
 ]
@@ -1051,13 +1057,16 @@ name = "kharon-connector"
 version = "0.0.0"
 dependencies = [
  "base64ct",
+ "futures-util",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "zeroize",
 ]
 
@@ -1077,6 +1086,8 @@ dependencies = [
  "hkdf",
  "hmac",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "kharon-bwcrypto",
  "kharon-connector",
  "kharond",

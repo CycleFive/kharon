@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use argon2::Argon2;
+use kharon_connector::Transport as Dial;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::connector::{
-    AgentParams, ClientError, ConnectorEvent, Hub, accept, pin_of_der, run_agent_once,
-    server_config_from_pem,
+    AgentParams, ClientError, ConnectorEvent, Hub, SessionTransport, accept, pin_of_der,
+    run_agent_once, server_config_from_pem,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tokio::net::TcpListener;
@@ -74,7 +75,10 @@ async fn rig(token_ok: bool) -> Rig {
 
 fn params(rig: &Rig) -> AgentParams {
     AgentParams {
-        broker: rig.broker,
+        transport: Dial::Tls {
+            broker: rig.broker,
+            host: None,
+        },
         server_name: "127.0.0.1".into(),
         pin: rig.pin,
         agent_id: "assistant".into(),
@@ -83,6 +87,7 @@ fn params(rig: &Rig) -> AgentParams {
         cdp: "127.0.0.1:9".parse().unwrap(),
         proxy: None,
         proxy_creds: None,
+        outer_roots: None,
     }
 }
 
@@ -125,15 +130,21 @@ async fn req_aud_150_attach_and_detach_logged_once() {
 
     let seen = events(&rig);
     assert_eq!(seen.len(), 1, "{seen:?}");
-    let ConnectorEvent::Attached { agent_id, peer } = &seen[0] else {
+    let ConnectorEvent::Attached {
+        agent_id,
+        transport,
+        peer,
+    } = &seen[0]
+    else {
         panic!("expected an attach, got {seen:?}");
     };
     assert_eq!(agent_id, "assistant");
+    assert_eq!(*transport, SessionTransport::Tls);
     assert!(peer.ip().is_loopback(), "{peer}");
     let line = seen[0].to_string();
     assert_eq!(
         line,
-        format!("agent connector attached: agent=assistant peer={peer}")
+        format!("agent connector attached: agent=assistant transport=tls peer={peer}")
     );
     assert!(!line.contains(&rig.token));
     assert!(!line.contains(TUNNEL_PREFIX));
@@ -159,7 +170,7 @@ async fn req_aud_150_attach_and_detach_logged_once() {
     let line = seen[1].to_string();
     assert!(
         line.starts_with(&format!(
-            "agent connector detached: agent=assistant peer={peer} after="
+            "agent connector detached: agent=assistant transport=tls peer={peer} after="
         )),
         "{line}"
     );

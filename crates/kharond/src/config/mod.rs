@@ -377,6 +377,12 @@ pub enum ConfigError {
     /// Connector TLS files are missing.
     #[error("[connector] requires tls_cert_file and tls_key_file")]
     ConnectorTlsMissing,
+    /// `[connector]` has neither `listen` nor `websocket = true` (#199).
+    #[error("[connector] needs `listen`, `websocket = true`, or both")]
+    ConnectorNoTransport,
+    /// `websocket = true` without `[public_ingress]` to mount it on (#199).
+    #[error("[connector].websocket = true requires [public_ingress]")]
+    ConnectorWebsocketNeedsPublicIngress,
     /// The connector and the agent API cannot share a socket.
     #[error("[connector].listen and [api].listen must be different addresses")]
     ConnectorListenConflict,
@@ -507,6 +513,10 @@ impl ConfigError {
             Self::ConnectorWildcardBind => "connector_wildcard_bind",
             Self::ConnectorListenNotUnicast => "connector_listen_not_unicast",
             Self::ConnectorTlsMissing => "connector_tls_missing",
+            Self::ConnectorNoTransport => "connector_no_transport",
+            Self::ConnectorWebsocketNeedsPublicIngress => {
+                "connector_websocket_needs_public_ingress"
+            }
             Self::ConnectorListenConflict => "connector_listen_conflict",
             Self::ApiListenNotUnicast => "api_listen_not_unicast",
             Self::DataDirNotAbsolute => "data_dir_not_absolute",
@@ -919,9 +929,12 @@ pub struct TlsMaterial {
 /// `[connector]`: where agents dial for path B.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectorConfig {
-    /// Specific unicast address. Never a wildcard.
-    pub listen: SocketAddr,
-    /// Broker certificate presented to the agent.
+    /// The raw pinned-TLS listener. Specific unicast address, never a
+    /// wildcard. `None` when only `websocket` carries agents.
+    pub listen: Option<SocketAddr>,
+    /// Also accept agents on `GET /connector` of `[public_ingress]` (#199).
+    pub websocket: bool,
+    /// Broker certificate presented to the agent (inner TLS on both paths).
     pub tls: TlsMaterial,
 }
 
@@ -1048,6 +1061,15 @@ impl Config {
 pub fn load_tls(
     material: &TlsMaterial,
 ) -> Result<std::sync::Arc<rustls::ServerConfig>, ConfigError> {
+    load_tls_with(material, kharon_connector::TlsVersions::Default)
+}
+
+/// [`load_tls`] with a chosen TLS version set (the connector's WebSocket
+/// path is TLS 1.3 only).
+pub fn load_tls_with(
+    material: &TlsMaterial,
+    versions: kharon_connector::TlsVersions,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, ConfigError> {
     // Permission denied gets its own reason: under plain Docker Compose
     // a bind-mounted key keeps the host owner and mode (#149).
     let read = |path: &Path, unreadable: &'static str, denied: &'static str| {
@@ -1069,8 +1091,10 @@ pub fn load_tls(
         "unreadable private key",
         "private key not readable by kharond's uid (make it owned by that uid, mode 0400)",
     )?;
-    kharon_connector::server_config_from_pem(&cert, &key).map_err(|_| ConfigError::TlsMaterial {
-        reason: "not a PEM certificate and private key",
+    kharon_connector::server_config_from_pem_with(&cert, &key, versions).map_err(|_| {
+        ConfigError::TlsMaterial {
+            reason: "not a PEM certificate and private key",
+        }
     })
 }
 

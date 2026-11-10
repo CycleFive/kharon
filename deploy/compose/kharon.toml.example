@@ -17,18 +17,26 @@ collection_ids = ["00000000-0000-0000-0000-000000000002"]
 # and this hash on stdout. Paste the hash here; never put the token here.
 token_hash = "$argon2id$..."
 # The agent host's Chromium (CDP). Fills need a path to the agent's
-# browser; until #199 that path is a VPN (compose.vpn.yml, WireGuard).
-# Without one, MCP calls, grants and approvals still work.
-# No path: kharond reads the current /devtools/browser/<id> from
-# /json/version on each connect, so a Chromium restart needs no edit.
-# Fills fail without compose.vpn.yml until #199.
+# browser. Two ways, pick one:
+#  - WireGuard (this line): needs compose.vpn.yml.
+#  - Path B over WebSocket (the commented block below): the agent host
+#    dials wss://<public host>/connector through the tunnel; no VPN.
+# Without a path, MCP calls, grants and approvals still work.
+# kharond reads the current /devtools/browser/<id> from /json/version
+# on each connect, so a Chromium restart needs no edit.
 cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
-# Path (B), egress-shaped agent host: these belong with a VPN or a
-# public address (overlay). See docs/deployment.md.
-# connector_token_hash comes from `kharon tunnel mint`, not `kharon token mint`.
+# Path (B) over WebSocket, egress-shaped agent host, no VPN. See
+# docs/deployment.md, "Over WebSocket". connector_token_hash comes
+# from `kharon tunnel mint`, not `kharon token mint`. [connector] needs
+# [public_ingress] below. `listen` is left out on purpose: behind the
+# tunnel nothing needs a raw port (set it only to also keep the raw
+# pinned-TLS listener, on a VPN address, never a wildcard).
 # cdp = { endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }
+# The compose base mounts nothing at these paths: bind-mount the cert
+# and key with the docker-compose.override.yml in docs/deployment.md
+# (Path (B) broker), read-only, key mode 0400 for uid 10001.
 # [connector]
-# listen = "203.0.113.4:8789"
+# websocket = true
 # tls_cert_file = "/etc/kharon/tls.crt"
 # tls_key_file = "/etc/kharon/tls.key"
 
@@ -40,9 +48,9 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 
 # Public gateway (#198): the origin the Cloudflare Tunnel forwards to.
 # Agents reach POST /mcp here. Serves only POST /mcp (and GET
-# /connector once #199 lands); everything else is 404. Loopback needs
-# no TLS, and only what shares the holder's namespace (cloudflared)
-# reaches it. Tunnel route: http://127.0.0.1:8790. See
+# /connector with `[connector] websocket = true`); everything else
+# is 404. Loopback needs no TLS, and only what shares the holder's
+# namespace (cloudflared) reaches it. Tunnel route: http://127.0.0.1:8790. See
 # docs/deployment.md, "Public gateway".
 [public_ingress]
 listen = "127.0.0.1:8790"

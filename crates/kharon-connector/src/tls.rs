@@ -13,6 +13,7 @@ use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signat
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use sha2::Digest;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
@@ -35,6 +36,30 @@ pub fn pin_of_der(der: &[u8]) -> CertSha256 {
     pin
 }
 
+static TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
+
+/// Which TLS protocol versions a config offers.
+///
+/// The raw `:8789` path keeps [`Default`](TlsVersions::Default). The
+/// WebSocket path's inner TLS is [`Tls13Only`](TlsVersions::Tls13Only) on
+/// both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVersions {
+    /// `rustls::DEFAULT_VERSIONS` (TLS 1.2 and 1.3).
+    Default,
+    /// TLS 1.3 only.
+    Tls13Only,
+}
+
+impl TlsVersions {
+    pub fn as_slice(self) -> &'static [&'static rustls::SupportedProtocolVersion] {
+        match self {
+            Self::Default => rustls::DEFAULT_VERSIONS,
+            Self::Tls13Only => &TLS13_ONLY,
+        }
+    }
+}
+
 /// Broker (or agent-API) `ServerConfig` from PEM files' bytes.
 /// The certificate file may hold a chain; the first certificate is the
 /// one the agent pins. The key file is PKCS#8 or SEC1.
@@ -42,18 +67,29 @@ pub fn server_config_from_pem(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<Arc<rustls::ServerConfig>, TlsMaterialError> {
+    server_config_from_pem_with(cert_pem, key_pem, TlsVersions::Default)
+}
+
+/// [`server_config_from_pem`] with a chosen version set. Early data is
+/// never accepted.
+pub fn server_config_from_pem_with(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    versions: TlsVersions,
+) -> Result<Arc<rustls::ServerConfig>, TlsMaterialError> {
     let certs = pem_certs(cert_pem)?;
     if certs.is_empty() {
         return Err(TlsMaterialError::BadPem);
     }
     let key = pem_key(key_pem)?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions.as_slice())
         .expect("aws-lc-rs supports the versions it advertises")
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|_| TlsMaterialError::BadPem)?;
+    config.max_early_data_size = 0;
     Ok(Arc::new(config))
 }
 
@@ -63,13 +99,23 @@ pub async fn connect_pinned(
     pin: CertSha256,
     stream: TcpStream,
 ) -> Result<TlsStream<TcpStream>, std::io::Error> {
+    connect_pinned_stream(server_name, pin, stream, TlsVersions::Default).await
+}
+
+/// [`connect_pinned`] over any byte stream, with a chosen version set.
+pub async fn connect_pinned_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    server_name: &str,
+    pin: CertSha256,
+    stream: S,
+    versions: TlsVersions,
+) -> std::io::Result<TlsStream<S>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = Arc::new(PinVerifier {
         pin,
         provider: Arc::clone(&provider),
     });
     let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .with_protocol_versions(versions.as_slice())
         .expect("aws-lc-rs supports the versions it advertises")
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -227,4 +273,157 @@ pub fn is_pin_mismatch(err: &std::io::Error) -> bool {
         cur = e.source();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    static TLS12_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS12];
+
+    struct Material {
+        pin: CertSha256,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+    }
+
+    fn material() -> Material {
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        Material {
+            pin: pin_of_der(cert.der()),
+            cert_pem: cert.pem().into_bytes(),
+            key_pem: key_pair.serialize_pem().into_bytes(),
+        }
+    }
+
+    /// A pinned client restricted to `versions`, for probing servers.
+    fn client_with(
+        pin: CertSha256,
+        versions: &'static [&'static rustls::SupportedProtocolVersion],
+    ) -> tokio_rustls::TlsConnector {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = Arc::new(PinVerifier {
+            pin,
+            provider: Arc::clone(&provider),
+        });
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    fn server_with_versions(
+        m: &Material,
+        versions: &'static [&'static rustls::SupportedProtocolVersion],
+    ) -> tokio_rustls::TlsAcceptor {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                pem_certs(&m.cert_pem).unwrap(),
+                pem_key(&m.key_pem).unwrap(),
+            )
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    fn name() -> ServerName<'static> {
+        server_name_from("localhost").unwrap()
+    }
+
+    #[tokio::test]
+    async fn tls13_only_server_refuses_a_tls12_client() {
+        let m = material();
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            server_config_from_pem_with(&m.cert_pem, &m.key_pem, TlsVersions::Tls13Only).unwrap(),
+        );
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move { acceptor.accept(b).await.is_err() });
+        let client = client_with(m.pin, &TLS12_ONLY).connect(name(), a).await;
+        assert!(client.is_err());
+        assert!(server.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn default_server_still_accepts_tls12() {
+        let m = material();
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            server_config_from_pem(&m.cert_pem, &m.key_pem).unwrap(),
+        );
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move { acceptor.accept(b).await.is_ok() });
+        let client = client_with(m.pin, &TLS12_ONLY).connect(name(), a).await;
+        assert!(client.is_ok());
+        assert!(server.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tls13_only_client_refuses_a_tls12_only_server() {
+        let m = material();
+        let acceptor = server_with_versions(&m, &TLS12_ONLY);
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let _ = acceptor.accept(b).await;
+        });
+        let client = connect_pinned_stream("localhost", m.pin, a, TlsVersions::Tls13Only).await;
+        assert!(client.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_stream_works_over_a_duplex() {
+        let m = material();
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            server_config_from_pem_with(&m.cert_pem, &m.key_pem, TlsVersions::Tls13Only).unwrap(),
+        );
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut s = acceptor.accept(b).await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(&buf).await.unwrap();
+            s.flush().await.unwrap();
+        });
+        let mut c = connect_pinned_stream("localhost", m.pin, a, TlsVersions::Tls13Only)
+            .await
+            .unwrap();
+        c.write_all(b"ping").await.unwrap();
+        c.flush().await.unwrap();
+        let mut back = [0u8; 4];
+        c.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"ping");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_stream_wrong_pin_is_a_mismatch() {
+        let m = material();
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            server_config_from_pem_with(&m.cert_pem, &m.key_pem, TlsVersions::Tls13Only).unwrap(),
+        );
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = acceptor.accept(b).await;
+        });
+        let err = connect_pinned_stream("localhost", [0u8; 32], a, TlsVersions::Tls13Only)
+            .await
+            .unwrap_err();
+        assert!(is_pin_mismatch(&err));
+    }
+
+    #[test]
+    fn ws_server_config_has_no_early_data() {
+        let m = material();
+        let cfg =
+            server_config_from_pem_with(&m.cert_pem, &m.key_pem, TlsVersions::Tls13Only).unwrap();
+        assert_eq!(cfg.max_early_data_size, 0);
+    }
 }

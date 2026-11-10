@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use argon2::Argon2;
 use futures_util::{SinkExt, StreamExt};
+use kharon_connector::Transport as Dial;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::cdp::{
     Browser, CdpClient, CdpDial, CdpEndpoint, FieldFill, FieldKind, FillEngine, FillPlan,
@@ -201,7 +202,10 @@ async fn rig(token_ok: bool) -> Rig {
 
 fn agent_params(rig: &Rig, pin: [u8; 32]) -> AgentParams {
     AgentParams {
-        broker: rig.broker,
+        transport: Dial::Tls {
+            broker: rig.broker,
+            host: None,
+        },
         server_name: "127.0.0.1".into(),
         pin,
         agent_id: "assistant".into(),
@@ -209,6 +213,7 @@ fn agent_params(rig: &Rig, pin: [u8; 32]) -> AgentParams {
         cdp: rig.cdp,
         proxy: None,
         proxy_creds: None,
+        outer_roots: None,
     }
 }
 

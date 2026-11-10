@@ -83,11 +83,18 @@ path B.
   kharond keeps the keys only in memory. The `vaultwarden` profile is
   for self-hosters: set `[bitwarden] server = "http://vaultwarden:80"`.
   Bitwarden Secrets Manager is not the default.
-- Fills need `compose.vpn.yml` until #199: kharond reaches the agent
-  host's browser over the `wg` network (holder 10.66.0.1, agent host
-  10.66.0.2), and `[api]`/`[connector]` over a VPN bind that address
-  (add `[api]` with `listen = "10.66.0.1:8787"`; the base has none).
-  Swap the network for your real tunnel.
+- Fills need a path to the agent host's browser. Path B over
+  WebSocket needs no VPN: set `[connector] websocket = true` (with
+  `[public_ingress]`, no `listen`), and the agent host dials
+  `wss://<public host>/connector` through the tunnel (see "Over
+  WebSocket" in `docs/deployment.md`). The certificate and key it
+  names are not mounted by the compose base: add the read-only
+  bind-mount from the `docker-compose.override.yml` shown under "Path
+  (B) broker" in that guide. `via = "wireguard"` still needs
+  `compose.vpn.yml`: kharond reaches the browser over the `wg` network
+  (holder 10.66.0.1, agent host 10.66.0.2), and `[api]` over a VPN
+  binds that address (add `[api]` with `listen = "10.66.0.1:8787"`; the
+  base has none). Swap the network for your real tunnel.
 - If you copied the N1 example (#211) before #210, your `kharon.toml`
   still has `[api] listen = "127.0.0.1:8787"`. Delete that block: a
   dashboard mis-route could reach it. For liveness use

@@ -262,3 +262,75 @@ fn req_dep_008_tls_material_not_openable_is_named() {
     std::fs::write(&cert, b"cert").unwrap();
     assert_eq!(reason(&material), "unreadable private key");
 }
+
+/// Path B export-mode config with the given `[connector]` body and an
+/// optional `[public_ingress]`.
+fn connector_config(connector: &str, public_ingress: bool) -> String {
+    let public = if public_ingress {
+        "[public_ingress]\nlisten = \"127.0.0.1:8790\"\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"mode = "export"
+data_dir = "/data"
+[export]
+file = "/run/secrets/export.json"
+[audit]
+checkpoint_local_only = true
+[agents.assistant]
+token_hash = "{TOKEN_HASH}"
+connector_token_hash = "{TOKEN_HASH}"
+cdp = {{ endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }}
+{public}
+[connector]
+{connector}
+tls_cert_file = "/run/secrets/tls.crt"
+tls_key_file = "/run/secrets/tls.key"
+"#
+    )
+}
+
+/// #199: `listen` may be left out when the WebSocket carries the agents.
+#[test]
+fn connector_listen_is_optional_with_websocket() {
+    let cfg = Config::from_toml_str(&connector_config("websocket = true", true)).unwrap();
+    let connector = cfg.connector.unwrap();
+    assert_eq!(connector.listen, None);
+    assert!(connector.websocket);
+
+    let both = connector_config("listen = \"127.0.0.1:8789\"\nwebsocket = true", true);
+    let connector = Config::from_toml_str(&both).unwrap().connector.unwrap();
+    assert_eq!(connector.listen, Some("127.0.0.1:8789".parse().unwrap()));
+    assert!(connector.websocket);
+}
+
+#[test]
+fn connector_no_transport_refused() {
+    for body in ["", "websocket = false"] {
+        let err = Config::from_toml_str(&connector_config(body, true)).unwrap_err();
+        assert_eq!(err, ConfigError::ConnectorNoTransport, "{body}");
+        assert_eq!(err.code(), "connector_no_transport");
+    }
+}
+
+#[test]
+fn connector_websocket_needs_public_ingress() {
+    let err = Config::from_toml_str(&connector_config("websocket = true", false)).unwrap_err();
+    assert_eq!(err, ConfigError::ConnectorWebsocketNeedsPublicIngress);
+    assert_eq!(err.code(), "connector_websocket_needs_public_ingress");
+    // `listen` alone never needs a public ingress.
+    let ok = connector_config("listen = \"127.0.0.1:8789\"", false);
+    assert!(Config::from_toml_str(&ok).is_ok());
+}
+
+/// An existing config with only `listen` parses as it always did: the
+/// raw listener, no WebSocket.
+#[test]
+fn connector_listen_only_unchanged() {
+    let cfg =
+        Config::from_toml_str(&connector_config("listen = \"127.0.0.1:8789\"", false)).unwrap();
+    let connector = cfg.connector.unwrap();
+    assert_eq!(connector.listen, Some("127.0.0.1:8789".parse().unwrap()));
+    assert!(!connector.websocket);
+}

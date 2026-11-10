@@ -38,36 +38,49 @@ pub async fn connect_http_proxy(
     target_port: u16,
     basic: Option<&[u8]>,
 ) -> Result<TcpStream, ClientError> {
+    let mut stream = TcpStream::connect(proxy)
+        .await
+        .map_err(|e| ClientError::Tcp { kind: e.kind() })?;
+    let _ = stream.set_nodelay(true);
+    http_connect(&mut stream, target_host, target_port, basic).await?;
+    Ok(stream)
+}
+
+/// The CONNECT exchange on a stream already connected to the proxy.
+pub(crate) async fn http_connect(
+    stream: &mut TcpStream,
+    target_host: &str,
+    target_port: u16,
+    basic: Option<&[u8]>,
+) -> Result<(), ClientError> {
     if target_host.is_empty() || target_host.len() > 253 || target_host.contains([' ', '\r', '\n'])
     {
         return Err(ClientError::Protocol);
     }
-    let mut stream = TcpStream::connect(proxy)
-        .await
-        .map_err(|_| ClientError::Transport { context: "proxy" })?;
-    let _ = stream.set_nodelay(true);
     {
         let req = connect_request(target_host, target_port, basic);
         stream
             .write_all(&req)
             .await
-            .map_err(|_| ClientError::Transport { context: "proxy" })?;
+            .map_err(|_| ClientError::ProxyStatus { code: 0 })?;
     }
-    let head = read_proxy_head(&mut stream).await?;
+    let head = read_proxy_head(stream).await?;
     let status = head
         .split("\r\n")
         .next()
-        .ok_or(ClientError::Transport { context: "proxy" })?;
+        .ok_or(ClientError::ProxyStatus { code: 0 })?;
     let mut parts = status.split(' ');
     let version = parts.next().unwrap_or("");
     let code = parts.next().unwrap_or("");
     if !version.starts_with("HTTP/1.") {
-        return Err(ClientError::Transport { context: "proxy" });
+        return Err(ClientError::ProxyStatus { code: 0 });
     }
     match code {
-        "200" => Ok(stream),
+        "200" => Ok(()),
         "407" => Err(ClientError::ProxyAuth),
-        _ => Err(ClientError::Transport { context: "proxy" }),
+        other => Err(ClientError::ProxyStatus {
+            code: other.parse().unwrap_or(0),
+        }),
     }
 }
 
@@ -121,16 +134,16 @@ async fn read_proxy_head(stream: &mut TcpStream) -> Result<String, ClientError> 
         let n = stream
             .read(&mut byte)
             .await
-            .map_err(|_| ClientError::Transport { context: "proxy" })?;
+            .map_err(|_| ClientError::ProxyStatus { code: 0 })?;
         if n == 0 {
-            return Err(ClientError::Transport { context: "proxy" });
+            return Err(ClientError::ProxyStatus { code: 0 });
         }
         buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {
-            return String::from_utf8(buf).map_err(|_| ClientError::Transport { context: "proxy" });
+            return String::from_utf8(buf).map_err(|_| ClientError::ProxyStatus { code: 0 });
         }
     }
-    Err(ClientError::Transport { context: "proxy" })
+    Err(ClientError::ProxyStatus { code: 0 })
 }
 
 #[cfg(test)]
@@ -250,12 +263,11 @@ open sesame";
     }
 
     #[tokio::test]
-    async fn other_proxy_status_stays_a_transport_error() {
+    async fn other_proxy_status_is_reported_as_received() {
         let (result, _) = exchange(b"HTTP/1.1 502 Bad Gateway\r\n\r\n", None).await;
-        assert_eq!(
-            result.unwrap_err(),
-            ClientError::Transport { context: "proxy" }
-        );
+        let err = result.unwrap_err();
+        assert_eq!(err, ClientError::ProxyStatus { code: 502 });
+        assert_eq!(err.to_string(), "proxy CONNECT answered 502");
     }
 
     #[test]

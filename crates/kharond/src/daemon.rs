@@ -612,9 +612,12 @@ pub enum StartupError {
 
 /// Path B accept task plus the hub the CDP backend dials through.
 struct ConnectorRuntime {
-    task: tokio::task::JoinHandle<()>,
-    addr: SocketAddr,
+    /// The raw listener's accept loop, when `[connector] listen` is set.
+    task: Option<tokio::task::JoinHandle<()>>,
+    addr: Option<SocketAddr>,
     hub: Arc<crate::connector::Hub>,
+    /// The `/connector` WebSocket entry, when `websocket = true` (#199).
+    ws: Option<Arc<crate::connector::WsEntry>>,
 }
 
 impl StartupError {
@@ -846,6 +849,14 @@ pub async fn start(
     });
     // Lock/unlock transitions belong in the audit log (REQ-AUD-003).
     broker.wire_lock_audit();
+    // #199: the connector's two audit events go through the broker's
+    // synchronous append (best effort; the hub logs a failure).
+    if let Some(rt) = &connector {
+        let audit_broker = Arc::clone(&broker);
+        rt.hub.set_audit(Arc::new(move |entry| {
+            audit_broker.append_audit(entry).map_err(|_| ())
+        }));
+    }
     // REQ-API-007: the server whose `Date` the clock is checked
     // against. Building the client does no I/O; config validation has
     // already read both files, so a failure here only skips the probe.
@@ -930,7 +941,14 @@ async fn bind_public_ingress(cfg: &Config) -> Result<Option<PublicIngressRuntime
 fn load_tls_material(
     material: &crate::config::TlsMaterial,
 ) -> Result<Arc<rustls::ServerConfig>, StartupError> {
-    crate::config::load_tls(material).map_err(|e| StartupError::TlsMaterial {
+    load_tls_material_with(material, kharon_connector::TlsVersions::Default)
+}
+
+fn load_tls_material_with(
+    material: &crate::config::TlsMaterial,
+    versions: kharon_connector::TlsVersions,
+) -> Result<Arc<rustls::ServerConfig>, StartupError> {
+    crate::config::load_tls_with(material, versions).map_err(|e| StartupError::TlsMaterial {
         reason: match e {
             crate::config::ConfigError::TlsMaterial { reason } => reason,
             _ => "unreadable certificate",
@@ -942,27 +960,37 @@ async fn bind_connector(cfg: &Config) -> Result<Option<ConnectorRuntime>, Startu
     let Some(connector) = &cfg.connector else {
         return Ok(None);
     };
-    let tls = load_tls_material(&connector.tls)?;
-    let listener =
-        TcpListener::bind(connector.listen)
-            .await
-            .map_err(|e| StartupError::ConnectorBind {
-                addr: connector.listen,
-                kind: e.kind().to_string(),
-            })?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| StartupError::ConnectorBind {
-            addr: connector.listen,
-            kind: e.kind().to_string(),
-        })?;
     let tokens = TokenStore::from_connector_agents(&cfg.agents)?;
     let hub = Arc::new(crate::connector::Hub::new(tokens));
-    let accept_hub = Arc::clone(&hub);
-    let task = tokio::spawn(async move {
-        crate::connector::accept(listener, tls, accept_hub).await;
-    });
-    Ok(Some(ConnectorRuntime { task, addr, hub }))
+    let (task, addr) = match connector.listen {
+        Some(listen) => {
+            let tls = load_tls_material(&connector.tls)?;
+            let bind_err = |e: io::Error| StartupError::ConnectorBind {
+                addr: listen,
+                kind: e.kind().to_string(),
+            };
+            let listener = TcpListener::bind(listen).await.map_err(bind_err)?;
+            let addr = listener.local_addr().map_err(bind_err)?;
+            let accept_hub = Arc::clone(&hub);
+            let task = tokio::spawn(async move {
+                crate::connector::accept(listener, tls, accept_hub).await;
+            });
+            (Some(task), Some(addr))
+        }
+        None => (None, None),
+    };
+    let ws = if connector.websocket {
+        let tls = load_tls_material_with(&connector.tls, kharon_connector::TlsVersions::Tls13Only)?;
+        Some(crate::connector::WsEntry::new(Arc::clone(&hub), tls))
+    } else {
+        None
+    };
+    Ok(Some(ConnectorRuntime {
+        task,
+        addr,
+        hub,
+        ws,
+    }))
 }
 
 /// Bind `[owner_ui]` when it is configured. The origin uses the
@@ -1083,7 +1111,7 @@ impl Daemon {
 
     /// The connector listen address, when path B is configured.
     pub fn connector_addr(&self) -> Option<SocketAddr> {
-        self.connector.as_ref().map(|rt| rt.addr)
+        self.connector.as_ref().and_then(|rt| rt.addr)
     }
 
     /// The owner socket path (`kharon unlock` / `lock` connect here).
@@ -1159,8 +1187,10 @@ impl Daemon {
         // #198: the public-ingress listener stops with the agent API,
         // after at most PUBLIC_INGRESS_DRAIN of graceful drain.
         let (public_stop, public_stopped) = tokio::sync::oneshot::channel::<()>();
+        let ws = self.connector.as_ref().and_then(|rt| rt.ws.clone());
         let public_ingress = self.public_ingress.map(|rt| {
             let broker = Arc::clone(&self.broker);
+            let ws = ws.clone();
             let stopped = async move {
                 let _ = public_stopped.await;
             };
@@ -1171,18 +1201,37 @@ impl Daemon {
                             rt.listener,
                             tls,
                             broker,
+                            ws,
                             stopped,
                         )
                         .await
                     }
                     None => {
-                        crate::api::public::serve_with_shutdown(rt.listener, broker, stopped).await
+                        crate::api::public::serve_with_shutdown(rt.listener, broker, ws, stopped)
+                            .await
                     }
                 };
             })
         });
         let shutdown_broker = Arc::clone(&self.broker);
-        let connector_task = self.connector.as_ref().map(|rt| rt.task.abort_handle());
+        let connector_task = self
+            .connector
+            .as_ref()
+            .and_then(|rt| rt.task.as_ref())
+            .map(|task| task.abort_handle());
+        // The per-minute count of refused WebSocket upgrades (#199).
+        let refusal_log = ws.clone().map(|ws| {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(WS_REFUSAL_LOG_PERIOD);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    if let Some(line) = ws.take_refusal_line() {
+                        eprintln!("kharond: {line}");
+                    }
+                }
+            })
+        });
         let served = match (self.listener, self.api_tls) {
             (Some((listener, _)), Some(tls)) => {
                 http::serve_tls_with_shutdown(listener, tls, self.broker, shutdown).await
@@ -1202,12 +1251,26 @@ impl Daemon {
         }
         // Graceful drain, bounded: an open public connection must not
         // hold shutdown (#198 review; #199 puts a WebSocket here).
+        // A held-open connector session is not a request the listener's
+        // graceful drain waits out: end every one, then wait for them
+        // inside the same bound.
+        if let Some(ws) = &ws {
+            ws.begin_shutdown();
+        }
         let _ = public_stop.send(());
-        if let Some(mut task) = public_ingress
-            && tokio::time::timeout(PUBLIC_INGRESS_DRAIN, &mut task)
-                .await
-                .is_err()
-        {
+        if let Some(mut task) = public_ingress {
+            let drained = tokio::time::timeout(PUBLIC_INGRESS_DRAIN, async {
+                let _ = (&mut task).await;
+                if let Some(ws) = &ws {
+                    ws.wait_idle().await;
+                }
+            })
+            .await;
+            if drained.is_err() {
+                task.abort();
+            }
+        }
+        if let Some(task) = refusal_log {
             task.abort();
         }
         checkpoint_timer.abort();
@@ -1229,6 +1292,9 @@ impl Daemon {
         served
     }
 }
+
+/// How often the refused-WebSocket-upgrade count is logged (#199).
+pub const WS_REFUSAL_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long the public-ingress listener (#198) may drain open
 /// connections at shutdown before it is aborted. A public client that

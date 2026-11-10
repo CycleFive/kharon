@@ -39,6 +39,25 @@
 //! again. A new authenticated session for the same agent replaces the
 //! previous one; streams on the old session fail.
 //!
+//! # Transport: WebSocket
+//!
+//! The same inner stack (pinned TLS, auth record, frames) can run inside a
+//! WebSocket at `wss://<host>/connector`, so it can pass through a
+//! Cloudflare Tunnel. The edge terminates the outer TLS and sees only
+//! WebSocket messages that carry the inner TLS records: neither the tunnel
+//! credential nor CDP bytes are visible to it.
+//!
+//! - Subprotocol [`WS_SUBPROTOCOL`], exact. No compression is negotiated.
+//! - [`WsByteStream`] turns the WebSocket into a byte stream: binary
+//!   messages in order, one message per write of at most [`MAX_WS_WRITE`]
+//!   bytes, and a limit of [`WS_MAX_MESSAGE`] per inbound message
+//!   ([`ws_config`]). A text message is an error.
+//! - The inner TLS is **TLS 1.3 only** with no early data
+//!   ([`TlsVersions::Tls13Only`]). The raw `:8789` path keeps
+//!   [`TlsVersions::Default`].
+//! - The broker admits at most [`WS_PREAUTH_SLOTS`] sockets that have not
+//!   yet authenticated.
+//!
 //! # Adjusting this
 //!
 //! The constants and the codecs in [`frame`] and [`auth`] are the whole
@@ -53,13 +72,20 @@ mod frame;
 mod mux;
 mod proxy;
 mod tls;
+mod ws;
 
 pub use auth::{read_client_hello, read_server_hello, write_client_hello, write_server_hello};
-pub use client::{AgentParams, run_agent_once};
+pub use client::{
+    AgentParams, AuthedSession, Leg, Transport, check_once, connect_and_auth, run_agent_once,
+};
 pub use frame::{Frame, encode_frame};
 pub use mux::{BrokerSession, MuxIo, OpenError, serve_agent, spawn_broker};
 pub use proxy::{connect_http_proxy, proxy_creds_line};
-pub use tls::{CertSha256, TlsMaterialError, connect_pinned, pin_of_der, server_config_from_pem};
+pub use tls::{
+    CertSha256, TlsMaterialError, TlsVersions, connect_pinned, connect_pinned_stream, pin_of_der,
+    server_config_from_pem, server_config_from_pem_with,
+};
+pub use ws::{WsByteStream, ws_config};
 
 /// Why [`run_agent_once`] stopped. Display text is fixed: it never includes
 /// the tunnel token, the proxy credential, the certificate, or a peer's
@@ -85,12 +111,89 @@ pub enum ClientError {
     /// `cdp` is not a loopback socket. The connector will not dial it.
     #[error("cdp address is not a loopback socket")]
     CdpNotLoopback,
-    /// TCP, proxy, or handshake failure that is not a pin mismatch.
-    #[error("connector transport error ({context})")]
-    Transport {
-        /// `tcp`, `tls`, or `proxy`.
-        context: &'static str,
+    /// The broker host did not resolve.
+    #[error("cannot resolve the broker host")]
+    Dns,
+    /// The TCP connect failed.
+    #[error("tcp connect failed ({kind})")]
+    Tcp {
+        /// The OS error kind, never the peer's text.
+        kind: std::io::ErrorKind,
     },
+    /// The proxy answered CONNECT with this status (0: no HTTP response).
+    #[error("{}", proxy_status_text(*code))]
+    ProxyStatus { code: u16 },
+    /// The outer TLS (to the edge) failed, with a WebPKI error class.
+    #[error("outer TLS to the broker host failed: {0}")]
+    OuterTls(OuterTlsClass),
+    /// The WebSocket upgrade was answered with this status as received
+    /// (0: no HTTP response; 101: the subprotocol was not echoed).
+    #[error("{}", upgrade_text(*status))]
+    Upgrade { status: u16 },
+    /// The inner TLS handshake failed for a reason other than the pin.
+    #[error("inner TLS handshake failed")]
+    InnerTls,
+}
+
+/// Why the outer TLS failed, as fixed text. It is mapped from rustls's
+/// certificate error and never carries the peer's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OuterTlsClass {
+    /// The certificate chain does not end in a trusted root.
+    #[error("untrusted issuer")]
+    UntrustedIssuer,
+    /// The certificate is not valid for the host name dialed.
+    #[error("name mismatch")]
+    NameMismatch,
+    /// The certificate is expired or not yet valid.
+    #[error("expired or not yet valid")]
+    Expired,
+    /// Any other certificate error.
+    #[error("other certificate error")]
+    OtherCertificate,
+    /// The handshake failed for a reason that is not a certificate error
+    /// (or timed out).
+    #[error("handshake failed")]
+    HandshakeFailed,
+}
+
+impl OuterTlsClass {
+    /// Classify a failed outer handshake.
+    pub fn of_io(e: &std::io::Error) -> Self {
+        use rustls::CertificateError as C;
+        let Some(rustls::Error::InvalidCertificate(cert)) = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        else {
+            return Self::HandshakeFailed;
+        };
+        match cert {
+            C::UnknownIssuer => Self::UntrustedIssuer,
+            C::NotValidForName | C::NotValidForNameContext { .. } => Self::NameMismatch,
+            C::Expired
+            | C::ExpiredContext { .. }
+            | C::NotValidYet
+            | C::NotValidYetContext { .. } => Self::Expired,
+            _ => Self::OtherCertificate,
+        }
+    }
+}
+
+fn proxy_status_text(code: u16) -> String {
+    match code {
+        0 => "proxy CONNECT got no answer".to_owned(),
+        c => format!("proxy CONNECT answered {c}"),
+    }
+}
+
+fn upgrade_text(status: u16) -> String {
+    match status {
+        0 => "websocket upgrade got no HTTP response".to_owned(),
+        101 => {
+            "websocket upgrade answered 101 without the kharon-connector.v1 subprotocol".to_owned()
+        }
+        s => format!("websocket upgrade answered {s}"),
+    }
 }
 
 /// ASCII magic at the start of both auth bodies.
@@ -135,3 +238,14 @@ pub const CLOSE_RESET: u8 = 2;
 /// One in-page fill carries the isolated-world script (tens of KiB) plus
 /// the WebSocket framing, so the buffer is well above [`MAX_PAYLOAD`].
 pub const DUPLEX_BYTES: usize = 256 * 1024;
+
+/// The WebSocket subprotocol, exact. The server answers with this or refuses.
+pub const WS_SUBPROTOCOL: &str = "kharon-connector.v1";
+/// Largest inbound WebSocket message and frame.
+pub const WS_MAX_MESSAGE: usize = 64 * 1024;
+/// Largest payload of one outbound WebSocket message: one frame plus the
+/// TLS record overhead.
+pub const MAX_WS_WRITE: usize = 16 * 1024 + 256;
+/// Broker-side cap on WebSocket sockets that have not authenticated yet,
+/// separate from the raw listener's budget.
+pub const WS_PREAUTH_SLOTS: usize = 8;

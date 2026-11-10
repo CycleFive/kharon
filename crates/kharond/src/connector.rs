@@ -138,8 +138,11 @@ pub const WS_PREAUTH_DEADLINE: Duration = Duration::from_secs(10);
 pub const RAW_PREAUTH_DEADLINE: Duration = Duration::from_secs(15);
 
 /// The bound on a server-hello write that only tells a refused or
-/// malformed peer why it is being closed. A peer that never reads must not
-/// hold a pre-auth slot past the deadline for it (#220).
+/// malformed peer why it is being closed. A refusal's closing answer gets
+/// at most this long after the slot is freed. The `AUTH_PROTOCOL` write
+/// happens while the pre-auth slot is still held, so it also stops at the
+/// socket's deadline (whichever is earlier); the `AUTH_UNAUTHORIZED` write
+/// comes after the slot is released and has this bound alone (#220).
 const TRAILING_HELLO_WRITE: Duration = Duration::from_secs(1);
 
 /// Accepted connector sessions, keyed by agent id.
@@ -541,8 +544,11 @@ where
             if transport == SessionTransport::Ws {
                 hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
             }
-            let _ = timeout(
-                TRAILING_HELLO_WRITE,
+            // The slot is still held here, so this write may not outlive
+            // the socket's deadline either. Best effort: a write that is
+            // ready at once still goes out, and it adds no hold time.
+            let _ = timeout_at(
+                deadline.min(Instant::now() + TRAILING_HELLO_WRITE),
                 write_server_hello(&mut tls, AUTH_PROTOCOL),
             )
             .await;
@@ -833,7 +839,9 @@ mod tests {
     /// (a whole length-prefixed record) and never read. Returns how long
     /// `authenticate` took after the hello was sent; asserts it returned
     /// `None`, released the slot, and never took the TLS-failure branch.
-    async fn stalled_refusal(hello_record: Vec<u8>) -> Duration {
+    /// `hello_record` of `None` sends nothing at all. The socket's deadline
+    /// is `deadline_in` after the call.
+    async fn stalled_refusal(hello_record: Option<Vec<u8>>, deadline_in: Duration) -> Run {
         use kharon_connector::{TlsVersions, connect_pinned_stream, server_config_from_pem_with};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -845,7 +853,7 @@ mod tests {
             TlsVersions::Tls13Only,
         )
         .unwrap();
-        let (hub, _entries) = hub();
+        let (hub, entries) = hub();
         let hub = Arc::new(hub);
         let permit = hub.ws_auth.clone().try_acquire_owned().unwrap();
         let armed = Arc::new(AtomicBool::new(false));
@@ -855,9 +863,8 @@ mod tests {
             armed: Arc::clone(&armed),
         };
         let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        // The pre-auth deadline is far past the 3 s ceiling below, so only
-        // the trailing-write bound can end `authenticate` in time.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline_std = std::time::Instant::now() + deadline_in;
+        let deadline = Instant::now() + deadline_in;
         let task = tokio::spawn({
             let hub = Arc::clone(&hub);
             async move {
@@ -878,10 +885,14 @@ mod tests {
             .await
             .unwrap();
         // A TLS 1.3 server sends session tickets after the client's
-        // Finished, possibly after `connect` returned. Reading until quiet
-        // takes them in; the server's `accept` cannot complete before the
-        // client has sent everything it owes, so arming now can only stall
-        // the write that follows the hello.
+        // Finished, possibly after `connect` returned. rustls consumes
+        // ticket records inside `read` without returning data for them, so
+        // this loop is a fixed 300 ms wait. What makes arming afterwards
+        // safe is the current_thread test runtime: the server task, woken
+        // by the client's Finished, runs `accept` to completion (tickets
+        // flushed) before the timer driver can fire this timeout. Do not
+        // switch these tests to a multi_thread runtime: that turns the
+        // guarantee into a timing assumption.
         let mut sink = [0u8; 1024];
         while let Ok(Ok(n)) =
             tokio::time::timeout(Duration::from_millis(300), client.read(&mut sink)).await
@@ -890,13 +901,19 @@ mod tests {
         }
         armed.store(true, Ordering::SeqCst);
         let sent = std::time::Instant::now();
-        client.write_all(&hello_record).await.unwrap();
-        client.flush().await.unwrap();
-        let none = tokio::time::timeout(Duration::from_secs(5), task)
+        if let Some(record) = &hello_record {
+            client.write_all(record).await.unwrap();
+            client.flush().await.unwrap();
+        }
+        let none = tokio::time::timeout(Duration::from_secs(5) + deadline_in, task)
             .await
-            .expect("authenticate did not return: the trailing write is unbounded")
+            .expect(
+                "authenticate did not return: the trailing write is unbounded \
+                 (or the stall landed in the TLS accept)",
+            )
             .unwrap();
-        let took = sent.elapsed();
+        let done = std::time::Instant::now();
+        let took = done - sent;
         assert!(none, "authenticate refused the peer");
         assert_eq!(
             hub.ws_auth.available_permits(),
@@ -908,8 +925,27 @@ mod tests {
             0,
             "the stall landed in the TLS handshake, not the trailing write"
         );
+        let auth_fail = entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.event == Event::ConnectorAuthFail)
+            .count();
         drop(client);
-        took
+        Run {
+            took,
+            past_deadline: done.checked_duration_since(deadline_std),
+            auth_fail,
+        }
+    }
+
+    struct Run {
+        /// From the hello being sent (or the stall being armed) to the return.
+        took: Duration,
+        /// How long after the socket's deadline it returned; `None` if before.
+        past_deadline: Option<Duration>,
+        /// `connector_auth_fail` audit entries: 1 only on the refusal branch.
+        auth_fail: usize,
     }
 
     fn assert_bounded(took: Duration) {
@@ -925,8 +961,9 @@ mod tests {
     #[tokio::test]
     async fn trailing_protocol_hello_write_is_bounded() {
         // Length 0 is a protocol error.
-        let took = stalled_refusal(vec![0, 0, 0, 0]).await;
-        assert_bounded(took);
+        let run = stalled_refusal(Some(vec![0, 0, 0, 0]), Duration::from_secs(30)).await;
+        assert_bounded(run.took);
+        assert_eq!(run.auth_fail, 0, "a protocol error is not a refusal");
     }
 
     /// A well-formed hello with a wrong token is answered with
@@ -943,7 +980,23 @@ mod tests {
         body.extend_from_slice(token.as_bytes());
         let mut record = (body.len() as u32).to_be_bytes().to_vec();
         record.extend_from_slice(&body);
-        let took = stalled_refusal(record).await;
-        assert_bounded(took);
+        let run = stalled_refusal(Some(record), Duration::from_secs(30)).await;
+        assert_bounded(run.took);
+        assert_eq!(run.auth_fail, 1, "the refusal branch ran");
+    }
+
+    /// A peer that never sends a hello and never reads: the `AUTH_PROTOCOL`
+    /// write starts at the deadline with the slot still held, so it must
+    /// stop at the deadline, not 1 s after it (REQ-DEP-006: frees its slot
+    /// by its deadline).
+    #[tokio::test]
+    async fn protocol_hello_write_stops_at_the_deadline() {
+        let run = stalled_refusal(None, Duration::from_secs(2)).await;
+        let past = run.past_deadline.expect("returned before the deadline");
+        assert!(
+            past < Duration::from_millis(500),
+            "returned {past:?} after the deadline"
+        );
+        assert_eq!(run.auth_fail, 0);
     }
 }

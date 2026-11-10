@@ -1102,8 +1102,8 @@ async fn ws_slow_client_cannot_chain_phase_timers() {
     let tls = inner_client(&rig, &[&rustls::version::TLS13])
         .connect(name, WsByteStream::new(ws))
         .await;
-    // The hello is due at 2.0 s; the 1.5 s deadline has passed by then.
-    tokio::time::sleep_until(started + Duration::from_millis(2000)).await;
+    // The hello is due at 2.0 s; the 1.5 s deadline has passed by 1.7 s.
+    tokio::time::sleep_until(started + Duration::from_millis(1700)).await;
     assert_eq!(
         rig.hub.ws_preauth_in_flight(),
         0,
@@ -1124,6 +1124,41 @@ async fn ws_slow_client_cannot_chain_phase_timers() {
         Err(_) => None,
     };
     assert_ne!(outcome, Some(0), "a slow client never reaches AUTH_OK");
+}
+
+/// #219 AC2, phase gate: a socket that upgrades and then sends nothing is
+/// freed by the one deadline, and counted as a `hello` refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_stall_in_the_gate_frees_the_slot_by_the_deadline() {
+    let rig = rig_with_deadline(argon(8, 1), Some(Duration::from_millis(1500))).await;
+    let started = tokio::time::Instant::now();
+    let _ws = raw_ws(rig.public).await;
+    eventually("slot taken", || rig.hub.ws_preauth_in_flight() == 1).await;
+    tokio::time::sleep_until(started + Duration::from_millis(1800)).await;
+    assert_eq!(rig.hub.ws_preauth_in_flight(), 0, "freed by the deadline");
+    let line = rig.ws.take_refusal_line().expect("counted");
+    assert!(line.contains("hello 1,"), "{line}");
+}
+
+/// #219 AC2, phase inner TLS: a ClientHello record header that passes the
+/// gate, a truncated body, then silence. The deadline is not restarted by
+/// the gate having finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_stall_in_inner_tls_frees_the_slot_by_the_deadline() {
+    let rig = rig_with_deadline(argon(8, 1), Some(Duration::from_millis(1500))).await;
+    let started = tokio::time::Instant::now();
+    let mut ws = raw_ws(rig.public).await;
+    // A late start: a fresh timer for this phase would run to 2.1 s.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Handshake record, TLS 1.0 legacy version, length 0x0100, ClientHello.
+    ws.send(Message::Binary(vec![0x16, 0x03, 0x01, 0x01, 0x00, 0x01]))
+        .await
+        .unwrap();
+    tokio::time::sleep_until(started + Duration::from_millis(1800)).await;
+    assert_eq!(rig.hub.ws_preauth_in_flight(), 0, "freed by the deadline");
+    let line = rig.ws.take_refusal_line().expect("counted");
+    assert!(line.contains("tls 1,"), "{line}");
+    assert!(line.contains("hello 0,"), "{line}");
 }
 
 /// The permit lives in the blocking task, not in the connection future:

@@ -857,7 +857,7 @@ fn slower() -> argon2::Argon2<'static> {
     argon(65536, 200)
 }
 
-/// Each verify takes about 2.6 s here (64 MiB, 80 passes): the holders of
+/// Each verify takes about 2.4 s here (64 MiB, 80 passes): the holders of
 /// the shutdown-waiter test, which only have to outlast one waiter's ws
 /// connect, inner TLS, hello and slot release (tens of milliseconds).
 fn middling() -> argon2::Argon2<'static> {
@@ -1062,6 +1062,11 @@ async fn argon_permit_released_after_wait_timeout_and_shutdown() {
     eventually("waiter hello sent", || ws_sent.load(Ordering::SeqCst) == 1).await;
     assert_eq!(rig.hub.ws_preauth_in_flight(), 1);
     assert_eq!(rig.hub.argon_in_flight(), 2);
+    // "hello sent" is the client's flush. Let the server read the hello
+    // through ws and inner TLS and reach the Argon2 permit wait (the
+    // holders keep it busy for seconds), so shutdown cancels a waiter
+    // that is waiting for a permit, not one still in the hello read.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     rig.ws.begin_shutdown();
     eventually("waiter's slot released", || {
         rig.hub.ws_preauth_in_flight() == 0

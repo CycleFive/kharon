@@ -38,14 +38,25 @@ pub async fn connect_http_proxy(
     target_port: u16,
     basic: Option<&[u8]>,
 ) -> Result<TcpStream, ClientError> {
-    if target_host.is_empty() || target_host.len() > 253 || target_host.contains([' ', '\r', '\n'])
-    {
-        return Err(ClientError::Protocol);
-    }
     let mut stream = TcpStream::connect(proxy)
         .await
         .map_err(|e| ClientError::Tcp { kind: e.kind() })?;
     let _ = stream.set_nodelay(true);
+    http_connect(&mut stream, target_host, target_port, basic).await?;
+    Ok(stream)
+}
+
+/// The CONNECT exchange on a stream already connected to the proxy.
+pub(crate) async fn http_connect(
+    stream: &mut TcpStream,
+    target_host: &str,
+    target_port: u16,
+    basic: Option<&[u8]>,
+) -> Result<(), ClientError> {
+    if target_host.is_empty() || target_host.len() > 253 || target_host.contains([' ', '\r', '\n'])
+    {
+        return Err(ClientError::Protocol);
+    }
     {
         let req = connect_request(target_host, target_port, basic);
         stream
@@ -53,7 +64,7 @@ pub async fn connect_http_proxy(
             .await
             .map_err(|_| ClientError::ProxyStatus { code: 0 })?;
     }
-    let head = read_proxy_head(&mut stream).await?;
+    let head = read_proxy_head(stream).await?;
     let status = head
         .split("\r\n")
         .next()
@@ -65,7 +76,7 @@ pub async fn connect_http_proxy(
         return Err(ClientError::ProxyStatus { code: 0 });
     }
     match code {
-        "200" => Ok(stream),
+        "200" => Ok(()),
         "407" => Err(ClientError::ProxyAuth),
         other => Err(ClientError::ProxyStatus {
             code: other.parse().unwrap_or(0),

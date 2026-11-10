@@ -62,7 +62,7 @@ async fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
 
 fn params(broker: SocketAddr, pin: [u8; 32], token: &str, cdp: SocketAddr) -> AgentParams {
     AgentParams {
-        transport: Transport::Tls { broker },
+        transport: Transport::Tls { broker, host: None },
         server_name: "127.0.0.1".into(),
         pin,
         agent_id: "assistant".into(),

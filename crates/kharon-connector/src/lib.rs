@@ -123,9 +123,9 @@ pub enum ClientError {
     /// The proxy answered CONNECT with this status (0: no HTTP response).
     #[error("{}", proxy_status_text(*code))]
     ProxyStatus { code: u16 },
-    /// The outer TLS (to the edge) failed.
-    #[error("outer TLS to the broker host failed")]
-    OuterTls,
+    /// The outer TLS (to the edge) failed, with a WebPKI error class.
+    #[error("outer TLS to the broker host failed: {0}")]
+    OuterTls(OuterTlsClass),
     /// The WebSocket upgrade was answered with this status as received
     /// (0: no HTTP response; 101: the subprotocol was not echoed).
     #[error("{}", upgrade_text(*status))]
@@ -133,6 +133,50 @@ pub enum ClientError {
     /// The inner TLS handshake failed for a reason other than the pin.
     #[error("inner TLS handshake failed")]
     InnerTls,
+}
+
+/// Why the outer TLS failed, as fixed text. It is mapped from rustls's
+/// certificate error and never carries the peer's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OuterTlsClass {
+    /// The certificate chain does not end in a trusted root.
+    #[error("untrusted issuer")]
+    UntrustedIssuer,
+    /// The certificate is not valid for the host name dialed.
+    #[error("name mismatch")]
+    NameMismatch,
+    /// The certificate is expired or not yet valid.
+    #[error("expired or not yet valid")]
+    Expired,
+    /// Any other certificate error.
+    #[error("other certificate error")]
+    OtherCertificate,
+    /// The handshake failed for a reason that is not a certificate error
+    /// (or timed out).
+    #[error("handshake failed")]
+    HandshakeFailed,
+}
+
+impl OuterTlsClass {
+    /// Classify a failed outer handshake.
+    pub fn of_io(e: &std::io::Error) -> Self {
+        use rustls::CertificateError as C;
+        let Some(rustls::Error::InvalidCertificate(cert)) = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        else {
+            return Self::HandshakeFailed;
+        };
+        match cert {
+            C::UnknownIssuer => Self::UntrustedIssuer,
+            C::NotValidForName | C::NotValidForNameContext { .. } => Self::NameMismatch,
+            C::Expired
+            | C::ExpiredContext { .. }
+            | C::NotValidYet
+            | C::NotValidYetContext { .. } => Self::Expired,
+            _ => Self::OtherCertificate,
+        }
+    }
 }
 
 fn proxy_status_text(code: u16) -> String {
@@ -145,6 +189,9 @@ fn proxy_status_text(code: u16) -> String {
 fn upgrade_text(status: u16) -> String {
     match status {
         0 => "websocket upgrade got no HTTP response".to_owned(),
+        101 => {
+            "websocket upgrade answered 101 without the kharon-connector.v1 subprotocol".to_owned()
+        }
         s => format!("websocket upgrade answered {s}"),
     }
 }

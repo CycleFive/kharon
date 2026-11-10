@@ -75,7 +75,10 @@ async fn rig(token_ok: bool) -> Rig {
 
 fn params(rig: &Rig) -> AgentParams {
     AgentParams {
-        transport: Dial::Tls { broker: rig.broker },
+        transport: Dial::Tls {
+            broker: rig.broker,
+            host: None,
+        },
         server_name: "127.0.0.1".into(),
         pin: rig.pin,
         agent_id: "assistant".into(),

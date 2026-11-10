@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kharon_connector::{
-    AUTH_OK, AgentParams, ClientError, Leg, TlsVersions, Transport, WS_SUBPROTOCOL, WsByteStream,
-    check_once, pin_of_der, read_client_hello, run_agent_once, server_config_from_pem,
-    server_config_from_pem_with, spawn_broker, write_server_hello, ws_config,
+    AUTH_OK, AgentParams, ClientError, Leg, OuterTlsClass, TlsVersions, Transport, WS_SUBPROTOCOL,
+    WsByteStream, check_once, pin_of_der, read_client_hello, run_agent_once,
+    server_config_from_pem, server_config_from_pem_with, spawn_broker, write_server_hello,
+    ws_config,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedKey, IsCa, KeyPair, generate_simple_self_signed,
@@ -74,6 +75,8 @@ enum Mode {
     NoSubprotocol,
     /// Read the request head, answer this status with no body.
     Status(u16),
+    /// Full upgrade and inner TLS, then read the hello and never answer.
+    HelloSilent,
 }
 
 struct Server {
@@ -97,8 +100,10 @@ async fn start_server(mode: Mode) -> Server {
         TlsVersions::Tls13Only,
     )
     .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    // All of 127.0.0.0/8, so a test can dial an address the outer
+    // certificate does not cover.
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let addr = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
     let inner_failed = Arc::new(AtomicBool::new(false));
     let hello_read = Arc::new(AtomicBool::new(false));
     let sessions = Arc::new(Mutex::new(Vec::new()));
@@ -134,7 +139,7 @@ async fn start_server(mode: Mode) -> Server {
                     let _ = tls.shutdown().await;
                     return;
                 }
-                let echo = matches!(mode, Mode::Full);
+                let echo = matches!(mode, Mode::Full | Mode::HelloSilent);
                 let cb = move |req: &Request, mut resp: Response| {
                     assert!(req.headers().get("origin").is_none());
                     assert_eq!(
@@ -161,6 +166,10 @@ async fn start_server(mode: Mode) -> Server {
                     return;
                 };
                 h.store(true, Ordering::SeqCst);
+                if matches!(mode, Mode::HelloSilent) {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                }
                 if hello.token.as_str() != TOKEN {
                     return;
                 }
@@ -290,8 +299,11 @@ async fn ws_untrusted_outer_cert_is_outer_tls() {
     let mut p = ws_params(&srv, srv.inner_pin, cdp);
     p.outer_roots = Some(Arc::new(RootCertStore::empty()));
     let err = run(&p).await.unwrap_err();
-    assert_eq!(err, ClientError::OuterTls);
-    assert_eq!(err.to_string(), "outer TLS to the broker host failed");
+    assert_eq!(err, ClientError::OuterTls(OuterTlsClass::UntrustedIssuer));
+    assert_eq!(
+        err.to_string(),
+        "outer TLS to the broker host failed: untrusted issuer"
+    );
 }
 
 #[tokio::test]
@@ -316,6 +328,27 @@ async fn ws_server_without_subprotocol_is_refused() {
     let p = ws_params(&srv, srv.inner_pin, cdp);
     assert_eq!(run(&p).await, Err(ClientError::Upgrade { status: 101 }));
     assert!(!srv.hello_read.load(Ordering::SeqCst));
+    assert_eq!(
+        ClientError::Upgrade { status: 101 }.to_string(),
+        "websocket upgrade answered 101 without the kharon-connector.v1 subprotocol"
+    );
+}
+
+/// A broker that completes inner TLS and reads the hello but never answers:
+/// the failure is on the auth leg, as an auth-leg error. Runs the real
+/// 10 s leg timeout.
+#[tokio::test]
+async fn hello_timeout_is_an_auth_leg_error() {
+    let (cdp, _) = echo_stub().await;
+    let srv = start_server(Mode::HelloSilent).await;
+    let p = ws_params(&srv, srv.inner_pin, cdp);
+    let legs = tokio::time::timeout(Duration::from_secs(20), check_once(&p))
+        .await
+        .expect("check_once hung");
+    assert_eq!(
+        legs.last().unwrap(),
+        &(Leg::Auth, Err(ClientError::Protocol))
+    );
 }
 
 #[tokio::test]
@@ -404,7 +437,7 @@ async fn raw_tls_transport_still_works() {
         s.closed().await;
     });
     let p = AgentParams {
-        transport: Transport::Tls { broker },
+        transport: Transport::Tls { broker, host: None },
         server_name: "127.0.0.1".into(),
         pin: inner.pin,
         agent_id: "assistant".into(),
@@ -572,9 +605,100 @@ async fn ws_proxy_that_never_answers_times_out() {
     let legs = tokio::time::timeout(Duration::from_secs(20), check_once(&p))
         .await
         .expect("check_once hung");
+    assert!(legs.contains(&(Leg::Tcp, Ok(()))), "{legs:?}");
     let (leg, err) = legs.last().unwrap();
     assert_eq!(*leg, Leg::Proxy);
     let err = err.unwrap_err();
     assert_eq!(err, ClientError::ProxyStatus { code: 0 });
     assert_eq!(err.to_string(), "proxy CONNECT got no answer");
+}
+
+/// A dead proxy is a `tcp` failure, and the CONNECT never happens.
+#[tokio::test]
+async fn proxy_connection_refused_is_the_tcp_leg() {
+    let (cdp, _) = echo_stub().await;
+    let srv = start_server(Mode::Full).await;
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = closed.local_addr().unwrap();
+    drop(closed);
+    let mut p = ws_params(&srv, srv.inner_pin, cdp);
+    p.proxy = Some(dead);
+    let legs = check_once(&p).await;
+    assert_eq!(
+        legs,
+        vec![(
+            Leg::Tcp,
+            Err(ClientError::Tcp {
+                kind: std::io::ErrorKind::ConnectionRefused
+            })
+        )]
+    );
+}
+
+/// `transport = "tls"` through a proxy: the CONNECT names the configured
+/// broker host, not the inner `server_name` override.
+#[tokio::test]
+async fn tls_proxy_connect_names_the_broker_host_not_server_name() {
+    let (cdp, _) = echo_stub().await;
+    let inner = inner_cert();
+    let cfg = server_config_from_pem(inner.pem_cert.as_bytes(), inner.pem_key.as_bytes()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let broker = listener.local_addr().unwrap();
+    let acc = tokio_rustls::TlsAcceptor::from(cfg);
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut tls = acc.accept(tcp).await.unwrap();
+        let _ = read_client_hello(&mut tls).await.unwrap();
+        write_server_hello(&mut tls, AUTH_OK).await.unwrap();
+        let s = spawn_broker(tls);
+        s.closed().await;
+    });
+    let proxy = start_proxy(ProxyMode::Tunnel(broker)).await;
+    let p = AgentParams {
+        transport: Transport::Tls {
+            broker,
+            host: Some("broker.example".into()),
+        },
+        server_name: "cert-name.example".into(),
+        pin: inner.pin,
+        agent_id: "assistant".into(),
+        token: Zeroizing::new(TOKEN.into()),
+        cdp,
+        proxy: Some(proxy.addr),
+        proxy_creds: None,
+        outer_roots: None,
+    };
+    let legs = check_once(&p).await;
+    assert!(legs.iter().all(|(_, r)| r.is_ok()), "{legs:?}");
+    let head = String::from_utf8(proxy.head.lock().unwrap().clone()).unwrap();
+    assert!(
+        head.starts_with(&format!(
+            "CONNECT broker.example:{} HTTP/1.1\r\n",
+            broker.port()
+        )),
+        "{head}"
+    );
+    assert!(!head.contains("cert-name.example"), "{head}");
+}
+
+/// The outer certificate chains to a trusted root but is not valid for the
+/// host name dialed: a name mismatch, as fixed text.
+#[tokio::test]
+async fn ws_outer_cert_for_another_name_is_a_name_mismatch() {
+    let (cdp, _) = echo_stub().await;
+    let srv = start_server(Mode::Full).await;
+    let mut p = ws_params(&srv, srv.inner_pin, cdp);
+    // The certificate covers `localhost` and 127.0.0.1, not 127.0.0.2.
+    p.transport = Transport::Ws {
+        host: "127.0.0.2".into(),
+        port: srv.addr.port(),
+        path: "/connector".into(),
+        outer_tls: true,
+    };
+    let err = run(&p).await.unwrap_err();
+    assert_eq!(err, ClientError::OuterTls(OuterTlsClass::NameMismatch));
+    assert_eq!(
+        err.to_string(),
+        "outer TLS to the broker host failed: name mismatch"
+    );
 }

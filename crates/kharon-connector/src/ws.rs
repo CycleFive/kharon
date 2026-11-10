@@ -46,6 +46,9 @@ impl<S> WsByteStream<S> {
 fn io_err(e: WsError) -> io::Error {
     match e {
         WsError::Io(e) => e,
+        e @ (WsError::Capacity(_) | WsError::Protocol(_)) => {
+            io::Error::new(io::ErrorKind::InvalidData, e)
+        }
         other => io::Error::other(other),
     }
 }
@@ -203,7 +206,8 @@ mod tests {
             .await
             .unwrap();
         let mut buf = [0u8; 8];
-        assert!(s.read(&mut buf).await.is_err());
+        let err = s.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

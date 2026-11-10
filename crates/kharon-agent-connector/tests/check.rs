@@ -36,6 +36,18 @@ async fn run_check(upgrade_status: Option<u16>) -> Out {
 
 /// `url_override` replaces the `broker_url` (the server still starts).
 async fn run_check_to(upgrade_status: Option<u16>, url_override: Option<&str>) -> Out {
+    run_check_with(upgrade_status, url_override, false, false).await
+}
+
+/// `other_ca` makes the binary trust a CA that did not sign the broker's
+/// outer certificate. `follow` runs the real reconnect loop (no `--check`)
+/// until it logs that its first session ended, then kills it.
+async fn run_check_with(
+    upgrade_status: Option<u16>,
+    url_override: Option<&str>,
+    other_ca: bool,
+    follow: bool,
+) -> Out {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -120,7 +132,18 @@ async fn run_check_to(upgrade_status: Option<u16>, url_override: Option<&str>) -
     std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     let ca_file = dir.join("ca.pem");
-    std::fs::write(&ca_file, ca.pem()).unwrap();
+    if other_ca {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        // A different subject, so the chain has no issuer match at all.
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "some other ca");
+        std::fs::write(&ca_file, params.self_signed(&key).unwrap().pem()).unwrap();
+    } else {
+        std::fs::write(&ca_file, ca.pem()).unwrap();
+    }
     let hex: String = pin.iter().map(|b| format!("{b:02x}")).collect();
     let cfg = dir.join("connector.toml");
     std::fs::write(
@@ -143,6 +166,17 @@ async fn run_check_to(upgrade_status: Option<u16>, url_override: Option<&str>) -
     .unwrap();
 
     let cfg2 = cfg.clone();
+    if follow {
+        let stderr = tokio::task::spawn_blocking(move || follow_until_session_ends(&cfg2))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        return Out {
+            code: None,
+            stdout: String::new(),
+            stderr,
+        };
+    }
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_kharon-agent-connector"))
             .arg("--check")
@@ -161,6 +195,38 @@ async fn run_check_to(upgrade_status: Option<u16>, url_override: Option<&str>) -
     }
 }
 
+/// Run the connector's own loop and return its stderr up to and including
+/// the first "session ended" line (or whatever it printed in 20 s).
+fn follow_until_session_ends(cfg: &std::path::Path) -> String {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kharon-agent-connector"))
+        .arg("--config")
+        .arg(cfg)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let pid = child.id();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+    let mut seen = String::new();
+    for line in BufReader::new(stderr).lines() {
+        let Ok(line) = line else { break };
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("session ended") {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(watchdog);
+    seen
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn check_exits_0_on_auth() {
     let out = run_check(None).await;
@@ -172,7 +238,15 @@ async fn check_exits_0_on_auth() {
             out.stdout
         );
     }
-    assert!(out.stdout.ends_with("check: ok\n"), "{}", out.stdout);
+    assert!(
+        out.stdout.ends_with(
+            "ok auth\n\
+             note: a successful check replaces this agent's live broker session\n\
+             check: ok\n"
+        ),
+        "{}",
+        out.stdout
+    );
     assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
 }
 
@@ -196,7 +270,106 @@ async fn check_exits_69_and_names_upgrade_on_502() {
 async fn check_exits_69_and_names_dns_on_unresolvable_host() {
     let out = run_check_to(None, Some("wss://kharon.invalid/connector")).await;
     assert_eq!(out.code, Some(69), "{} / {}", out.stdout, out.stderr);
-    assert!(out.stdout.contains("fail dns: "), "{}", out.stdout);
+    assert!(
+        out.stdout
+            .contains("fail dns: cannot resolve the broker host (kharon.invalid)\n"),
+        "{}",
+        out.stdout
+    );
     assert!(out.stdout.ends_with("check: failed\n"), "{}", out.stdout);
     assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
+}
+
+/// The outer certificate is signed by a CA the binary does not trust: the
+/// line names the WebPKI class as fixed text.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_names_the_outer_tls_class() {
+    let out = run_check_with(None, None, true, false).await;
+    assert_eq!(out.code, Some(69), "{} / {}", out.stdout, out.stderr);
+    assert!(
+        out.stdout
+            .contains("fail outer-tls: outer TLS to the broker host failed: untrusted issuer\n"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.ends_with("check: failed\n"), "{}", out.stdout);
+}
+
+/// The tcp leg names the address it dialed.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_names_the_tcp_address() {
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let out = run_check_to(None, Some(&format!("wss://127.0.0.1:{port}/connector"))).await;
+    assert_eq!(out.code, Some(69), "{} / {}", out.stdout, out.stderr);
+    assert!(
+        out.stdout.contains(&format!(
+            "fail tcp: tcp connect failed (connection refused) to 127.0.0.1:{port}\n"
+        )),
+        "{}",
+        out.stdout
+    );
+}
+
+/// `transport = "tls"` resolves the broker in the binary before any dial:
+/// an unresolvable host prints the dns failure naming it, then fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_check_names_an_unresolvable_broker_host() {
+    let dir: PathBuf = std::env::temp_dir().join(format!(
+        "kharon-check-tls-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("token");
+    std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let cfg = dir.join("connector.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "transport = \"tls\"\n\
+             broker = \"broker.invalid:8789\"\n\
+             broker_pin = \"{pin}\"\n\
+             agent_id = \"assistant\"\n\
+             token_file = \"{token}\"\n\
+             cdp = \"127.0.0.1:9\"\n",
+            pin = "00".repeat(32),
+            token = token.display(),
+        ),
+    )
+    .unwrap();
+    let cfg2 = cfg.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_kharon-agent-connector"))
+            .arg("--check")
+            .arg("--config")
+            .arg(&cfg2)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(69), "{stdout}");
+    assert_eq!(
+        stdout,
+        "fail dns: cannot resolve the broker host (broker.invalid)\ncheck: failed\n"
+    );
+    assert!(!stdout.contains(TOKEN));
+}
+
+/// The reconnect loop says how long the session lasted.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_end_line_carries_the_duration() {
+    let out = run_check_with(None, None, false, true).await;
+    assert!(
+        out.stderr
+            .contains("kharon-agent-connector: session ended after 0s; reconnecting\n"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("connection ended"), "{}", out.stderr);
 }

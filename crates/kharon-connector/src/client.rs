@@ -15,16 +15,24 @@ use zeroize::Zeroizing;
 
 use crate::auth::{read_server_hello, write_client_hello};
 use crate::mux::serve_agent;
-use crate::proxy::connect_http_proxy;
+use crate::proxy::http_connect;
 use crate::tls::{TlsVersions, connect_pinned_stream, is_pin_mismatch};
 use crate::ws::{WsByteStream, ws_config};
-use crate::{AUTH_OK, AUTH_PROTOCOL, AUTH_UNAUTHORIZED, ClientError, WS_SUBPROTOCOL};
+use crate::{
+    AUTH_OK, AUTH_PROTOCOL, AUTH_UNAUTHORIZED, ClientError, OuterTlsClass, WS_SUBPROTOCOL,
+};
 
 /// How the agent reaches the broker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
-    /// Raw pinned TLS to a broker address (the `:8789` listener).
-    Tls { broker: SocketAddr },
+    /// Raw pinned TLS to a broker address (the `:8789` listener). `host` is
+    /// the configured broker host name: an HTTP CONNECT proxy is asked for
+    /// it (never for the inner `server_name`, which may differ). `None`
+    /// names the `broker` address itself.
+    Tls {
+        broker: SocketAddr,
+        host: Option<String>,
+    },
     /// The same inner stack inside a WebSocket at `path` on `host:port`.
     Ws {
         host: String,
@@ -125,8 +133,8 @@ async fn dial(params: &AgentParams, legs: &mut Legs) -> Result<AuthedSession, Cl
         return Err(ClientError::CdpNotLoopback);
     }
     match &params.transport {
-        Transport::Tls { broker } => {
-            let tcp = tcp_leg(params, legs, Target::Addr(*broker)).await?;
+        Transport::Tls { broker, host } => {
+            let tcp = tcp_leg(params, legs, Target::Addr(*broker, host.as_deref())).await?;
             finish(params, tcp, TlsVersions::Default, legs).await
         }
         Transport::Ws {
@@ -149,7 +157,8 @@ async fn dial(params: &AgentParams, legs: &mut Legs) -> Result<AuthedSession, Cl
 }
 
 enum Target<'a> {
-    Addr(SocketAddr),
+    /// A resolved address and the configured broker host name, if any.
+    Addr(SocketAddr, Option<&'a str>),
     Host(&'a str, u16),
 }
 
@@ -164,46 +173,24 @@ async fn tcp_leg(
 ) -> Result<TcpStream, ClientError> {
     if let Some(proxy) = params.proxy {
         let (name, port) = match target {
-            Target::Addr(a) => (params.server_name.as_str(), a.port()),
-            Target::Host(h, p) => (h, p),
+            Target::Addr(a, Some(host)) => (host.to_owned(), a.port()),
+            Target::Addr(a, None) => (connect_host(a), a.port()),
+            Target::Host(h, p) => (h.to_owned(), p),
         };
-        let attempt = tokio::time::timeout(
-            LEG_TIMEOUT,
-            connect_http_proxy(
-                proxy,
-                name,
-                port,
-                params.proxy_creds.as_deref().map(Vec::as_slice),
-            ),
-        )
-        .await
-        .unwrap_or(Err(ClientError::ProxyStatus { code: 0 }));
-        return match attempt {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                note(legs, Leg::Tcp, Ok(()));
-                note(legs, Leg::Proxy, Ok(()));
-                Ok(s)
-            }
-            Err(e @ ClientError::Tcp { .. }) => {
-                note(legs, Leg::Tcp, Err(e));
-                Err(e)
-            }
-            Err(e) => {
-                note(legs, Leg::Tcp, Ok(()));
-                note(legs, Leg::Proxy, Err(e));
-                Err(e)
-            }
-        };
+        return proxy_leg(params, legs, proxy, &name, port).await;
     }
     let addrs: Vec<SocketAddr> = match target {
-        Target::Addr(a) => vec![a],
+        Target::Addr(a, _) => vec![a],
         Target::Host(host, port) => {
-            let found = tokio::net::lookup_host((host, port))
-                .await
-                .map(|it| it.collect::<Vec<_>>());
+            let found =
+                tokio::time::timeout(LEG_TIMEOUT, tokio::net::lookup_host((host, port))).await;
             match found {
-                Ok(v) if !v.is_empty() => {
+                Ok(Ok(it)) => {
+                    let v: Vec<SocketAddr> = it.collect();
+                    if v.is_empty() {
+                        note(legs, Leg::Dns, Err(ClientError::Dns));
+                        return Err(ClientError::Dns);
+                    }
                     note(legs, Leg::Dns, Ok(()));
                     v
                 }
@@ -229,6 +216,51 @@ async fn tcp_leg(
     let e = ClientError::Tcp { kind: last };
     note(legs, Leg::Tcp, Err(e));
     Err(e)
+}
+
+/// The CONNECT host for a bare address: an IPv6 literal is bracketed.
+fn connect_host(addr: SocketAddr) -> String {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+/// TCP to the proxy (the `tcp` leg), then the CONNECT exchange (the
+/// `proxy` leg), each with its own timeout.
+async fn proxy_leg(
+    params: &AgentParams,
+    legs: &mut Legs,
+    proxy: SocketAddr,
+    name: &str,
+    port: u16,
+) -> Result<TcpStream, ClientError> {
+    let mut stream = match tokio::time::timeout(LEG_TIMEOUT, TcpStream::connect(proxy)).await {
+        Ok(Ok(s)) => s,
+        other => {
+            let kind = match other {
+                Ok(Err(e)) => e.kind(),
+                _ => std::io::ErrorKind::TimedOut,
+            };
+            let e = ClientError::Tcp { kind };
+            note(legs, Leg::Tcp, Err(e));
+            return Err(e);
+        }
+    };
+    let _ = stream.set_nodelay(true);
+    note(legs, Leg::Tcp, Ok(()));
+    let exchange = http_connect(
+        &mut stream,
+        name,
+        port,
+        params.proxy_creds.as_deref().map(Vec::as_slice),
+    );
+    let result = tokio::time::timeout(LEG_TIMEOUT, exchange)
+        .await
+        .unwrap_or(Err(ClientError::ProxyStatus { code: 0 }));
+    note(legs, Leg::Proxy, result);
+    result?;
+    Ok(stream)
 }
 
 fn outer_config(roots: Option<&Arc<rustls::RootCertStore>>) -> rustls::ClientConfig {
@@ -258,12 +290,13 @@ async fn outer_tls_leg(
     tcp: TcpStream,
     legs: &mut Legs,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ClientError> {
-    let fail = |legs: &mut Legs| {
-        note(legs, Leg::OuterTls, Err(ClientError::OuterTls));
-        ClientError::OuterTls
+    let fail = |legs: &mut Legs, class: OuterTlsClass| {
+        let e = ClientError::OuterTls(class);
+        note(legs, Leg::OuterTls, Err(e));
+        e
     };
     let Ok(name) = rustls::pki_types::ServerName::try_from(host.to_owned()) else {
-        return Err(fail(legs));
+        return Err(fail(legs, OuterTlsClass::HandshakeFailed));
     };
     let connector =
         tokio_rustls::TlsConnector::from(Arc::new(outer_config(params.outer_roots.as_ref())));
@@ -272,7 +305,8 @@ async fn outer_tls_leg(
             note(legs, Leg::OuterTls, Ok(()));
             Ok(tls)
         }
-        _ => Err(fail(legs)),
+        Ok(Err(e)) => Err(fail(legs, OuterTlsClass::of_io(&e))),
+        Err(_) => Err(fail(legs, OuterTlsClass::HandshakeFailed)),
     }
 }
 
@@ -397,7 +431,7 @@ where
     let status = match tokio::time::timeout(LEG_TIMEOUT, exchange).await {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(ClientError::InnerTls),
+        Err(_) => return Err(ClientError::Protocol),
     };
     match status {
         AUTH_OK => Ok(()),
@@ -416,7 +450,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let broker = listener.local_addr().unwrap();
         let params = AgentParams {
-            transport: Transport::Tls { broker },
+            transport: Transport::Tls { broker, host: None },
             server_name: "127.0.0.1".into(),
             pin: [0; 32],
             agent_id: "a".into(),
@@ -426,7 +460,7 @@ mod tests {
             proxy_creds: None,
             outer_roots: None,
         };
-        let tcp = tcp_leg(&params, &mut Vec::new(), Target::Addr(broker))
+        let tcp = tcp_leg(&params, &mut Vec::new(), Target::Addr(broker, None))
             .await
             .unwrap();
         assert!(tcp.nodelay().unwrap());

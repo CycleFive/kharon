@@ -136,7 +136,10 @@ async fn rig_with(sink: &ConnectorAudit) -> Rig {
 
 fn dial(rig: &Rig, transport: SessionTransport, agent: &str, token: &str) -> AgentParams {
     let transport = match transport {
-        SessionTransport::Tls => Dial::Tls { broker: rig.raw },
+        SessionTransport::Tls => Dial::Tls {
+            broker: rig.raw,
+            host: None,
+        },
         SessionTransport::Ws => Dial::Ws {
             host: "127.0.0.1".into(),
             port: rig.public.port(),

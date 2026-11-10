@@ -249,7 +249,10 @@ pub fn ws_dial(rig: &Rig, token: &str) -> AgentParams {
 
 pub fn raw_dial(rig: &Rig) -> AgentParams {
     AgentParams {
-        transport: Dial::Tls { broker: rig.raw },
+        transport: Dial::Tls {
+            broker: rig.raw,
+            host: None,
+        },
         ..ws_dial(rig, &rig.token)
     }
 }

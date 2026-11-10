@@ -33,7 +33,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use backoff::{Backoff, Outage, is_fixed_wait, leg_line};
+use backoff::{At, Backoff, Outage, err_text, fmt_dur, is_fixed_wait, leg_line_at};
 use kharon_connector::{
     AgentParams, ClientError, Leg, Transport, check_once, connect_and_auth, proxy_creds_line,
 };
@@ -44,6 +44,8 @@ use zeroize::Zeroizing;
 const EX_CONFIG: u8 = 78;
 /// `sysexits.h` `EX_UNAVAILABLE` — could not resolve the broker or proxy.
 const EX_UNAVAILABLE: u8 = 69;
+/// How long a name lookup may take before it counts as a failed `dns` leg.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -109,6 +111,26 @@ struct Config {
     proxy_creds: Option<Zeroizing<Vec<u8>>>,
 }
 
+impl Config {
+    fn at(&self) -> At {
+        let (host, port) = match &self.dest {
+            Dest::Tls { host, port } | Dest::Ws { host, port, .. } => (host, *port),
+        };
+        let join = |h: &str, p: u16| {
+            if h.contains(':') {
+                format!("[{h}]:{p}")
+            } else {
+                format!("{h}:{p}")
+            }
+        };
+        At {
+            host: host.clone(),
+            broker: join(host, port),
+            proxy: self.proxy.as_ref().map(|(h, p)| join(h, *p)),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let mut path = PathBuf::from("/etc/kharon-connector/connector.toml");
@@ -165,10 +187,11 @@ fn main() -> ExitCode {
                 return ExitCode::from(EX_UNAVAILABLE);
             }
         };
+        let at = cfg.at();
         if check {
-            return run_check(&params).await;
+            return run_check(&params, &at).await;
         }
-        run_until_signal(params).await;
+        run_until_signal(params, at).await;
         ExitCode::SUCCESS
     })
 }
@@ -422,13 +445,14 @@ fn valid_agent_id(id: &str) -> bool {
 async fn resolve(cfg: &Config) -> Result<AgentParams, String> {
     let proxy = match &cfg.proxy {
         None => None,
-        Some((host, port)) => Some(lookup(host, *port).await?),
+        Some((host, port)) => Some(lookup(host, *port, "proxy").await?),
     };
     // Through a proxy the proxy resolves the broker host; with `ws` the
     // dial resolves it, so there is nothing to look up here.
     let transport = match &cfg.dest {
         Dest::Tls { host, port } => Transport::Tls {
-            broker: lookup(host, *port).await?,
+            broker: lookup(host, *port, "broker").await?,
+            host: Some(host.clone()),
         },
         Dest::Ws { host, port, path } => Transport::Ws {
             host: host.clone(),
@@ -450,24 +474,32 @@ async fn resolve(cfg: &Config) -> Result<AgentParams, String> {
     })
 }
 
-async fn lookup(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let mut it = tokio::net::lookup_host((host, port))
+/// Resolve `host`, which is the `what` host ("broker" or "proxy") in the
+/// failure text. A lookup that hangs fails after [`LOOKUP_TIMEOUT`].
+async fn lookup(host: &str, port: u16, what: &str) -> Result<SocketAddr, String> {
+    let fail = || format!("cannot resolve the {what} host ({host})");
+    let mut it = tokio::time::timeout(LOOKUP_TIMEOUT, tokio::net::lookup_host((host, port)))
         .await
-        .map_err(|_| "cannot resolve host".to_owned())?;
-    it.next().ok_or_else(|| "cannot resolve host".to_owned())
+        .map_err(|_| fail())?
+        .map_err(|_| fail())?;
+    it.next().ok_or_else(fail)
 }
 
 /// `--check`: one pass over the legs. Exit 0 only when auth succeeded.
-async fn run_check(params: &AgentParams) -> ExitCode {
+async fn run_check(params: &AgentParams, at: &At) -> ExitCode {
     let legs = check_once(params).await;
     let mut authed = false;
     for (leg, result) in &legs {
         match result {
             Ok(()) => {
                 println!("ok {}", leg_label(*leg));
-                authed |= *leg == Leg::Auth;
+                if *leg == Leg::Auth {
+                    authed = true;
+                    // Wire v1 has no probe that leaves a live session alone.
+                    println!("note: a successful check replaces this agent's live broker session");
+                }
             }
-            Err(e) => println!("fail {}: {e}", leg_label(*leg)),
+            Err(e) => println!("fail {}: {}", leg_label(*leg), err_text(e, at)),
         }
     }
     if authed {
@@ -505,7 +537,7 @@ async fn session(
     sess.serve().await
 }
 
-async fn run_until_signal(params: AgentParams) {
+async fn run_until_signal(params: AgentParams, at: At) {
     let mut backoff = Backoff::default();
     let mut outage = Outage::default();
     let mut rng = rand::thread_rng();
@@ -536,14 +568,20 @@ async fn run_until_signal(params: AgentParams) {
                 return;
             }
             Ok(()) | Err(ClientError::Disconnected) => {
-                eprintln!("kharon-agent-connector: connection ended; reconnecting");
+                match authed_at {
+                    Some(t) => eprintln!(
+                        "kharon-agent-connector: session ended after {}; reconnecting",
+                        fmt_dur(t.elapsed())
+                    ),
+                    None => eprintln!("kharon-agent-connector: connection ended; reconnecting"),
+                }
                 if lived {
                     backoff.reset();
                 }
                 backoff.next(&mut rng)
             }
             Err(e) => {
-                eprintln!("kharon-agent-connector: {}", leg_line(&e));
+                eprintln!("kharon-agent-connector: {}", leg_line_at(&e, &at));
                 if authed_at.is_some() {
                     // Authenticated, then failed mid-session: the outage
                     // clock was just reset by `on_auth`.

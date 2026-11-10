@@ -50,7 +50,7 @@ pub fn leg_name(err: &ClientError) -> &'static str {
         ClientError::Dns => "dns",
         ClientError::Tcp { .. } => "tcp",
         ClientError::ProxyStatus { .. } | ClientError::ProxyAuth => "proxy",
-        ClientError::OuterTls => "outer-tls",
+        ClientError::OuterTls(_) => "outer-tls",
         ClientError::Upgrade { .. } => "upgrade",
         ClientError::InnerTls | ClientError::BadCert => "inner-tls",
         ClientError::Unauthorized | ClientError::Protocol => "auth",
@@ -62,6 +62,35 @@ pub fn leg_name(err: &ClientError) -> &'static str {
 /// `<leg>: <fixed error text>`. Never holds a token, credential or peer body.
 pub fn leg_line(err: &ClientError) -> String {
     format!("{}: {err}", leg_name(err))
+}
+
+/// Where this process dials, for the failure lines that name a host or an
+/// address. Taken from the binary's own config, never from the peer.
+#[derive(Debug, Clone)]
+pub struct At {
+    /// The broker host (no port).
+    pub host: String,
+    /// `host:port` of the broker.
+    pub broker: String,
+    /// `host:port` of the proxy, when one is configured.
+    pub proxy: Option<String>,
+}
+
+/// The fixed error text, naming the host (dns) or the address (tcp) that
+/// was tried. The `tcp` leg dials the proxy when there is one.
+pub fn err_text(err: &ClientError, at: &At) -> String {
+    match err {
+        ClientError::Dns => format!("{err} ({})", at.host),
+        ClientError::Tcp { .. } => {
+            format!("{err} to {}", at.proxy.as_deref().unwrap_or(&at.broker))
+        }
+        _ => err.to_string(),
+    }
+}
+
+/// Like [`leg_line`], with the host or address named.
+pub fn leg_line_at(err: &ClientError, at: &At) -> String {
+    format!("{}: {}", leg_name(err), err_text(err, at))
 }
 
 /// Credential refusals wait a fixed 60 s; everything else is jittered.
@@ -102,7 +131,7 @@ impl Outage {
     }
 }
 
-fn fmt_dur(d: Duration) -> String {
+pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s >= 3600 {
         format!("{}h{}m", s / 3600, (s % 3600) / 60)

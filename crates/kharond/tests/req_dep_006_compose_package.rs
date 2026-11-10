@@ -254,7 +254,10 @@ fn n1_tunnel_routes_in_docs_use_127_0_0_1() {
         assert!(guide.contains(needle), "deployment guide lacks {needle}");
     }
     for stale in ["about 100 seconds", "websocket upgrades in the last 60s"] {
-        assert!(!guide.contains(stale), "deployment guide still says {stale}");
+        assert!(
+            !guide.contains(stale),
+            "deployment guide still says {stale}"
+        );
     }
     assert!(
         !guide.contains("404 until it lands"),

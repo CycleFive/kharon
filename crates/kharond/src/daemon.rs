@@ -1220,10 +1220,14 @@ impl Daemon {
             .and_then(|rt| rt.task.as_ref())
             .map(|task| task.abort_handle());
         // Connector housekeeping: see `connector_housekeeping`.
-        let housekeeping = self
-            .connector
-            .as_ref()
-            .map(|rt| tokio::spawn(connector_housekeeping(Arc::clone(&rt.hub), ws.clone())));
+        let (housekeeping_stop, housekeeping_rx) = tokio::sync::watch::channel(false);
+        let housekeeping = self.connector.as_ref().map(|rt| {
+            tokio::spawn(connector_housekeeping(
+                Arc::clone(&rt.hub),
+                ws.clone(),
+                housekeeping_rx,
+            ))
+        });
         let served = match (self.listener, self.api_tls) {
             (Some((listener, _)), Some(tls)) => {
                 http::serve_tls_with_shutdown(listener, tls, self.broker, shutdown).await
@@ -1262,10 +1266,11 @@ impl Daemon {
                 task.abort();
             }
         }
-        // `abort` does not wait: await the task so no flush is still
-        // running on another worker once the final one below starts.
+        // Signal, don't abort: a flush already on the blocking pool
+        // finishes before the task returns, so none is still running once
+        // the final one below starts (an abort would leave it behind).
+        let _ = housekeeping_stop.send(true);
         if let Some(task) = housekeeping {
-            task.abort();
             let _ = task.await;
         }
         // The last refusal count leaves before the exit checkpoint
@@ -1305,11 +1310,16 @@ impl Daemon {
 
 /// The connector's periodic work: flush closed audit-limiter windows every
 /// [`CONNECTOR_AUDIT_FLUSH_PERIOD`] (#219), and log the count of refused
-/// WebSocket upgrades every [`WS_REFUSAL_LOG_PERIOD`] (#199). Runs until
-/// aborted. Each flush runs on the blocking pool: the sink fsyncs.
+/// WebSocket upgrades every [`WS_REFUSAL_LOG_PERIOD`] (#199). Each flush
+/// runs on the blocking pool: the sink fsyncs. Returns once `stop` is
+/// true. The signal is checked only between iterations, so a flush that
+/// has started finishes first. That is why shutdown signals and awaits
+/// this task instead of aborting it: an abort would drop the await and
+/// leave a running flush behind the daemon's final one.
 pub async fn connector_housekeeping(
     hub: Arc<crate::connector::Hub>,
     ws: Option<Arc<crate::connector::WsEntry>>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut flush = tokio::time::interval(CONNECTOR_AUDIT_FLUSH_PERIOD);
     let mut refusals = tokio::time::interval(WS_REFUSAL_LOG_PERIOD);
@@ -1325,6 +1335,12 @@ pub async fn connector_housekeeping(
             _ = refusals.tick() => {
                 if let Some(line) = ws.as_ref().and_then(|ws| ws.take_refusal_line()) {
                     eprintln!("kharond: {line}");
+                }
+            }
+            changed = stop.changed() => {
+                // A dropped sender also ends the task.
+                if changed.is_err() || *stop.borrow() {
+                    return;
                 }
             }
         }

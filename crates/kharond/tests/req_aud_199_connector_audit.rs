@@ -512,9 +512,11 @@ async fn housekeeping_flushes_a_burst_followed_by_silence() {
     let (store, _) = store();
     let hub = Arc::new(Hub::with_events(store, Arc::new(|_| {})));
     hub.set_audit(sink.audit());
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(kharond::daemon::connector_housekeeping(
         Arc::clone(&hub),
         None,
+        stop_rx,
     ));
     for _ in 0..3 {
         hub.audit_auth_fail("assistant", SessionTransport::Tls);
@@ -534,5 +536,23 @@ async fn housekeeping_flushes_a_burst_followed_by_silence() {
     assert_eq!(all.len(), 2, "exactly one summary: {all:?}");
     assert_eq!(all[1].suppressed, Some(2));
     assert_eq!(all[1].result.as_deref(), Some("suppressed_only"));
-    task.abort();
+    let _ = stop.send(true);
+    let _ = task.await;
+}
+
+/// Shutdown stops the housekeeping task with a signal rather than an
+/// abort, so a flush already on the blocking pool finishes before the task
+/// returns, and the daemon's final flush and exit checkpoint come after it.
+#[tokio::test]
+async fn housekeeping_returns_when_stopped() {
+    let (store, _) = store();
+    let hub = Arc::new(Hub::with_events(store, Arc::new(|_| {})));
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(kharond::daemon::connector_housekeeping(hub, None, stop_rx));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = stop.send(true);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("housekeeping returns once stopped")
+        .expect("housekeeping task did not panic");
 }

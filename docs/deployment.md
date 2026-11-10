@@ -640,6 +640,9 @@ At start kharond prints which one it bound:
 kharond: public ingress listening on 127.0.0.1:8790 (plain HTTP, loopback; POST /mcp only)
 ```
 
+With `[connector] websocket = true` the line ends
+`POST /mcp and GET /connector)` instead.
+
 On a host address, the input filter in
 [Tunnel-only listeners](#tunnel-only-listeners-req-dep-006) already
 covers it when it shares an address with `[api]`. Otherwise add one

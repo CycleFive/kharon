@@ -14,7 +14,7 @@ mod api_support;
 
 use std::sync::Arc;
 
-use api_support::{Harness, TestBroker, raw_request};
+use api_support::{Harness, TestBroker, mcp_call, raw_request};
 use kharond::api::transport::PER_IP_PER_MINUTE;
 
 async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
@@ -82,4 +82,42 @@ async fn api_listener_ignores_a_spoofed_header() {
         r.status, 429,
         "the real peer exhausted the window; the spoofed header moved nothing"
     );
+}
+
+/// The audit half of the contract: entries a call produces carry
+/// the effective client address — the honoured header value on
+/// public ingress, the connection peer on `[api]`.
+#[tokio::test]
+async fn audit_entries_carry_the_effective_client_ip() {
+    // Public ingress, header honoured.
+    let h = Harness::new(false);
+    let addr = serve_public(h.broker.clone()).await;
+    let payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"kharon_list\",\"arguments\":{},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}";
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: kharon.test\r\nAuthorization: Bearer {}\r\nCF-Connecting-IP: 198.51.100.23\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: kharon_list\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        h.alpha,
+        payload.len(),
+        payload
+    );
+    let r = raw_request(addr, req.as_bytes()).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let entries = h.audit.entries.lock().unwrap();
+    let list = entries
+        .iter()
+        .find(|e| e.event == kharond::audit::Event::List)
+        .expect("a list entry");
+    assert_eq!(list.client_ip.as_deref(), Some("198.51.100.23"));
+    drop(entries);
+
+    // The tailnet listener: the peer, header or no header.
+    let h = Harness::new(false);
+    let addr = api_support::serve_http(h.broker.clone()).await;
+    let r = mcp_call(addr, Some(&h.alpha), "kharon_list", "{}").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let entries = h.audit.entries.lock().unwrap();
+    let list = entries
+        .iter()
+        .find(|e| e.event == kharond::audit::Event::List)
+        .expect("a list entry");
+    assert_eq!(list.client_ip.as_deref(), Some("127.0.0.1"));
 }

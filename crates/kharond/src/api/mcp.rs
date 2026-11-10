@@ -640,6 +640,7 @@ async fn rpc<S, C>(
     headers: &HeaderMap,
     body: &[u8],
     received: Instant,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Reply
 where
     S: VaultView,
@@ -790,23 +791,27 @@ where
                     .and_then(|pairs| {
                         parse_request(op, pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     })
-                    .and_then(|r| broker.dispatch(agent, r)),
+                    .and_then(|r| broker.dispatch_from(agent, r, client_ip)),
                 (None, Some(op)) => {
                     match fill_arguments(call.arguments).and_then(|raw| parse_fill(op, raw)) {
-                        Ok(r) => broker.fill(agent, r, received).await,
+                        Ok(r) => broker.fill_from(agent, r, received, client_ip).await,
                         Err(e) => Err(e),
                     }
                 }
                 (None, None) => match tool {
                     Tool::Context => {
                         match fill_arguments(call.arguments).and_then(parse_context_body) {
-                            Ok(()) => broker.context(agent, received).await,
+                            Ok(()) => broker.context_from(agent, received, client_ip).await,
                             Err(e) => Err(e),
                         }
                     }
                     Tool::RequestGrant => {
                         match fill_arguments(call.arguments).and_then(parse_grant) {
-                            Ok(r) => broker.request_grant(agent, r, received).await,
+                            Ok(r) => {
+                                broker
+                                    .request_grant_from(agent, r, received, client_ip)
+                                    .await
+                            }
                             Err(e) => Err(e),
                         }
                     }
@@ -884,7 +889,16 @@ where
     if json_depth(&bytes) > MAX_JSON_DEPTH {
         return error(ApiError::JSON_TOO_DEEP);
     }
-    match rpc(&state.broker, &agent, &parts.headers, &bytes, received).await {
+    match rpc(
+        &state.broker,
+        &agent,
+        &parts.headers,
+        &bytes,
+        received,
+        client_ip,
+    )
+    .await
+    {
         Reply::Accepted => Response::builder()
             .status(StatusCode::ACCEPTED)
             .body(axum::body::Body::empty())

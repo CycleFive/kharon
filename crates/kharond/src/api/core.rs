@@ -433,6 +433,16 @@ fn new_request_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
+/// Stamp an audit entry with the client address of the call that
+/// produced it, when the call arrived over a network transport
+/// (#200). Direct (in-process) calls pass `None` and stay unstamped.
+fn stamp(entry: Entry, client_ip: &Option<std::net::IpAddr>) -> Entry {
+    match client_ip {
+        Some(ip) => entry.client_ip(ip.to_string()),
+        None => entry,
+    }
+}
+
 /// The grant action of a fill operation (SPEC §5's `actions`).
 fn grant_action(op: FillOperation) -> GrantAction {
     match op {
@@ -828,6 +838,18 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
 
     /// Run `req` for `agent`.
     pub fn dispatch(&self, agent: &AgentId, req: Request) -> Result<Outcome, ApiError> {
+        self.dispatch_from(agent, req, None)
+    }
+
+    /// [`dispatch`](Self::dispatch) admitted by a network transport:
+    /// `client_ip` (the effective client address, #200) stamps the
+    /// call's audit entries.
+    pub fn dispatch_from(
+        &self,
+        agent: &AgentId,
+        req: Request,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Outcome, ApiError> {
         let tool = match &req {
             Request::Status => "kharon_status",
             Request::List { .. } => "kharon_list",
@@ -836,8 +858,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         self.require_tool(agent, tool)?;
         match req {
             Request::Status => Ok(Outcome::Status(self.status(agent))),
-            Request::List { origin } => self.items(agent, Event::List, None, origin),
-            Request::Search { q, origin } => self.items(agent, Event::Search, Some(q), origin),
+            Request::List { origin } => self.items(agent, Event::List, None, origin, &client_ip),
+            Request::Search { q, origin } => {
+                self.items(agent, Event::Search, Some(q), origin, &client_ip)
+            }
         }
     }
 
@@ -874,6 +898,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         event: Event,
         q: Option<String>,
         origin: Option<String>,
+        client_ip: &Option<std::net::IpAddr>,
     ) -> Result<Outcome, ApiError> {
         // REQ-RL-001 list/search bucket (and suspension).
         let now = self.grant_now();
@@ -887,12 +912,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 RateDenied::Suspended => "agent_suspended",
                 RateDenied::Limited => "list_rate_limited",
             };
-            self.append(
+            self.append(stamp(
                 Entry::new(Event::RateLimit)
                     .agent_id(agent.0.clone())
                     .result("rate_limited")
                     .detail_code(detail),
-            )?;
+                client_ip,
+            ))?;
             return Err(ApiError::RATE_LIMITED);
         }
         let result = {
@@ -916,7 +942,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         };
         // Same entry whichever transport carried the request (the
         // contract test compares them). `q` is not logged.
-        let mut entry = Entry::new(event).agent_id(agent.0.clone());
+        let mut entry = stamp(Entry::new(event).agent_id(agent.0.clone()), client_ip);
         if let Some(o) = &origin {
             entry = entry.origin(o.clone());
         }
@@ -977,6 +1003,18 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         req: FillRequest,
         received: Instant,
     ) -> Result<Outcome, ApiError> {
+        self.fill_from(agent, req, received, None).await
+    }
+
+    /// [`fill`](Self::fill) admitted by a network transport:
+    /// `client_ip` stamps the call's audit entries (#200).
+    pub async fn fill_from(
+        &self,
+        agent: &AgentId,
+        req: FillRequest,
+        received: Instant,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Outcome, ApiError> {
         self.require_tool(agent, req.operation.tool_name())?;
         let deadline = received + self.fill_policy.deadline;
         let request_id = new_request_id();
@@ -985,10 +1023,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             FillOperation::FillTotp => Event::FillTotp,
         };
         let base = |e: Event| {
-            Entry::new(e)
-                .agent_id(agent.0.clone())
-                .item_id(req.item_id.clone())
-                .request_id(request_id.clone())
+            stamp(
+                Entry::new(e)
+                    .agent_id(agent.0.clone())
+                    .item_id(req.item_id.clone())
+                    .request_id(request_id.clone()),
+                &client_ip,
+            )
         };
         // The live origin the engine read, if the fill got that far
         // (REQ-AUD-003†, #67); copied into the outcome entry.
@@ -1029,13 +1070,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     RateDenied::Limited => "fill_rate_limited",
                 };
                 self.append(base(event).result("rate_limited").detail_code(detail))?;
-                self.append(
+                self.append(stamp(
                     Entry::new(Event::RateLimit)
                         .agent_id(agent.0.clone())
                         .item_id(req.item_id.clone())
                         .result("rate_limited")
                         .detail_code(detail),
-                )?;
+                    &client_ip,
+                ))?;
                 return Ok(Outcome::Fill(FillStatus::RateLimited.result()));
             }
         }
@@ -1050,7 +1092,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             }
             Err(Unresolved::Refused(status)) => status,
             Err(Unresolved::NeedsApproval) => {
-                let (status, id, observed) = self.pending_for_fill(agent, &req, deadline).await?;
+                let (status, id, observed) = self
+                    .pending_for_fill(agent, &req, deadline, &client_ip)
+                    .await?;
                 grant_request_id = id;
                 // #67: the observed origin is the outcome entry's
                 // live_origin, as when the engine reads it.
@@ -1138,12 +1182,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     .unwrap_or_else(|p| p.into_inner())
                     .note_origin_mismatch(agent.as_str());
                 if newly {
-                    let _ = self.append(
+                    let _ = self.append(stamp(
                         Entry::new(Event::RateLimit)
                             .agent_id(agent.0.clone())
                             .result("suspended")
                             .detail_code("origin_mismatch_streak"),
-                    );
+                        &client_ip,
+                    ));
                 }
             }
             // An insecure-context refusal (#180 item 3) never counted
@@ -1218,6 +1263,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         agent: &AgentId,
         req: &FillRequest,
         deadline: Instant,
+        client_ip: &Option<std::net::IpAddr>,
     ) -> Result<(FillStatus, Option<String>, Option<String>), ApiError> {
         // #180 item 3: a claim that fails the scheme rule is
         // refused here, before any observation or request — the
@@ -1274,13 +1320,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 });
             if claim_ok && !deduped && store.pending_count(agent.as_str()) >= max {
                 drop(store);
-                let _ = self.append(
+                let _ = self.append(stamp(
                     Entry::new(Event::RateLimit)
                         .agent_id(agent.0.clone())
                         .item_id(req.item_id.clone())
                         .result("rate_limited")
                         .detail_code("pending_grant_cap"),
-                );
+                    client_ip,
+                ));
                 return Ok((FillStatus::RateLimited, None, Some(observed)));
             }
         }
@@ -1297,7 +1344,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 self.grant_now(),
             );
         if created {
-            self.append(Self::grant_creation_entry(&greq))?;
+            self.append(stamp(Self::grant_creation_entry(&greq), client_ip))?;
             if greq.state == RequestState::Pending {
                 self.mint_approval_tokens(&greq.id);
                 self.notify_grant_request(&greq);
@@ -1326,15 +1373,30 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         args: GrantRequestArgs,
         received: Instant,
     ) -> Result<Outcome, ApiError> {
+        self.request_grant_from(agent, args, received, None).await
+    }
+
+    /// [`request_grant`](Self::request_grant) admitted by a network
+    /// transport: `client_ip` stamps the call's audit entries (#200).
+    pub async fn request_grant_from(
+        &self,
+        agent: &AgentId,
+        args: GrantRequestArgs,
+        received: Instant,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Outcome, ApiError> {
         self.require_tool(agent, "kharon_request_grant")?;
         let deadline = received + self.fill_policy.deadline;
         self.expire_grant_requests()
             .map_err(|_| ApiError::AUDIT_FAILED)?;
         let base = |result: &'static str| {
-            Entry::new(Event::GrantRequest)
-                .agent_id(agent.0.clone())
-                .item_id(args.item_id.clone())
-                .result(result)
+            stamp(
+                Entry::new(Event::GrantRequest)
+                    .agent_id(agent.0.clone())
+                    .item_id(args.item_id.clone())
+                    .result(result),
+                &client_ip,
+            )
         };
         let known = {
             let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1401,7 +1463,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 self.grant_now(),
             );
         if created {
-            self.append(Self::grant_creation_entry(&greq))?;
+            self.append(stamp(Self::grant_creation_entry(&greq), &client_ip))?;
             if greq.state == RequestState::Pending {
                 self.mint_approval_tokens(&greq.id);
                 self.notify_grant_request(&greq);
@@ -1963,13 +2025,27 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// agent, expired before dispatch) writes only the outcome entry.
     /// Not fill activity: does not reset the idle timer.
     pub async fn context(&self, agent: &AgentId, received: Instant) -> Result<Outcome, ApiError> {
+        self.context_from(agent, received, None).await
+    }
+
+    /// [`context`](Self::context) admitted by a network transport:
+    /// `client_ip` stamps the call's audit entries (#200).
+    pub async fn context_from(
+        &self,
+        agent: &AgentId,
+        received: Instant,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Outcome, ApiError> {
         self.require_tool(agent, "kharon_context")?;
         let deadline = received + self.fill_policy.deadline;
         let request_id = new_request_id();
         let base = |e: Event| {
-            Entry::new(e)
-                .agent_id(agent.0.clone())
-                .request_id(request_id.clone())
+            stamp(
+                Entry::new(e)
+                    .agent_id(agent.0.clone())
+                    .request_id(request_id.clone()),
+                &client_ip,
+            )
         };
         let generation = {
             let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());

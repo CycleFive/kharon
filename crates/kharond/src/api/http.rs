@@ -350,6 +350,7 @@ where
     // `!Send`.
     let token = bearer_token(&req);
     let query = req.uri().query().map(str::to_owned);
+    let client_ip = req.extensions().get::<ClientIp>().map(|c| c.0);
     drop(req);
     let agent = match authenticate(&state, token).await {
         Ok(a) => a,
@@ -361,7 +362,7 @@ where
         Route::OpenApi => unreachable!("handled above"),
     };
     let api_req = parse_query(op, query.as_deref().unwrap_or(""));
-    let outcome = api_req.and_then(|r| state.broker.dispatch(&agent, r));
+    let outcome = api_req.and_then(|r| state.broker.dispatch_from(&agent, r, client_ip));
     match outcome {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
@@ -396,6 +397,7 @@ where
     if !is_json(&parts.headers) {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
     }
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
         return error(ApiError::BODY_TOO_LARGE);
@@ -405,7 +407,11 @@ where
         Err(e) => return error(e),
     };
     drop(bytes);
-    match state.broker.fill(&agent, fill_req, received).await {
+    match state
+        .broker
+        .fill_from(&agent, fill_req, received, client_ip)
+        .await
+    {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
     }
@@ -436,6 +442,7 @@ where
         Err(e) => return error(e),
     };
     let json = is_json(&parts.headers);
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
         return error(ApiError::BODY_TOO_LARGE);
@@ -446,7 +453,7 @@ where
     if let Err(e) = parse_context_body(&bytes) {
         return error(e);
     }
-    match state.broker.context(&agent, received).await {
+    match state.broker.context_from(&agent, received, client_ip).await {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
     }
@@ -586,6 +593,7 @@ where
     if !is_json(&parts.headers) {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
     }
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
         return error(ApiError::BODY_TOO_LARGE);
@@ -597,7 +605,7 @@ where
     drop(bytes);
     match state
         .broker
-        .request_grant(&agent, grant_req, received)
+        .request_grant_from(&agent, grant_req, received, client_ip)
         .await
     {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),

@@ -355,6 +355,21 @@ async fn hello_timeout_is_an_auth_leg_error() {
     );
 }
 
+/// True if the resolver gives `host` any address.
+async fn resolver_answers(host: &str) -> bool {
+    // A broken resolver is no reason to skip: a timeout counts as "does not
+    // answer", and the test runs as in production.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host((host, 443)),
+    )
+    .await
+    {
+        Ok(Ok(mut addrs)) => addrs.next().is_some(),
+        _ => false,
+    }
+}
+
 #[tokio::test]
 async fn check_once_names_each_leg() {
     let (cdp, hits) = echo_stub().await;
@@ -377,17 +392,25 @@ async fn check_once_names_each_leg() {
     assert!(legs.iter().all(|(_, r)| r.is_ok()), "{legs:?}");
     assert_eq!(hits.load(Ordering::SeqCst), 0, "check_once opens no CDP");
 
-    let mut dns = ws_params(&srv, srv.inner_pin, cdp);
-    dns.transport = Transport::Ws {
-        host: "no-such-host.invalid".into(),
-        port: 443,
-        path: "/connector".into(),
-        outer_tls: true,
-    };
-    assert_eq!(
-        check_once(&dns).await,
-        vec![(Leg::Dns, Err(ClientError::Dns))]
-    );
+    // A resolver that answers a reserved `.invalid` name (RFC 6761) defeats
+    // this sub-check; skip only it. CI's resolver conforms.
+    if resolver_answers("no-such-host.invalid").await {
+        eprintln!(
+            "SKIP check_once_names_each_leg (dns leg): the resolver answers no-such-host.invalid (a reserved .invalid name, RFC 6761); the dns-leg check is not meaningful here"
+        );
+    } else {
+        let mut dns = ws_params(&srv, srv.inner_pin, cdp);
+        dns.transport = Transport::Ws {
+            host: "no-such-host.invalid".into(),
+            port: 443,
+            path: "/connector".into(),
+            outer_tls: true,
+        };
+        assert_eq!(
+            check_once(&dns).await,
+            vec![(Leg::Dns, Err(ClientError::Dns))]
+        );
+    }
 
     let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = closed.local_addr().unwrap().port();

@@ -134,24 +134,6 @@ fn stderr_sink() -> EventSink {
 /// append. Best effort: an `Err` is logged and changes nothing else.
 pub type ConnectorAudit = Arc<dyn Fn(Entry) -> Result<(), ()> + Send + Sync>;
 
-/// Why a hello for a configured agent was refused (`detail_code`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthFailCode {
-    /// The token did not verify (`AUTH_UNAUTHORIZED`).
-    Unauthorized,
-    /// The hello was malformed (`AUTH_PROTOCOL`).
-    Protocol,
-}
-
-impl AuthFailCode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Unauthorized => "unauthorized",
-            Self::Protocol => "protocol",
-        }
-    }
-}
-
 /// Accepted connector sessions, keyed by agent id.
 pub struct Hub {
     tokens: TokenStore,
@@ -250,7 +232,9 @@ impl Hub {
         let _ = self.audit.set(sink);
     }
 
-    /// Append `entry` through the sink, if one is set. Best effort: a
+    /// Append `entry` through the sink, if one is set. The sink runs
+    /// synchronously on the calling connection task; the per-agent
+    /// per-minute limiter bounds how often. Best effort: a
     /// failure prints a fixed line (no detail) and changes nothing. Never
     /// call this with a `Hub` lock held.
     fn emit(&self, entry: Entry) {
@@ -263,8 +247,10 @@ impl Hub {
 
     /// Audit a refused hello that claimed `claimed` (#199). Written only
     /// when `claimed` is a configured agent, at most one entry per agent
-    /// per 60 s; unknown ids and junk are not audited.
-    pub fn audit_auth_fail(&self, claimed: &str, transport: Transport, code: AuthFailCode) {
+    /// per 60 s; unknown ids and junk are not audited. `detail_code` is
+    /// always `unauthorized`: a malformed hello carries no attributable
+    /// agent id.
+    pub fn audit_auth_fail(&self, claimed: &str, transport: Transport) {
         if !self.tokens.agents().any(|id| id == claimed) {
             return;
         }
@@ -277,7 +263,7 @@ impl Hub {
                 Entry::new(Event::ConnectorAuthFail)
                     .agent_id(claimed)
                     .transport(transport.to_string())
-                    .detail_code(code.as_str())
+                    .detail_code("unauthorized")
                     .suppressed(suppressed),
             );
         }
@@ -484,7 +470,7 @@ where
         Some((tls, hello.agent_id))
     } else {
         hub.report(ConnectorEvent::Refused { peer });
-        hub.audit_auth_fail(&hello.agent_id, transport, AuthFailCode::Unauthorized);
+        hub.audit_auth_fail(&hello.agent_id, transport);
         let _ = write_server_hello(&mut tls, AUTH_UNAUTHORIZED).await;
         None
     }

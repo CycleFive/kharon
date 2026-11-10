@@ -75,7 +75,7 @@ pub enum Event {
     LogTruncated,
     /// #199: a connector hello named a configured agent but the tunnel
     /// credential did not verify. Carries `agent_id`, `transport`,
-    /// `detail_code` (`unauthorized`|`protocol`) and `suppressed`; at
+    /// `detail_code` (always `unauthorized`) and `suppressed`; at
     /// most one per agent per 60 s. Best effort.
     ConnectorAuthFail,
     /// #199: a new connector session evicted a live one. Carries

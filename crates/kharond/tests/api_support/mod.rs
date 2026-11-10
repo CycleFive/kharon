@@ -288,6 +288,47 @@ impl Harness {
             &CHEAP_FLOOR,
         )
         .unwrap();
+        Self::assemble(
+            locked,
+            tokens,
+            alpha.expose_secret().clone(),
+            beta.expose_secret().clone(),
+            configure,
+        )
+    }
+
+    /// As [`Harness::new`], with `alpha` restricted to the given tool
+    /// allow-list (#200; `beta` stays unrestricted, `None` leaves
+    /// alpha unrestricted too).
+    pub fn with_alpha_tools(locked: bool, alpha_tools: Option<Vec<String>>) -> Self {
+        let (alpha, ha) = generate_with(&cheap_argon(), "alpha");
+        let (beta, hb) = generate_with(&cheap_argon(), "beta");
+        let tokens = TokenStore::with_floor(
+            [("alpha", ha.as_str()), ("beta", hb.as_str())],
+            &CHEAP_FLOOR,
+        )
+        .unwrap()
+        .with_allow_lists(
+            [("alpha", alpha_tools.as_deref())],
+            &kharond::api::mcp::TOOL_NAMES,
+        )
+        .unwrap();
+        Self::assemble(
+            locked,
+            tokens,
+            alpha.expose_secret().clone(),
+            beta.expose_secret().clone(),
+            |b| b,
+        )
+    }
+
+    fn assemble(
+        locked: bool,
+        tokens: TokenStore,
+        alpha: String,
+        beta: String,
+        configure: impl FnOnce(TestBroker) -> TestBroker,
+    ) -> Self {
         let clock = Arc::new(ManualClock::new());
         let mut lock = LockController::new(
             LockPolicy::default(),
@@ -308,8 +349,8 @@ impl Harness {
             broker: Arc::new(broker),
             clock,
             audit,
-            alpha: alpha.expose_secret().clone(),
-            beta: beta.expose_secret().clone(),
+            alpha,
+            beta,
         }
     }
 

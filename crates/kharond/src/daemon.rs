@@ -763,7 +763,7 @@ pub async fn start(
         hardening.lock_memory().map_err(StartupError::Mlock)?;
     }
 
-    let tokens = TokenStore::from_agents(&cfg.agents)?;
+    let tokens = TokenStore::from_agents(&cfg.agents, &crate::api::mcp::TOOL_NAMES)?;
 
     let audit_dir = cfg.data_dir.join("audit");
     create_private_dir(&audit_dir).map_err(|e| StartupError::DataDir {

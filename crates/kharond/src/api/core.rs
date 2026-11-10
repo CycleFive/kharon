@@ -809,8 +809,31 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         self.transport.check_agent(&agent.0, now)
     }
 
+    /// Whether `agent`'s token may call `tool` (#200; the allow-list
+    /// bound to the token's identity in [`TokenStore`]). Both
+    /// transports enforce it — the broker methods below refuse before
+    /// any state is read, and `tools/list` filters by it — so a
+    /// restricted token is restricted everywhere, not just on /mcp.
+    pub fn tool_allowed(&self, agent: &AgentId, tool: &str) -> bool {
+        self.tokens.allows(&agent.0, tool)
+    }
+
+    fn require_tool(&self, agent: &AgentId, tool: &str) -> Result<(), ApiError> {
+        if self.tool_allowed(agent, tool) {
+            Ok(())
+        } else {
+            Err(ApiError::TOOL_NOT_ALLOWED)
+        }
+    }
+
     /// Run `req` for `agent`.
     pub fn dispatch(&self, agent: &AgentId, req: Request) -> Result<Outcome, ApiError> {
+        let tool = match &req {
+            Request::Status => "kharon_status",
+            Request::List { .. } => "kharon_list",
+            Request::Search { .. } => "kharon_search",
+        };
+        self.require_tool(agent, tool)?;
         match req {
             Request::Status => Ok(Outcome::Status(self.status(agent))),
             Request::List { origin } => self.items(agent, Event::List, None, origin),
@@ -954,6 +977,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         req: FillRequest,
         received: Instant,
     ) -> Result<Outcome, ApiError> {
+        self.require_tool(agent, req.operation.tool_name())?;
         let deadline = received + self.fill_policy.deadline;
         let request_id = new_request_id();
         let event = match req.operation {
@@ -1302,6 +1326,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         args: GrantRequestArgs,
         received: Instant,
     ) -> Result<Outcome, ApiError> {
+        self.require_tool(agent, "kharon_request_grant")?;
         let deadline = received + self.fill_policy.deadline;
         self.expire_grant_requests()
             .map_err(|_| ApiError::AUDIT_FAILED)?;
@@ -1938,6 +1963,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// agent, expired before dispatch) writes only the outcome entry.
     /// Not fill activity: does not reset the idle timer.
     pub async fn context(&self, agent: &AgentId, received: Instant) -> Result<Outcome, ApiError> {
+        self.require_tool(agent, "kharon_context")?;
         let deadline = received + self.fill_policy.deadline;
         let request_id = new_request_id();
         let base = |e: Event| {

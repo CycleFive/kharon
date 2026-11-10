@@ -32,7 +32,7 @@
 //! [`TokenStore::with_floor`] takes an explicit floor; only tests use a
 //! lower one (debug-build Argon2id at the production cost is slow).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHash, PasswordHashString, PasswordHasher, SaltString};
@@ -79,6 +79,14 @@ pub enum TokenStoreError {
         t_cost: u32,
         /// Floor parallelism.
         p_cost: u32,
+    },
+    /// An agent's tool allow-list names a tool that does not exist.
+    #[error("agents.{agent}.tools names an unknown tool '{tool}'")]
+    UnknownTool {
+        /// Agent id.
+        agent: String,
+        /// The offending tool name.
+        tool: String,
     },
 }
 
@@ -223,6 +231,11 @@ pub struct TokenStore {
     /// `kh_agent_` or `kh_tunnel_`. A token with the other prefix never
     /// verifies against this store.
     prefix: &'static str,
+    /// Per-agent tool allow-lists (#200): only restricted agents are
+    /// present; an absent agent may call every tool. Bound to the
+    /// agent identity the token authenticates as — a token cannot act
+    /// as another agent, so it cannot borrow another's list.
+    allow: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for TokenStore {
@@ -293,17 +306,68 @@ impl TokenStore {
             hashes: map,
             decoy,
             prefix,
+            allow: BTreeMap::new(),
         })
     }
 
     /// From the config's `[agents.*]` tables (REQ-API-003), at the
-    /// production floor.
-    pub fn from_agents(agents: &BTreeMap<String, AgentConfig>) -> Result<Self, TokenStoreError> {
-        Self::new(
+    /// production floor. `valid_tools` is the tool registry's name
+    /// set: an agent's `tools` allow-list may only name those
+    /// (#200). An agent without `tools` is unrestricted.
+    pub fn from_agents(
+        agents: &BTreeMap<String, AgentConfig>,
+        valid_tools: &[&str],
+    ) -> Result<Self, TokenStoreError> {
+        let store = Self::new(
             agents
                 .iter()
                 .map(|(id, a)| (id.as_str(), a.token_hash.expose().as_str())),
+        )?;
+        store.with_allow_lists(
+            agents
+                .iter()
+                .map(|(id, a)| (id.as_str(), a.tools.as_deref())),
+            valid_tools,
         )
+    }
+
+    /// Attach per-agent tool allow-lists (#200). An entry of `None`
+    /// leaves the agent unrestricted; `Some(names)` restricts it to
+    /// exactly those tools (an empty list: none). Every name must be
+    /// in `valid_tools`, so a typo in config fails at startup instead
+    /// of silently widening or narrowing access at request time.
+    pub fn with_allow_lists<'a>(
+        mut self,
+        lists: impl IntoIterator<Item = (&'a str, Option<&'a [String]>)>,
+        valid_tools: &[&str],
+    ) -> Result<Self, TokenStoreError> {
+        for (agent, list) in lists {
+            let Some(names) = list else { continue };
+            let mut set = BTreeSet::new();
+            for name in names {
+                if !valid_tools.contains(&name.as_str()) {
+                    return Err(TokenStoreError::UnknownTool {
+                        agent: agent.to_owned(),
+                        tool: name.clone(),
+                    });
+                }
+                set.insert(name.clone());
+            }
+            self.allow.insert(agent.to_owned(), set);
+        }
+        Ok(self)
+    }
+
+    /// Whether `agent`'s token may call `tool` (#200). Agents with
+    /// no allow-list may call every tool. Read fresh on every call:
+    /// there is no cache, so a rebuilt store (or an owner's revoke,
+    /// which is checked separately in `Broker::authenticate`) takes
+    /// effect on the very next request.
+    pub fn allows(&self, agent: &str, tool: &str) -> bool {
+        match self.allow.get(agent) {
+            None => true,
+            Some(set) => set.contains(tool),
+        }
     }
 
     /// Tunnel credentials for agents with `via = agent_connector`.
@@ -358,6 +422,43 @@ impl TokenStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TOOLS: [&str; 3] = ["kharon_status", "kharon_list", "kharon_fill"];
+
+    fn store_with(list: Option<Vec<String>>) -> Result<TokenStore, TokenStoreError> {
+        let (_tok, hash) = generate_with(&cheap(), "alpha");
+        TokenStore::with_floor([("alpha", hash.as_str())], &TEST_FLOOR)?
+            .with_allow_lists([("alpha", list.as_deref())], &TOOLS)
+    }
+
+    #[test]
+    fn allow_list_restricts_and_absence_does_not() {
+        let store = store_with(Some(vec!["kharon_status".to_owned()])).unwrap();
+        assert!(store.allows("alpha", "kharon_status"));
+        assert!(!store.allows("alpha", "kharon_fill"));
+        assert!(
+            store.allows("beta", "kharon_fill"),
+            "no list, no restriction"
+        );
+
+        let store = store_with(None).unwrap();
+        assert!(store.allows("alpha", "kharon_fill"), "None = unrestricted");
+
+        let store = store_with(Some(vec![])).unwrap();
+        assert!(!store.allows("alpha", "kharon_status"), "empty = none");
+    }
+
+    #[test]
+    fn allow_list_rejects_unknown_tool_names() {
+        let err = store_with(Some(vec!["kharon_fly".to_owned()])).unwrap_err();
+        assert_eq!(
+            err,
+            TokenStoreError::UnknownTool {
+                agent: "alpha".to_owned(),
+                tool: "kharon_fly".to_owned(),
+            }
+        );
+    }
 
     fn cheap() -> Argon2<'static> {
         Argon2::new(

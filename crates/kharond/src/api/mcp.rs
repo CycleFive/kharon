@@ -387,6 +387,18 @@ pub fn tool_definitions() -> Value {
     Value::Array(Tool::ALL.into_iter().map(Tool::definition).collect())
 }
 
+/// Every tool name, in [`Tool::ALL`] order — the registry the other
+/// layers validate against (per-agent allow-lists, #200).
+pub const TOOL_NAMES: [&str; 7] = {
+    let mut names = [""; 7];
+    let mut i = 0;
+    while i < Tool::ALL.len() {
+        names[i] = Tool::ALL[i].name();
+        i += 1;
+    }
+    names
+};
+
 // ------------------------------------------------------------- JSON-RPC
 
 /// JSON-RPC errors this server sends. Messages are literals.
@@ -755,7 +767,13 @@ where
             id,
             era,
             object(json!({
-                "tools": tool_definitions(),
+                // Scope-filtered (#200): an agent with an allow-list
+                // sees only its tools. Unrestricted agents get the
+                // full registry (the mcp-tools.json snapshot).
+                "tools": Tool::ALL.into_iter()
+                    .filter(|t| broker.tool_allowed(agent, t.name()))
+                    .map(Tool::definition)
+                    .collect::<Vec<_>>(),
                 "ttlMs": CACHE_TTL_MS,
                 "cacheScope": "public",
             })),

@@ -92,6 +92,8 @@ pub enum Detail {
     /// The token did not verify (wrong, unknown agent, malformed — not
     /// distinguished).
     InvalidToken,
+    /// The tool is not in the agent's allow-list (#200).
+    ToolNotAllowed,
     /// Locked; the owner must unlock.
     Locked,
     /// A query parameter the route does not take.
@@ -154,6 +156,7 @@ impl Detail {
         match self {
             Self::MissingToken => "missing bearer token",
             Self::InvalidToken => "invalid agent token",
+            Self::ToolNotAllowed => "tool not in the agent's allow-list",
             Self::Locked => "broker is locked; owner unlock required",
             Self::UnknownParameter => "unknown query parameter",
             Self::DuplicateParameter => "duplicate query parameter",
@@ -184,9 +187,10 @@ impl Detail {
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::MissingToken,
         Self::InvalidToken,
+        Self::ToolNotAllowed,
         Self::Locked,
         Self::UnknownParameter,
         Self::DuplicateParameter,
@@ -236,6 +240,8 @@ impl ApiError {
     pub const MISSING_TOKEN: Self = Self::new(ErrorCode::Unauthorized, Detail::MissingToken);
     /// 401, token did not verify.
     pub const INVALID_TOKEN: Self = Self::new(ErrorCode::Unauthorized, Detail::InvalidToken);
+    /// 403, the tool is outside the agent's allow-list (#200).
+    pub const TOOL_NOT_ALLOWED: Self = Self::new(ErrorCode::Forbidden, Detail::ToolNotAllowed);
     /// 423.
     pub const LOCKED: Self = Self::new(ErrorCode::Locked, Detail::Locked);
     /// 500, REQ-AUD-003 fail-closed.

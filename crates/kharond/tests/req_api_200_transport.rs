@@ -101,13 +101,14 @@ async fn audit_entries_carry_the_effective_client_ip() {
     );
     let r = raw_request(addr, req.as_bytes()).await;
     assert_eq!(r.status, 200, "{}", r.body);
-    let entries = h.audit.entries.lock().unwrap();
-    let list = entries
-        .iter()
-        .find(|e| e.event == kharond::audit::Event::List)
-        .expect("a list entry");
-    assert_eq!(list.client_ip.as_deref(), Some("198.51.100.23"));
-    drop(entries);
+    {
+        let entries = h.audit.entries.lock().unwrap();
+        let list = entries
+            .iter()
+            .find(|e| e.event == kharond::audit::Event::List)
+            .expect("a list entry");
+        assert_eq!(list.client_ip.as_deref(), Some("198.51.100.23"));
+    }
 
     // The tailnet listener: the peer, header or no header.
     let h = Harness::new(false);

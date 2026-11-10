@@ -121,3 +121,62 @@ async fn audit_entries_carry_the_effective_client_ip() {
         .expect("a list entry");
     assert_eq!(list.client_ip.as_deref(), Some("127.0.0.1"));
 }
+
+/// The redaction probe (#200): canary-shaped secrets — the fixture
+/// vault's passwords and full usernames, the agent's own bearer
+/// token, and a canary used as a search query — must appear in no
+/// response body and no audit entry the public surface produces,
+/// across success and error paths alike.
+#[tokio::test]
+async fn public_surface_never_echoes_secrets() {
+    use api_support::{assert_no_canary, canaries, mcp_request};
+    let h = Harness::new(false);
+    let addr = serve_public(h.broker.clone()).await;
+    let token = h.alpha.clone();
+
+    let mut bodies: Vec<String> = Vec::new();
+    // Discovery + reads.
+    for (method, params) in [
+        ("tools/list", "{}"),
+        ("tools/call", r#"{"name":"kharon_list","arguments":{}}"#),
+        ("tools/call", r#"{"name":"kharon_status","arguments":{}}"#),
+    ] {
+        let r = mcp_request(addr, Some(&token), method, params).await;
+        bodies.push(r.body);
+    }
+    // The canary as a search query: queries are not logged, and the
+    // query itself is a vault password — it must come back nowhere.
+    let q = canaries()[0].clone();
+    let params = format!(r#"{{"name":"kharon_search","arguments":{{"q":"{q}"}}}}"#);
+    let r = mcp_request(addr, Some(&token), "tools/call", &params).await;
+    bodies.push(r.body);
+    // A near-miss token (the real one, corrupted) is refused; the
+    // refusal must not echo what was presented.
+    let bad = format!("{token}x");
+    let r = mcp_request(addr, Some(&bad), "tools/list", "{}").await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert!(!r.body.contains(&bad), "401 echoed the presented token");
+    bodies.push(r.body);
+    // An oversized body: the 413 shape is fixed text too.
+    let big = " ".repeat(70 * 1024);
+    let r = api_support::post_mcp_raw(
+        addr,
+        Some(&token),
+        &[("Content-Type", "application/json")],
+        &big,
+    )
+    .await;
+    assert_eq!(r.status, 413, "{}", r.body);
+    bodies.push(r.body);
+
+    for body in &bodies {
+        assert_no_canary(body);
+        assert!(!body.contains(&token), "response echoed the bearer token");
+    }
+    let audit = serde_json::to_string(&*h.audit.entries.lock().unwrap()).unwrap();
+    assert_no_canary(&audit);
+    assert!(
+        !audit.contains(&token),
+        "audit entry holds the bearer token"
+    );
+}

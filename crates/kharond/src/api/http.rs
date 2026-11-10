@@ -359,7 +359,7 @@ where
     }
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
     let fill_req = match parse_fill(op, &bytes) {
         Ok(r) => r,
@@ -399,7 +399,7 @@ where
     let json = is_json(&parts.headers);
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
     if !bytes.is_empty() && !json {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
@@ -549,7 +549,7 @@ where
     }
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
     let grant_req = match parse_grant(&bytes) {
         Ok(r) => r,

@@ -26,13 +26,13 @@
 //! tokens from the internet cannot starve tailnet agents of Argon2id
 //! permits.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::Method;
+use axum::http::{HeaderMap, Method};
 use axum::response::Response;
 use axum::serve::IncomingStream;
 use tokio::net::TcpListener;
@@ -46,6 +46,47 @@ use crate::lock::Clock;
 
 /// `GET /connector`: the agent-connector WebSocket upgrade (#199).
 pub const CONNECTOR_PATH: &str = "/connector";
+
+/// The header Cloudflare sets for the client address of a request it
+/// proxied (`CF-Connecting-IP`).
+pub const CF_CONNECTING_IP: &str = "cf-connecting-ip";
+
+/// The client address of a request, taken from
+/// [`CF_CONNECTING_IP`] — the trusted-proxy helper (#200; the
+/// contract below is the one recorded on #206, and #208 reuses this
+/// helper for the owner UI).
+///
+/// **The trust root is placement.** The header is honoured *only*
+/// on a public-ingress request ([`PublicIngress`]): that listener's
+/// loopback is one only cloudflared shares by placement (a shared
+/// network-namespace holder in compose; host networking on VM 125).
+/// On any other listener the header is ignored — there the peer
+/// identity comes from the connection itself, and a client must not
+/// be able to name its own address. On a host-networked deploy every
+/// local process shares that loopback and could set the header; that
+/// residual is accepted for single-purpose hosts, and it is
+/// acceptable only because of the next paragraph.
+///
+/// **What the result may decide: nothing next to auth.** An address
+/// taken from this helper may key throttling and may appear in
+/// audit. It must never gate authentication or any decision beside
+/// it: no allow-list, no exemption from a token or the passkey, no
+/// choice of mode.
+///
+/// Returns `None` when the request is not public-ingress, the
+/// header is absent, appears more than once, or does not parse as
+/// one IP address (v4 or v6).
+pub fn client_ip(headers: &HeaderMap, public_ingress: bool) -> Option<IpAddr> {
+    if !public_ingress {
+        return None;
+    }
+    let mut values = headers.get_all(CF_CONNECTING_IP).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().ok()?,
+        _ => return None,
+    };
+    value.trim().parse().ok()
+}
 
 /// Request extension: this request arrived on the public-ingress
 /// listener (#198), not the tailnet `[api]` listener.
@@ -176,6 +217,35 @@ fn not_found() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_ip_is_honoured_only_on_public_ingress() {
+        let mut h = HeaderMap::new();
+        h.insert(CF_CONNECTING_IP, "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            client_ip(&h, false),
+            None,
+            "spoofed on the private listener"
+        );
+        assert_eq!(
+            client_ip(&h, true),
+            Some("203.0.113.7".parse::<IpAddr>().unwrap())
+        );
+        let mut h = HeaderMap::new();
+        h.insert(CF_CONNECTING_IP, "2001:db8::1".parse().unwrap());
+        assert_eq!(
+            client_ip(&h, true),
+            Some("2001:db8::1".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(client_ip(&HeaderMap::new(), true), None);
+        let mut h = HeaderMap::new();
+        h.insert(CF_CONNECTING_IP, "not-an-ip".parse().unwrap());
+        assert_eq!(client_ip(&h, true), None);
+        let mut h = HeaderMap::new();
+        h.append(CF_CONNECTING_IP, "203.0.113.7".parse().unwrap());
+        h.append(CF_CONNECTING_IP, "203.0.113.8".parse().unwrap());
+        assert_eq!(client_ip(&h, true), None, "two values is not one address");
+    }
 
     #[test]
     fn only_post_mcp_and_get_connector_are_admitted() {

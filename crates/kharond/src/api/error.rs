@@ -29,6 +29,9 @@ pub enum ErrorCode {
     NotFound,
     /// Route exists, method does not (HTTP 405).
     MethodNotAllowed,
+    /// The request body exceeds a size or nesting limit (HTTP 413;
+    /// #200).
+    PayloadTooLarge,
     /// The audit write failed; the request was refused (REQ-AUD-003,
     /// HTTP 500).
     AuditFailed,
@@ -46,6 +49,7 @@ impl ErrorCode {
             Self::BadRequest => "bad_request",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
+            Self::PayloadTooLarge => "payload_too_large",
             Self::AuditFailed => "audit_failed",
             Self::RateLimited => "rate_limited",
         }
@@ -60,19 +64,21 @@ impl ErrorCode {
             Self::BadRequest => 400,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
+            Self::PayloadTooLarge => 413,
             Self::AuditFailed => 500,
             Self::RateLimited => 429,
         }
     }
 
     /// Every code (for the REQ-API-006 tests and the OpenAPI enum).
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::Locked,
         Self::BadRequest,
         Self::NotFound,
         Self::MethodNotAllowed,
+        Self::PayloadTooLarge,
         Self::AuditFailed,
         Self::RateLimited,
     ];
@@ -118,6 +124,8 @@ pub enum Detail {
     UnsupportedContentType,
     /// The request body (MCP, `fill`) exceeds its cap.
     BodyTooLarge,
+    /// The request JSON is nested deeper than the cap (#200).
+    JsonTooDeep,
     /// The request body is not valid JSON (`fill`, `fill_totp`).
     InvalidJsonBody,
     /// The fill request does not match `FillRequest` / `FillTotpRequest`
@@ -162,6 +170,7 @@ impl Detail {
             Self::BrowserOriginRefused => "browser origins are not accepted",
             Self::UnsupportedContentType => "content type must be application/json",
             Self::BodyTooLarge => "request body too large",
+            Self::JsonTooDeep => "request JSON nested too deeply",
             Self::InvalidJsonBody => "request body is not valid JSON",
             Self::InvalidFillRequest => "fill request does not match the schema",
             Self::InvalidItemId => "item_id must be a UUID",
@@ -175,7 +184,7 @@ impl Detail {
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::MissingToken,
         Self::InvalidToken,
         Self::Locked,
@@ -194,6 +203,7 @@ impl Detail {
         Self::BrowserOriginRefused,
         Self::UnsupportedContentType,
         Self::BodyTooLarge,
+        Self::JsonTooDeep,
         Self::InvalidJsonBody,
         Self::InvalidFillRequest,
         Self::InvalidItemId,
@@ -233,6 +243,10 @@ impl ApiError {
 
     /// Audit write failed.
     pub const AUDIT_FAILED: Self = Self::new(ErrorCode::AuditFailed, Detail::AuditWriteFailed);
+    /// 413, request body over its byte cap (#200: excess is 413, not 400).
+    pub const BODY_TOO_LARGE: Self = Self::new(ErrorCode::PayloadTooLarge, Detail::BodyTooLarge);
+    /// 413, request JSON nested past the depth cap (#200).
+    pub const JSON_TOO_DEEP: Self = Self::new(ErrorCode::PayloadTooLarge, Detail::JsonTooDeep);
 
     /// 400 with `detail`.
     pub const fn bad_request(detail: Detail) -> Self {

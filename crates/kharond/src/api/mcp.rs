@@ -92,6 +92,45 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = [
 ];
 /// Largest accepted request body (bytes).
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Deepest accepted JSON nesting in a request body (#200). An
+/// explicit cap, well under `serde_json`'s implicit recursion limit,
+/// so a hostile body cannot spend the parser's stack; excess is 413.
+/// Counted by [`json_depth`], which scans the raw bytes *before* any
+/// JSON parser runs.
+pub const MAX_JSON_DEPTH: usize = 32;
+
+/// The nesting depth of a JSON text: the maximum number of
+/// simultaneously open `[` / `{`, ignoring brackets inside strings
+/// (and their escapes). Malformed input simply yields the depth seen
+/// so far; validity is the parser's call, not this scan's.
+pub fn json_depth(body: &[u8]) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
 /// Server name in `serverInfo`.
 pub const SERVER_NAME: &str = "kharond";
 
@@ -805,8 +844,11 @@ where
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
     }
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
+    if json_depth(&bytes) > MAX_JSON_DEPTH {
+        return error(ApiError::JSON_TOO_DEEP);
+    }
     match rpc(&state.broker, &agent, &parts.headers, &bytes, received).await {
         Reply::Accepted => Response::builder()
             .status(StatusCode::ACCEPTED)
@@ -826,6 +868,18 @@ mod tests {
         assert!(!is_version_shaped("2026-07-2x"));
         assert!(!is_version_shaped("2026-07-288"));
         assert!(!is_version_shaped("hunter2hun"));
+    }
+
+    #[test]
+    fn json_depth_counts_nesting_not_string_brackets() {
+        assert_eq!(json_depth(b"{}"), 1);
+        assert_eq!(json_depth(b"42"), 0);
+        assert_eq!(json_depth(b"[[[{}]]]"), 4);
+        assert_eq!(json_depth(br#"{"a":"[[[{"}"#), 1);
+        assert_eq!(json_depth(br#"{"a":"\"[[["}"#), 1);
+        assert_eq!(json_depth(b"[[[]"), 3, "malformed input still scans");
+        let deep = "[".repeat(MAX_JSON_DEPTH + 1);
+        assert_eq!(json_depth(deep.as_bytes()), MAX_JSON_DEPTH + 1);
     }
 
     #[test]

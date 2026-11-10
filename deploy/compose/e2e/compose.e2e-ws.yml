@@ -1,0 +1,115 @@
+# CI overlay for the path-B compose E2E (issue #220, REQ-ARCH-002): the
+# agent host's kharon-agent-connector dials wss://kharon.e2e.test:8443
+# /connector through a fake TLS-terminating edge into kharond, the way
+# it reaches the broker through Cloudflare in production. No VPN: this
+# stack has no compose.vpn.yml, no wg network and no kharond [api].
+#
+#   docker compose -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/e2e/compose.e2e-ws.yml -p kharon-e2e-ws \
+#     --env-file deploy/compose/e2e/run-ws/env \
+#     --profile vaultwarden ...
+#
+# Topology:
+#   edge    10.67.0.0/24  gateway 10.67.0.254 (the docker host; serves
+#                         the test page). holder 10.67.0.1 (alias
+#                         kharon.e2e.test), agent-host 10.67.0.2.
+#   harness 10.68.0.0/24  gateway 10.68.0.254. agent-host 10.68.0.2 only;
+#                         the test reaches Chromium's CDP relay here.
+# - fake-edge joins the holder's network namespace (as cloudflared
+#   does) and terminates TLS with the edge CA's leaf on 10.67.0.1:8443,
+#   forwarding to kharond's public ingress on 127.0.0.1:8790;
+# - connector joins agent-host's namespace, so Chromium's loopback CDP
+#   (127.0.0.1:9222) is its local end;
+# - the test writes everything under e2e/run-ws/ (gitignored): configs,
+#   TLS material, the tunnel token (mode 0600, owned by the host user,
+#   which the connector container runs as: KHARON_E2E_UID in run-ws/env).
+#
+# Relative paths resolve against deploy/compose (the first file).
+services:
+  holder:
+    container_name: kharon-e2e-ws-holder
+    restart: "no"
+    networks:
+      edge:
+        ipv4_address: 10.67.0.1
+        aliases: [kharon.e2e.test]
+
+  fake-edge:
+    image: kharon-e2e-agent-host:local
+    container_name: kharon-e2e-ws-fake-edge
+    restart: "no"
+    network_mode: "service:holder"
+    init: true
+    entrypoint:
+      - socat
+      - "OPENSSL-LISTEN:8443,bind=10.67.0.1,fork,reuseaddr,verify=0,cert=/edge/cert.pem,key=/edge/key.pem"
+      - "TCP:127.0.0.1:8790"
+    volumes:
+      - "./e2e/run-ws/edge:/edge:ro"
+
+  vaultwarden:
+    extends:
+      file: ../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/docker-compose.yml
+      service: vaultwarden
+    container_name: kharon-e2e-ws-vaultwarden
+    restart: "no"
+    volumes: !override
+      - "vaultwarden-fixture-data:/data"
+      - "../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls:/ssl:ro"
+
+  kharon:
+    image: kharon:e2e
+    container_name: kharon-e2e-ws-kharond
+    restart: "no"
+    volumes: !override
+      - "kharon-data:/data"
+      - "./e2e/run-ws/kharon.toml:/etc/kharon.toml:ro"
+      - "../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem:/etc/kharon/vault-ca.pem:ro"
+      - "./e2e/run-ws/inner/cert.pem:/etc/kharon/connector-cert.pem:ro"
+      - "./e2e/run-ws/inner/key.pem:/etc/kharon/connector-key.pem:ro"
+
+  agent-host:
+    build: { context: ./e2e/agent-host }
+    image: kharon-e2e-agent-host:local
+    container_name: kharon-e2e-ws-agent-host
+    restart: "no"
+    environment:
+      # The CDP relay serves the harness network only.
+      AGENT_HOST_ADDR: 10.68.0.2
+      # The E2E's test page runs on the docker host, at the edge gateway.
+      PAGE_HOST_RULES: "MAP canary.example.test 10.67.0.254"
+    volumes:
+      - "./e2e/run-ws/page:/e2e:ro"
+    networks:
+      edge: { ipv4_address: 10.67.0.2 }
+      harness: { ipv4_address: 10.68.0.2 }
+
+  connector:
+    build: { context: ../.., dockerfile: deploy/compose/e2e/connector/Dockerfile }
+    image: kharon-e2e-connector:local
+    container_name: kharon-e2e-ws-connector
+    restart: "no"
+    network_mode: "service:agent-host"
+    # The token file is mode 0600 and owned by the host user that ran
+    # the test, so the connector runs as that uid (no host sudo needed).
+    user: "${KHARON_E2E_UID:-1000}:${KHARON_E2E_GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - "./e2e/run-ws/connector:/etc/kharon-connector:ro"
+    command: ["--config", "/etc/kharon-connector/connector.toml"]
+
+secrets:
+  kharon_bw_api_key:
+    file: ./e2e/run-ws/api-key.json
+
+volumes:
+  vaultwarden-fixture-data:
+    name: kharon-e2e-ws-vaultwarden-data
+
+networks:
+  edge:
+    ipam: { config: [{ subnet: 10.67.0.0/24, gateway: 10.67.0.254 }] }
+  harness:
+    ipam: { config: [{ subnet: 10.68.0.0/24, gateway: 10.68.0.254 }] }

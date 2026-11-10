@@ -2,3 +2,5 @@ target
 .git
 **/tls
 deploy/compose/e2e/run
+deploy/compose/e2e/run-ws
+deploy/compose/secrets

@@ -8,7 +8,7 @@
 //! | Request | Answer |
 //! |---|---|
 //! | `POST /mcp` | the MCP transport ([`super::mcp`]), exactly as on `[api]`: same bearer auth, rate limits, audit |
-//! | `GET /connector` | reserved for the agent-connector WebSocket (#199); 404 until that handler is mounted here |
+//! | `GET /connector` | the agent-connector WebSocket upgrade (#199) when `[connector] websocket = true`; 404 otherwise |
 //! | anything else | 404 `not_found` / `no_such_route` |
 //!
 //! "Anything else" includes `/v1/*` and `/v1/openapi.json` (the tailnet
@@ -26,18 +26,22 @@
 //! tokens from the internet cannot starve tailnet agents of Argon2id
 //! permits.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::Method;
 use axum::response::Response;
+use axum::serve::IncomingStream;
 use tokio::net::TcpListener;
 
 use super::core::{Broker, VaultView};
 use super::error::{ApiError, Detail, ErrorCode};
 use super::http::{AppState, TlsListener, error};
 use super::mcp::MCP_PATH;
+use crate::connector::WsEntry;
 use crate::lock::Clock;
 
 /// `GET /connector`: the agent-connector WebSocket upgrade (#199).
@@ -48,14 +52,35 @@ pub const CONNECTOR_PATH: &str = "/connector";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicIngress;
 
-/// The public-ingress router over `broker`.
-pub fn router<S, C>(broker: Arc<Broker<S, C>>) -> Router
+/// The TCP peer of a public-ingress connection: the edge, not the client.
+#[derive(Debug, Clone, Copy)]
+struct Peer(SocketAddr);
+
+impl Connected<IncomingStream<'_, TcpListener>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+/// The public-ingress router over `broker`. `ws` mounts `GET /connector`;
+/// without it the route answers 404.
+pub fn router<S, C>(broker: Arc<Broker<S, C>>, ws: Option<Arc<WsEntry>>) -> Router
 where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
     Router::new()
-        .fallback(handle::<S, C>)
+        .fallback(
+            move |state: State<Arc<AppState<S, C>>>,
+                  ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
+                  req: Request| { handle(state, ws.clone(), peer, req) },
+        )
         .with_state(AppState::new(broker))
 }
 
@@ -64,6 +89,7 @@ where
 pub async fn serve_with_shutdown<S, C, F>(
     listener: TcpListener,
     broker: Arc<Broker<S, C>>,
+    ws: Option<Arc<WsEntry>>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -71,9 +97,12 @@ where
     C: Clock + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, router(broker))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        router(broker, ws).into_make_service_with_connect_info::<Peer>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// Serve the public-ingress surface over TLS. The edge pins this
@@ -83,6 +112,7 @@ pub async fn serve_tls_with_shutdown<S, C, F>(
     listener: TcpListener,
     tls: Arc<rustls::ServerConfig>,
     broker: Arc<Broker<S, C>>,
+    ws: Option<Arc<WsEntry>>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -90,16 +120,19 @@ where
     C: Clock + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(TlsListener::new(listener, tls), router(broker))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        TlsListener::new(listener, tls),
+        router(broker, ws).into_make_service_with_connect_info::<Peer>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// Which allow-listed route a request is, if any.
 #[derive(Debug, PartialEq, Eq)]
 enum Admit {
     Mcp,
-    /// `GET /connector`, not mounted yet (#199).
+    /// `GET /connector`: the connector WebSocket (#199).
     Connector,
 }
 
@@ -111,7 +144,12 @@ fn admit(method: &Method, path: &str) -> Option<Admit> {
     }
 }
 
-async fn handle<S, C>(State(state): State<Arc<AppState<S, C>>>, mut req: Request) -> Response
+async fn handle<S, C>(
+    State(state): State<Arc<AppState<S, C>>>,
+    ws: Option<Arc<WsEntry>>,
+    peer: SocketAddr,
+    mut req: Request,
+) -> Response
 where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
@@ -121,9 +159,13 @@ where
             req.extensions_mut().insert(PublicIngress);
             super::mcp::handle(state, req).await
         }
-        // #199 mounts the WebSocket upgrade here. Until then the route
-        // is indistinguishable from an unknown one.
-        Some(Admit::Connector) | None => not_found(),
+        // Without `[connector] websocket = true` the route is
+        // indistinguishable from an unknown one.
+        Some(Admit::Connector) => match ws {
+            Some(ws) => ws.upgrade(req, peer),
+            None => not_found(),
+        },
+        None => not_found(),
     }
 }
 

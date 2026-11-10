@@ -42,6 +42,10 @@ tokio-tungstenite = "0.24"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"] }
 futures-util = { version = "0.3", features = ["sink"] }
+# The connector WebSocket upgrade (#199): axum serves it, hyper hands over
+# the upgraded socket, hyper-util adapts it to tokio's I/O traits.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
 

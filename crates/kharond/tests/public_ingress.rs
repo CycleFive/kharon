@@ -55,6 +55,7 @@ async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
     tokio::spawn(kharond::api::public::serve_with_shutdown(
         listener,
         broker,
+        None,
         std::future::pending(),
     ));
     addr

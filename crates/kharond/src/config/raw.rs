@@ -73,7 +73,10 @@ struct RawApi {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConnector {
-    listen: String,
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    websocket: bool,
     tls_cert_file: PathBuf,
     tls_key_file: PathBuf,
 }
@@ -350,6 +353,9 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         }
     }
     let connector = raw.connector.map(validate_connector).transpose()?;
+    if connector.as_ref().is_some_and(|c| c.websocket) && raw.public_ingress.is_none() {
+        return Err(ConfigError::ConnectorWebsocketNeedsPublicIngress);
+    }
     match (path_b, connector.is_some()) {
         (true, false) => return Err(ConfigError::ConnectorMissing),
         (false, true) => return Err(ConfigError::ConnectorUnexpected),
@@ -357,7 +363,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     }
     let api = raw.api.map(|a| validate_api(a, path_b)).transpose()?;
     if let (Some(api), Some(connector)) = (&api, &connector)
-        && api.listen == connector.listen
+        && connector.listen == Some(api.listen)
     {
         return Err(ConfigError::ConnectorListenConflict);
     }
@@ -369,7 +375,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     if let Some(public) = &public_ingress {
         let taken = [
             api.as_ref().map(|a| a.listen),
-            connector.as_ref().map(|c| c.listen),
+            connector.as_ref().and_then(|c| c.listen),
             owner_ui.as_ref().map(|u| u.listen),
         ];
         if taken
@@ -452,19 +458,31 @@ fn validate_api(raw: RawApi, path_b: bool) -> Result<ApiConfig, ConfigError> {
 }
 
 fn validate_connector(raw: RawConnector) -> Result<ConnectorConfig, ConfigError> {
-    let listen: SocketAddr = raw
+    if raw.listen.is_none() && !raw.websocket {
+        return Err(ConfigError::ConnectorNoTransport);
+    }
+    let listen = raw
         .listen
-        .parse()
-        .map_err(|_| ConfigError::ConnectorListenInvalid)?;
-    check_listen_ip(listen.ip()).map_err(|problem| match problem {
-        ListenProblem::Wildcard => ConfigError::ConnectorWildcardBind,
-        ListenProblem::NotUnicast => ConfigError::ConnectorListenNotUnicast,
-    })?;
+        .map(|text| {
+            let listen: SocketAddr = text
+                .parse()
+                .map_err(|_| ConfigError::ConnectorListenInvalid)?;
+            check_listen_ip(listen.ip()).map_err(|problem| match problem {
+                ListenProblem::Wildcard => ConfigError::ConnectorWildcardBind,
+                ListenProblem::NotUnicast => ConfigError::ConnectorListenNotUnicast,
+            })?;
+            Ok(listen)
+        })
+        .transpose()?;
     let tls = TlsMaterial {
         cert_file: raw.tls_cert_file,
         key_file: raw.tls_key_file,
     };
-    Ok(ConnectorConfig { listen, tls })
+    Ok(ConnectorConfig {
+        listen,
+        websocket: raw.websocket,
+        tls,
+    })
 }
 
 fn optional_tls(

@@ -1086,6 +1086,8 @@ dependencies = [
  "hkdf",
  "hmac",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "kharon-bwcrypto",
  "kharon-connector",
  "kharond",

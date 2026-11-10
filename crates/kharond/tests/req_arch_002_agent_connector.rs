@@ -17,8 +17,7 @@ use kharond::cdp::{
     LiveOrigin, Tunnel, ValuesSent,
 };
 use kharond::connector::{
-    AgentParams, ClientError, Hub, Transport, accept, pin_of_der, run_agent_once,
-    server_config_from_pem,
+    AgentParams, ClientError, Dial, Hub, accept, pin_of_der, run_agent_once, server_config_from_pem,
 };
 use kharond::origin::{OriginConfig, OriginMatcher};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -202,7 +201,7 @@ async fn rig(token_ok: bool) -> Rig {
 
 fn agent_params(rig: &Rig, pin: [u8; 32]) -> AgentParams {
     AgentParams {
-        transport: Transport::Tls { broker: rig.broker },
+        transport: Dial::Tls { broker: rig.broker },
         server_name: "127.0.0.1".into(),
         pin,
         agent_id: "assistant".into(),

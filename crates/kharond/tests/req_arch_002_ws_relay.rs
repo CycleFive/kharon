@@ -551,8 +551,9 @@ async fn relay_flipping_a_ciphertext_byte_drops_the_session() {
 
 /// 25 s real time: with the paused clock, auto-advance would fire the 5 s
 /// hello deadline or the 90 s idle timeout before the in-process IO.
+/// Ignored in the default run; CI runs it in the `rust` job (#220).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "25 s real time: run with --ignored"]
+#[ignore = "25 s real time: CI runs it in the rust job, locally use --ignored"]
 async fn idle_session_keeps_messages_flowing() {
     let rig = rig().await;
     let relay = Relay::start(Mode::Forward {

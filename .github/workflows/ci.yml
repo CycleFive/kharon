@@ -14,6 +14,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # #220 item 1: the 20 s mux ping (PING_INTERVAL) across an idle
+      # period. 25 s of real time, so it stays out of the default run.
+      - name: req_arch_002 idle ws session keepalive (25 s)
+        run: cargo test -p kharond --test req_arch_002_ws_relay -- --ignored --exact idle_session_keeps_messages_flowing
       # REQ-EXP-001 (#85): hosted runners refuse unprivileged userns, so the
       # plain run above skips the no-egress AC. Re-run that one test as root
       # (prebuilt binary; no root cargo) with KHARON_REQUIRE_NETNS=1, which

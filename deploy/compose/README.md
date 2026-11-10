@@ -168,3 +168,15 @@ paths the compose E2E test
 namespace as cloudflared does and probes kharond's two loopback
 listeners across kharond restarts. CI runs it from
 `.github/workflows/image.yml`.
+
+A second variant covers path B over WebSocket with no VPN. It layers
+`docker-compose.yml` and `e2e/compose.e2e-ws.yml` (no `compose.vpn.yml`,
+no `wg` network, no `[api]`), and
+`crates/kharond/tests/req_arch_002_compose_ws_e2e.rs` drives it. Its
+`fake-edge` is a TLS-terminating socat in the holder's namespace
+(standing in for Cloudflare), and the agent host's
+`kharon-agent-connector` dials `wss://kharon.e2e.test:8443/connector`
+through it. Fills go through `POST /mcp` by way of that edge. The test
+needs the host to accept connections from the compose bridges (it serves
+its test page on the `edge` gateway, `10.67.0.254`). The `compose-e2e-ws`
+job in `.github/workflows/image.yml` runs it.

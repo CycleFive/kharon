@@ -5,7 +5,9 @@ name: image
 # - compose-e2e: the compose example plus its CI overlay against the
 #   seeded Vaultwarden fixture, filling through the agent host's
 #   headless Chromium (REQ-DEP-002, REQ-DEP-006, REQ-ARCH-004,
-#   REQ-GOAL-002).
+#   REQ-GOAL-002);
+# - compose-e2e-ws: path B over WebSocket with no VPN (issue #220,
+#   REQ-ARCH-002): the agent connector through a fake TLS edge.
 on:
   workflow_dispatch:
   push: { branches: [master] }
@@ -21,6 +23,10 @@ on:
       - "crates/kharond/tests/compose_support/**"
       - "crates/kharond/tests/req_dep_001_image.rs"
       - "crates/kharond/tests/req_dep_002_compose_e2e.rs"
+      - "crates/kharond/tests/req_arch_002_compose_ws_e2e.rs"
+      - "crates/kharond/tests/api_support/**"
+      - "crates/kharon-agent-connector/**"
+      - "crates/kharon-connector/**"
       - "crates/kharond/tests/req_dep_006_compose_package.rs"
       - "crates/kharon-bwcrypto/tests/fixtures/vaultwarden/**"
       - ".github/workflows/image.yml"
@@ -88,3 +94,47 @@ jobs:
       - name: Tear down
         if: always()
         run: $COMPOSE down -v
+
+  compose-e2e-ws:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # No --env-file here: the project's services that these steps
+      # touch (the builds, the Vaultwarden fixture) don't read the
+      # connector uid, and its defaults are fine. The test writes
+      # run-ws/env and passes it to its own compose calls.
+      COMPOSE: >-
+        docker compose -f deploy/compose/docker-compose.yml
+        -f deploy/compose/e2e/compose.e2e-ws.yml -p kharon-e2e-ws
+        --profile vaultwarden
+      FIXTURE: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install "cryptography==43.0.3"
+      - name: Build the kharond, agent-host and connector images
+        run: |
+          docker build -t "$KHARON_IMAGE" .
+          $COMPOSE build agent-host connector
+      - name: Start and seed the Vaultwarden fixture
+        run: |
+          sh "$FIXTURE/gen-tls.sh"
+          $COMPOSE up -d --no-build vaultwarden
+          python3 "$FIXTURE/seed.py" --live --base-url https://127.0.0.1:8222 \
+            --ca-cert "$PWD/$FIXTURE/tls/ca.pem" \
+            --out "${{ runner.temp }}/sync.live.json" \
+            --api-key-out "${{ runner.temp }}/api-key.json"
+      - name: Compose E2E, path B over ws (REQ-ARCH-002, REQ-DEP-006, REQ-GOAL-002)
+        env:
+          KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222
+          KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
+          KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
+        run: cargo test -p kharond --test req_arch_002_compose_ws_e2e -- --ignored
+      - name: Container logs
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: $COMPOSE down -v --remove-orphans

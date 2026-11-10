@@ -440,3 +440,151 @@ pub fn owner_approve(data_volume: &str, image: &str, request_id: &str) {
     });
     assert_eq!(reply["ok"], json!(true), "approve: {reply}");
 }
+
+// ------------------------------------------------- MCP over TLS
+
+/// `_meta` of a 2026-07-28 MCP request.
+#[derive(serde::Serialize)]
+struct McpMeta {
+    #[serde(rename = "io.modelcontextprotocol/protocolVersion")]
+    protocol_version: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct McpToolCall<'a, A> {
+    name: &'a str,
+    arguments: &'a A,
+    #[serde(rename = "_meta")]
+    meta: McpMeta,
+}
+
+#[derive(serde::Serialize)]
+struct McpRequest<P> {
+    jsonrpc: &'static str,
+    id: u32,
+    method: &'static str,
+    params: P,
+}
+
+#[derive(serde::Deserialize)]
+struct McpResponse {
+    result: Option<McpToolResult>,
+    error: Option<McpRpcError>,
+}
+
+#[derive(serde::Deserialize)]
+struct McpRpcError {
+    code: i64,
+    message: String,
+}
+
+#[derive(serde::Deserialize)]
+struct McpToolResult {
+    content: Vec<McpContent>,
+    #[serde(rename = "isError")]
+    is_error: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct McpContent {
+    text: String,
+}
+
+/// A TLS client config trusting only `ca_pem` (one CA certificate).
+fn tls_client(ca_pem: &str) -> tokio_rustls::TlsConnector {
+    use rustls_pki_types::{CertificateDer, pem::PemObject};
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(ca_pem.as_bytes()).expect("edge CA pem"))
+        .unwrap();
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(cfg))
+}
+
+/// `tools/call` of `tool` through `POST /mcp` over TLS to `addr` (SNI
+/// and `Host` `sni`, trusting `ca_pem`), with the headers and body of
+/// `api_support::mcp_request`. Returns the tool result's text (the
+/// `ApiError`/`FillResult` JSON). `Err` carries a transport, HTTP,
+/// JSON-RPC or `isError: true` failure, never the bearer token.
+pub async fn mcp_tool_tls<A: serde::Serialize>(
+    addr: std::net::SocketAddr,
+    sni: &str,
+    ca_pem: &str,
+    token: &str,
+    tool: &str,
+    arguments: &A,
+) -> Result<String, String> {
+    const VERSION: &str = "2026-07-28";
+    let body = serde_json::to_string(&McpRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: McpToolCall {
+            name: tool,
+            arguments,
+            meta: McpMeta {
+                protocol_version: VERSION,
+            },
+        },
+    })
+    .unwrap();
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {sni}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+         MCP-Protocol-Version: {VERSION}\r\nMcp-Method: tools/call\r\nMcp-Name: {tool}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let tcp = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let name = rustls_pki_types::ServerName::try_from(sni.to_owned()).unwrap();
+    let mut tls = tls_client(ca_pem)
+        .connect(name, tcp)
+        .await
+        .map_err(|e| format!("TLS to {addr} as {sni}: {e}"))?;
+    tls.write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    // The edge may close without a TLS close_notify: keep what arrived.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = tls.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (resp_head, resp_body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("no HTTP response ({} bytes)", buf.len()))?;
+    let status = resp_head.lines().next().unwrap_or("");
+    if !status.contains(" 200") {
+        return Err(format!("{status}; body: {resp_body}"));
+    }
+    let parsed: McpResponse = serde_json::from_str(resp_body)
+        .map_err(|e| format!("bad MCP reply ({e}); body: {resp_body}"))?;
+    if let Some(e) = parsed.error {
+        return Err(format!("JSON-RPC error {}: {}", e.code, e.message));
+    }
+    let result = parsed
+        .result
+        .ok_or("MCP reply has neither result nor error")?;
+    let text = result
+        .content
+        .into_iter()
+        .next()
+        .map(|c| c.text)
+        .unwrap_or_default();
+    if result.is_error {
+        return Err(format!("tool error: {text}"));
+    }
+    Ok(text)
+}

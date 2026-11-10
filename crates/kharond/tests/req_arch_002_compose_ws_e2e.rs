@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use compose_support::{
-    add_canary_item, browser_ws_url, env, fixture_scope, manifest, page_tls, random_hex32,
-    serve_page, write_public,
+    Cdp, add_canary_item, browser_ws_url, data_volume_of, env, fixture_scope, manifest,
+    mcp_tool_tls, owner_approve, page_tls, random_hex32, serve_page, ss_in, write_public,
 };
 use docker_support::{docker, docker_on_tty, docker_raw, wait_for_log};
 use kharond::api::token::{generate, generate_tunnel};
@@ -50,9 +50,15 @@ const AGENT_HOST_CDP: &str = "10.68.0.2:9222";
 const BROKER_URL: &str = "wss://kharon.e2e.test:8443/connector";
 const PUBLIC_INGRESS: &str = "127.0.0.1:8790";
 const OWNER_UI: &str = "127.0.0.1:8788";
+const AGENT_HOST_IMAGE: &str = "kharon-e2e-agent-host:local";
+const FAKE_EDGE: &str = "kharon-e2e-ws-fake-edge";
+const CONNECTOR: &str = "kharon-e2e-ws-connector";
+/// The fake edge's listener, as the host reaches it.
+const EDGE_ADDR: &str = "10.67.0.1:8443";
+const EDGE_SNI: &str = "kharon.e2e.test";
 const CONNECTOR_CONFIG: &str = "/etc/kharon-connector/connector.toml";
 
-const FILLS: usize = 10;
+const FILLS: usize = 2;
 /// Admissions one agent and one item need: [`FILLS`] successes plus the
 /// first call's `pending_approval` (its retry is a second admission).
 /// Production defaults (10/min, 5/item/10min) would stop at fill 4.
@@ -111,7 +117,7 @@ cdp = {{ endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }}
 
 [policy]
 # Harness only: {FILL_ADMISSIONS} admissions of one item inside a minute
-# (ten fills, and the pending_approval retry). Production stays 10/min
+# ({FILLS} fills, and the pending_approval retry). Production stays 10/min
 # and 5/item/10min.
 fills_per_minute = {FILL_ADMISSIONS}
 item_fills_per_window = {FILL_ADMISSIONS}
@@ -168,9 +174,141 @@ struct Run {
     /// many attach lines it had before that (the `--check` session's).
     attach_logs: String,
     attaches_before: usize,
-    /// The test page server (Task 3 drives fills against it).
-    #[allow(dead_code)]
-    page_port: u16,
+    /// The agent token and the canary, for "never logged" assertions.
+    agent_token: String,
+    canary: String,
+    /// One record per fill, in order.
+    fills: Result<Vec<FillRecord>, String>,
+    /// Per POST the page server saw: did its password carry the canary?
+    page_posts: Vec<bool>,
+    /// The route probes: `socat` from the holder's netns to the
+    /// browser's CDP (must fail), and the host's `GET /json/version`.
+    probe_negative: ProbeNegative,
+    probe_positive: Result<u16, String>,
+    /// `ss -ltnpH` and `ss -lxpH` in kharond's netns. `Err` when
+    /// `sudo -n nsenter` is unavailable; only the listener test unwraps.
+    ss_tcp: Result<String, String>,
+    ss_unix: Result<String, String>,
+    /// `docker logs` of kharond, the fake edge and the connector.
+    logs: Vec<(&'static str, String)>,
+}
+
+/// What one fill came to.
+struct FillRecord {
+    /// Statuses in order: `["pending_approval", "filled"]` for the first.
+    statuses: Vec<String>,
+    fields_filled: Vec<String>,
+}
+
+struct ProbeNegative {
+    /// `socat` exited 0 (it reached the CDP port).
+    connected: bool,
+    detail: String,
+}
+
+// ------------------------------------------------------------ MCP
+
+#[derive(serde::Serialize)]
+struct NoArgs {}
+
+#[derive(serde::Serialize)]
+struct SearchArgs<'a> {
+    q: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct ItemMeta {
+    id: String,
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ContextReply {
+    browser_context_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct FillArgs<'a> {
+    item_id: &'a str,
+    target: FillTarget<'a>,
+    fields: [FieldSpec; 2],
+    submit: bool,
+}
+
+#[derive(serde::Serialize)]
+struct FillTarget<'a> {
+    cdp_target_id: &'a str,
+    expected_origin: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct FieldSpec {
+    kind: &'static str,
+}
+
+#[derive(serde::Deserialize)]
+struct FillReply {
+    status: String,
+    grant_request_id: Option<String>,
+    fields_filled: Option<Vec<String>>,
+}
+
+#[derive(serde::Serialize)]
+struct CloseTarget<'a> {
+    #[serde(rename = "targetId")]
+    target_id: &'a str,
+}
+
+/// One MCP tool call through the fake edge, the result text parsed as `R`.
+async fn mcp<A: serde::Serialize, R: serde::de::DeserializeOwned>(
+    edge_ca: &str,
+    token: &str,
+    tool: &str,
+    args: &A,
+) -> R {
+    let text = mcp_tool_tls(
+        EDGE_ADDR.parse().unwrap(),
+        EDGE_SNI,
+        edge_ca,
+        token,
+        tool,
+        args,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{tool} through the fake edge: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool} reply ({e}): {text}"))
+}
+
+/// `GET /json/version` status from the host, over HTTP to the CDP relay.
+async fn cdp_http_status() -> Result<u16, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(AGENT_HOST_CDP),
+    )
+    .await
+    .map_err(|_| "connect timed out".to_owned())?
+    .map_err(|e| e.to_string())?;
+    let req = format!(
+        "GET /json/version HTTP/1.1\r\nHost: {AGENT_HOST_CDP}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(2).any(|w| w == b"\r\n") {
+        let n = s.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let line = String::from_utf8_lossy(&buf);
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| format!("no status line: {line}"))
 }
 
 static RUN: Mutex<Option<Result<Arc<Run>, String>>> = Mutex::new(None);
@@ -241,6 +379,91 @@ fn edge_pki(host: &str) -> (String, String, String) {
         .signed_by(&leaf_key, &ca, &ca_key)
         .unwrap();
     (ca.pem(), leaf.pem(), leaf_key.serialize_pem())
+}
+
+/// The agent's browser context (created by kharond through the
+/// connector), then `FILLS` fills of the canary item, each followed by
+/// the in-page submit. Runs inside `setup()`, so the page server's
+/// runtime is alive.
+async fn fill_phase(
+    edge_ca: String,
+    agent_token: String,
+    item_name: String,
+    browser_ws: String,
+    page_port: u16,
+    submits: Arc<Mutex<Vec<bool>>>,
+) -> Vec<FillRecord> {
+    let ctx: ContextReply = mcp(&edge_ca, &agent_token, "kharon_context", &NoArgs {}).await;
+    let items: Vec<ItemMeta> = mcp(
+        &edge_ca,
+        &agent_token,
+        "kharon_search",
+        &SearchArgs { q: &item_name },
+    )
+    .await;
+    let item_id = items
+        .iter()
+        .find(|i| i.name == item_name)
+        .unwrap_or_else(|| panic!("the canary item is not listed ({} items)", items.len()))
+        .id
+        .clone();
+
+    let mut cdp = Cdp::connect(&browser_ws).await;
+    let url = format!("https://{}:{page_port}/login", compose_support::PAGE_HOST);
+    let origin = format!("https://{}:{page_port}", compose_support::PAGE_HOST);
+    let mut fills = Vec::new();
+    for n in 0..FILLS {
+        let ready = format!(
+            "location.href === {} && document.readyState === 'complete'",
+            serde_json::to_string(&url).unwrap()
+        );
+        let (target, session) = cdp.open(Some(&ctx.browser_context_id), &url, &ready).await;
+        let args = FillArgs {
+            item_id: &item_id,
+            target: FillTarget {
+                cdp_target_id: &target,
+                expected_origin: &origin,
+            },
+            fields: [
+                FieldSpec { kind: "username" },
+                FieldSpec { kind: "password" },
+            ],
+            submit: true,
+        };
+        let mut statuses = Vec::new();
+        let mut reply: FillReply = mcp(&edge_ca, &agent_token, "kharon_fill", &args).await;
+        statuses.push(reply.status.clone());
+        if reply.status == "pending_approval" {
+            let grid = reply
+                .grant_request_id
+                .clone()
+                .unwrap_or_else(|| panic!("pending_approval without a grant_request_id"));
+            owner_approve(&data_volume_of(KHAROND), AGENT_HOST_IMAGE, &grid);
+            reply = mcp(&edge_ca, &agent_token, "kharon_fill", &args).await;
+            statuses.push(reply.status.clone());
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while submits.lock().unwrap().len() < n + 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        fills.push(FillRecord {
+            statuses,
+            fields_filled: reply.fields_filled.unwrap_or_default(),
+        });
+        cdp.wait(
+            &session,
+            "location.pathname === '/submitted' && document.readyState === 'complete'",
+            "post-submit page",
+        )
+        .await;
+        cdp.call(
+            None,
+            "Target.closeTarget",
+            serde_json::to_value(CloseTarget { target_id: &target }).unwrap(),
+        )
+        .await;
+    }
+    fills
 }
 
 async fn setup() -> Run {
@@ -326,11 +549,12 @@ async fn setup() -> Run {
     // served on the edge gateway and the browser is reachable.
     compose(&["up", "-d", "--no-build", "agent-host"]);
     // Chromium answers on the harness network (Task 3 drives it).
-    let _browser_ws = browser_ws_url(AGENT_HOST_CDP.parse().unwrap()).await;
-    let (page_port, _submits) = serve_page(PAGE_ADDR, acceptor, &canary).await;
+    let browser_ws = browser_ws_url(AGENT_HOST_CDP.parse().unwrap()).await;
+    let (page_port, submits) = serve_page(PAGE_ADDR, acceptor, &canary).await;
 
     // 5. The agent and tunnel tokens, and the two configs.
-    let (_token, hash) = generate("alpha");
+    let (token, hash) = generate("alpha");
+    let agent_token = token.expose_secret().clone();
     let (tunnel, tunnel_hash) = generate_tunnel("alpha");
     let tunnel_token = tunnel.expose_secret().clone();
     write_public(
@@ -406,6 +630,73 @@ async fn setup() -> Run {
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
+    // 11-12. Context and fills, in a spawned task: a failure (the page
+    // unreachable from the browser, say) is recorded as an Err so the
+    // tests that do not need the fills still run.
+    let fills = tokio::spawn(fill_phase(
+        edge_ca.clone(),
+        agent_token.clone(),
+        item_name.clone(),
+        browser_ws,
+        page_port,
+        submits.clone(),
+    ))
+    .await
+    .map_err(|e| match e.try_into_panic() {
+        Ok(p) => p
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "the fill phase panicked".into()),
+        Err(e) => e.to_string(),
+    });
+    let page_posts = submits.lock().unwrap().clone();
+
+    // 13. Routes: the holder's netns (where kharond lives) must have no
+    // path to the browser's CDP port; the host must (positive control).
+    let neg = docker_raw(
+        &[
+            "exec",
+            FAKE_EDGE,
+            "socat",
+            "-T",
+            "3",
+            "-",
+            "TCP:10.68.0.2:9222,connect-timeout=3",
+        ],
+        None,
+    );
+    let probe_negative = ProbeNegative {
+        connected: neg.status.success(),
+        detail: format!(
+            "exit {:?}, stderr: {}",
+            neg.status.code(),
+            String::from_utf8_lossy(&neg.stderr).trim()
+        ),
+    };
+    let probe_positive = cdp_http_status().await;
+
+    // 14. Listeners, after the fills: without sudo these are Errs and
+    // only the listener test fails.
+    let ss_tcp = ss_in(KHAROND, "-ltnpH");
+    let ss_unix = ss_in(KHAROND, "-lxpH");
+
+    // 15. Logs, then lock.
+    let logs: Vec<(&'static str, String)> = [
+        ("kharon", KHAROND),
+        ("fake-edge", FAKE_EDGE),
+        ("connector", CONNECTOR),
+    ]
+    .iter()
+    .map(|(label, c)| {
+        let out = docker_raw(&["logs", c], None);
+        let mut l = String::from_utf8_lossy(&out.stdout).into_owned();
+        l.push_str(&String::from_utf8_lossy(&out.stderr));
+        (*label, l)
+    })
+    .collect();
+    docker(&["exec", KHAROND, "kharon", "lock"]);
+
     Run {
         check_code: check.status.code(),
         check_stdout,
@@ -413,7 +704,15 @@ async fn setup() -> Run {
         tunnel_token,
         attach_logs,
         attaches_before,
-        page_port,
+        agent_token,
+        canary,
+        fills,
+        page_posts,
+        probe_negative,
+        probe_positive,
+        ss_tcp,
+        ss_unix,
+        logs,
     }
 }
 
@@ -511,5 +810,121 @@ fn req_arch_002_compose_ws_connector_attaches_over_ws() {
             !svc.networks.contains_key("wg"),
             "service {name} is on the wg network"
         );
+    }
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_arch_002_compose_ws_fills_over_the_connector() {
+    let r = run();
+    let fills = r
+        .fills
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the fill phase failed: {e}"));
+    assert_eq!(fills.len(), FILLS);
+    for (n, f) in fills.iter().enumerate() {
+        assert_eq!(
+            f.statuses.last().map(String::as_str),
+            Some("filled"),
+            "fill {n}: statuses {:?}",
+            f.statuses
+        );
+        assert_eq!(f.fields_filled, ["username", "password"], "fill {n}");
+    }
+    assert_eq!(
+        fills[0].statuses,
+        ["pending_approval", "filled"],
+        "the first fill goes through owner approval"
+    );
+    assert_eq!(
+        fills[1].statuses,
+        ["filled"],
+        "the per-origin grant covers the second fill"
+    );
+    assert_eq!(r.page_posts.len(), FILLS, "one page POST per fill");
+    assert!(
+        r.page_posts.iter().all(|&c| c),
+        "a posted password was not the seeded canary: {:?}",
+        r.page_posts
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml); ss needs sudo -n"]
+fn req_dep_006_compose_ws_kharond_listens_on_loopback_only() {
+    let r = run();
+    let tcp = r
+        .ss_tcp
+        .as_ref()
+        .unwrap_or_else(|e| panic!("ss -ltnpH in kharond's netns: {e}"));
+    let unix = r
+        .ss_unix
+        .as_ref()
+        .unwrap_or_else(|e| panic!("ss -lxpH in kharond's netns: {e}"));
+    let mut kharond_listeners = Vec::new();
+    for line in tcp.lines() {
+        let local = line.split_whitespace().nth(3).unwrap_or("");
+        if local.starts_with("127.0.0.11:") {
+            continue; // docker's embedded DNS
+        }
+        if local == EDGE_ADDR {
+            assert!(line.contains("socat"), "{EDGE_ADDR} is not socat: {line}");
+            continue;
+        }
+        kharond_listeners.push(local.to_owned());
+    }
+    kharond_listeners.sort();
+    assert_eq!(
+        kharond_listeners,
+        [OWNER_UI, PUBLIC_INGRESS],
+        "kharond's TCP listeners; full ss output:\n{tcp}"
+    );
+    assert!(
+        unix.contains("/data/owner.sock"),
+        "no owner socket in:\n{unix}"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_arch_002_compose_ws_kharond_has_no_direct_route_to_cdp() {
+    let r = run();
+    assert!(
+        !r.probe_negative.connected,
+        "negative probe: the holder's netns (kharond) reached the browser's CDP port \
+         10.68.0.2:9222 directly; {}",
+        r.probe_negative.detail
+    );
+    assert_eq!(
+        r.probe_positive,
+        Ok(200),
+        "positive control: the host could not GET http://{AGENT_HOST_CDP}/json/version"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_goal_002_compose_ws_secrets_stay_out_of_logs() {
+    let r = run();
+    let secrets = [
+        ("canary", r.canary.clone()),
+        ("canary (hex of its text)", hex::encode(r.canary.as_bytes())),
+        ("agent token", r.agent_token.clone()),
+        ("tunnel token", r.tunnel_token.clone()),
+    ];
+    assert_eq!(r.logs.len(), 3);
+    for (container, logs) in &r.logs {
+        // socat logs nothing at its default verbosity.
+        assert!(
+            *container == "fake-edge" || !logs.is_empty(),
+            "no {container} logs were collected"
+        );
+        for (what, secret) in &secrets {
+            assert!(
+                !logs.contains(secret.as_str()),
+                "the {what} is in the {container} logs"
+            );
+        }
+        api_support::assert_no_canary(logs);
     }
 }

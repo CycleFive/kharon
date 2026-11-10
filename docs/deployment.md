@@ -355,7 +355,10 @@ that cannot start before the deadline closes the socket with no
 answer, so a legitimate agent sees a disconnect and retries with
 jitter. On the WebSocket path it is counted as `auth`; the raw listener
 prints `agent connector busy: credential check did not start in time`
-(not audited, because no credential was refused).
+(not audited, because no credential was refused). On the agent a busy
+close shows as `auth: connector protocol error`; that line can mean the
+broker's credential check could not start in time (a busy broker), not
+only a version mismatch.
 
 A Cloudflare Worker or Transform Rule must not add an `Origin` header
 to `/connector`, or every upgrade gets 403.
@@ -368,16 +371,18 @@ agent connector detached: agent=assistant transport=ws peer=127.0.0.1:41822 afte
 connector: refused 37 websocket connections in the last 60s (budget 12, protocol 10, hello 5, tls 4, auth 6)
 ```
 
-The last line appears at most once a minute, and only when something
-was refused. A refusal on the WebSocket path is counted, never logged
+The last line appears at most once a minute, plus once at shutdown for
+the last partial minute, and only when something was refused. A refusal on the WebSocket path is counted, never logged
 one by one: `budget` is a full pre-auth budget (503), `protocol` a bad
 upgrade request, `hello` a first inner record that is not a TLS
 ClientHello, `tls` an inner TLS handshake that failed or timed out, and
-`auth` a hello record that was malformed or timed out, or a tunnel
-credential that was refused. (The raw `[connector].listen` listener still
+`auth` a hello record that was malformed or timed out, a tunnel
+credential that was refused, or no Argon2id permit coming free before the
+deadline. (The raw `[connector].listen` listener still
 logs `agent connector refused a credential` once per refusal.) Two events are audit entries (`kharon audit verify`
 covers them), each at most once per agent per minute, with a
-`suppressed` count for the refusals folded into the next entry:
+`suppressed` count for the events folded into the next entry, or into a
+`suppressed_only` summary:
 
 - `connector_auth_fail`: a hello named a configured agent id and the
   tunnel credential was refused. Fields: `agent_id`, `transport`
@@ -392,11 +397,13 @@ covers them), each at most once per agent per minute, with a
   authenticates, so it replaces the running connector's session (a fill
   in flight fails) and writes one `connector_replaced`.
 
-When a window closes with refusals still folded in and no later event
+When a window closes with events still folded in and no later event
 arrives, kharond writes a summary entry for them: the same event with
 `agent_id`, `suppressed` and `result = "suppressed_only"`, and no
 `transport`, `detail_code` or `old_session_secs`. Closed windows are
-flushed every 15 seconds and at shutdown.
+flushed every 15 seconds, so a count reaches the log within 75 seconds of
+a burst's last written entry (one 60 s window plus one tick). At shutdown
+every window with a pending count is flushed, open ones too.
 
 Both appends are best effort; a failed append is logged and never
 blocks authentication.

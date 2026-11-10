@@ -139,7 +139,9 @@ pub fn page_tls() -> (tokio_rustls::TlsAcceptor, String) {
     (tokio_rustls::TlsAcceptor::from(Arc::new(tls)), spki)
 }
 
-/// Serves the test page on the wg gateway address (the docker host).
+/// Serves the test page on `bind_ip`, an address of the docker host
+/// (a compose network's gateway, where the agent host's Chromium maps
+/// the page's hostname).
 /// Returns the port and, per form POST, whether its password field
 /// carried the canary (nothing else of the body is kept).
 pub async fn serve_page(
@@ -386,14 +388,15 @@ pub fn data_volume_of(container: &str) -> String {
         container,
     ]);
     let volume = mounts.trim();
-    assert!(!volume.is_empty(), "kharon-data volume not found");
+    assert!(!volume.is_empty(), "no volume mounted at /data");
     volume.to_owned()
 }
 
 /// Owner-approve a grant request for the compose daemon (#20,
 /// REQ-APR-001).
 ///
-/// kharond's owner socket lives in the `kharon-data` volume, and
+/// kharond's owner socket lives in its data volume (`data_volume`, from
+/// [`data_volume_of`]), and
 /// the daemon accepts only its own uid (10001) as a peer
 /// (REQ-APR-006). The test host has no client for it yet (the
 /// `kharon` CLI's approve surface is #21), so the approval rides a
@@ -403,7 +406,6 @@ pub fn data_volume_of(container: &str) -> String {
 /// through `docker exec`. Nothing in the running deployment is
 /// touched: the helper container is gone before the fill retries.
 pub fn owner_approve(data_volume: &str, image: &str, request_id: &str) {
-    let volume = data_volume;
     let line = format!(
         "{}\n",
         json!({"op": "approve", "request_id": request_id, "kind": "per-origin"})
@@ -418,7 +420,7 @@ pub fn owner_approve(data_volume: &str, image: &str, request_id: &str) {
             "--entrypoint",
             "socat",
             "-v",
-            &format!("{volume}:/data"),
+            &format!("{data_volume}:/data"),
             image,
             "-",
             "UNIX-CONNECT:/data/owner.sock",

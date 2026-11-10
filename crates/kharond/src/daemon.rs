@@ -1219,15 +1219,25 @@ impl Daemon {
             .as_ref()
             .and_then(|rt| rt.task.as_ref())
             .map(|task| task.abort_handle());
-        // The per-minute count of refused WebSocket upgrades (#199).
-        let refusal_log = ws.clone().map(|ws| {
+        // Connector housekeeping: flush closed audit-limiter windows every
+        // CONNECTOR_AUDIT_FLUSH_PERIOD (#219), and log the count of refused
+        // WebSocket upgrades once a WS_REFUSAL_LOG_PERIOD (#199).
+        let housekeeping = self.connector.as_ref().map(|rt| {
+            let hub = Arc::clone(&rt.hub);
+            let ws = ws.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(WS_REFUSAL_LOG_PERIOD);
-                tick.tick().await;
+                let mut flush = tokio::time::interval(CONNECTOR_AUDIT_FLUSH_PERIOD);
+                let mut refusals = tokio::time::interval(WS_REFUSAL_LOG_PERIOD);
+                flush.tick().await;
+                refusals.tick().await;
                 loop {
-                    tick.tick().await;
-                    if let Some(line) = ws.take_refusal_line() {
-                        eprintln!("kharond: {line}");
+                    tokio::select! {
+                        _ = flush.tick() => hub.flush_audit(tokio::time::Instant::now()),
+                        _ = refusals.tick() => {
+                            if let Some(line) = ws.as_ref().and_then(|ws| ws.take_refusal_line()) {
+                                eprintln!("kharond: {line}");
+                            }
+                        }
                     }
                 }
             })
@@ -1270,8 +1280,17 @@ impl Daemon {
                 task.abort();
             }
         }
-        if let Some(task) = refusal_log {
+        if let Some(task) = housekeeping {
             task.abort();
+        }
+        // The last refusal count, and the audit counts the rate limiter
+        // swallowed, leave before the exit checkpoint anchors the tail
+        // (#219). A failing sink only prints a line; it cannot hang this.
+        if let Some(line) = ws.as_ref().and_then(|ws| ws.take_refusal_line()) {
+            eprintln!("kharond: {line}");
+        }
+        if let Some(rt) = &self.connector {
+            rt.hub.flush_audit_all();
         }
         checkpoint_timer.abort();
         request_expiry.abort();
@@ -1295,6 +1314,11 @@ impl Daemon {
 
 /// How often the refused-WebSocket-upgrade count is logged (#199).
 pub const WS_REFUSAL_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often closed connector audit windows are flushed (#219). A burst's
+/// suppressed count reaches the log at most one window plus one period
+/// after its first event.
+pub const CONNECTOR_AUDIT_FLUSH_PERIOD: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long the public-ingress listener (#198) may drain open
 /// connections at shutdown before it is aborted. A public client that

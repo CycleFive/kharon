@@ -208,6 +208,30 @@ fn admit(windows: &mut HashMap<String, Window>, agent: &str, now: Instant) -> Op
     }
 }
 
+/// Remove every window `expired` selects from `windows`, pushing a summary
+/// entry onto `out` for each one that has a pending count.
+fn drain_windows(
+    windows: &mut HashMap<String, Window>,
+    event: Event,
+    out: &mut Vec<Entry>,
+    expired: impl Fn(&Window) -> bool,
+) {
+    windows.retain(|agent, w| {
+        if !expired(w) {
+            return true;
+        }
+        if w.pending > 0 {
+            out.push(
+                Entry::new(event.clone())
+                    .agent_id(agent.as_str())
+                    .suppressed(w.pending)
+                    .result("suppressed_only"),
+            );
+        }
+        false
+    });
+}
+
 struct Live {
     id: u64,
     session: BrokerSession,
@@ -282,6 +306,49 @@ impl Hub {
                     .detail_code("unauthorized")
                     .suppressed(suppressed),
             );
+        }
+    }
+
+    /// Write the counts the rate limiter swallowed (#219). For every window
+    /// older than [`AUDIT_WINDOW`] at `now`, a summary entry when anything
+    /// is pending; the window is then dropped, so the agent's next event
+    /// writes at once. Without this a burst followed by silence would never
+    /// reach the log. The sink runs after the `limits` lock is released.
+    pub fn flush_audit(&self, now: Instant) {
+        let mut out = Vec::new();
+        {
+            let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+            let Limits {
+                auth_fail,
+                replaced,
+            } = &mut *limits;
+            drain_windows(auth_fail, Event::ConnectorAuthFail, &mut out, |w| {
+                now.saturating_duration_since(w.start) >= AUDIT_WINDOW
+            });
+            drain_windows(replaced, Event::ConnectorReplaced, &mut out, |w| {
+                now.saturating_duration_since(w.start) >= AUDIT_WINDOW
+            });
+        }
+        for entry in out {
+            self.emit(entry);
+        }
+    }
+
+    /// Shutdown: a summary entry for every window with a pending count,
+    /// open or not, then forget all windows (#219).
+    pub fn flush_audit_all(&self) {
+        let mut out = Vec::new();
+        {
+            let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+            let Limits {
+                auth_fail,
+                replaced,
+            } = &mut *limits;
+            drain_windows(auth_fail, Event::ConnectorAuthFail, &mut out, |_| true);
+            drain_windows(replaced, Event::ConnectorReplaced, &mut out, |_| true);
+        }
+        for entry in out {
+            self.emit(entry);
         }
     }
 
@@ -572,4 +639,137 @@ async fn authenticate_and_serve<S>(
         secs: since.elapsed().as_secs(),
         replaced: replaced.load(Ordering::SeqCst),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
+    use std::sync::Mutex;
+
+    fn hub() -> (Hub, Arc<Mutex<Vec<Entry>>>) {
+        let floor = ParamFloor {
+            m_cost: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let argon = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(8, 1, 1, None).unwrap(),
+        );
+        let (_, a) = generate_tunnel_with(&argon, "assistant");
+        let (_, b) = generate_tunnel_with(&argon, "other");
+        let store = TokenStore::with_floor_and_prefix(
+            [("assistant", a.as_str()), ("other", b.as_str())],
+            &floor,
+            TUNNEL_PREFIX,
+        )
+        .unwrap();
+        let hub = Hub::with_events(store, Arc::new(|_| {}));
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&entries);
+        hub.set_audit(Arc::new(move |e| {
+            sink.lock().unwrap().push(e);
+            Ok(())
+        }));
+        (hub, entries)
+    }
+
+    /// Count one `replaced` event for `agent` the way `insert` does.
+    fn replaced_event(hub: &Hub, agent: &str, now: Instant) {
+        let due = {
+            let mut limits = hub.limits.lock().unwrap();
+            admit(&mut limits.replaced, agent, now)
+        };
+        if let Some(suppressed) = due {
+            hub.emit(
+                Entry::new(Event::ConnectorReplaced)
+                    .agent_id(agent)
+                    .suppressed(suppressed),
+            );
+        }
+    }
+
+    fn summaries(entries: &Mutex<Vec<Entry>>, event: Event, agent: &str) -> Vec<Entry> {
+        entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.event == event
+                    && e.agent_id.as_deref() == Some(agent)
+                    && e.result.as_deref() == Some("suppressed_only")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Both windows of one agent and one window of another flush on their
+    /// own: one summary each where something is pending, none elsewhere.
+    #[tokio::test(start_paused = true)]
+    async fn flush_is_per_agent_and_event() {
+        let (hub, entries) = hub();
+        let t0 = Instant::now();
+        // assistant: auth_fail pending 2, replaced pending 1.
+        for _ in 0..3 {
+            hub.audit_auth_fail("assistant", SessionTransport::Tls);
+        }
+        replaced_event(&hub, "assistant", t0);
+        replaced_event(&hub, "assistant", t0);
+        // other: auth_fail pending 0, replaced pending 4.
+        hub.audit_auth_fail("other", SessionTransport::Tls);
+        for _ in 0..5 {
+            replaced_event(&hub, "other", t0);
+        }
+        hub.flush_audit(t0 + AUDIT_WINDOW);
+        let a = summaries(&entries, Event::ConnectorAuthFail, "assistant");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].suppressed, Some(2));
+        let r = summaries(&entries, Event::ConnectorReplaced, "assistant");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].suppressed, Some(1));
+        assert!(summaries(&entries, Event::ConnectorAuthFail, "other").is_empty());
+        let r = summaries(&entries, Event::ConnectorReplaced, "other");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].suppressed, Some(4));
+        assert!(r[0].transport.is_none() && r[0].old_session_secs.is_none());
+    }
+
+    /// A window that expires with nothing pending writes nothing and is
+    /// dropped, so the next event is a fresh first event.
+    #[tokio::test(start_paused = true)]
+    async fn expired_empty_window_writes_nothing() {
+        let (hub, entries) = hub();
+        let t0 = Instant::now();
+        replaced_event(&hub, "assistant", t0);
+        assert_eq!(entries.lock().unwrap().len(), 1);
+        hub.flush_audit(t0 + AUDIT_WINDOW);
+        assert_eq!(entries.lock().unwrap().len(), 1, "nothing was pending");
+        replaced_event(
+            &hub,
+            "assistant",
+            t0 + AUDIT_WINDOW + Duration::from_secs(1),
+        );
+        let all = entries.lock().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].suppressed, Some(0));
+    }
+
+    /// Open windows with pending counts are written by `flush_audit_all`
+    /// and both maps are cleared.
+    #[tokio::test(start_paused = true)]
+    async fn flush_all_covers_replaced_and_clears() {
+        let (hub, entries) = hub();
+        let t0 = Instant::now();
+        replaced_event(&hub, "assistant", t0);
+        replaced_event(&hub, "assistant", t0);
+        replaced_event(&hub, "assistant", t0);
+        hub.flush_audit_all();
+        let r = summaries(&entries, Event::ConnectorReplaced, "assistant");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].suppressed, Some(2));
+        let limits = hub.limits.lock().unwrap();
+        assert!(limits.auth_fail.is_empty() && limits.replaced.is_empty());
+    }
 }

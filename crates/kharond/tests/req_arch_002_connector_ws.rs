@@ -710,6 +710,80 @@ async fn daemon_audits_a_refused_ws_credential() {
     let _ = tokio::time::timeout(PUBLIC_INGRESS_DRAIN + Duration::from_secs(2), server).await;
 }
 
+/// Counts swallowed by the rate limit reach `audit.jsonl` at shutdown, and
+/// the chain still verifies (#219).
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_shutdown_flushes_pending_audit_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = cert();
+    let (text, _token) = daemon_config(dir.path(), &cert, "websocket = true");
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    let public = daemon.public_ingress_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(daemon.run(async {
+        let _ = stopped.await;
+    }));
+
+    for _ in 0..2 {
+        let wrong = kharond::api::token::generate_tunnel("assistant")
+            .0
+            .expose_secret()
+            .clone();
+        let params = AgentParams {
+            transport: Dial::Ws {
+                host: "127.0.0.1".into(),
+                port: public.port(),
+                path: "/connector".into(),
+                outer_tls: false,
+            },
+            server_name: "127.0.0.1".into(),
+            pin: cert.pin,
+            agent_id: "assistant".into(),
+            token: Zeroizing::new(wrong),
+            cdp: "127.0.0.1:9".parse().unwrap(),
+            proxy: None,
+            proxy_creds: None,
+            outer_roots: None,
+        };
+        assert_eq!(
+            kharon_connector::connect_and_auth(&params).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+    }
+
+    let _ = stop.send(());
+    tokio::time::timeout(PUBLIC_INGRESS_DRAIN + Duration::from_secs(2), server)
+        .await
+        .expect("run() did not return")
+        .unwrap()
+        .unwrap();
+
+    let log = dir.path().join("data/audit/audit.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"connector_auth_fail""#))
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains(r#""suppressed":0"#), "{}", lines[0]);
+    assert!(lines[1].contains(r#""suppressed":1"#), "{}", lines[1]);
+    assert!(
+        lines[1].contains(r#""result":"suppressed_only""#),
+        "{}",
+        lines[1]
+    );
+    assert!(!lines[1].contains(r#""transport""#), "{}", lines[1]);
+    let keys =
+        kharond::audit::AuditKeys::load_or_generate(&dir.path().join("data/audit/keys")).unwrap();
+    assert!(matches!(
+        kharond::audit::verify(&log, &[], &keys.verifying_key()).unwrap(),
+        kharond::audit::VerifyOutcome::Ok { .. }
+    ));
+}
+
 /// A held-open, authenticated session ends when the daemon stops, inside
 /// the drain bound, and `run()` returns.
 #[tokio::test(flavor = "multi_thread")]

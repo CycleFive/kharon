@@ -385,3 +385,92 @@ async fn audit_append_failure_does_not_block_auth() {
     rig.hub.disconnect("assistant");
     let _ = tokio::time::timeout(Duration::from_secs(5), second).await;
 }
+
+// ---- #219: suppressed counts are flushed, not left in memory ----------
+
+/// A closed window with swallowed events writes one summary entry on the
+/// flush, and the next event opens a fresh window with `suppressed = 0`.
+#[tokio::test(start_paused = true)]
+async fn flush_writes_a_summary_for_a_closed_window() {
+    let sink = Sink::default();
+    let (store, _) = store();
+    let hub = Hub::with_events(store, Arc::new(|_| {}));
+    hub.set_audit(sink.audit());
+    let fail = |hub: &Hub| hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    let t0 = tokio::time::Instant::now();
+
+    fail(&hub);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    for _ in 0..3 {
+        fail(&hub);
+    }
+    assert_eq!(sink.of(Event::ConnectorAuthFail).len(), 1);
+
+    hub.flush_audit(t0 + Duration::from_secs(59));
+    assert_eq!(sink.of(Event::ConnectorAuthFail).len(), 1, "window is open");
+
+    hub.flush_audit(t0 + Duration::from_secs(60));
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 2);
+    let summary = &all[1];
+    assert_eq!(summary.suppressed, Some(3));
+    assert_eq!(summary.result.as_deref(), Some("suppressed_only"));
+    assert_eq!(summary.agent_id.as_deref(), Some("assistant"));
+    assert_eq!(summary.transport, None);
+    assert_eq!(summary.detail_code, None);
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    fail(&hub);
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 3, "the next event writes at once");
+    assert_eq!(all[2].suppressed, Some(0));
+    assert_eq!(all[2].result, None);
+}
+
+/// Shutdown flushes an open window's pending count.
+#[tokio::test(start_paused = true)]
+async fn flush_all_writes_pending_of_open_windows() {
+    let sink = Sink::default();
+    let (store, _) = store();
+    let hub = Hub::with_events(store, Arc::new(|_| {}));
+    hub.set_audit(sink.audit());
+    hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    hub.audit_auth_fail("assistant", SessionTransport::Tls);
+
+    hub.flush_audit_all();
+    let all = sink.of(Event::ConnectorAuthFail);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[1].suppressed, Some(2));
+    assert_eq!(all[1].result.as_deref(), Some("suppressed_only"));
+
+    hub.flush_audit_all();
+    assert_eq!(
+        sink.of(Event::ConnectorAuthFail).len(),
+        2,
+        "maps were cleared"
+    );
+}
+
+/// Review Focus 5: a failing sink must not make the flush hang or panic.
+#[tokio::test(start_paused = true)]
+async fn flush_with_failing_sink_returns() {
+    let sink = Sink {
+        fail: true,
+        ..Sink::default()
+    };
+    let (store, _) = store();
+    let hub = Hub::with_events(store, Arc::new(|_| {}));
+    hub.set_audit(sink.audit());
+    for _ in 0..3 {
+        hub.audit_auth_fail("assistant", SessionTransport::Tls);
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        hub.flush_audit(tokio::time::Instant::now() + Duration::from_secs(60));
+        hub.flush_audit_all();
+    })
+    .await
+    .expect("flush returned");
+    assert!(sink.all().is_empty());
+}

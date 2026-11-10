@@ -649,6 +649,65 @@ async fn raw_listener_still_accepts_tls12() {
     let _ = tokio::time::timeout(PUBLIC_INGRESS_DRAIN + Duration::from_secs(2), server).await;
 }
 
+/// The daemon wires the hub's audit sink to the broker's log: a refused
+/// credential for a configured agent over the websocket lands in
+/// `audit.jsonl` as `connector_auth_fail` with `transport: "ws"` (#199).
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_audits_a_refused_ws_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = cert();
+    let (text, _token) = daemon_config(dir.path(), &cert, "websocket = true");
+    let cfg = Config::from_toml_str(&text).unwrap();
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .unwrap();
+    let public = daemon.public_ingress_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(daemon.run(async {
+        let _ = stopped.await;
+    }));
+
+    let wrong = kharond::api::token::generate_tunnel("assistant")
+        .0
+        .expose_secret()
+        .clone();
+    let params = AgentParams {
+        transport: Dial::Ws {
+            host: "127.0.0.1".into(),
+            port: public.port(),
+            path: "/connector".into(),
+            outer_tls: false,
+        },
+        server_name: "127.0.0.1".into(),
+        pin: cert.pin,
+        agent_id: "assistant".into(),
+        token: Zeroizing::new(wrong),
+        cdp: "127.0.0.1:9".parse().unwrap(),
+        proxy: None,
+        proxy_creds: None,
+        outer_roots: None,
+    };
+    assert_eq!(
+        kharon_connector::connect_and_auth(&params).await.err(),
+        Some(ClientError::Unauthorized)
+    );
+
+    let log = dir.path().join("data/audit/audit.jsonl");
+    eventually("connector_auth_fail in audit.jsonl", || {
+        std::fs::read_to_string(&log).is_ok_and(|text| {
+            text.lines().any(|l| {
+                l.contains(r#""event":"connector_auth_fail""#)
+                    && l.contains(r#""transport":"ws""#)
+                    && l.contains(r#""agent_id":"assistant""#)
+            })
+        })
+    })
+    .await;
+
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(PUBLIC_INGRESS_DRAIN + Duration::from_secs(2), server).await;
+}
+
 /// A held-open, authenticated session ends when the daemon stops, inside
 /// the drain bound, and `run()` returns.
 #[tokio::test(flavor = "multi_thread")]

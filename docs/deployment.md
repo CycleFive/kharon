@@ -300,6 +300,75 @@ the input filter in
 kharond still reads `/json/version` on each connect, over the
 connector, so a Chromium restart needs no config edit.
 
+#### Over WebSocket, through the public gateway (#199)
+
+When the agent host cannot reach the broker on a raw TCP port (no VPN,
+no open inbound port), the connector can dial
+`wss://<public host>/connector` through the Cloudflare Tunnel
+instead (see [Public gateway](#public-gateway-197-198)). Inside
+WebSocket binary messages it runs the same pinned inner TLS, the same
+auth record and the same mux, so the edge carries only ciphertext. On
+this path the inner TLS is 1.3 only; the raw `:8789` listener keeps
+its TLS version set.
+
+```toml
+[connector]
+tls_cert_file = "/etc/kharon/connector.crt"   # the pinned key, both transports
+tls_key_file  = "/etc/kharon/connector.key"
+websocket = true                               # serve GET /connector on [public_ingress]
+# listen = "100.64.0.10:8789"                  # optional: also keep the raw pinned-TLS listener
+```
+
+- `websocket = true` requires `[public_ingress]`; kharond refuses to
+  start without it (`connector_websocket_needs_public_ingress`).
+- `listen` is optional. Set at least one of `listen` and
+  `websocket = true`, or there is nothing for the connector to dial
+  (`connector_no_transport`). Behind the tunnel on a Compose
+  deployment, leave `listen` out: nothing needs a raw port.
+- An existing raw-TLS path-B config (`listen` set, `websocket`
+  absent, default `false`) keeps working unchanged.
+- `[connector]` is still required exactly when some agent uses
+  `via = "agent_connector"`.
+- `BROKER_PIN` is the SHA-256 of the `[connector]` certificate's DER,
+  as above, not of anything Cloudflare presents. The pin is the
+  authentication of the broker; the outer TLS to Cloudflare is only
+  transport.
+
+The upgrade is accepted only for `GET /connector` with
+`Upgrade: websocket`, `Sec-WebSocket-Version: 13`, a
+`Sec-WebSocket-Key` and the subprotocol `kharon-connector.v1`. A
+missing or wrong item gets 400, any `Origin` header gets 403, and a
+full pre-auth budget (8 sockets that have not authenticated yet,
+separate from the raw listener's) gets 503. Compression is never
+negotiated. The inner TLS handshake and the hello each get 5 seconds,
+and the first inner bytes must look like a TLS ClientHello or the
+socket is closed.
+
+kharond writes log lines, not one per stranger:
+
+```text
+agent connector attached: agent=assistant transport=ws peer=127.0.0.1:41822
+agent connector detached: agent=assistant transport=ws peer=127.0.0.1:41822 after=3600s
+connector: refused 37 websocket upgrades in the last 60s (budget 12, protocol 20, hello 5)
+```
+
+The last line appears at most once a minute, and only when something
+was refused. Two events are audit entries (`kharon audit verify`
+covers them), each at most once per agent per minute, with a
+`suppressed` count for the refusals folded into the next entry:
+
+- `connector_auth_fail`: a hello named a configured agent id and the
+  tunnel credential was refused. Fields: `agent_id`, `transport`
+  (`tls` or `ws`), `detail_code` (`unauthorized`) and `suppressed`.
+  Unknown agent ids and junk are only counted in the log line above.
+- `connector_replaced`: a new session evicted a live one for the same
+  agent. Fields: `agent_id`, the new session's `transport`,
+  `old_session_secs` and `suppressed`. Unexpected replacement means
+  someone else holds the tunnel credential: mint a new one.
+
+Both appends are best effort; a failed append is logged and never
+blocks authentication.
+
 ### Tunnel-only listeners (REQ-DEP-006)
 
 kharond refuses a wildcard bind, and `ss -ltn` shows the agent API
@@ -446,7 +515,7 @@ cannot join the tailnet can still reach the broker:
 | Public request | Reaches |
 |---|---|
 | `POST /mcp` | the MCP transport, with the same bearer token, audit and limits as on `[api]` |
-| `GET /connector` | the agent-connector WebSocket (#199; 404 until it lands) |
+| `GET /connector` | the agent-connector WebSocket (#199): 404 unless `[connector] websocket = true`, subprotocol `kharon-connector.v1` |
 | anything else | 404 |
 
 Nothing else is reachable through the hostname: not the owner UI,
@@ -484,6 +553,12 @@ bypasses it and reaches, with none of the public-side limits:
   need a token.
 
 Don't set *HTTP Host Header* on a route.
+
+`/connector` is a WebSocket, so the zone's **Network → WebSockets**
+setting must be on (it is by default). Cloudflare closes an idle
+proxied WebSocket after about 100 seconds; the connector's mux pings
+every 20 seconds, which keeps it open. Cloudflare also drops long-lived
+WebSockets during edge restarts, and the connector reconnects.
 
 **Cloudflare-side changes (the tunnel, its DNS record, WAF and rate
 limit rules) are applied by the owner, not by implementers.**
@@ -715,7 +790,7 @@ curl -s -o /dev/null -w '%{http_code}\n' --cacert /etc/kharon/tls.crt \
   -X POST https://100.64.0.10:8790/mcp -H 'Content-Type: application/json' -d '{}'   # 401
 ```
 
-### Optional: WAF and rate limits for `/mcp`
+### Optional: WAF and rate limits for `/mcp` and `/connector`
 
 These cost little and stop junk at the edge, before it reaches the
 tunnel. Suggestions, for the owner to apply in the zone's Security
@@ -729,8 +804,17 @@ rules:
 - **Rate limiting rule:** on `http.request.uri.path eq "/mcp"`,
   counted per IP, for example 120 requests per minute, then block for
   ten minutes. An agent filling forms makes a few calls a minute.
+- **Rate limiting rule, `/connector`:** on
+  `http.request.uri.path eq "/connector"`, counted per IP, for example
+  20 requests per minute, then block for ten minutes. A healthy
+  connector dials once and holds the socket; even a flapping one backs
+  off to 30-second retries. kharond's pre-auth budget (8 sockets, shared by
+  everyone) is global, so a stranger who keeps it full can delay a
+  *reconnecting* agent; this rule is what keeps strangers from doing
+  that. Live sessions are untouched.
 - **Bot Fight Mode and "I'm Under Attack":** keep them off for this
-  hostname. MCP clients cannot answer a browser challenge.
+  hostname. MCP clients and the connector cannot answer a browser
+  challenge.
 
 kharond's own limits (fill rate per agent, token-check concurrency)
 apply regardless. #200 adds the `/mcp` hardening that depends on the
@@ -861,6 +945,15 @@ sudo CONNECTOR_BIN=./kharon-agent-connector \
   ./provision-connector.sh
 ```
 
+Set exactly one of `BROKER_ADDR` (`host:port`, the raw `[connector]
+listen`) and `BROKER_URL` (`wss://broker.example.net/connector`, the
+public gateway; see
+[Over WebSocket](#over-websocket-through-the-public-gateway-199)).
+The script refuses both or neither, and refuses a `BROKER_URL` that
+does not start with `wss://`. With `BROKER_URL` it writes
+`transport = "ws"` and `broker_url` to the connector config instead
+of `broker`. `BROKER_PIN` is required either way.
+
 It:
 
 - installs `chromium` and `fonts-liberation` (not `wireguard-tools`,
@@ -902,6 +995,73 @@ re-run with the new file) if this host is rebuilt. The broker
 certificate pin is not a secret. The proxy credential, when set, is
 the egress proxy's secret: the connector presents it to that proxy
 and nowhere else.
+
+#### Connector config over WebSocket
+
+`/etc/kharon-connector/connector.toml` as the script writes it with
+`BROKER_URL`:
+
+```toml
+transport = "ws"                                  # "tls" (default) dials broker
+broker_url = "wss://broker.example.net/connector"  # wss:// only; port defaults to 443
+broker_pin = "<64 hex>"                           # the inner [connector] cert, as for tls
+agent_id = "assistant"
+token_file = "/etc/kharon-connector/token"
+cdp = "127.0.0.1:9222"
+# proxy = "http://proxy.example:3128"             # optional, as for tls
+# server_name = "broker.internal"                 # optional
+# outer_ca_file = "/etc/kharon-connector/edge-ca.pem"   # tests and private edges only
+```
+
+- `transport = "tls"` takes `broker = "host:port"` and refuses
+  `broker_url` and `outer_ca_file`; `transport = "ws"` takes
+  `broker_url` and refuses `broker`. A config that mixes them is a
+  config error (exit 78).
+- The connector verifies the outer TLS to the edge against the system
+  roots. `outer_ca_file` is for tests and private edges only: it
+  *replaces* the system roots for the outer TLS and never turns
+  verification off.
+- `server_name` sets the inner TLS server name on both transports; it
+  defaults to the broker host (or the URL's host). The server name is
+  not what authenticates the broker, `broker_pin` is.
+- An existing raw-TLS config (`broker`, no `transport`) keeps working
+  unchanged.
+
+`kharon-agent-connector --config /etc/kharon-connector/connector.toml
+--check` dials once, walks each leg up to `AUTH_OK` and prints one line
+per leg, never opening CDP. Run it first on a failing host:
+
+```text
+ok dns
+ok tcp
+ok outer-tls
+fail upgrade: websocket upgrade answered 502
+check: failed
+```
+
+Exit codes: 0 when auth succeeded, 69 when a leg failed, 78 for a
+config error. The legs are `dns`, `tcp`, `proxy`, `outer-tls`,
+`upgrade`, `inner-tls` and `auth`. Log lines are fixed text and never
+carry the token, a proxy credential or a peer's response body.
+
+The service retries with exponential backoff and full jitter, from 1
+second to a 30-second cap. A rejected tunnel credential and a proxy
+authentication failure wait a fixed 60 seconds. With no authenticated
+session for 2 minutes the connector logs one summary line, and repeats it
+every 10 minutes while the outage lasts. Alert on it:
+
+```text
+kharon-agent-connector: no broker session for 2m10s (14 attempts); last failure: upgrade: websocket upgrade answered 502
+```
+
+When the failing leg is `upgrade`, the status is printed as received:
+
+| Agent log | Meaning |
+|---|---|
+| `websocket upgrade answered 404` | the route is missing at the edge, or kharond has `websocket` off or no `[public_ingress]` |
+| `websocket upgrade answered 502` | the origin is down (kharond or cloudflared); also 52x from Cloudflare |
+| `websocket upgrade answered 503` | kharond's pre-auth budget is full; retry, and see the rate-limit rule |
+| `websocket upgrade answered 400` / `403` | the request was malformed, or something added an `Origin` header |
 
 Point the agent harness at `https://203.0.113.4:8787` with its agent
 API token, and trust the broker certificate there. The connector does

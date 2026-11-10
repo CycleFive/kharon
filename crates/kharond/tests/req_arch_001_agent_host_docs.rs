@@ -498,3 +498,21 @@ fn req_arch_001_checker_rejects_kharon_on_the_agent_host() {
     let unlisted = guide.replace("no-password-manager.json", "the policy file");
     assert!(!guide_problems(&unlisted, &good).is_empty());
 }
+
+#[test]
+fn req_dep_005_connector_script_takes_broker_url_for_the_websocket_transport() {
+    let script = repo_file("deploy/agent-host/provision-connector.sh");
+    for needle in [
+        "BROKER_URL",
+        "transport = \"ws\"",
+        "broker_url",
+        "BROKER_URL must start with wss://",
+        "set exactly one of BROKER_ADDR and BROKER_URL",
+    ] {
+        assert!(script.contains(needle), "script lacks {needle}");
+    }
+    let guide = repo_file("docs/deployment.md");
+    let section = agent_host_section(&guide).unwrap();
+    assert!(section.contains("BROKER_URL"));
+    assert!(section.contains("wss://"));
+}

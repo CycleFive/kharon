@@ -236,7 +236,31 @@ fn n1_tunnel_routes_in_docs_use_127_0_0_1() {
         assert!(readme.contains(needle), "compose README lacks {needle}");
     }
     let guide = read("docs/deployment.md");
-    for needle in ["http://127.0.0.1:8790", "--token-file"] {
+    for needle in [
+        "http://127.0.0.1:8790",
+        "--token-file",
+        "transport = \"ws\"",
+        "kharon-connector.v1",
+        "websocket = true",
+        "connector_auth_fail",
+        "connector_replaced",
+        "websocket upgrade answered 503",
+    ] {
         assert!(guide.contains(needle), "deployment guide lacks {needle}");
     }
+    assert!(
+        !guide.contains("404 until it lands"),
+        "deployment guide still says /connector is a placeholder"
+    );
+    for f in [
+        "deploy/compose/README.md",
+        "deploy/compose/kharon.toml.example",
+    ] {
+        let text = read(f);
+        assert!(!text.contains("until #199"), "{f}: stale \"until #199\"");
+    }
+    assert!(
+        read("deploy/compose/kharon.toml.example").contains("websocket = true"),
+        "compose example does not show the websocket connector"
+    );
 }

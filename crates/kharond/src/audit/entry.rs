@@ -169,6 +169,26 @@ impl<'de> Deserialize<'de> for Event {
     }
 }
 
+/// How a connector session reached the broker (#199). Serialized as
+/// `"tls"` / `"ws"`; `Display` prints the same text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionTransport {
+    /// The raw pinned-TLS listener (`[connector].listen`).
+    Tls,
+    /// A WebSocket on `[public_ingress]` (`GET /connector`, #199).
+    Ws,
+}
+
+impl std::fmt::Display for SessionTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tls => "tls",
+            Self::Ws => "ws",
+        })
+    }
+}
+
 /// One audit entry. `seq`, `ts`, `prev_hash`, `hash`, and `log_id` are
 /// assigned by [`crate::audit::AuditLog::append`]; callers set the rest via
 /// builder methods.
@@ -235,7 +255,7 @@ pub struct Entry {
     /// How a connector session reached the broker: `tls` or `ws` (only on
     /// `connector_auth_fail` / `connector_replaced`, #199).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport: Option<String>,
+    pub transport: Option<SessionTransport>,
     /// Events of this kind and agent dropped by the rate limiter since the
     /// previous entry (only on the connector events, #199).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -343,8 +363,8 @@ impl Entry {
     }
 
     /// The connector transport (`tls` or `ws`).
-    pub fn transport(mut self, v: impl Into<String>) -> Self {
-        self.transport = Some(v.into());
+    pub fn transport(mut self, v: SessionTransport) -> Self {
+        self.transport = Some(v);
         self
     }
 

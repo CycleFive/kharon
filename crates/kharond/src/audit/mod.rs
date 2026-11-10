@@ -44,7 +44,7 @@ mod verify;
 pub use checkpoint::{
     Checkpoint, CheckpointSink, FileCheckpointSink, NtfyCheckpointSink, NullCheckpointSink,
 };
-pub use entry::{Entry, Event, GENESIS_PREV_HASH};
+pub use entry::{Entry, Event, GENESIS_PREV_HASH, SessionTransport};
 pub use keys::{AuditKeys, KeysError};
 pub use log::{
     AppendError, AuditConfig, AuditLog, DEFAULT_CHECKPOINT_EVERY, DEFAULT_CHECKPOINT_PERIOD,

@@ -42,25 +42,8 @@ use crate::api::token::TokenStore;
 use crate::audit::{Entry, Event};
 
 mod ws;
+pub use crate::audit::SessionTransport;
 pub use ws::WsEntry;
-
-/// How an attached session reached the broker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    /// The raw pinned-TLS listener (`[connector].listen`).
-    Tls,
-    /// A WebSocket on `[public_ingress]` (`GET /connector`, #199).
-    Ws,
-}
-
-impl fmt::Display for Transport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Tls => "tls",
-            Self::Ws => "ws",
-        })
-    }
-}
 
 /// A connector session event, reported once per occurrence (#150).
 ///
@@ -72,14 +55,14 @@ pub enum ConnectorEvent {
     /// the TCP peer, which is the proxy when the agent dials through one.
     Attached {
         agent_id: String,
-        transport: Transport,
+        transport: SessionTransport,
         peer: SocketAddr,
     },
     /// An attached session ended. `replaced` is true when a newer session
     /// for the same agent superseded it.
     Detached {
         agent_id: String,
-        transport: Transport,
+        transport: SessionTransport,
         peer: SocketAddr,
         secs: u64,
         replaced: bool,
@@ -250,7 +233,7 @@ impl Hub {
     /// per 60 s; unknown ids and junk are not audited. `detail_code` is
     /// always `unauthorized`: a malformed hello carries no attributable
     /// agent id.
-    pub fn audit_auth_fail(&self, claimed: &str, transport: Transport) {
+    pub fn audit_auth_fail(&self, claimed: &str, transport: SessionTransport) {
         if !self.tokens.agents().any(|id| id == claimed) {
             return;
         }
@@ -262,7 +245,7 @@ impl Hub {
             self.emit(
                 Entry::new(Event::ConnectorAuthFail)
                     .agent_id(claimed)
-                    .transport(transport.to_string())
+                    .transport(transport)
                     .detail_code("unauthorized")
                     .suppressed(suppressed),
             );
@@ -337,7 +320,7 @@ impl Hub {
         &self,
         agent: String,
         session: BrokerSession,
-        transport: Transport,
+        transport: SessionTransport,
     ) -> (u64, Arc<AtomicBool>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let replaced = Arc::new(AtomicBool::new(false));
@@ -365,7 +348,7 @@ impl Hub {
                 self.emit(
                     Entry::new(Event::ConnectorReplaced)
                         .agent_id(agent)
-                        .transport(transport.to_string())
+                        .transport(transport)
                         .old_session_secs(old_secs)
                         .suppressed(suppressed),
                 );
@@ -405,7 +388,7 @@ pub async fn accept(listener: TcpListener, tls: Arc<rustls::ServerConfig>, hub: 
             authenticate_and_serve(
                 tcp,
                 peer,
-                Transport::Tls,
+                SessionTransport::Tls,
                 acceptor,
                 hub,
                 Duration::from_secs(10),
@@ -433,7 +416,7 @@ async fn stopped(stop: &mut Option<watch::Receiver<bool>>) {
 async fn authenticate<S>(
     stream: S,
     peer: SocketAddr,
-    transport: Transport,
+    transport: SessionTransport,
     acceptor: TlsAcceptor,
     hub: &Arc<Hub>,
     deadline: Duration,
@@ -483,7 +466,7 @@ where
 async fn authenticate_and_serve<S>(
     stream: S,
     peer: SocketAddr,
-    transport: Transport,
+    transport: SessionTransport,
     acceptor: TlsAcceptor,
     hub: Arc<Hub>,
     deadline: Duration,

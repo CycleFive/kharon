@@ -30,7 +30,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-use super::{Hub, Transport, authenticate_and_serve, stopped};
+use super::{Hub, SessionTransport, authenticate_and_serve, stopped};
 
 /// The inner TLS handshake and the hello each get this long on the
 /// WebSocket path (the raw listener allows 10 s for the handshake).
@@ -180,7 +180,7 @@ impl WsEntry {
         authenticate_and_serve(
             stream,
             peer,
-            Transport::Ws,
+            SessionTransport::Ws,
             self.acceptor.clone(),
             Arc::clone(&self.hub),
             WS_DEADLINE,

@@ -19,7 +19,9 @@ use futures_util::{SinkExt, StreamExt};
 use kharon_connector::Transport as Dial;
 use kharon_connector::WsByteStream;
 use kharond::config::Config;
-use kharond::connector::{AgentParams, ClientError, ConnectorEvent, Transport, run_agent_once};
+use kharond::connector::{
+    AgentParams, ClientError, ConnectorEvent, SessionTransport, run_agent_once,
+};
 use kharond::daemon::{self, PUBLIC_INGRESS_DRAIN};
 use kharond::lock::StaticHardening;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -117,7 +119,7 @@ async fn ws_fill_over_public_ingress() {
             matches!(
                 events.as_slice(),
                 [ConnectorEvent::Attached {
-                    transport: Transport::Ws,
+                    transport: SessionTransport::Ws,
                     ..
                 }]
             ),
@@ -449,7 +451,7 @@ async fn ws_inner_tls12_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_and_ws_sessions_replace_each_other() {
     let rig = rig().await;
-    let detached = |rig: &Rig, transport: Transport| {
+    let detached = |rig: &Rig, transport: SessionTransport| {
         rig.events.lock().unwrap().iter().any(|e| {
             matches!(e, ConnectorEvent::Detached { transport: t, replaced: true, .. } if *t == transport)
         })
@@ -461,7 +463,7 @@ async fn raw_and_ws_sessions_replace_each_other() {
     eventually("raw attach", || rig.hub.is_connected("assistant")).await;
     let ws = ws_dial(&rig, &rig.token);
     let ws_task = tokio::spawn(async move { run_agent_once(&ws).await });
-    eventually("raw replaced", || detached(&rig, Transport::Tls)).await;
+    eventually("raw replaced", || detached(&rig, SessionTransport::Tls)).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), raw_task)
         .await
         .expect("the evicted raw agent kept its socket");
@@ -470,7 +472,7 @@ async fn raw_and_ws_sessions_replace_each_other() {
     // and back: a raw dial evicts the ws session.
     let raw = raw_dial(&rig);
     let raw_task = tokio::spawn(async move { run_agent_once(&raw).await });
-    eventually("ws replaced", || detached(&rig, Transport::Ws)).await;
+    eventually("ws replaced", || detached(&rig, SessionTransport::Ws)).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), ws_task)
         .await
         .expect("the evicted ws agent kept its socket");

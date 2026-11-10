@@ -14,8 +14,8 @@ use argon2::Argon2;
 use kharon_connector::Transport as Dial;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::connector::{
-    AgentParams, ClientError, ConnectorEvent, Hub, Transport, accept, pin_of_der, run_agent_once,
-    server_config_from_pem,
+    AgentParams, ClientError, ConnectorEvent, Hub, SessionTransport, accept, pin_of_der,
+    run_agent_once, server_config_from_pem,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tokio::net::TcpListener;
@@ -136,7 +136,7 @@ async fn req_aud_150_attach_and_detach_logged_once() {
         panic!("expected an attach, got {seen:?}");
     };
     assert_eq!(agent_id, "assistant");
-    assert_eq!(*transport, Transport::Tls);
+    assert_eq!(*transport, SessionTransport::Tls);
     assert!(peer.ip().is_loopback(), "{peer}");
     let line = seen[0].to_string();
     assert_eq!(

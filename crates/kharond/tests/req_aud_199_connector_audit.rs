@@ -16,8 +16,8 @@ use kharond::audit::{
     AuditConfig, AuditKeys, AuditLog, Entry, Event, NullCheckpointSink, VerifyOutcome, verify,
 };
 use kharond::connector::{
-    AgentParams, ConnectorAudit, Hub, Transport, WsEntry, accept, pin_of_der, run_agent_once,
-    server_config_from_pem,
+    AgentParams, ConnectorAudit, Hub, SessionTransport, WsEntry, accept, pin_of_der,
+    run_agent_once, server_config_from_pem,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tokio::net::TcpListener;
@@ -134,10 +134,10 @@ async fn rig_with(sink: &ConnectorAudit) -> Rig {
     }
 }
 
-fn dial(rig: &Rig, transport: Transport, agent: &str, token: &str) -> AgentParams {
+fn dial(rig: &Rig, transport: SessionTransport, agent: &str, token: &str) -> AgentParams {
     let transport = match transport {
-        Transport::Tls => Dial::Tls { broker: rig.raw },
-        Transport::Ws => Dial::Ws {
+        SessionTransport::Tls => Dial::Tls { broker: rig.raw },
+        SessionTransport::Ws => Dial::Ws {
             host: "127.0.0.1".into(),
             port: rig.public.port(),
             path: "/connector".into(),
@@ -158,7 +158,7 @@ fn dial(rig: &Rig, transport: Transport, agent: &str, token: &str) -> AgentParam
 }
 
 /// One dial that is expected to be refused; returns when the agent is told.
-async fn refused(rig: &Rig, transport: Transport, agent: &str, token: &str) {
+async fn refused(rig: &Rig, transport: SessionTransport, agent: &str, token: &str) {
     let params = dial(rig, transport, agent, token);
     let r = tokio::time::timeout(Duration::from_secs(10), run_agent_once(&params))
         .await
@@ -175,7 +175,7 @@ async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
 }
 
 /// Attach `assistant` over `transport`; returns the agent task.
-async fn attach(rig: &Rig, transport: Transport) -> tokio::task::JoinHandle<()> {
+async fn attach(rig: &Rig, transport: SessionTransport) -> tokio::task::JoinHandle<()> {
     let params = dial(rig, transport, "assistant", &rig.token);
     let task = tokio::spawn(async move {
         let _ = run_agent_once(&params).await;
@@ -193,7 +193,7 @@ async fn refused_configured_agent_writes_one_entry_per_minute() {
     let (store, _) = store();
     let hub = Hub::with_events(store, Arc::new(|_| {}));
     hub.set_audit(sink.audit());
-    let fail = |hub: &Hub| hub.audit_auth_fail("assistant", Transport::Tls);
+    let fail = |hub: &Hub| hub.audit_auth_fail("assistant", SessionTransport::Tls);
 
     fail(&hub);
     fail(&hub);
@@ -201,7 +201,7 @@ async fn refused_configured_agent_writes_one_entry_per_minute() {
     let first = sink.of(Event::ConnectorAuthFail);
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].agent_id.as_deref(), Some("assistant"));
-    assert_eq!(first[0].transport.as_deref(), Some("tls"));
+    assert_eq!(first[0].transport, Some(SessionTransport::Tls));
     assert_eq!(first[0].detail_code.as_deref(), Some("unauthorized"));
     assert_eq!(first[0].suppressed, Some(0));
 
@@ -214,7 +214,7 @@ async fn refused_configured_agent_writes_one_entry_per_minute() {
     );
 
     tokio::time::advance(Duration::from_secs(2)).await;
-    hub.audit_auth_fail("assistant", Transport::Ws);
+    hub.audit_auth_fail("assistant", SessionTransport::Ws);
     let all = sink.of(Event::ConnectorAuthFail);
     assert_eq!(all.len(), 2);
     assert_eq!(
@@ -222,7 +222,7 @@ async fn refused_configured_agent_writes_one_entry_per_minute() {
         Some(3),
         "two + one dropped, then this one writes"
     );
-    assert_eq!(all[1].transport.as_deref(), Some("ws"));
+    assert_eq!(all[1].transport, Some(SessionTransport::Ws));
     assert_eq!(all[1].detail_code.as_deref(), Some("unauthorized"));
 
     // A new window: the counter restarted.
@@ -246,13 +246,16 @@ async fn refused_configured_agent_writes_one_entry_per_minute() {
 /// thing that can have written the entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_over_raw_and_ws_is_audited_with_transport() {
-    for (transport, name) in [(Transport::Tls, "tls"), (Transport::Ws, "ws")] {
+    for (transport, name) in [(SessionTransport::Tls, "tls"), (SessionTransport::Ws, "ws")] {
         let sink = Sink::default();
         let rig = rig_with(&sink.audit()).await;
         refused(&rig, transport, "assistant", &wrong_token()).await;
         let got = sink.of(Event::ConnectorAuthFail);
         assert_eq!(got.len(), 1, "{name}: written before the agent is told");
-        assert_eq!(got[0].transport.as_deref(), Some(name));
+        assert_eq!(
+            got[0].transport.map(|t| t.to_string()).as_deref(),
+            Some(name)
+        );
         assert_eq!(got[0].detail_code.as_deref(), Some("unauthorized"));
         assert_eq!(got[0].agent_id.as_deref(), Some("assistant"));
         assert_eq!(got[0].suppressed, Some(0));
@@ -264,9 +267,9 @@ async fn refused_unknown_agent_writes_none() {
     let sink = Sink::default();
     let rig = rig_with(&sink.audit()).await;
     // A valid credential for `assistant`, claimed as someone else.
-    refused(&rig, Transport::Tls, "ghost", &rig.token).await;
-    refused(&rig, Transport::Ws, "ghost", &wrong_token()).await;
-    rig.hub.audit_auth_fail("ghost", Transport::Tls);
+    refused(&rig, SessionTransport::Tls, "ghost", &rig.token).await;
+    refused(&rig, SessionTransport::Ws, "ghost", &wrong_token()).await;
+    rig.hub.audit_auth_fail("ghost", SessionTransport::Tls);
     assert!(sink.all().is_empty(), "{:?}", sink.all());
 }
 
@@ -275,7 +278,7 @@ async fn replace_writes_connector_replaced_with_age_and_transport() {
     let sink = Sink::default();
     let rig = rig_with(&sink.audit()).await;
     let started = tokio::time::Instant::now();
-    let raw = attach(&rig, Transport::Tls).await;
+    let raw = attach(&rig, SessionTransport::Tls).await;
     assert!(
         sink.of(Event::ConnectorReplaced).is_empty(),
         "no eviction yet"
@@ -285,7 +288,7 @@ async fn replace_writes_connector_replaced_with_age_and_transport() {
     })
     .await;
 
-    let ws = attach(&rig, Transport::Ws).await;
+    let ws = attach(&rig, SessionTransport::Ws).await;
     eventually("replaced entry", || {
         !sink.of(Event::ConnectorReplaced).is_empty()
     })
@@ -293,13 +296,17 @@ async fn replace_writes_connector_replaced_with_age_and_transport() {
     let got = sink.of(Event::ConnectorReplaced);
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].agent_id.as_deref(), Some("assistant"));
-    assert_eq!(got[0].transport.as_deref(), Some("ws"), "the new session's");
+    assert_eq!(
+        got[0].transport,
+        Some(SessionTransport::Ws),
+        "the new session's"
+    );
     assert_eq!(got[0].suppressed, Some(0));
     let age = got[0].old_session_secs.expect("old_session_secs");
     assert!((1..=3).contains(&age), "age {age}");
 
     // Back to raw inside the window: the eviction happens, no new entry.
-    let raw2 = attach(&rig, Transport::Tls).await;
+    let raw2 = attach(&rig, SessionTransport::Tls).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), ws).await;
     assert_eq!(sink.of(Event::ConnectorReplaced).len(), 1);
     rig.hub.disconnect("assistant");
@@ -325,9 +332,9 @@ async fn audit_entries_never_hold_the_credential() {
     let rig = rig_with(&audit).await;
     let bad = wrong_token();
 
-    refused(&rig, Transport::Tls, "assistant", &bad).await;
-    let a = attach(&rig, Transport::Tls).await;
-    let b = attach(&rig, Transport::Ws).await;
+    refused(&rig, SessionTransport::Tls, "assistant", &bad).await;
+    let a = attach(&rig, SessionTransport::Tls).await;
+    let b = attach(&rig, SessionTransport::Ws).await;
     eventually("two entries", || log.lock().unwrap().head_seq() >= 2).await;
     rig.hub.disconnect("assistant");
     let _ = tokio::time::timeout(Duration::from_secs(5), a).await;
@@ -363,10 +370,10 @@ async fn audit_append_failure_does_not_block_auth() {
     let rig = rig_with(&sink.audit()).await;
 
     // Still refused, still told so.
-    refused(&rig, Transport::Tls, "assistant", &wrong_token()).await;
+    refused(&rig, SessionTransport::Tls, "assistant", &wrong_token()).await;
     // Still accepted, and a second session still evicts the first.
-    let first = attach(&rig, Transport::Tls).await;
-    let second = attach(&rig, Transport::Ws).await;
+    let first = attach(&rig, SessionTransport::Tls).await;
+    let second = attach(&rig, SessionTransport::Ws).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), first)
         .await
         .expect("the evicted session kept its socket");

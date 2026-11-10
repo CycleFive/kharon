@@ -210,6 +210,22 @@ fn kharond_logs() -> String {
     logs
 }
 
+/// The parts of `docker compose config --format json` the tests read.
+#[derive(serde::Deserialize)]
+struct ComposeConfig {
+    #[serde(default)]
+    services: std::collections::HashMap<String, ComposeService>,
+    #[serde(default)]
+    networks: std::collections::HashMap<String, serde::de::IgnoredAny>,
+}
+
+#[derive(serde::Deserialize)]
+struct ComposeService {
+    #[serde(default)]
+    networks: std::collections::HashMap<String, serde::de::IgnoredAny>,
+}
+
+const DETACH: &str = "agent connector detached: agent=alpha transport=ws";
 const ATTACH: &str = "agent connector attached: agent=alpha transport=ws";
 
 /// A CA and a server leaf for `host` signed by it: (ca pem, leaf cert
@@ -371,6 +387,9 @@ async fn setup() -> Run {
     // 10. The long-running connector. It backs off with full jitter up
     // to 30 s if it starts before kharond is ready, so allow 90 s. The
     // `--check` session logged an attach line too, so wait for one more.
+    // Wait for the `--check` session's detach line first, so its attach
+    // line is certainly logged and the count below is deterministic.
+    wait_for_log(KHAROND, DETACH, Duration::from_secs(30));
     let attaches_before = kharond_logs().matches(ATTACH).count();
     compose(&["up", "-d", "--no-build", "connector"]);
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -477,9 +496,20 @@ fn req_arch_002_compose_ws_connector_attaches_over_ws() {
         !names.iter().any(|n| n.ends_with("_wg")),
         "a wg network exists: {names:?}"
     );
-    let config = compose(&["config"]);
+    let config = compose(&["config", "--format", "json"]);
     assert!(
-        !config.contains("10.66.0.") && !config.contains("compose.vpn.yml"),
-        "the compose config names the VPN overlay:\n{config}"
+        !config.contains("10.66.0."),
+        "the compose config names the VPN subnet:\n{config}"
     );
+    let parsed: ComposeConfig = serde_json::from_str(&config).unwrap();
+    assert!(
+        !parsed.networks.contains_key("wg"),
+        "the compose config defines a wg network"
+    );
+    for (name, svc) in &parsed.services {
+        assert!(
+            !svc.networks.contains_key("wg"),
+            "service {name} is on the wg network"
+        );
+    }
 }

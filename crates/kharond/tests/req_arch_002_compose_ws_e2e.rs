@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use compose_support::{
     Cdp, add_canary_item, browser_ws_url, data_volume_of, env, fixture_scope, manifest,
-    mcp_tool_tls, owner_approve, page_tls, random_hex32, serve_page, ss_in, write_public,
+    mcp_tool_tls, owner_approve, page_tls, random_hex32, redact, serve_page, ss_in, write_public,
 };
 use docker_support::{docker, docker_on_tty, docker_raw, wait_for_log};
 use kharond::api::token::{generate, generate_tunnel};
@@ -191,6 +191,8 @@ struct Run {
     ss_unix: Result<String, String>,
     /// `docker logs` of kharond, the fake edge and the connector.
     logs: Vec<(&'static str, String)>,
+    /// The edge and inner TLS private-key PEMs, for "never logged".
+    tls_keys: Vec<String>,
 }
 
 /// What one fill came to.
@@ -210,6 +212,12 @@ struct ProbeNegative {
     /// Control: the same invocation to kharond's own ingress, in the
     /// same netns. Must succeed, proving exec, binary and netns work.
     control: SocatProbe,
+    /// The agent host's address on the shared `edge` network. kharond's
+    /// netns reaches it by design, but nothing listens on 9222 there
+    /// (the relay binds the harness address, Chromium 127.0.0.1), so the
+    /// right answer is `Connection refused`. A relay rebound to 0.0.0.0
+    /// would flip this.
+    edge_side: SocatProbe,
     /// The browser's CDP port across the harness network.
     target: SocatProbe,
 }
@@ -294,6 +302,8 @@ async fn mcp<A: serde::Serialize, R: serde::de::DeserializeOwned>(
     tool: &str,
     args: &A,
 ) -> R {
+    let hex_canary = hex::encode(canary.as_bytes());
+    let secrets = [canary, hex_canary.as_str(), token];
     let text = mcp_tool_tls(
         EDGE_ADDR.parse().unwrap(),
         EDGE_SNI,
@@ -303,14 +313,15 @@ async fn mcp<A: serde::Serialize, R: serde::de::DeserializeOwned>(
         args,
     )
     .await
-    .unwrap_or_else(|e| panic!("{tool} through the fake edge: {e}"));
+    .unwrap_or_else(|e| panic!("{tool} through the fake edge: {}", redact(&e, &secrets)));
     // REQ-GOAL-002: no reply carries the canary, raw or hex.
     assert!(
         !text.contains(canary) && !text.contains(&hex::encode(canary.as_bytes())),
         "the canary is in a {tool} reply"
     );
     api_support::assert_no_canary(&text);
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool} reply ({e}): {text}"))
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{tool} reply ({e}): {}", redact(&text, &secrets)))
 }
 
 /// `GET /json/version` status from the host, over HTTP to the CDP relay.
@@ -543,16 +554,17 @@ async fn setup() -> Run {
     // would wipe it. Remove every other service instead, and the daemon's
     // data volume (a stale audit chain and unlock state would skew the
     // run). Networks stay: `up` reuses them.
-    compose(&[
-        "rm",
-        "-sf",
-        "holder",
-        "fake-edge",
-        "kharon",
-        "agent-host",
-        "connector",
-    ]);
-    docker_raw(&["volume", "rm", &format!("{PROJECT}_kharon-data")], None);
+    let services = compose(&["config", "--services"]);
+    let mut rm = vec!["rm", "-sf"];
+    rm.extend(services.lines().filter(|s| *s != "vaultwarden"));
+    compose(&rm);
+    let volume = format!("{PROJECT}_kharon-data");
+    let gone = docker_raw(&["volume", "rm", &volume], None);
+    let gone_err = String::from_utf8_lossy(&gone.stderr).to_lowercase();
+    assert!(
+        gone.status.success() || gone_err.contains("no such volume"),
+        "could not remove the stale volume {volume}: {gone_err}"
+    );
     std::fs::remove_dir_all(&run_dir).unwrap();
     for sub in ["page", "edge", "inner", "connector"] {
         std::fs::create_dir_all(run_dir.join(sub)).unwrap();
@@ -597,6 +609,7 @@ async fn setup() -> Run {
         inner.key_pair.serialize_pem().as_bytes(),
     );
     let pin = hex::encode(Sha256::digest(inner.cert.der()));
+    let tls_keys = vec![edge_key.clone(), inner.key_pair.serialize_pem()];
 
     // 4. The agent host creates the networks; then the test page can be
     // served on the edge gateway and the browser is reachable.
@@ -632,7 +645,10 @@ async fn setup() -> Run {
     compose(&["up", "-d", "--no-build", "kharon", "fake-edge"]);
     wait_for_log(
         KHAROND,
-        &format!("kharond: public ingress listening on {PUBLIC_INGRESS}"),
+        &format!(
+            "kharond: public ingress listening on {PUBLIC_INGRESS} \
+             (plain HTTP, loopback; POST /mcp and GET /connector)"
+        ),
         Duration::from_secs(60),
     );
 
@@ -666,7 +682,12 @@ async fn setup() -> Run {
     // `--check` session logged an attach line too, so wait for one more.
     // Wait for the `--check` session's detach line first, so its attach
     // line is certainly logged and the count below is deterministic.
-    wait_for_log(KHAROND, DETACH, Duration::from_secs(30));
+    // Only a passing check attaches and detaches. A failing one is
+    // reported by its own test (and in the attach-wait message below).
+    if check.status.code() == Some(0) {
+        wait_for_log(KHAROND, DETACH, Duration::from_secs(30));
+    }
+    let redactions = [tunnel_token.as_str(), agent_token.as_str(), canary.as_str()];
     let attaches_before = kharond_logs().matches(ATTACH).count();
     compose(&["up", "-d", "--no-build", "connector"]);
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -677,8 +698,12 @@ async fn setup() -> Run {
         }
         assert!(
             Instant::now() < deadline,
-            "the connector never attached over ws; kharond logs:\n{logs}\nconnector logs:\n{}",
-            compose(&["logs", "--no-color", "connector"])
+            "the connector never attached over ws; --check exit {:?}, stdout:\n{}\nstderr:\n{}\n\
+             kharond logs:\n{logs}\nconnector logs:\n{}",
+            check.status.code(),
+            redact(&check_stdout, &redactions),
+            redact(&check_stderr, &redactions),
+            redact(&compose(&["logs", "--no-color", "connector"]), &redactions)
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
@@ -710,6 +735,7 @@ async fn setup() -> Run {
     // path to the browser's CDP port; the host must (positive control).
     let probe_negative = ProbeNegative {
         control: socat_probe(PUBLIC_INGRESS),
+        edge_side: socat_probe("10.67.0.2:9222"),
         target: socat_probe("10.68.0.2:9222"),
     };
     let probe_positive = cdp_http_status().await;
@@ -720,19 +746,15 @@ async fn setup() -> Run {
     let ss_unix = ss_in(KHAROND, "-lxpH");
 
     // 15. Logs, then lock.
-    let logs: Vec<(&'static str, String)> = [
-        ("kharon", KHAROND),
-        ("fake-edge", FAKE_EDGE),
-        ("connector", CONNECTOR),
-    ]
-    .iter()
-    .map(|(label, c)| {
-        let out = docker_raw(&["logs", c], None);
-        let mut l = String::from_utf8_lossy(&out.stdout).into_owned();
-        l.push_str(&String::from_utf8_lossy(&out.stderr));
-        (*label, l)
-    })
-    .collect();
+    let logs: Vec<(&'static str, String)> = [("kharon", KHAROND), ("connector", CONNECTOR)]
+        .iter()
+        .map(|(label, c)| {
+            let out = docker_raw(&["logs", c], None);
+            let mut l = String::from_utf8_lossy(&out.stdout).into_owned();
+            l.push_str(&String::from_utf8_lossy(&out.stderr));
+            (*label, l)
+        })
+        .collect();
     docker(&["exec", KHAROND, "kharon", "lock"]);
 
     Run {
@@ -751,6 +773,7 @@ async fn setup() -> Run {
         ss_tcp,
         ss_unix,
         logs,
+        tls_keys,
     }
 }
 
@@ -769,6 +792,11 @@ fn ws_harness_config_is_path_b_with_no_api() {
     let cfg = kharond::config::Config::from_toml_str(&toml).unwrap();
     assert!(cfg.api.is_none(), "the ws variant has no [api]");
     assert_eq!(
+        cfg.agents["alpha"].cdp.tunnel,
+        kharond::cdp::Tunnel::AgentConnector,
+        "nothing but the connector can carry CDP"
+    );
+    assert_eq!(
         cfg.public_ingress.as_ref().unwrap().listen.to_string(),
         PUBLIC_INGRESS
     );
@@ -782,12 +810,23 @@ fn ws_harness_config_is_path_b_with_no_api() {
 #[ignore = "needs the compose E2E stack (image.yml)"]
 fn req_arch_002_compose_ws_connector_check_passes_through_the_fake_edge() {
     let r = run();
+    // First, so a connector that printed its token fails here and the
+    // later messages (which print the output) never see it.
+    assert!(
+        !r.check_stdout.contains(&r.tunnel_token) && !r.check_stderr.contains(&r.tunnel_token),
+        "the tunnel token is in the --check output"
+    );
+    let secrets = [
+        r.tunnel_token.as_str(),
+        r.agent_token.as_str(),
+        r.canary.as_str(),
+    ];
     assert_eq!(
         r.check_code,
         Some(0),
         "connector --check failed; stdout:\n{}\nstderr:\n{}",
-        r.check_stdout,
-        r.check_stderr
+        redact(&r.check_stdout, &secrets),
+        redact(&r.check_stderr, &secrets)
     );
     // `leg_label` in kharon-agent-connector, in order; the `note:` line
     // follows a successful auth leg (wire v1 has no probe that spares
@@ -797,10 +836,6 @@ fn req_arch_002_compose_ws_connector_check_passes_through_the_fake_edge() {
         "ok dns\nok tcp\nok outer-tls\nok upgrade\nok inner-tls\nok auth\n\
          note: a successful check replaces this agent's live broker session\n\
          check: ok\n"
-    );
-    assert!(
-        !r.check_stdout.contains(&r.tunnel_token) && !r.check_stderr.contains(&r.tunnel_token),
-        "the tunnel token is in the --check output"
     );
 }
 
@@ -832,6 +867,20 @@ fn req_arch_002_compose_ws_connector_attaches_over_ws() {
     assert!(
         !names.iter().any(|n| n.ends_with("_wg")),
         "a wg network exists: {names:?}"
+    );
+    // Docker records the files the project was started with.
+    let files = docker(&[
+        "inspect",
+        "--format",
+        r#"{{ index .Config.Labels "com.docker.compose.project.config_files" }}"#,
+        KHAROND,
+    ]);
+    let files: Vec<&str> = files.trim().split(',').collect();
+    assert!(
+        files.len() == 2
+            && files[0].ends_with("/docker-compose.yml")
+            && files[1].ends_with("/e2e/compose.e2e-ws.yml"),
+        "kharond was not started from exactly docker-compose.yml + e2e/compose.e2e-ws.yml: {files:?}"
     );
     let config = compose(&["config", "--format", "json"]);
     assert!(
@@ -941,6 +990,15 @@ fn req_arch_002_compose_ws_kharond_has_no_direct_route_to_cdp() {
         c.code,
         c.stderr
     );
+    let e = &r.probe_negative.edge_side;
+    assert!(
+        e.code == Some(1) && e.stderr.contains("Connection refused"),
+        "negative probe (edge side): 10.67.0.2:9222, the agent host's address on the shared \
+         edge network, should refuse the connection (the relay must bind the harness address \
+         only); exit {:?}, stderr: {}",
+        e.code,
+        e.stderr
+    );
     let t = &r.probe_negative.target;
     assert_ne!(
         t.code,
@@ -981,19 +1039,40 @@ fn req_arch_002_compose_ws_kharond_has_no_direct_route_to_cdp() {
 #[ignore = "needs the compose E2E stack (image.yml)"]
 fn req_goal_002_compose_ws_secrets_stay_out_of_logs() {
     let r = run();
-    let secrets = [
-        ("canary", r.canary.clone()),
-        ("canary (hex of its text)", hex::encode(r.canary.as_bytes())),
-        ("agent token", r.agent_token.clone()),
-        ("tunnel token", r.tunnel_token.clone()),
+    // The scan means something only if the canary actually moved.
+    assert!(
+        r.fills.is_ok(),
+        "the fills did not run: {:?}",
+        r.fills.as_ref().err()
+    );
+    assert_eq!(r.page_posts.len(), FILLS, "the canary reached the page");
+    let mut secrets = vec![
+        ("canary".to_owned(), r.canary.clone()),
+        (
+            "canary (hex of its text)".to_owned(),
+            hex::encode(r.canary.as_bytes()),
+        ),
+        ("agent token".to_owned(), r.agent_token.clone()),
+        ("tunnel token".to_owned(), r.tunnel_token.clone()),
     ];
-    assert_eq!(r.logs.len(), 3);
+    for (n, pem) in r.tls_keys.iter().enumerate() {
+        // The base64 body, which a log would carry with or without the
+        // armor lines and line breaks.
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        secrets.push((format!("TLS private key {n}"), body));
+        if let Some(first) = pem.lines().nth(1) {
+            secrets.push((
+                format!("TLS private key {n} (first line)"),
+                first.to_owned(),
+            ));
+        }
+    }
+    // kharond and the connector only: the fake edge is socat, which logs
+    // nothing at default verbosity. The relay-plaintext clause is covered
+    // in-process by req_arch_002_ws_relay.rs::relay_sees_neither_canary_nor_credential.
+    assert_eq!(r.logs.len(), 2);
     for (container, logs) in &r.logs {
-        // socat logs nothing at its default verbosity.
-        assert!(
-            *container == "fake-edge" || !logs.is_empty(),
-            "no {container} logs were collected"
-        );
+        assert!(!logs.is_empty(), "no {container} logs were collected");
         for (what, secret) in &secrets {
             assert!(
                 !logs.contains(secret.as_str()),

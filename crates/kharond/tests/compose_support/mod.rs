@@ -607,3 +607,12 @@ async fn mcp_tool_tls_inner<A: serde::Serialize>(
     }
     Ok(text)
 }
+
+/// `text` with every non-empty `secret` replaced, for failure messages
+/// that print process output or response bodies.
+pub fn redact(text: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .fold(text.to_owned(), |t, s| t.replace(s, "<redacted>"))
+}

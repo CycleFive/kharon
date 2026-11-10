@@ -148,7 +148,7 @@ Validation rules:
 
 From Q4 and Nyx's ruling.
 
-**The identity.** Each completed consent creates one agent identity, with id `c-<10 lowercase base32>`. It matches the existing `[a-z0-9-]{1,64}`, so the audit and rate-limit code is unchanged. It carries:
+**The identity.** Each completed Connect (consent, then the code redeemed at the token endpoint; D4) creates one agent identity, with id `c-<10 lowercase base32>`. It matches the existing `[a-z0-9-]{1,64}`, so the audit and rate-limit code is unchanged. It carries:
 - the `client_id` and the `client_name` as shown at consent;
 - the granted scopes;
 - `created_at`, and `connected_via = "oauth"`;
@@ -163,7 +163,7 @@ The state file holds:
 - for each live token, its SHA-256 hash, kind (access or refresh), expiry, refresh family id and parent;
 - the revoked flag.
 
-It holds no plaintext token and no code. Tokens are 256-bit random values (`kh_at_…`, `kh_rt_…`), so a hash at rest reveals nothing usable. SHA-256, not Argon2id, is right for high-entropy random tokens, and it keeps the per-request check cheap.
+It holds no plaintext token and **no code**. Authorization codes and pending authorizations (I1) live only in memory, so they don't survive a restart. At 60 s and 10 min that is harmless. Tokens are 256-bit random values (`kh_at_…`, `kh_rt_…`), so a hash at rest reveals nothing usable. SHA-256, not Argon2id, is right for high-entropy random tokens, and it keeps the per-request check cheap.
 
 **This departs from #132's accepted "no new store, rebuild from audit".**
 - That position is about agents that exist in `kharon.toml`: their revoke state can be recomputed from the config hash plus the audit log.
@@ -186,14 +186,18 @@ From Q5 and Nyx's ruling.
 - **Reuse detection.** Presenting a retired refresh token revokes the whole Connect: every token of that identity, and the identity itself. It writes `oauth_refresh_reuse` and needs a new Connect. This follows the OAuth 2.1 / Security BCP pattern for public clients.
 
 **Authorization codes.**
-- 32 random bytes, single use, valid for 60 s.
-- Bound to the `client_id`, `redirect_uri`, `code_challenge` (S256 only), `resource`, scopes and the identity being created.
-- A second redemption revokes everything issued from the first.
+- 32 random bytes, single use, valid for 60 s. They are held **in memory only**, never written to disk.
+- A code is bound to the `client_id`, `redirect_uri`, `code_challenge` (S256 only), `resource` and the granted scopes. It carries everything the identity will need, but **no identity exists yet**.
+- **The identity is created when the code is redeemed** at the token endpoint, not at consent. A consent whose code is never redeemed (a crashed dashboard, a closed tab) leaves no identity and no audit entry behind. There are no orphans in Connections (A17).
+- **Single use.** The first redemption moves the code to a redeemed set until its 60 s expiry. A second redemption within that time revokes the identity and everything issued from the first.
 
 **Revocation.**
-- **Disconnect** in the owner UI, `kharon revoke agent <c-id>` on the owner socket, or a client's call to `POST /oauth/revoke` with its refresh token, revokes the identity's tokens at once. Disconnect and the socket revoke also revoke the identity's live grants, as REQ-REV-001 does for "token + grants".
+- **Disconnect** in the owner UI, `kharon revoke agent <c-id>` on the owner socket, or a client's call to `POST /oauth/revoke` with its **refresh** token, ends the whole Connect: the identity and all its tokens, at once. Disconnect and the socket revoke also revoke the identity's live grants, as REQ-REV-001 does for "token + grants".
+- `POST /oauth/revoke` with an **access** token ends only that access token. RFC 7009 allows either kind.
 - It takes effect on the next request (REQ-REV-001) and is durable, because the state file records it.
-- Panic (REQ-REV-002) revokes every Connect identity as well as locking.
+- **Panic** (REQ-REV-002) revokes every Connect identity as well as locking. It also clears every pending authorization and unredeemed code, so a consent begun before the panic can't be completed after it.
+  - After a panic, the customer re-clicks Connect on every dashboard. The panic confirmation text and the deployment doc say so (follow-up 7).
+  - An ordinary lock (idle or manual) leaves Connects, pending authorizations and codes alone. A Connect doesn't need the vault.
 
 **Where Argon2id stays.** `kh_agent_` tokens keep it; nothing changes for config agents.
 
@@ -213,6 +217,8 @@ From Q5 and Nyx's ruling.
 
 Rules:
 - A Connect asks for all three by default, which is the spec's "all of `scopes_supported`".
+- **The granted scopes are always a subset of the requested ones.** The consent checkboxes can untick requested scopes but never add one.
+- **`tools/list` returns only the tools the token's scopes allow,** so a client doesn't learn about tools it can't call. Calling a tool outside the scopes gets 403 `insufficient_scope`, as in D1.
 - The owner can untick `kharon:fill` or `kharon:request` on the consent screen. `kharon:read` is always granted, because without it nothing else works.
 - **No scope approves anything, and none ever will.** That is the structural guarantee behind "a token can request but never approve":
   - approval lives only on owner surfaces (passkey UI, ntfy, owner socket; REQ-APR-001/-004/-005/-006);
@@ -229,23 +235,25 @@ The flow, after the dashboard's MCP client has discovered the AS through D1:
    1. `client_id` is on the allow-list.
    2. The CIMD fetches and validates.
    3. `redirect_uri` exactly matches.
-   4. `code_challenge_method` is `S256`.
-   5. `resource` is this deploy's `/mcp`.
+   4. `response_type` is `code`.
+   5. `code_challenge_method` is `S256`.
+   6. `resource` is this deploy's `/mcp`.
+   7. Every requested scope is in `scopes_supported`. An absent `scope` means all three.
 
-   Any failure up to and including the redirect check renders an error page and **never redirects**. After it, errors go back to the redirect URI with `error`, `state` and `iss`.
+   Any failure up to and including the redirect check (steps 1–3) renders an error page and **never redirects**. After it (steps 4–7), errors go back to the redirect URI with `error` (`unsupported_response_type`, `invalid_request`, `invalid_target` or `invalid_scope`), `state` and `iss`.
 3. **Sign-in.** With no live owner session, the page runs the existing passkey sign-in (REQ-APR-005, #208), then returns to the consent screen.
 4. **The consent screen** is plain words, in the language of #213's target user. It shows:
    - the dashboard's `client_name`, and its CIMD hostname in full, because the spec says to display the redirect hostname;
    - the redirect hostname;
    - the scopes, as the table in D5 words them, with the optional ones as checkboxes;
-   - a fixed line: **"Connecting does not let it sign in anywhere on its own. Every sign-in still needs your approval on this page."**
+   - a fixed line: **"Connecting does not let it sign in anywhere on its own. Every sign-in still needs your approval in kharon."**
 5. **Approve.** The Approve button runs a fresh passkey assertion (user verification required), even inside a live session.
    - A Connect creates a credential that outlives the 15-minute session, so it gets the same weight as an unlock.
    - The POST carries the ceremony result and a one-time consent nonce bound to the authorize request.
    - It needs `Origin` equal to the owner origin and the `SameSite=Strict` session cookie, as every owner POST does today.
-6. On success, kharond creates the identity (D3), writes `oauth_connect`, issues the code, and redirects `302` to `redirect_uri?code=…&state=…&iss=https://kharon-owner.twkr.io`.
+6. On success, kharond issues the code (in memory, carrying everything the identity needs; D4) and the page navigates to `redirect_uri?code=…&state=…&iss=https://kharon-owner.twkr.io` (I1). Nothing is persisted yet.
 7. **Deny** redirects with `error=access_denied`, `state` and `iss`, and creates nothing.
-8. **Token exchange.** The dashboard backend sends `POST /oauth/token` with `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `code_verifier` and `resource`.
+8. **Token exchange.** The dashboard backend sends `POST /oauth/token` with `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `code_verifier` and `resource`. A valid redemption **creates the identity (D3) and writes `oauth_connect`** (ordering in I5), then issues the first token pair.
    - This endpoint is on **#208's named exemption list**. Like the ntfy redeem routes, it can pass neither the owner `Origin` rule nor a Cloudflare Access login.
    - It answers JSON, `Cache-Control: no-store`, with this body:
 
@@ -283,11 +291,13 @@ From Q1 and the target-user note: the dashboard's own runtime holds the browser,
 
 Open in phase 2: how the dashboard runtime is told the inner pin. That will likely be a field in the token response, or the protected-resource metadata, for the `/connector` resource. Phase 2 is not part of this design's approval.
 
+**Phase 1 is not the integration milestone.** A Connect alone gives Muse no end-to-end fills: those need phase 2 (follow-up 9). The pending grant-and-fill test with Muse runs on the existing `kh_agent_` token and the connector, through the public endpoint, not on N3.
+
 ### D8. Single-tenant now, multi-tenant later
 
 **Today:** one deploy, one issuer (its owner hostname), one state file, one allow-list. Nothing is shared between deploys. The client allow-list is per deploy and set by us as operator.
 
-**Multi-tenant later:** each tenant gets its own owner hostname, and so its own issuer, state, keys and allow-list. That is Q7's recommendation, which Nyx ruled. Nothing in D1–D7 assumes one tenant per process, except the file path, which becomes per tenant.
+**Multi-tenant later:** each tenant gets its own owner hostname, and so its own issuer, state, keys and allow-list. That is Q7's recommendation, which Nyx ruled. Today the state-file path, the issuer and the `[oauth]` allow-list are per-process singletons. Multi-tenant makes each of them per tenant. Nothing else in D1–D7 assumes one tenant per process.
 
 The one-RP-ID-per-passkey rule (gateway Decision 7) keeps working, because each tenant's passkey binds to its own owner hostname. Self-serve sign-up replaces the operator-issued first-passkey link (Q8, A8). Its design belongs to multi-tenant.
 
@@ -338,11 +348,17 @@ A builder read this design cold, and asked these questions. Each answer is the d
 - Egress is already open on a managed deploy, for Bitwarden and for cloudflared.
 
 **I5. Ordering against REQ-AUD-003, and the refresh race.**
-- **Connect:** append `oauth_connect` first, then persist the identity and the code, then answer. If the audit append fails, consent fails closed with an error.
+- **Connect** (at code redemption):
+  1. Append `oauth_connect`.
+  2. Persist the identity and its first token pair.
+  3. Answer.
+
+  If the audit append fails, the token request fails closed (500, no identity, no tokens). If the append succeeds but the persist fails, kharond appends a compensating `oauth_disconnect` (`detail_code = persist_failed`) on a best-effort basis and answers 500. The chain then reads connect, then disconnect, for an identity that never served a request. The code is spent either way.
 - **Disconnect, panic and refresh reuse:** revoke first, in memory and in the state file, then audit. This is the revoke-first precedent of #135.
 - **Token issue:** a failed state-file write fails the request (500, no tokens). The store is written before the response.
 - **The refresh race (A13).** A client can lose the response to a refresh (a network blip), then present the just-retired refresh token again.
-  - Within **30 s** of rotation, that is treated as a retry. It rotates again and retires the pair issued moments before, without tripping reuse detection.
+  - Within **30 s** of rotation, that is treated as a retry. It rotates again and retires the pair issued moments before, **both its refresh and its access token**, without tripping reuse detection.
+  - The grace allows **one retry per rotation**. A second presentation of the same retired token, even inside the 30 s, is reuse. A thief can't keep a chain going inside the window.
   - After 30 s, presenting a retired token is reuse, and kills the Connect.
   - The cost: a thief racing inside those 30 s gets one pair. The legitimate client's next refresh then presents a retired token, which trips the kill. Detection is delayed, never lost.
 
@@ -394,6 +410,7 @@ These extend SPEC §2. The actors are §2's, plus the operator as #208 adds them
 - **SSRF.**
   - The only outbound fetch is a CIMD URL already on the allow-list.
   - No redirects; address-class refusal; size and time limits.
+- **CIMD cache window.** A `redirect_uri` that a dashboard removes from its CIMD can still be honoured from cache for up to the 24 h clamp. This is accepted: the URI was the dashboard's own, and the client is allow-listed. A restart clears the cache, because it isn't persisted.
 - **Denial of service.**
   - `/oauth/token`, `/oauth/revoke` and the authorize page are unauthenticated and on the internet, so they are throttled per source as in D6.
   - The token check on `/mcp` for `kh_at_` is a hash lookup, so it can't be used to exhaust the Argon2id permits.
@@ -431,9 +448,9 @@ These extend SPEC §2. The actors are §2's, plus the operator as #208 adds them
 2. **Discovery.** Protected-resource metadata, AS metadata, the 401/403 challenge headers, and the `[oauth]` config with its errors.
 3. **Client admission.** CIMD fetch, validation and cache, behind the allow-list, with the SSRF rules.
 4. **Authorize, consent and code** (D6), on the owner hostname.
-5. **The token side.** Token and revoke endpoints, the state file, rotation and reuse detection (D3, D4).
-6. **Scope enforcement and the `no_browser` error** (D5, D7 phase 1), on #200's allow-list.
-7. **The Connections page,** Disconnect, the panic hook, and the audit events (D9).
+5. **The token side.** Token and revoke endpoints, the state file, rotation and reuse detection (D3, D4). This includes the one-retry grace, which retires the whole superseded pair (I5).
+6. **Scope enforcement and the `no_browser` error** (D5, D7 phase 1), on #200's allow-list, with `tools/list` filtered by scope.
+7. **The Connections page,** Disconnect, the panic hook (clearing pending authorizations and codes), the audit events (D9), and the panic confirmation text and deployment-doc note that a panic means re-clicking Connect on every dashboard.
 8. **An E2E.** A fake dashboard client (a CIMD served by the test) runs the full Connect, refresh, reuse-kill and Disconnect cycle against the compose stack.
 9. **Phase 2 design:** a dashboard runtime's connector authenticating with a Connect token (D7).
 10. **Optional:** a "customer-only approvals" mode for the owner socket (D9).
@@ -458,3 +475,4 @@ Each one is the design's call. Overturn any in review.
 - **A14:** `kh_at_` tokens work only on `POST /mcp`, never on `/v1/*` (I3).
 - **A15:** N3 is implemented after both #200 and #208 merge. There's no stub and no loopback interim (I3, I6).
 - **A16:** a failed CIMD fetch fails closed. There's no stale-on-error (I4).
+- **A17:** the identity is created at code redemption, not at consent (Nyx's review on #226). An unredeemed consent leaves nothing behind, so the owner's consent click itself isn't audited; `oauth_connect` marks the Connect.

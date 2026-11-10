@@ -73,6 +73,15 @@ pub enum Event {
     /// The log itself truncated a torn (partially written) tail line during
     /// open and recovered to `recovered_seq`. See [`crate::audit::AuditLog`].
     LogTruncated,
+    /// #199: a connector hello named a configured agent but the tunnel
+    /// credential did not verify. Carries `agent_id`, `transport`,
+    /// `detail_code` (`unauthorized`|`protocol`) and `suppressed`; at
+    /// most one per agent per 60 s. Best effort.
+    ConnectorAuthFail,
+    /// #199: a new connector session evicted a live one. Carries
+    /// `agent_id`, the new session's `transport`, `old_session_secs` and
+    /// `suppressed`; at most one per agent per 60 s. Best effort.
+    ConnectorReplaced,
 }
 
 impl Event {
@@ -106,6 +115,8 @@ impl Event {
             Event::Context => "context",
             Event::ClockSkew => "clock_skew",
             Event::LogTruncated => "log_truncated",
+            Event::ConnectorAuthFail => "connector_auth_fail",
+            Event::ConnectorReplaced => "connector_replaced",
         }
     }
 }
@@ -147,6 +158,8 @@ impl<'de> Deserialize<'de> for Event {
             "context" => Event::Context,
             "clock_skew" => Event::ClockSkew,
             "log_truncated" => Event::LogTruncated,
+            "connector_auth_fail" => Event::ConnectorAuthFail,
+            "connector_replaced" => Event::ConnectorReplaced,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"
@@ -219,6 +232,17 @@ pub struct Entry {
     /// agent's claim; this is the evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_origin: Option<String>,
+    /// How a connector session reached the broker: `tls` or `ws` (only on
+    /// `connector_auth_fail` / `connector_replaced`, #199).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Events of this kind and agent dropped by the rate limiter since the
+    /// previous entry (only on the connector events, #199).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed: Option<u64>,
+    /// Age in whole seconds of the session a `connector_replaced` evicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_session_secs: Option<u64>,
 }
 
 impl Entry {
@@ -243,6 +267,9 @@ impl Entry {
             request_id: None,
             field_count: None,
             live_origin: None,
+            transport: None,
+            suppressed: None,
+            old_session_secs: None,
         }
     }
 
@@ -312,6 +339,24 @@ impl Entry {
     /// The live origin a fill observed (outcome entries, #67).
     pub fn live_origin(mut self, v: impl Into<String>) -> Self {
         self.live_origin = Some(v.into());
+        self
+    }
+
+    /// The connector transport (`tls` or `ws`).
+    pub fn transport(mut self, v: impl Into<String>) -> Self {
+        self.transport = Some(v.into());
+        self
+    }
+
+    /// Connector events dropped by the rate limiter since the last entry.
+    pub fn suppressed(mut self, v: u64) -> Self {
+        self.suppressed = Some(v);
+        self
+    }
+
+    /// Age in seconds of the session a `connector_replaced` evicted.
+    pub fn old_session_secs(mut self, v: u64) -> Self {
+        self.old_session_secs = Some(v);
         self
     }
 

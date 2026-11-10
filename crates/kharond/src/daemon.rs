@@ -849,6 +849,14 @@ pub async fn start(
     });
     // Lock/unlock transitions belong in the audit log (REQ-AUD-003).
     broker.wire_lock_audit();
+    // #199: the connector's two audit events go through the broker's
+    // synchronous append (best effort; the hub logs a failure).
+    if let Some(rt) = &connector {
+        let audit_broker = Arc::clone(&broker);
+        rt.hub.set_audit(Arc::new(move |entry| {
+            audit_broker.append_audit(entry).map_err(|_| ())
+        }));
+    }
     // REQ-API-007: the server whose `Date` the clock is checked
     // against. Building the client does no I/O; config validation has
     // already read both files, so a failure here only skips the probe.

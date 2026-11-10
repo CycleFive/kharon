@@ -12,14 +12,18 @@
 //! detach, with the agent id and peer address and never the credential
 //! (#150). These are log lines, not audit entries: the audit chain records
 //! requests, grants, fills and owner actions (SPEC §7, REQ-AUD-003), and a
-//! transport attach changes none of them.
+//! transport attach changes none of them. Two connector events are audit
+//! entries (#199), best effort and rate-limited per agent: a refused
+//! credential for a configured agent (`connector_auth_fail`) and a session
+//! that evicts a live one (`connector_replaced`).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kharon_connector::{
     AUTH_OK, AUTH_PROTOCOL, AUTH_UNAUTHORIZED, BrokerSession, MuxIo, WS_PREAUTH_SLOTS,
@@ -31,9 +35,11 @@ pub use kharon_connector::{
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use crate::api::token::TokenStore;
+use crate::audit::{Entry, Event};
 
 mod ws;
 pub use ws::WsEntry;
@@ -124,6 +130,28 @@ fn stderr_sink() -> EventSink {
     Arc::new(|event| eprintln!("kharond: {event}"))
 }
 
+/// Where the connector's audit entries go (#199): the broker's audit
+/// append. Best effort: an `Err` is logged and changes nothing else.
+pub type ConnectorAudit = Arc<dyn Fn(Entry) -> Result<(), ()> + Send + Sync>;
+
+/// Why a hello for a configured agent was refused (`detail_code`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailCode {
+    /// The token did not verify (`AUTH_UNAUTHORIZED`).
+    Unauthorized,
+    /// The hello was malformed (`AUTH_PROTOCOL`).
+    Protocol,
+}
+
+impl AuthFailCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Protocol => "protocol",
+        }
+    }
+}
+
 /// Accepted connector sessions, keyed by agent id.
 pub struct Hub {
     tokens: TokenStore,
@@ -134,6 +162,55 @@ pub struct Hub {
     ws_auth: Arc<Semaphore>,
     next: AtomicU64,
     events: EventSink,
+    /// Audit sink; unset means the connector writes no audit entries.
+    audit: OnceLock<ConnectorAudit>,
+    /// Per-agent rate-limit windows for the two audit events.
+    limits: std::sync::Mutex<Limits>,
+}
+
+/// Length of one audit rate-limit window.
+const AUDIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// One (event kind, agent) window: when it opened and how many events it
+/// has swallowed since its entry was written.
+struct Window {
+    start: Instant,
+    pending: u64,
+}
+
+/// Rate-limit state of the two connector audit events. Keyed by configured
+/// agent id only, so a peer cannot grow it.
+#[derive(Default)]
+struct Limits {
+    auth_fail: HashMap<String, Window>,
+    replaced: HashMap<String, Window>,
+}
+
+/// `Some(suppressed)` when an entry is due for `agent` at `now`: the
+/// first event ever, or the first after the window expired. Otherwise the
+/// event is only counted.
+fn admit(windows: &mut HashMap<String, Window>, agent: &str, now: Instant) -> Option<u64> {
+    match windows.get_mut(agent) {
+        None => {
+            windows.insert(
+                agent.to_owned(),
+                Window {
+                    start: now,
+                    pending: 0,
+                },
+            );
+            Some(0)
+        }
+        Some(w) if now.duration_since(w.start) >= AUDIT_WINDOW => {
+            let suppressed = std::mem::take(&mut w.pending);
+            w.start = now;
+            Some(suppressed)
+        }
+        Some(w) => {
+            w.pending = w.pending.saturating_add(1);
+            None
+        }
+    }
 }
 
 struct Live {
@@ -141,6 +218,8 @@ struct Live {
     session: BrokerSession,
     /// Set when a newer session for the same agent evicts this one.
     replaced: Arc<AtomicBool>,
+    /// When this session was registered.
+    since: Instant,
 }
 
 impl Hub {
@@ -160,6 +239,47 @@ impl Hub {
             ws_auth: Arc::new(Semaphore::new(WS_PREAUTH_SLOTS)),
             next: AtomicU64::new(1),
             events,
+            audit: OnceLock::new(),
+            limits: std::sync::Mutex::new(Limits::default()),
+        }
+    }
+
+    /// Send the connector's audit entries to `sink` (the broker's audit
+    /// append). Set once; a later call is ignored.
+    pub fn set_audit(&self, sink: ConnectorAudit) {
+        let _ = self.audit.set(sink);
+    }
+
+    /// Append `entry` through the sink, if one is set. Best effort: a
+    /// failure prints a fixed line (no detail) and changes nothing. Never
+    /// call this with a `Hub` lock held.
+    fn emit(&self, entry: Entry) {
+        if let Some(sink) = self.audit.get()
+            && sink(entry).is_err()
+        {
+            eprintln!("kharond: connector audit append failed");
+        }
+    }
+
+    /// Audit a refused hello that claimed `claimed` (#199). Written only
+    /// when `claimed` is a configured agent, at most one entry per agent
+    /// per 60 s; unknown ids and junk are not audited.
+    pub fn audit_auth_fail(&self, claimed: &str, transport: Transport, code: AuthFailCode) {
+        if !self.tokens.agents().any(|id| id == claimed) {
+            return;
+        }
+        let due = {
+            let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+            admit(&mut limits.auth_fail, claimed, Instant::now())
+        };
+        if let Some(suppressed) = due {
+            self.emit(
+                Entry::new(Event::ConnectorAuthFail)
+                    .agent_id(claimed)
+                    .transport(transport.to_string())
+                    .detail_code(code.as_str())
+                    .suppressed(suppressed),
+            );
         }
     }
 
@@ -225,21 +345,46 @@ impl Hub {
 
     /// Register `session` for `agent`, evicting (and flagging as replaced)
     /// any older session. Returns the new session's id and its flag.
-    fn insert(&self, agent: String, session: BrokerSession) -> (u64, Arc<AtomicBool>) {
+    /// `transport` is the new session's; an eviction is audited with it
+    /// (`connector_replaced`, #199) after the sessions lock is released.
+    fn insert(
+        &self,
+        agent: String,
+        session: BrokerSession,
+        transport: Transport,
+    ) -> (u64, Arc<AtomicBool>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let replaced = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
         let live = Live {
             id,
             session,
             replaced: Arc::clone(&replaced),
+            since: now,
         };
         let mut map = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(old) = map.insert(agent, live) {
+        let old_age = map.insert(agent.clone(), live).map(|old| {
             old.replaced.store(true, Ordering::SeqCst);
             old.session.shutdown();
-        }
+            now.duration_since(old.since).as_secs()
+        });
         drop(map);
         self.changed.notify_waiters();
+        if let Some(old_secs) = old_age {
+            let due = {
+                let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+                admit(&mut limits.replaced, &agent, now)
+            };
+            if let Some(suppressed) = due {
+                self.emit(
+                    Entry::new(Event::ConnectorReplaced)
+                        .agent_id(agent)
+                        .transport(transport.to_string())
+                        .old_session_secs(old_secs)
+                        .suppressed(suppressed),
+                );
+            }
+        }
         (id, replaced)
     }
 
@@ -302,6 +447,7 @@ async fn stopped(stop: &mut Option<watch::Receiver<bool>>) {
 async fn authenticate<S>(
     stream: S,
     peer: SocketAddr,
+    transport: Transport,
     acceptor: TlsAcceptor,
     hub: &Arc<Hub>,
     deadline: Duration,
@@ -338,6 +484,7 @@ where
         Some((tls, hello.agent_id))
     } else {
         hub.report(ConnectorEvent::Refused { peer });
+        hub.audit_auth_fail(&hello.agent_id, transport, AuthFailCode::Unauthorized);
         let _ = write_server_hello(&mut tls, AUTH_UNAUTHORIZED).await;
         None
     }
@@ -360,7 +507,7 @@ async fn authenticate_and_serve<S>(
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let authed = tokio::select! {
-        a = authenticate(stream, peer, acceptor, &hub, deadline, permit) => a,
+        a = authenticate(stream, peer, transport, acceptor, &hub, deadline, permit) => a,
         () = stopped(&mut stop) => return,
     };
     let Some((tls, agent_id)) = authed else {
@@ -375,7 +522,7 @@ async fn authenticate_and_serve<S>(
         transport,
         peer,
     });
-    let (id, replaced) = hub.insert(agent_id.clone(), session.clone());
+    let (id, replaced) = hub.insert(agent_id.clone(), session.clone(), transport);
     tokio::select! {
         () = session.closed() => {}
         () = stopped(&mut stop) => session.shutdown(),

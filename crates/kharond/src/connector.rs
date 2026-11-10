@@ -130,9 +130,11 @@ pub type ConnectorAudit = Arc<dyn Fn(Entry) -> Result<(), ()> + Send + Sync>;
 
 /// Argon2id evaluations allowed at once, across both transports (#219).
 pub const ARGON2_CONCURRENCY: usize = 2;
-/// Pre-auth time of a WebSocket socket, from the slot to the Argon2id result.
+/// Pre-auth time of a WebSocket socket, from its slot to the start of the
+/// Argon2id check. A hash already running is bounded by its parameters.
 pub const WS_PREAUTH_DEADLINE: Duration = Duration::from_secs(10);
-/// Pre-auth time of a raw socket: the old 10 s TLS plus 5 s hello maximum.
+/// Pre-auth time of a raw socket, from accept to the start of the Argon2id
+/// check: the old 10 s TLS plus 5 s hello maximum.
 pub const RAW_PREAUTH_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Accepted connector sessions, keyed by agent id.

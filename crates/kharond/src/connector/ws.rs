@@ -72,7 +72,7 @@ impl WsEntry {
     }
 
     /// Like [`WsEntry::new`], with the pre-auth `deadline` set: one budget
-    /// from the slot to the Argon2id result.
+    /// from the slot to the start of the Argon2id check.
     pub fn with_preauth_deadline(
         hub: Arc<Hub>,
         tls: Arc<rustls::ServerConfig>,

@@ -366,10 +366,10 @@ async fn hello_then_wait(rig: &Rig, token: String, hello_sent: Arc<AtomicUsize>)
 /// two verify at once (#219), so the eight finish in four rounds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_preauth_budget_is_8_including_argon2() {
-    // 64 MiB, 12 passes: about 0.4 s a verify, four rounds of two, well
-    // inside the 10 s deadline, and the first slots free up no sooner
+    // 64 MiB, 28 passes: about 0.9 s a verify, four rounds of two (3-5 s),
+    // well inside the 10 s deadline, and the first slots free up no sooner
     // than the first round ends.
-    let rig = Arc::new(rig_with(argon(65536, 12)).await);
+    let rig = Arc::new(rig_with(argon(65536, 28)).await);
     let hello_sent = Arc::new(AtomicUsize::new(0));
     let mut clients = Vec::new();
     for _ in 0..8 {
@@ -778,9 +778,9 @@ fn slow() -> argon2::Argon2<'static> {
     argon(65536, 40)
 }
 
-/// Each verify takes about 3 s: it outlasts a 1 s deadline by well over 1 s.
+/// Each verify takes about 6 s: it outlasts a 2 s deadline by far.
 fn slower() -> argon2::Argon2<'static> {
-    argon(65536, 96)
+    argon(65536, 200)
 }
 
 /// A raw (pinned TLS) hello; `hello_sent` counts the hellos written and
@@ -879,7 +879,7 @@ async fn argon2_runs_at_most_two_at_once_across_transports() {
 /// (no leak after the wait times out).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn argon_wait_timeout_counts_auth_and_sends_no_server_hello() {
-    let rig = Arc::new(rig_with_deadline(slower(), Some(Duration::from_secs(1))).await);
+    let rig = Arc::new(rig_with_deadline(slower(), Some(Duration::from_secs(2))).await);
     let audited = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&audited);
     rig.hub.set_audit(Arc::new(move |_| {
@@ -1050,4 +1050,39 @@ async fn ws_slow_client_cannot_chain_phase_timers() {
         Err(_) => None,
     };
     assert_ne!(outcome, Some(0), "a slow client never reaches AUTH_OK");
+}
+
+/// The permit lives in the blocking task, not in the connection future:
+/// shutdown drops the future mid-hash and the cap still counts the hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn argon_permit_held_after_the_connection_future_is_cancelled() {
+    let rig = Arc::new(rig_with(slow()).await);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let client = {
+        let rig = Arc::clone(&rig);
+        let sent = Arc::clone(&sent);
+        tokio::spawn(async move { hello_then_wait(&rig, rig.token.clone(), sent).await })
+    };
+    eventually("hash started", || rig.hub.argon_in_flight() == 1).await;
+    rig.ws.begin_shutdown();
+    eventually("connection future dropped", || {
+        rig.hub.ws_preauth_in_flight() == 0
+    })
+    .await;
+    assert_eq!(
+        rig.hub.argon_in_flight(),
+        1,
+        "the hash is still running after its connection was cancelled"
+    );
+    eventually("hash finished", || rig.hub.argon_in_flight() == 0).await;
+    let _ = client.await;
+}
+
+#[test]
+fn busy_event_text_is_pinned() {
+    let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    assert_eq!(
+        ConnectorEvent::Busy { peer }.to_string(),
+        "agent connector busy: credential check did not start in time"
+    );
 }

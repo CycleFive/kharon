@@ -358,7 +358,10 @@ prints `agent connector busy: credential check did not start in time`
 (not audited, because no credential was refused). On the agent a busy
 close shows as `auth: connector protocol error`; that line can mean the
 broker's credential check could not start in time (a busy broker), not
-only a version mismatch.
+only a version mismatch. Every WebSocket socket frees its pre-auth slot
+by its deadline. A refusal's closing answer (the server hello that says
+why) gets at most 1 second after the slot is freed, so a peer that never
+reads cannot hold anything longer.
 
 A Cloudflare Worker or Transform Rule must not add an `Origin` header
 to `/connector`, or every upgrade gets 403.
@@ -636,6 +639,9 @@ At start kharond prints which one it bound:
 ```text
 kharond: public ingress listening on 127.0.0.1:8790 (plain HTTP, loopback; POST /mcp only)
 ```
+
+With `[connector] websocket = true` the line ends
+`POST /mcp and GET /connector)` instead.
 
 On a host address, the input filter in
 [Tunnel-only listeners](#tunnel-only-listeners-req-dep-006) already

@@ -121,12 +121,14 @@ async fn serve(cfg: Config) -> ExitCode {
         );
     }
     if let Some(public) = daemon.public_ingress_addr() {
-        let tls = if daemon.public_ingress_tls() {
-            "TLS"
-        } else {
-            "plain HTTP, loopback"
-        };
-        eprintln!("kharond: public ingress listening on {public} ({tls}; POST /mcp only)");
+        eprintln!(
+            "{}",
+            daemon::public_ingress_line(
+                public,
+                daemon.public_ingress_tls(),
+                daemon.connector_websocket()
+            )
+        );
     }
     match daemon.run(shutdown_signal()).await {
         Ok(()) => {

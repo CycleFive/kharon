@@ -264,10 +264,32 @@ async fn check_exits_69_and_names_upgrade_on_502() {
     assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
 }
 
+/// A resolver that answers a reserved `.invalid` name (RFC 6761) defeats the
+/// dns-leg tests; they skip themselves there. CI's resolver conforms.
+async fn resolver_answers(host: &str) -> bool {
+    // A broken resolver is no reason to skip: a timeout counts as "does not
+    // answer", and the test runs as in production.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host((host, 443)),
+    )
+    .await
+    {
+        Ok(Ok(mut addrs)) => addrs.next().is_some(),
+        _ => false,
+    }
+}
+
 /// ws without a proxy resolves inside `check_once`, so this exercises the
 /// client's own Dns leg.
 #[tokio::test(flavor = "multi_thread")]
 async fn check_exits_69_and_names_dns_on_unresolvable_host() {
+    if resolver_answers("kharon.invalid").await {
+        eprintln!(
+            "SKIP check_exits_69_and_names_dns_on_unresolvable_host: the resolver answers kharon.invalid (a reserved .invalid name, RFC 6761); the dns-leg check is not meaningful here"
+        );
+        return;
+    }
     let out = run_check_to(None, Some("wss://kharon.invalid/connector")).await;
     assert_eq!(out.code, Some(69), "{} / {}", out.stdout, out.stderr);
     assert!(
@@ -316,6 +338,12 @@ async fn check_names_the_tcp_address() {
 /// an unresolvable host prints the dns failure naming it, then fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn tls_check_names_an_unresolvable_broker_host() {
+    if resolver_answers("broker.invalid").await {
+        eprintln!(
+            "SKIP tls_check_names_an_unresolvable_broker_host: the resolver answers broker.invalid (a reserved .invalid name, RFC 6761); the dns-leg check is not meaningful here"
+        );
+        return;
+    }
     let dir: PathBuf = std::env::temp_dir().join(format!(
         "kharon-check-tls-{}-{}",
         std::process::id(),

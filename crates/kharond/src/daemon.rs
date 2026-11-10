@@ -620,6 +620,39 @@ struct ConnectorRuntime {
     ws: Option<Arc<crate::connector::WsEntry>>,
 }
 
+/// The startup line for the public-ingress listener. `tls` says how it
+/// listens; `ws` adds `GET /connector` when the WebSocket connector is on.
+pub fn public_ingress_line(addr: SocketAddr, tls: bool, ws: bool) -> String {
+    let tls = if tls { "TLS" } else { "plain HTTP, loopback" };
+    let routes = if ws {
+        "POST /mcp and GET /connector"
+    } else {
+        "POST /mcp only"
+    };
+    format!("kharond: public ingress listening on {addr} ({tls}; {routes})")
+}
+
+#[cfg(test)]
+mod public_ingress_line_tests {
+    use super::public_ingress_line;
+
+    #[test]
+    fn names_get_connector_only_when_it_is_served() {
+        let addr = "127.0.0.1:8790".parse().unwrap();
+        assert_eq!(
+            public_ingress_line(addr, false, false),
+            "kharond: public ingress listening on 127.0.0.1:8790 (plain HTTP, loopback; POST /mcp only)"
+        );
+        assert_eq!(
+            public_ingress_line(addr, false, true),
+            "kharond: public ingress listening on 127.0.0.1:8790 (plain HTTP, loopback; POST /mcp and GET /connector)"
+        );
+        assert!(
+            public_ingress_line(addr, true, true).contains("(TLS; POST /mcp and GET /connector)")
+        );
+    }
+}
+
 impl StartupError {
     /// Stable machine-readable code, printed by the daemon on refusal.
     pub fn code(&self) -> &'static str {
@@ -1112,6 +1145,11 @@ impl Daemon {
     /// The connector listen address, when path B is configured.
     pub fn connector_addr(&self) -> Option<SocketAddr> {
         self.connector.as_ref().and_then(|rt| rt.addr)
+    }
+
+    /// Whether the `/connector` WebSocket entry is on (`websocket = true`).
+    pub fn connector_websocket(&self) -> bool {
+        self.connector.as_ref().is_some_and(|rt| rt.ws.is_some())
     }
 
     /// The owner socket path (`kharon unlock` / `lock` connect here).

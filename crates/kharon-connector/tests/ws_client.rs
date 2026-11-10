@@ -6,7 +6,7 @@
 
 #![allow(clippy::result_large_err)] // tungstenite's callback signature
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -89,6 +89,12 @@ struct Server {
 }
 
 async fn start_server(mode: Mode) -> Server {
+    start_server_on(mode, Ipv4Addr::LOCALHOST).await
+}
+
+/// [`start_server`] listening on one loopback address, so a test can dial
+/// an address the outer certificate does not cover.
+async fn start_server_on(mode: Mode, ip: Ipv4Addr) -> Server {
     let pki = outer_pki();
     let inner = inner_cert();
     let outer_cfg =
@@ -100,10 +106,8 @@ async fn start_server(mode: Mode) -> Server {
         TlsVersions::Tls13Only,
     )
     .unwrap();
-    // All of 127.0.0.0/8, so a test can dial an address the outer
-    // certificate does not cover.
-    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let addr = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+    let listener = TcpListener::bind(SocketAddr::from((ip, 0))).await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let inner_failed = Arc::new(AtomicBool::new(false));
     let hello_read = Arc::new(AtomicBool::new(false));
     let sessions = Arc::new(Mutex::new(Vec::new()));
@@ -686,7 +690,7 @@ async fn tls_proxy_connect_names_the_broker_host_not_server_name() {
 #[tokio::test]
 async fn ws_outer_cert_for_another_name_is_a_name_mismatch() {
     let (cdp, _) = echo_stub().await;
-    let srv = start_server(Mode::Full).await;
+    let srv = start_server_on(Mode::Full, Ipv4Addr::new(127, 0, 0, 2)).await;
     let mut p = ws_params(&srv, srv.inner_pin, cdp);
     // The certificate covers `localhost` and 127.0.0.1, not 127.0.0.2.
     p.transport = Transport::Ws {

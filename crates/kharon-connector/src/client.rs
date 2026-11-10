@@ -173,9 +173,9 @@ async fn tcp_leg(
 ) -> Result<TcpStream, ClientError> {
     if let Some(proxy) = params.proxy {
         let (name, port) = match target {
-            Target::Addr(a, Some(host)) => (host.to_owned(), a.port()),
+            Target::Addr(a, Some(host)) => (connect_name(host), a.port()),
             Target::Addr(a, None) => (connect_host(a), a.port()),
-            Target::Host(h, p) => (h.to_owned(), p),
+            Target::Host(h, p) => (connect_name(h), p),
         };
         return proxy_leg(params, legs, proxy, &name, port).await;
     }
@@ -216,6 +216,16 @@ async fn tcp_leg(
     let e = ClientError::Tcp { kind: last };
     note(legs, Leg::Tcp, Err(e));
     Err(e)
+}
+
+/// The CONNECT host for a configured host name: an IPv6 literal (the config
+/// parser strips its brackets) is bracketed again; anything else is as is.
+fn connect_name(host: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
 }
 
 /// The CONNECT host for a bare address: an IPv6 literal is bracketed.
@@ -444,6 +454,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_name_brackets_an_ipv6_literal_only() {
+        assert_eq!(connect_name("::1"), "[::1]");
+        assert_eq!(connect_name("[::1]"), "[::1]");
+        assert_eq!(connect_name("2001:db8::7"), "[2001:db8::7]");
+        assert_eq!(connect_name("192.0.2.7"), "192.0.2.7");
+        assert_eq!(connect_name("broker.example.net"), "broker.example.net");
+    }
 
     #[tokio::test]
     async fn direct_tcp_leg_sets_nodelay() {

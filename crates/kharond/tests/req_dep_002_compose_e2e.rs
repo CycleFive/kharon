@@ -218,6 +218,12 @@ struct EdgeProbe {
     owner_wrong_host: u16,
     /// `POST /owner/login/options` with the public Host and no `Origin`.
     owner_no_origin: u16,
+    /// `POST /owner/approve/AAAA` with the public Host and no `Origin`:
+    /// the ntfy redeem route takes none (an unknown token is 410).
+    owner_redeem_no_origin: u16,
+    /// `POST /owner/login/options` with the public Host and the right
+    /// `Origin`: past the Origin rule; no passkey is enrolled (409).
+    owner_right_origin: u16,
 }
 
 impl EdgeProbe {
@@ -227,6 +233,8 @@ impl EdgeProbe {
         owner_home: 200,
         owner_wrong_host: 421,
         owner_no_origin: 403,
+        owner_redeem_no_origin: 410,
+        owner_right_origin: 409,
     };
 }
 
@@ -321,6 +329,18 @@ fn edge_probe() -> EdgeProbe {
             OWNER_UI,
             &format!(
                 "POST /owner/login/options HTTP/1.1\r\nHost: {OWNER_PUBLIC_HOST}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        ),
+        owner_redeem_no_origin: edge_status(
+            OWNER_UI,
+            &format!(
+                "POST /owner/approve/AAAA HTTP/1.1\r\nHost: {OWNER_PUBLIC_HOST}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        owner_right_origin: edge_status(
+            OWNER_UI,
+            &format!(
+                "POST /owner/login/options HTTP/1.1\r\nHost: {OWNER_PUBLIC_HOST}\r\nOrigin: {OWNER_PUBLIC_ORIGIN}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
             ),
         ),
     }

@@ -79,7 +79,7 @@ path B.
   `--metrics` the container build binds every interface and serves
   `/metrics`, `/config`, `/diag` and pprof.
 - The default vault is the customer's own Bitwarden Password Manager
-  on Bitwarden cloud. The customer unlocks it (`kharon unlock`), and
+  on Bitwarden cloud. The customer unlocks it (from the owner web UI, or `kharon unlock` on the box), and
   kharond keeps the keys only in memory. The `vaultwarden` profile is
   for self-hosters: set `[bitwarden] server = "http://vaultwarden:80"`.
   Bitwarden Secrets Manager is not the default.
@@ -137,10 +137,11 @@ The example `kharon.toml` turns on `[owner_ui]` with
 `public_origin = "https://kharon-owner.example.com"`. Use your own
 hostname there. Then:
 
-1. In the Cloudflare dashboard, add a public-hostname route to the
-   tunnel: `kharon-owner.<domain>` to `http://127.0.0.1:8788` (service
-   type HTTP). Set nothing under additional settings: no HTTP Host
-   Header, no HTTP2 connection. See "Publishing the owner UI" in the
+1. In the Cloudflare dashboard (Networking, Tunnels, your tunnel,
+   Routes, Add route, Published application), publish
+   `kharon-owner.<domain>` with Service URL `http://127.0.0.1:8788`.
+   Set nothing under additional settings: no HTTP Host Header, no
+   HTTP/2 to origin. See "Publishing the owner UI" in the
    [deployment guide](../../docs/deployment.md#publishing-the-owner-ui).
 2. Restart kharond so it reads the config: `docker compose restart kharon`.
 3. Enroll the first passkey. Open `https://kharon-owner.<domain>/enroll`
@@ -151,13 +152,20 @@ hostname there. Then:
    docker compose exec kharon kharon passkey-enroll
    ```
 
-   Enter the code it prints and follow the browser's passkey prompt (run
+   Send the owner the code it prints (43 characters) as a message they
+   can paste from; it works once, for 120 seconds. They enter it and follow the browser's passkey prompt (run
    the command again if it expired). After that, sign in at
    `https://kharon-owner.<domain>/`.
 
-The CLI stays as the fallback, and it is the way in when the browser
-cannot be (a throttled address, a lost passkey). It talks to the owner
-socket inside the container:
+The CLI stays as the fallback for whoever has a shell on the box. On a
+managed deploy that is the operator, who can approve, deny, revoke or
+panic on the owner's instruction. A throttled owner waits out the window
+the page shows, or signs in from another network. A CLI unlock means
+the owner giving the operator the master password: a last resort. A
+lost passkey is not fixed by the CLI: `passkey-enroll` adds a passkey
+but nothing removes one, so see "A lost passkey" in the
+[deployment guide](../../docs/deployment.md#a-lost-passkey). The CLI
+talks to the owner socket inside the container:
 
 ```sh
 docker compose exec kharon kharon grants                       # pending requests

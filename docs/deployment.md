@@ -78,6 +78,10 @@ rewrite both the log and its checkpoints.
 
 ### The kharon account and its master password (REQ-DEP-007)
 
+On a managed deploy the customer runs the `init` step below on their own
+machine and creates the account themselves: whoever runs `kharon init`
+sees the password.
+
 kharond logs in to a dedicated Bitwarden account with an API key and
 reads one organization (SPEC OQ-5). The API-key file sits on the
 broker host. Anyone who gets that file and a copy of the server's
@@ -534,6 +538,12 @@ an SSH forward on the host. Use the public origin there: with
 `/owner/approve/*` and `/owner/deny/*` are the routes the Access bypass
 below leaves open.
 
+In public mode an action URL works from anywhere, and its single-use
+token is the only credential. Whoever can read the ntfy topic can
+approve a pending request from the internet within its 120 seconds. Use
+a topic only the owner can read: an ntfy access token (`token_file`),
+and a reserved or self-hosted topic, never a guessable public one.
+
 The owner unix socket remains the CLI channel (`kharon unlock`,
 `kharon approve`). It does not speak this HTTP.
 
@@ -564,6 +574,11 @@ reaches it because cloudflared shares kharond's network namespace.
 The examples use `kharon-owner.example.com`. Use a hostname of its own,
 not a path under the gateway hostname.
 
+This needs cloudflared running beside kharond, in the same network
+namespace (the compose package does this). A tunnel on a separate guest
+cannot reach the loopback owner listener. Stopping cloudflared, as in
+Rollback below, also takes the owner UI offline.
+
 ### Two modes
 
 The config key decides which mode the UI runs in:
@@ -576,10 +591,20 @@ The config key decides which mode the UI runs in:
 - **Local mode**, `origin = "http://localhost:8788"`: the loopback UI
   reached over an SSH forward, as before. None of the checks above apply.
 
-Exactly one of the two keys is allowed. A config that sets plain
-`origin = "https://kharon-owner.example.com"` is still local mode: no
-Host check, no Origin requirement and no `__Host-` cookie, whatever
-the URL says. Set `public_origin` to publish.
+Exactly one of the two keys is allowed (`owner_ui_origin_choice`).
+Set `public_origin` to publish; it is the only way to run the published
+UI. **Never point a tunnel route at a UI configured with `origin`.**
+Local mode has no Host check, no `Origin` requirement, no failure
+throttle and no audit ceiling, so a stranger could write to the audit
+log without limit and fill the disk. The public URL does not load as
+local mode anyway: `origin = "https://kharon-owner.example.com"` with
+`listen = "127.0.0.1:8788"` is refused at startup (`owner_ui_origin`,
+because local mode wants `rp_id` to be that host, and it defaults to
+`localhost`; with `rp_id` set it is refused as `owner_ui_origin_port`,
+because the origin's port must equal the listen port). kharond's
+startup line says which mode it is in: `owner UI listening on
+127.0.0.1:8788 (public origin https://…, behind the edge; …)` in public
+mode, `(origin …; …)` in local mode.
 
 ### Steps
 
@@ -601,16 +626,17 @@ the URL says. Set `public_origin` to publish.
    [the `[public_ingress]` listener](#kharond-the-public_ingress-listener)).
    Do this on any published deploy.
 
-3. **Tunnel route.** In the Cloudflare dashboard (Zero Trust, Networks,
-   Tunnels), add a public hostname to the existing tunnel:
-   `kharon-owner.example.com`, service `HTTP`, URL `127.0.0.1:8788`.
-   Leave "Additional application settings" empty. In particular:
+3. **Tunnel route.** In the Cloudflare dashboard, go to Networking,
+   Tunnels, your tunnel, Routes, Add route, Published application.
+   Hostname `kharon-owner.example.com`, leave the path empty, and set
+   **Service URL** to `http://127.0.0.1:8788`. Leave the additional
+   application settings empty. In particular:
 
-   - **Never set `httpHostHeader`** (the dashboard's "HTTP Host
-     Header"). It rewrites the `Host` the browser sent, and kharond
-     refuses any `Host` that is not the public hostname.
-   - **Never set `http2Origin`** (the "HTTP2 connection" switch).
-     kharond speaks HTTP/1.1 only, and `Host` has to arrive as a header.
+   - **Never set `httpHostHeader`** (the "HTTP Host Header" setting).
+     It rewrites the `Host` the browser sent, and kharond refuses any
+     `Host` that is not the public hostname.
+   - **Never set `http2Origin`** ("HTTP/2 to origin", under TLS).
+     kharond speaks HTTP/1.1 only, so cloudflared's HTTP/2 to it fails.
 
    The dashboard creates the proxied DNS record.
 
@@ -620,6 +646,11 @@ the URL says. Set `public_origin` to publish.
    The throttle keys on that header. Without it a request is still
    served and still audited (with the tunnel's loopback address), but it
    is not throttled. See "Watching it" below.
+
+   Also leave Cloudflare features that rewrite HTML or challenge
+   requests (Rocket Loader, Bot Fight Mode) off for the owner hostname
+   until tested: the page's script and the phone's approve request must
+   pass unmodified.
 
 5. **Restart and enroll.** Restart kharond (`docker compose restart
    kharon`). Have the owner open
@@ -631,8 +662,10 @@ the URL says. Set `public_origin` to publish.
    docker compose exec kharon kharon passkey-enroll
    ```
 
-   Give the owner the code it prints. They paste it into the page and
-   follow the browser's passkey prompt. If it expires, run the command
+   Give the owner the code it prints (43 characters). Send it as a
+   message they can paste from, not by voice and not in a shared
+   channel: whoever uses it first registers a passkey. They paste it
+   into the page and follow the browser's passkey prompt. If it expires, run the command
    again. Registering does not sign you in; the owner goes to
    `https://kharon-owner.example.com/` and signs in with the passkey.
 
@@ -643,11 +676,7 @@ the URL says. Set `public_origin` to publish.
    - **200**: healthy.
    - **421**: the Host check refused it. Look for an `httpHostHeader` on
      the tunnel route, or a hostname that differs from `public_origin`.
-   - **403** with Access on: kharond refuses a request that carries no
-     valid Access token. Normally Cloudflare's Access application
-     redirects a browser to its login before the request reaches kharond,
-     so a plain `curl` gets that redirect (a 302) at the edge, and a 403
-     from kharond means the request reached it without a token. See
+   - **403** with Access on: see
      [Optional: Cloudflare Access in front](#optional-cloudflare-access-in-front).
 
 ### If the RP ID changes
@@ -656,6 +685,46 @@ A passkey is bound to the RP ID (by default, the hostname in
 `public_origin`). Moving a deploy from local to public mode, or to
 another hostname, changes it, and the old passkey stops working. Run
 `kharon passkey-enroll` again and register a new passkey at `/enroll`.
+A new hostname also needs its own tunnel route and Access application.
+The old passkey's entry stays in the store (see the next section).
+
+### A lost passkey
+
+`kharon passkey-enroll` adds a passkey; nothing lists or removes one
+(a `passkey list` / `passkey remove` command is tracked as a follow-up
+issue). A lost or stolen authenticator therefore stays valid until the
+passkey file is deleted. Deleting it removes **all** passkeys. Then
+enroll again. kharond reads the file at start, so stop it first:
+
+```sh
+docker compose stop kharon
+docker run --rm --volumes-from "$(docker compose ps -aq kharon)" alpine:3.22 rm /data/owner/passkeys.json
+docker compose start kharon
+docker compose exec kharon kharon passkey-enroll    # then /enroll, as in step 5
+```
+
+The file is `<data_dir>/owner/passkeys.json` (`/data` under compose).
+Without it kharond starts with no passkeys and accepts a fresh
+enrollment. The restart locks the vault, and none of this is audited
+(#249).
+
+### Unlocking from the browser
+
+The unlock form encrypts the master password in the page before it is
+sent, so it never appears in a request body or a log. The page itself,
+and the key it encrypts to, come through Cloudflare, so the unlock
+trusts the edge and whoever administers the Cloudflare account: they
+could change the page and read the password.
+
+To protect against a lookalike site, the owner opens the UI from a
+bookmark and lets the Bitwarden browser extension fill the master
+password. The extension fills only on the saved hostname. The passkey
+sign-in is bound to the real hostname, but the unlock form is an
+ordinary password field.
+
+Unlocking over the CLI (`kharon unlock` on the box) avoids the edge.
+On a managed deploy the terminal is the operator's, so it means
+trusting the operator with the password instead.
 
 ### Optional: Cloudflare Access in front
 
@@ -676,7 +745,10 @@ sign-in: the passkey is still required.
    ```
 
    `team_domain` is your Zero Trust team name plus `.cloudflareaccess.com`.
-   The block only works with `public_origin`.
+   The block only works with `public_origin`. Then restart kharond
+   (`docker compose restart kharon`; this locks the vault). Cloudflare
+   Access works without it, but kharond's own second check is loaded
+   only at start.
 
 4. kharond needs outbound HTTPS to `<team_domain>`: it fetches the
    signing keys from `https://<team_domain>/cdn-cgi/access/certs`. It
@@ -691,11 +763,31 @@ sign-in: the passkey is still required.
 5. **ntfy bypass.** The approve and deny buttons in an ntfy message
    are HTTP actions that the ntfy app on the owner's phone sends when
    tapped (not ntfy's server), and that app has no Access session. If
-   `[approval].ntfy` is on, add a second Access policy of action
-   **Bypass** for the paths `/owner/approve/*` and `/owner/deny/*` on the
-   same hostname. Those routes are protected by single-use tokens that
-   last 120 seconds, and kharond's own Access check skips them too. Leave
-   every other path behind the login policy.
+   `[approval].ntfy` is on, create a **second, separate** self-hosted
+   Access application with two destinations,
+   `kharon-owner.example.com/owner/approve/*` and
+   `kharon-owner.example.com/owner/deny/*`, and give it one policy:
+   action **Bypass**, Include **Everyone**. Access uses the most
+   specific application for each request, so these two paths skip the
+   login and every other path stays behind the first application.
+   **Do not add a Bypass policy to the owner application itself.** A
+   policy has no path: it covers every path of its application, so that
+   would turn Access off for the whole hostname. What goes wrong each
+   way:
+
+   - No bypass application and `[owner_ui.access]` set: the phone's
+     approve tap gets 403, and the log shows `missing_token`.
+   - A hostname-wide bypass: no Access login at the edge, and with
+     `[owner_ui.access]` set every request reaches kharond without a
+     token and everyone gets 403.
+
+   kharond's own Access check skips these two routes too. They are
+   protected by single-use tokens that last 120 seconds, and anyone who
+   can read the ntfy topic holds those tokens (see
+   [ntfy approve and deny](#ntfy-approve-and-deny-req-apr-004-req-dep-006)).
+   Check it: an approve link works with no Access login, and
+   `https://kharon-owner.example.com/` in a private window still goes to
+   the Access login.
 
 When everyone gets 403, read the kharond log first
 (`docker compose logs kharon | grep 'owner UI Access'`). There is one
@@ -713,24 +805,38 @@ the first time each kind of refusal is seen
 | `missing_token` | The request did not come through an Access application covering this path, or the hostname bypasses Access. |
 | `malformed_token`, `bad_signature`, `claims` | Not a token from this team's Access. |
 | `audience` | `audience` is not this application's AUD tag. Often the Client ID was pasted. |
-| `issuer` | `team_domain` is not this team's. |
-| `unknown_key` | Right after a key rotation it clears within a minute; otherwise `team_domain` is wrong. |
+| `issuer` | The token was issued by a different team than `team_domain`, or its `iss` is not exactly `https://<team_domain>` (for example a trailing slash). |
+| `unknown_key` | kharond has no key with that id yet. Right after start or a key rotation it clears within a minute. If it persists, the key fetch is failing: read the fetch-failure line. |
 | `expired`, `not_yet_valid` | The token or the box's clock is off. |
 
 ### Checks on the first live deploy
 
-With Access on, after the first real sign-in:
+These checks can fail. Run the first two from `deploy/compose`, inside
+the holder's network namespace, with the public `Host` and no Access
+token:
 
-- The log shows no fetch failure of class `http_4xx`. kharond's request
-  to the certs endpoint carries no `User-Agent`; if Cloudflare ever
-  refuses that, this is where it shows.
-- A signed-in owner is not refused with class `issuer`. The token's
-  `iss` must be `https://<team>.cloudflareaccess.com`, with no trailing
-  slash.
-- `kharon status` prints no `owner_ui_without_edge_address` line after
-  real traffic (the edge is sending `CF-Connecting-IP`).
-- A request with a wrong `Host` gets 421.
-- With ntfy on, the approve link works without an Access login.
+```sh
+N='--network container:'"$(docker compose ps -q holder)"
+docker run --rm $N alpine:3.22 wget -qSO- --header 'Host: kharon-owner.example.com' http://127.0.0.1:8788/   # 200 before [owner_ui.access] is loaded, 403 after
+docker run --rm $N alpine:3.22 wget -qSO- --header 'Host: wrong.example' http://127.0.0.1:8788/            # 421
+```
+
+`wget` exits 1 on a non-2xx status and `-S` prints the status line.
+
+- With Access on, the first command gives 403: kharond's own check is
+  loaded. A 200 means kharond was not restarted after adding
+  `[owner_ui.access]`.
+- The second gives 421 (the edge cannot test this: it routes only the
+  configured hostname).
+- A signed-in owner reaches `/`. The log has no `owner UI Access …:
+  issuer` line (the token's `iss` must be
+  `https://<team>.cloudflareaccess.com`, no trailing slash) and no
+  fetch failure `http_4xx` (kharond's key fetch sends no `User-Agent`;
+  if Cloudflare ever refuses that, it shows here).
+- `kharon status` prints no `owner UI: N requests without a usable
+  CF-Connecting-IP (not throttled)` line after real traffic. If it
+  does, the edge is not sending the header.
+- With ntfy on, an approve link works with no Access login.
 
 ### The throttle, and getting back in
 
@@ -742,15 +848,22 @@ who is already signed in can still approve, deny, revoke and panic.
 A successful sign-in or unlock clears the count.
 
 The count is per address (an IPv4 address, or an IPv6 /64) and is kept
-in memory. To get in without waiting, use the CLI on the box
-(`kharon unlock`, `kharon approve`, `kharon deny`, `kharon panic`; see
-the [compose README](../deploy/compose/README.md#owner-web-ui)), or
-sign in from another network. Anyone who shares the owner's address (an
-office, a mobile carrier) can trip it for them; this is the cost of
-per-address limits.
+in memory. The refusal lasts until ten minutes after that address's
+first counted failure. An owner with no shell on the box has, in order:
+wait for the time the page shows; sign in from another network (a
+phone off Wi-Fi); or ask the operator to act on the box. The operator
+can approve, deny, revoke or panic over the CLI on the owner's
+instruction (`docker compose exec kharon kharon grants`, `approve`,
+`deny`, `panic`; see the
+[compose README](../deploy/compose/README.md#owner-web-ui)). A CLI
+unlock needs the master password typed on the box, which means giving
+it to the operator: a last resort, so wait instead. Restarting kharond
+clears every count, but it also locks the vault and ends every session.
+Anyone who shares the owner's address (an office, a mobile carrier) can
+trip it for them; this is the cost of per-address limits.
 
 The audit log keeps the first 20 `owner_auth_fail` entries a minute from
-requests with no session, plus 5 `throttled` entries; the rest are
+requests with no session (and every refused `Origin`), plus 5 `throttled` entries; the rest are
 counted, not written, so the worst case is 26 entries a minute.
 
 ### Watching it
@@ -1111,7 +1224,7 @@ Take the public path away in either order; each step alone closes it.
 
 ```sh
 # Compose: stop serving the hostname, and drop `edge` from .env.
-docker compose stop cloudflared
+docker compose stop cloudflared      # also takes the owner UI offline
 # Host-networked or guest:
 sudo systemctl disable --now cloudflared-kharon.service
 # On the broker: remove [public_ingress] from the config, then restart kharond.

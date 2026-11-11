@@ -316,6 +316,13 @@ fn compose_docs_no_longer_wait_for_208() {
     for needle in ["httpHostHeader", "/owner/approve/*", "public_host"] {
         assert!(guide.contains(needle), "deployment guide lacks {needle}");
     }
+    // The ntfy bypass is its own Access application, never a policy
+    // added to the owner application (a policy has no path).
+    assert!(
+        guide.contains("**second, separate** self-hosted\n   Access application")
+            && guide.contains("**Do not add a Bypass policy to the owner application itself.**"),
+        "deployment guide's ntfy bypass step regressed"
+    );
     for stale in ["after #208", "until #208", "waits for #208"] {
         assert!(
             !guide.contains(stale),

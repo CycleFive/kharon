@@ -535,8 +535,8 @@ namespace. A published host port does not reach it, and neither does
 an SSH forward on the host. Use the public origin there: with
 `[owner_ui] public_origin` set, the action URL is
 `https://kharon-owner.example.com/owner/approve/<token>`, and
-`/owner/approve/*` and `/owner/deny/*` are the routes the Access bypass
-below leaves open.
+`/owner/approve/*` and `/owner/deny/*` are the routes the separate
+bypass application leaves open (step 5 of the Access section below).
 
 In public mode an action URL works from anywhere, and its single-use
 token is the only credential. Whoever can read the ntfy topic can
@@ -589,7 +589,7 @@ The config key decides which mode the UI runs in:
   much a stranger can write to the audit log, and uses a `__Host-`
   session cookie.
 - **Local mode**, `origin = "http://localhost:8788"`: the loopback UI
-  reached over an SSH forward, as before. None of the checks above apply.
+  reached over an SSH forward. None of the checks above apply.
 
 Exactly one of the two keys is allowed (`owner_ui_origin_choice`).
 Set `public_origin` to publish; it is the only way to run the published
@@ -691,8 +691,7 @@ The old passkey's entry stays in the store (see the next section).
 ### A lost passkey
 
 `kharon passkey-enroll` adds a passkey; nothing lists or removes one
-(a `passkey list` / `passkey remove` command is tracked as a follow-up
-issue). A lost or stolen authenticator therefore stays valid until the
+(a `passkey list` / `passkey remove` command is tracked as #258). A lost or stolen authenticator therefore stays valid until the
 passkey file is deleted. Deleting it removes **all** passkeys. Then
 enroll again. kharond reads the file at start, so stop it first:
 
@@ -717,10 +716,14 @@ trusts the edge and whoever administers the Cloudflare account: they
 could change the page and read the password.
 
 To protect against a lookalike site, the owner opens the UI from a
-bookmark and lets the Bitwarden browser extension fill the master
-password. The extension fills only on the saved hostname. The passkey
-sign-in is bound to the real hostname, but the unlock form is an
-ordinary password field.
+bookmark, never from a link. A password manager helps only if it is
+set up for it: save a login item for the owner hostname in Bitwarden
+with URI match detection set to **Host** (the default, base domain,
+also matches sibling hostnames), and try it once. The unlock field
+is marked `autocomplete="off"`, so a browser's built-in manager may
+not offer to fill it. The passkey sign-in is bound to the real
+hostname, but the unlock form is an ordinary password field: a copied
+page can ask for the master password.
 
 Unlocking over the CLI (`kharon unlock` on the box) avoids the edge.
 On a managed deploy the terminal is the operator's, so it means
@@ -775,11 +778,13 @@ sign-in: the passkey is still required.
    would turn Access off for the whole hostname. What goes wrong each
    way:
 
-   - No bypass application and `[owner_ui.access]` set: the phone's
-     approve tap gets 403, and the log shows `missing_token`.
-   - A hostname-wide bypass: no Access login at the edge, and with
-     `[owner_ui.access]` set every request reaches kharond without a
-     token and everyone gets 403.
+   - No bypass application: Cloudflare Access stops the phone's
+     approve tap at the edge. The request never reaches kharond, so
+     its log shows nothing, with or without `[owner_ui.access]`.
+   - A hostname-wide bypass: no Access login at the edge. With
+     `[owner_ui.access]` set, every request reaches kharond without a
+     token and everyone gets 403. Without it, nothing shows: the UI is
+     simply open, with no Access in front of the passkey.
 
    kharond's own Access check skips these two routes too. They are
    protected by single-use tokens that last 120 seconds, and anyone who
@@ -805,8 +810,8 @@ the first time each kind of refusal is seen
 | `missing_token` | The request did not come through an Access application covering this path, or the hostname bypasses Access. |
 | `malformed_token`, `bad_signature`, `claims` | Not a token from this team's Access. |
 | `audience` | `audience` is not this application's AUD tag. Often the Client ID was pasted. |
-| `issuer` | The token was issued by a different team than `team_domain`, or its `iss` is not exactly `https://<team_domain>` (for example a trailing slash). |
-| `unknown_key` | kharond has no key with that id yet. Right after start or a key rotation it clears within a minute. If it persists, the key fetch is failing: read the fetch-failure line. |
+| `issuer` | The signature is this team's, but the token's `iss` is not exactly `https://<team_domain>` (for example a trailing slash). |
+| `unknown_key` | kharond has no key with that id. Right after start or a key rotation it clears within a minute. If it persists, either the key fetch is failing (read the fetch-failure line) or the token comes from a different team than `team_domain`. |
 | `expired`, `not_yet_valid` | The token or the box's clock is off. |
 
 ### Checks on the first live deploy

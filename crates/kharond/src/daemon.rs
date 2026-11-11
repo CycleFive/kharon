@@ -491,9 +491,16 @@ impl OwnerOps for DaemonOwner {
 
     async fn panic_lock(&self) -> Result<(), OwnerFailure> {
         let broker = Arc::clone(&self.broker);
-        tokio::task::spawn_blocking(move || broker.panic_lock().map_err(map_grant_error))
-            .await
-            .map_err(|_| OwnerFailure::AuditFailed)?
+        let outcome =
+            tokio::task::spawn_blocking(move || broker.panic_lock().map_err(map_grant_error))
+                .await
+                .unwrap_or(Err(OwnerFailure::AuditFailed));
+        // A panic ends the web UI's ceremonies in flight (D7), whether
+        // or not its own audit append succeeded.
+        if let Some(ui) = &self.owner_ui {
+            ui.invalidate_sealed();
+        }
+        outcome
     }
 }
 

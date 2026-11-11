@@ -67,6 +67,7 @@
 //! and enrollment attempts are audited as `owner_auth_fail`.
 
 mod approvals;
+mod sealed;
 mod store;
 pub mod unlock;
 mod webauthn;
@@ -88,11 +89,13 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
+use self::sealed::{Burn, Sealer, UsedOnce};
 use self::store::PasskeyStore;
 use self::webauthn::{RegisteredCredential, b64url_decode, b64url_encode, ct_eq};
 use crate::api::http::{
@@ -168,7 +171,6 @@ pub const ROUTES: &[(&str, &str)] = &[
 const MAX_ID_LEN: usize = 64;
 
 const MAX_BODY: usize = 16 * 1024;
-const MAX_CEREMONIES: usize = 8;
 const MAX_ENROLL: usize = 4;
 const MAX_SESSIONS: usize = 4;
 
@@ -238,7 +240,11 @@ pub struct OwnerUi {
     audit: Arc<dyn OwnerAudit>,
     approvals: Arc<dyn OwnerApprovals>,
     passkeys: Mutex<PasskeyStore>,
-    ceremonies: Mutex<Vec<Ceremony>>,
+    /// Seals and opens ceremony tokens (D7): nothing is stored at
+    /// `options`.
+    sealer: Sealer,
+    /// Tokens that already finished a ceremony.
+    used: UsedOnce,
     sessions: Mutex<Vec<Session>>,
     enroll: Mutex<Vec<Enroll>>,
     /// The web unlock backend (slice 5b). Set once, after the daemon
@@ -248,17 +254,35 @@ pub struct OwnerUi {
     unlock_attempts: Mutex<Vec<unlock::Attempt>>,
 }
 
+/// A ceremony as `options` hands it out: the sealed token (the
+/// `ceremony_id` on the wire) and its challenge.
 struct Ceremony {
     id: String,
     challenge: Vec<u8>,
-    kind: CeremonyKind,
-    expires: Instant,
+}
+
+/// What a ceremony token carries besides its purpose and expiry.
+#[derive(Serialize, Deserialize)]
+struct CeremonyClaims {
+    /// base64url of 32 random bytes.
+    challenge: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CeremonyKind {
     Login,
     Register,
+}
+
+impl CeremonyKind {
+    /// The purpose sealed into the token: a `login` token never opens
+    /// as `register`.
+    fn purpose(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Register => "register",
+        }
+    }
 }
 
 struct Session {
@@ -338,7 +362,8 @@ impl OwnerUi {
             audit,
             approvals,
             passkeys: Mutex::new(passkeys),
-            ceremonies: Mutex::new(Vec::new()),
+            sealer: Sealer::new(),
+            used: UsedOnce::new(),
             sessions: Mutex::new(Vec::new()),
             enroll: Mutex::new(Vec::new()),
             unlocker: OnceLock::new(),
@@ -770,7 +795,11 @@ impl OwnerUi {
         if !body.confirm {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         }
-        match self.approvals.panic() {
+        let outcome = self.approvals.panic();
+        // Whether or not the panic's own audit append succeeded: it
+        // keeps grants revoked either way, so it ends ceremonies too.
+        self.invalidate_sealed();
+        match outcome {
             Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
             Err(e) => decide_error(e),
         }
@@ -972,7 +1001,7 @@ impl OwnerUi {
         let Some(ceremony_id) = value.get("ceremony_id").and_then(|v| v.as_str()) else {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         };
-        let Some(ceremony) = self.take_ceremony(ceremony_id, CeremonyKind::Login) else {
+        let Some((challenge, opened)) = self.open_ceremony(ceremony_id, CeremonyKind::Login) else {
             self.fail(req, "bad_assertion");
             return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
         };
@@ -994,7 +1023,7 @@ impl OwnerUi {
                 client_data_json: &cred.client_data_json,
                 authenticator_data: &cred.authenticator_data,
                 signature: &cred.signature,
-                challenge: &ceremony.challenge,
+                challenge: &challenge,
                 origin: &self.origin,
                 rp_id: &self.rp_id,
                 public_key: &known.public_key,
@@ -1008,6 +1037,9 @@ impl OwnerUi {
                 return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
             }
         };
+        if let Some(refused) = self.burn_ceremony(req, &opened) {
+            return refused;
+        }
         if self
             .passkeys
             .lock()
@@ -1044,14 +1076,15 @@ impl OwnerUi {
         let Some(ceremony_id) = value.get("ceremony_id").and_then(|v| v.as_str()) else {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         };
-        let Some(ceremony) = self.take_ceremony(ceremony_id, CeremonyKind::Register) else {
+        let Some((challenge, opened)) = self.open_ceremony(ceremony_id, CeremonyKind::Register)
+        else {
             self.fail(req, "bad_assertion");
             return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
         };
         let registered = webauthn::verify_registration(
             &cred.client_data_json,
             &cred.attestation_object,
-            &ceremony.challenge,
+            &challenge,
             &self.origin,
             &self.rp_id,
         );
@@ -1062,6 +1095,9 @@ impl OwnerUi {
                 return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
             }
         };
+        if let Some(refused) = self.burn_ceremony(req, &opened) {
+            return refused;
+        }
         if self.store_credential(registered).is_err() {
             self.fail(req, "bad_assertion");
             return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
@@ -1126,39 +1162,58 @@ impl OwnerUi {
         self.take_enroll(token)
     }
 
-    fn begin(&self, kind: CeremonyKind) -> Ceremony {
-        let mut id_raw = [0u8; 32];
-        let mut challenge = vec![0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut id_raw);
-        rand::rngs::OsRng.fill_bytes(&mut challenge);
-        let ceremony = Ceremony {
-            id: b64url_encode(&id_raw),
-            challenge,
-            kind,
-            expires: Instant::now() + CEREMONY_TTL,
-        };
-        let mut guard = self.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
-        guard.retain(|c| c.expires > now);
-        if guard.len() >= MAX_CEREMONIES {
-            guard.remove(0);
-        }
-        guard.push(Ceremony {
-            id: ceremony.id.clone(),
-            challenge: ceremony.challenge.clone(),
-            kind: ceremony.kind,
-            expires: ceremony.expires,
-        });
-        ceremony
+    /// A panic happened: every outstanding ceremony token (and any
+    /// later pending authorization sealed the same way) must stop
+    /// working at once (REQ-OAU-005, REQ-REV-002).
+    pub fn invalidate_sealed(&self) {
+        // Rotate BEFORE clearing the used-set. With the order reversed,
+        // a token sealed under the old key could still open in the gap,
+        // be burned into the just-emptied set, and sign in. After the
+        // rotation nothing old opens, so the clear can't re-admit it.
+        self.sealer.rotate();
+        self.used.clear();
     }
 
-    fn take_ceremony(&self, id: &str, kind: CeremonyKind) -> Option<Ceremony> {
-        let mut guard = self.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
-        let idx = guard
-            .iter()
-            .position(|c| c.id == id && c.kind == kind && c.expires > now)?;
-        Some(guard.remove(idx))
+    fn begin(&self, kind: CeremonyKind) -> Ceremony {
+        let challenge = random_bytes::<32>().to_vec();
+        let claims = CeremonyClaims {
+            challenge: b64url_encode(&challenge),
+        };
+        Ceremony {
+            id: self
+                .sealer
+                .seal(kind.purpose(), &claims, CEREMONY_TTL, Instant::now()),
+            challenge,
+        }
+    }
+
+    /// Open a ceremony token: its challenge and its single-use handle.
+    fn open_ceremony(
+        &self,
+        token: &str,
+        kind: CeremonyKind,
+    ) -> Option<(Vec<u8>, sealed::Opened<CeremonyClaims>)> {
+        let opened = self
+            .sealer
+            .open::<CeremonyClaims>(kind.purpose(), token, Instant::now())?;
+        let challenge = b64url_decode(&opened.claims.challenge).ok()?;
+        Some((challenge, opened))
+    }
+
+    /// Record a verified ceremony as used. `Some` is the refusal.
+    fn burn_ceremony(
+        &self,
+        req: &Incoming,
+        opened: &sealed::Opened<CeremonyClaims>,
+    ) -> Option<Response> {
+        match self.used.burn(opened.id, opened.expires, Instant::now()) {
+            Burn::Fresh => None,
+            Burn::Replayed => {
+                self.fail(req, "bad_assertion");
+                Some(respond(StatusCode::UNAUTHORIZED, "bad_assertion", None))
+            }
+            Burn::Full => Some(respond(StatusCode::TOO_MANY_REQUESTS, "rate_limited", None)),
+        }
     }
 
     fn take_enroll(&self, token: &str) -> bool {
@@ -3156,5 +3211,121 @@ mod tests {
             &ApprovalsRig::sealed("x", &key, "right horse"),
         );
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+    #[derive(serde::Deserialize)]
+    struct OptionsReply {
+        ceremony_id: String,
+        #[serde(rename = "publicKey")]
+        public_key: OptionsKey,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OptionsKey {
+        challenge: String,
+    }
+
+    #[derive(serde::Serialize)]
+    struct FinishBody<'a> {
+        ceremony_id: &'a str,
+        credential: FinishCred,
+    }
+
+    #[derive(serde::Serialize)]
+    struct FinishCred {
+        id: String,
+        #[serde(rename = "type")]
+        kind: &'static str,
+        response: FinishResponse,
+    }
+
+    #[derive(serde::Serialize)]
+    struct FinishResponse {
+        #[serde(rename = "clientDataJSON")]
+        client_data_json: String,
+        #[serde(rename = "authenticatorData")]
+        authenticator_data: String,
+        signature: String,
+    }
+
+    fn post_ui(ui: &OwnerUi, path: &str, body: &[u8]) -> (StatusCode, String) {
+        let response = ui.dispatch(Incoming {
+            method: Method::POST,
+            path: path.into(),
+            cookie: None,
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            content_type: (!body.is_empty()).then(|| "application/json".to_owned()),
+            body: body.to_vec(),
+            client_ip: None,
+        });
+        let status = response.status();
+        (status, futures_body(response))
+    }
+
+    #[test]
+    fn req_apr_009_ceremony_creation_stores_nothing() {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ui = OwnerUi::open(
+            dir.path(),
+            "localhost",
+            ORIGIN,
+            Arc::new(StaticShell(ShellView {
+                locked: true,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
+        let cred_id = vec![9u8; 16];
+        ui.store_credential(RegisteredCredential {
+            credential_id: cred_id.clone(),
+            public_key: key.public_key().as_ref().try_into().unwrap(),
+            sign_count: 0,
+        })
+        .unwrap();
+
+        let (status, body) = post_ui(&ui, "/owner/login/options", b"");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let first: OptionsReply = serde_json::from_str(&body).unwrap();
+
+        for i in 0..100_000 {
+            let (status, _) = post_ui(&ui, "/owner/login/options", b"");
+            assert_eq!(status, StatusCode::OK, "options #{i}");
+        }
+
+        let client = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}","crossOrigin":false}}"#,
+            first.public_key.challenge
+        );
+        let mut auth = sha256(b"localhost").to_vec();
+        auth.push(0x01 | 0x04);
+        auth.extend_from_slice(&0u32.to_be_bytes());
+        let mut message = auth.clone();
+        message.extend_from_slice(&sha256(client.as_bytes()));
+        let signature = key.sign(&SystemRandom::new(), &message).unwrap();
+        let body = serde_json::to_vec(&FinishBody {
+            ceremony_id: &first.ceremony_id,
+            credential: FinishCred {
+                id: b64url_encode(&cred_id),
+                kind: "public-key",
+                response: FinishResponse {
+                    client_data_json: b64url_encode(client.as_bytes()),
+                    authenticator_data: b64url_encode(&auth),
+                    signature: b64url_encode(signature.as_ref()),
+                },
+            },
+        })
+        .unwrap();
+        let (status, reply) = post_ui(&ui, "/owner/login/finish", &body);
+        assert_eq!(status, StatusCode::OK, "{reply}");
     }
 }

@@ -398,3 +398,244 @@ async fn req_apr_009_public_session_cookie_is_host_prefixed() {
     assert!(cleared.contains("Max-Age=0"), "{cleared}");
     run.shutdown().await;
 }
+
+// ---- Sealed ceremonies (D7, AC5) ----
+
+/// The `Origin` and `Host` of every call in this section.
+fn pub_post<'a>(path: &'a str, body: &'a str) -> Http<'a> {
+    let ct = (!body.is_empty()).then_some("application/json");
+    Http::post(path, ct, body).host(PUBLIC_HOST)
+}
+
+/// Enrol a software passkey through the owner socket's code. Returns it
+/// with the user handle already set.
+async fn enroll_public(run: &Running) -> VirtAuth {
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
+    let mut auth = VirtAuth::new();
+    let opts = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/options", "").bearer(&enroll),
+    )
+    .await;
+    assert_eq!(opts.status, 200, "{}", opts.body);
+    let opts: Json = serde_json::from_str(&opts.body).unwrap();
+    auth.user_handle = b64url_dec(opts["publicKey"]["user"]["id"].as_str().unwrap());
+    let reg = auth.registration(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    let body = json!({"ceremony_id": opts["ceremony_id"], "credential": reg}).to_string();
+    let done = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/finish", &body),
+    )
+    .await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    auth
+}
+
+/// `login/options` from `ip`: the whole reply.
+async fn login_options(run: &Running, ip: &str) -> Json {
+    let r = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/login/options", "").header("CF-Connecting-IP", ip),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{ip}: {}", r.body);
+    serde_json::from_str(&r.body).unwrap()
+}
+
+fn login_body(auth: &mut VirtAuth, opts: &Json) -> String {
+    let assertion = auth.assertion(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    json!({"ceremony_id": opts["ceremony_id"], "credential": assertion}).to_string()
+}
+
+async fn finish(run: &Running, body: &str) -> api_support::RawResponse {
+    http(run.ui, PUBLIC_ORIGIN, pub_post("/owner/login/finish", body)).await
+}
+
+fn has_session_cookie(r: &api_support::RawResponse) -> bool {
+    set_cookie(r, "__Host-kharon_owner").is_some()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_login_survives_a_flood_of_login_options() {
+    let run = start_public().await;
+    let mut auth = enroll_public(&run).await;
+    let owner = login_options(&run, "198.51.100.1").await;
+
+    for i in 0..2_000u32 {
+        let ip = if i % 2 == 0 {
+            format!("203.0.{}.{}", i / 256, i % 256)
+        } else {
+            format!("2001:db8:{i:x}::1")
+        };
+        login_options(&run, &ip).await;
+    }
+    for _ in 0..500 {
+        login_options(&run, "192.0.2.9").await;
+    }
+
+    let ok = finish(&run, &login_body(&mut auth, &owner)).await;
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    assert!(has_session_cookie(&ok), "no session cookie");
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_a_used_ceremony_cannot_be_replayed() {
+    let run = start_public().await;
+    let mut auth = enroll_public(&run).await;
+    let opts = login_options(&run, "198.51.100.1").await;
+    let body = login_body(&mut auth, &opts);
+
+    let first = finish(&run, &body).await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert!(has_session_cookie(&first));
+
+    let again = finish(&run, &body).await;
+    assert_eq!(again.status, 401, "{}", again.body);
+    assert!(
+        again.body.contains(r#""error":"bad_assertion""#),
+        "{}",
+        again.body
+    );
+    assert!(!has_session_cookie(&again), "a replay minted a session");
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_a_failed_finish_does_not_burn_the_ceremony() {
+    let run = start_public().await;
+    let mut auth = enroll_public(&run).await;
+    let opts = login_options(&run, "198.51.100.1").await;
+    let good = login_body(&mut auth, &opts);
+
+    // One signature byte flipped.
+    let mut value: Json = serde_json::from_str(&good).unwrap();
+    let sig = value["credential"]["response"]["signature"]
+        .as_str()
+        .unwrap();
+    let mut raw = b64url_dec(sig);
+    let last = raw.len() - 1;
+    raw[last] ^= 0x01;
+    value["credential"]["response"]["signature"] = json!(owner_ui_support::b64url(&raw));
+    let bad = finish(&run, &value.to_string()).await;
+    assert_eq!(bad.status, 401, "{}", bad.body);
+    assert!(
+        bad.body.contains(r#""error":"bad_assertion""#),
+        "{}",
+        bad.body
+    );
+    assert!(!has_session_cookie(&bad));
+
+    let ok = finish(&run, &good).await;
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    assert!(has_session_cookie(&ok));
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_ceremony_kinds_do_not_cross() {
+    let run = start_public().await;
+    let mut auth = enroll_public(&run).await;
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
+    let reg = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/options", "").bearer(&enroll),
+    )
+    .await;
+    assert_eq!(reg.status, 200, "{}", reg.body);
+    let reg: Json = serde_json::from_str(&reg.body).unwrap();
+
+    // A register ceremony's id, with an assertion over its challenge.
+    let body = login_body(&mut auth, &reg);
+    let r = finish(&run, &body).await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert!(r.body.contains(r#""error":"bad_assertion""#), "{}", r.body);
+    assert!(!has_session_cookie(&r));
+
+    // And a login ceremony's id sent to register/finish.
+    let opts = login_options(&run, "198.51.100.1").await;
+    let attestation = auth.registration(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    let body = json!({"ceremony_id": opts["ceremony_id"], "credential": attestation}).to_string();
+    let r = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/finish", &body),
+    )
+    .await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_panic_ends_ceremonies_in_flight() {
+    let run = start_public().await;
+    let mut auth = enroll_public(&run).await;
+
+    // The owner socket's panic.
+    let opts = login_options(&run, "198.51.100.1").await;
+    let body = login_body(&mut auth, &opts);
+    let panicked = owner_op(&run.socket, &json!({"op":"panic"}));
+    assert_eq!(panicked["ok"], json!(true), "{panicked}");
+    let r = finish(&run, &body).await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert!(r.body.contains(r#""error":"bad_assertion""#), "{}", r.body);
+    let fresh = login_options(&run, "198.51.100.1").await;
+    let signed_in = finish(&run, &login_body(&mut auth, &fresh)).await;
+    assert_eq!(signed_in.status, 200, "{}", signed_in.body);
+    let cookie = set_cookie(&signed_in, "__Host-kharon_owner").expect("session cookie");
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+
+    // The web route.
+    let opts = login_options(&run, "198.51.100.1").await;
+    let body = login_body(&mut auth, &opts);
+    let r = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/panic", r#"{"confirm":true}"#).cookie(&cookie),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = finish(&run, &body).await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert!(r.body.contains(r#""error":"bad_assertion""#), "{}", r.body);
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_odd_ceremony_ids_are_refused_cleanly() {
+    let run = start_public().await;
+    let mut auth = enroll_public(&run).await;
+    let opts = login_options(&run, "198.51.100.1").await;
+    let assertion = auth.assertion(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    let old_style = "A".repeat(43);
+    let long = "a".repeat(5_000);
+    for id in [long.as_str(), "é.é", old_style.as_str()] {
+        let body = json!({"ceremony_id": id, "credential": assertion}).to_string();
+        let r = finish(&run, &body).await;
+        assert_eq!(r.status, 401, "{}", r.body);
+        assert!(r.body.contains(r#""error":"bad_assertion""#), "{}", r.body);
+    }
+    run.shutdown().await;
+}

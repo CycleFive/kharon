@@ -101,11 +101,11 @@ path B.
   `docker compose exec kharon kharon status`, or expect `401` from
   `POST /mcp` on `127.0.0.1:8790` inside the namespace. Nothing
   listens on 8787 now.
-- The owner UI is not published yet. Its loopback address is inside
-  the holder's namespace, so no SSH forward reaches it; #208 turns it
-  on. Until then the owner works through the CLI, below.
+- The owner UI is published on its own hostname, `kharon-owner.<domain>`.
+  See "Owner web UI" below. Its loopback address is inside the holder's
+  namespace, so an SSH forward does not reach it; the tunnel does.
 - ntfy approve/deny (`/owner/approve/<token>`, `/owner/deny/<token>`)
-  needs the owner UI, so it waits for #208 too. See the
+  go through the same hostname. See the
   [deployment guide](../../docs/deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
 - `memlock` is unlimited so `require_mlock` holds, and core dumps are
   off. `cap_add: IPC_LOCK` has no effect for a non-root uid; the
@@ -131,19 +131,44 @@ The CDP endpoint in `kharon.toml` is the agent host's CDP address
 so restarting Chromium needs no config change (see the
 [deployment guide](../../docs/deployment.md#pointing-kharond-at-the-browser)).
 
-## Owner actions until #208
+## Owner web UI
 
-Approve and deny through the owner socket, with the CLI inside the
-container:
+The example `kharon.toml` turns on `[owner_ui]` with
+`public_origin = "https://kharon-owner.example.com"`. Use your own
+hostname there. Then:
+
+1. In the Cloudflare dashboard, add a public-hostname route to the
+   tunnel: `kharon-owner.<domain>` to `http://127.0.0.1:8788` (service
+   type HTTP). Set nothing under additional settings: no HTTP Host
+   Header, no HTTP2 connection. See "Publishing the owner UI" in the
+   [deployment guide](../../docs/deployment.md#publishing-the-owner-ui).
+2. Restart kharond so it reads the config: `docker compose restart kharon`.
+3. Enroll the first passkey. The command prints a one-time code:
+
+   ```sh
+   docker compose exec kharon kharon passkey-enroll
+   ```
+
+   Open `https://kharon-owner.<domain>/enroll`, enter the code, and
+   follow the browser's passkey prompt. After that, sign in at
+   `https://kharon-owner.<domain>/`.
+
+The CLI stays as the fallback, and it is the way in when the browser
+cannot be (a throttled address, a lost passkey). It talks to the owner
+socket inside the container:
 
 ```sh
 docker compose exec kharon kharon grants                       # pending requests
 docker compose exec kharon kharon approve gr_… [--kind once|per-origin|standing]
 docker compose exec kharon kharon deny gr_…
 docker compose exec kharon kharon panic                        # lock, zeroize, revoke all
+docker compose exec kharon kharon status                       # also prints the owner-UI counter below
 ```
 
-#208 publishes the web UI.
+If `kharon status` prints `owner UI: N requests without a usable
+CF-Connecting-IP (not throttled)` and N keeps growing, the edge is not
+sending that header and sign-in has lost its per-address throttle. See
+the deployment guide.
 
 Verify the audit log with `--data` set to the audit directory,
 `<data_dir>/audit`, not `<data_dir>` (`--data /data` fails on

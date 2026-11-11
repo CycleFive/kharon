@@ -130,7 +130,7 @@ listen = "{PUBLIC_INGRESS}"
 
 [owner_ui]
 listen = "{OWNER_UI}"
-origin = "http://localhost:8788"
+public_origin = "https://kharon-owner.e2e.test"
 
 [connector]
 websocket = true
@@ -800,7 +800,10 @@ fn ws_harness_config_is_path_b_with_no_api() {
         cfg.public_ingress.as_ref().unwrap().listen.to_string(),
         PUBLIC_INGRESS
     );
-    assert_eq!(cfg.owner_ui.as_ref().unwrap().listen.to_string(), OWNER_UI);
+    let ui = cfg.owner_ui.as_ref().unwrap();
+    assert_eq!(ui.listen.to_string(), OWNER_UI);
+    assert!(ui.public, "the ws harness owner UI is in public mode");
+    assert_eq!(ui.origin, "https://kharon-owner.e2e.test");
     assert!(cfg.connector.as_ref().unwrap().websocket);
     assert!(cfg.connector.as_ref().unwrap().listen.is_none());
     assert_eq!(cfg.policy.fills_per_minute, FILL_ADMISSIONS);

@@ -118,7 +118,8 @@ fn n1_example_config_is_loopback_only() {
     assert_eq!(ingress.listen.to_string(), "127.0.0.1:8790");
     assert!(ingress.tls.is_none());
     assert!(cfg.connector.is_none());
-    assert!(cfg.owner_ui.is_none());
+    // #208: the owner UI is published on its own hostname.
+    assert!(cfg.owner_ui.is_some());
     let Source::Sync(bw) = &cfg.source else {
         panic!("example config is not a Bitwarden sync source");
     };
@@ -282,4 +283,37 @@ fn n1_tunnel_routes_in_docs_use_127_0_0_1() {
         read("deploy/compose/kharon.toml.example").contains("websocket = true"),
         "compose example does not show the websocket connector"
     );
+}
+
+/// #208 AC10: the compose example publishes the owner UI behind the
+/// edge, in public mode, on the loopback port the tunnel route names.
+#[test]
+fn req_dep_006_compose_example_publishes_the_owner_ui() {
+    let raw = std::fs::read_to_string(compose_dir().join("kharon.toml.example"))
+        .expect("read kharon.toml.example");
+    let hash = format!("{:?}", kharond::api::token::generate("assistant").1);
+    let text = raw.replace("\"$argon2id$...\"", &hash);
+    let cfg = Config::from_toml_str(&text).expect("example config parses");
+    let ui = cfg.owner_ui.expect("example enables [owner_ui]");
+    assert!(ui.public, "example is not in public mode");
+    assert_eq!(ui.listen.to_string(), "127.0.0.1:8788");
+    assert_eq!(ui.origin, "https://kharon-owner.example.com");
+    assert!(ui.access.is_none(), "Access block is a comment");
+}
+
+/// #208: the package docs describe the published owner UI, not the
+/// wait for it.
+#[test]
+fn compose_docs_no_longer_wait_for_208() {
+    let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let read =
+        |p: &str| std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let readme = read("deploy/compose/README.md");
+    for stale in ["until #208", "waits for #208"] {
+        assert!(!readme.contains(stale), "README still says {stale}");
+    }
+    let guide = read("docs/deployment.md");
+    for needle in ["httpHostHeader", "/owner/approve/*", "public_host"] {
+        assert!(guide.contains(needle), "deployment guide lacks {needle}");
+    }
 }

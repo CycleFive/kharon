@@ -29,7 +29,9 @@
 //!   namespace, so a `fake-edge` container joined to the holder (a
 //!   stand-in for cloudflared, with socat) reaches kharond's two
 //!   loopback listeners: `POST /mcp` on the public ingress answers 401
-//!   and `GET /` on the owner UI answers 200. It does so at the start
+//!   and `GET /` on the owner UI answers 200. The owner UI runs in
+//!   public mode (#208), so it also answers 421 to a foreign `Host` and
+//!   403 to a POST with no `Origin`. It does so at the start
 //!   and after `restart kharon`, `up --force-recreate kharon` (kharond
 //!   really replaced, holder and fake-edge not) and a whole-stack
 //!   `restart`.
@@ -98,6 +100,10 @@ const AGENT_API: &str = "10.66.0.1:8787";
 /// kharond's loopback listeners, in the holder's namespace.
 const PUBLIC_INGRESS: &str = "127.0.0.1:8790";
 const OWNER_UI: &str = "127.0.0.1:8788";
+/// The owner UI's public origin (#208): the Host the fake edge sends,
+/// as the tunnel would pass the browser's.
+const OWNER_PUBLIC_HOST: &str = "kharon-owner.e2e.test";
+const OWNER_PUBLIC_ORIGIN: &str = "https://kharon-owner.e2e.test";
 const AGENT_HOST_CDP: &str = "10.66.0.2:9222";
 /// The docker host's address on `wg`, where the test page is served.
 const PAGE_ADDR: &str = "10.66.0.254";
@@ -171,7 +177,7 @@ listen = "{PUBLIC_INGRESS}"
 
 [owner_ui]
 listen = "{OWNER_UI}"
-origin = "http://localhost:8788"
+public_origin = "{OWNER_PUBLIC_ORIGIN}"
 "#
     )
 }
@@ -206,8 +212,22 @@ struct Run {
 struct EdgeProbe {
     /// `POST /mcp` without credentials, on the public ingress.
     mcp: u16,
-    /// `GET /` on the owner UI, signed out.
+    /// `GET /` on the owner UI, signed out, with the public Host.
     owner_home: u16,
+    /// The same with a Host that is not the public host (#208).
+    owner_wrong_host: u16,
+    /// `POST /owner/login/options` with the public Host and no `Origin`.
+    owner_no_origin: u16,
+}
+
+impl EdgeProbe {
+    /// What a healthy stack answers (#207, #208).
+    const EXPECTED: EdgeProbe = EdgeProbe {
+        mcp: 401,
+        owner_home: 200,
+        owner_wrong_host: 421,
+        owner_no_origin: 403,
+    };
 }
 
 /// One probe, and what survived the step that preceded it.
@@ -291,24 +311,28 @@ fn edge_probe() -> EdgeProbe {
         ),
         owner_home: edge_status(
             OWNER_UI,
-            "GET / HTTP/1.1\r\nHost: localhost:8788\r\nConnection: close\r\n\r\n",
+            &format!("GET / HTTP/1.1\r\nHost: {OWNER_PUBLIC_HOST}\r\nConnection: close\r\n\r\n"),
+        ),
+        owner_wrong_host: edge_status(
+            OWNER_UI,
+            "GET / HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n",
+        ),
+        owner_no_origin: edge_status(
+            OWNER_UI,
+            &format!(
+                "POST /owner/login/options HTTP/1.1\r\nHost: {OWNER_PUBLIC_HOST}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
         ),
     }
 }
 
-/// Polls [`edge_probe`] until both listeners answer as expected (401,
-/// 200), or 60 s pass; either way, returns the last probe.
+/// Polls [`edge_probe`] until the listeners answer as expected
+/// ([`EdgeProbe::EXPECTED`]), or 60 s pass; either way, returns the last probe.
 fn wait_edge() -> EdgeProbe {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let probe = edge_probe();
-        if probe
-            == (EdgeProbe {
-                mcp: 401,
-                owner_home: 200,
-            })
-            || Instant::now() >= deadline
-        {
+        if probe == EdgeProbe::EXPECTED || Instant::now() >= deadline {
             return probe;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -746,7 +770,11 @@ fn compose_harness_fill_budget_covers_arch_004_and_leaves_other_defaults() {
         cfg.public_ingress.as_ref().unwrap().listen.to_string(),
         PUBLIC_INGRESS
     );
-    assert_eq!(cfg.owner_ui.as_ref().unwrap().listen.to_string(), OWNER_UI);
+    let ui = cfg.owner_ui.as_ref().unwrap();
+    assert_eq!(ui.listen.to_string(), OWNER_UI);
+    assert!(ui.public, "the harness owner UI is in public mode");
+    assert_eq!(ui.origin, OWNER_PUBLIC_ORIGIN);
+    assert_eq!(ui.rp_id, OWNER_PUBLIC_HOST);
 }
 
 #[test]
@@ -807,15 +835,7 @@ fn n1_edge_reaches_both_loopback_listeners_across_kharond_restarts() {
         ]
     );
     for c in &r.edge {
-        assert_eq!(
-            c.probe,
-            EdgeProbe {
-                mcp: 401,
-                owner_home: 200
-            },
-            "edge probe after {}",
-            c.after
-        );
+        assert_eq!(c.probe, EdgeProbe::EXPECTED, "edge probe after {}", c.after);
     }
     for c in &r.edge[1..3] {
         assert_eq!(c.holder_kept, Some(true), "holder replaced by {}", c.after);

@@ -397,7 +397,7 @@ impl TokenStore {
     pub fn token_fingerprint(&self, agent: &str) -> Option<String> {
         self.hashes
             .get(agent)
-            .map(|h| super::revocation::token_fingerprint(&h.to_string()))
+            .map(|h| super::revocation::token_fingerprint(h.as_str()))
     }
 
     /// Verify a presented bearer token; returns the agent id it

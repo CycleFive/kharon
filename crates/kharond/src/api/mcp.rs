@@ -43,9 +43,11 @@
 //!
 //! Order per request: method (405, `Allow: POST`), `Origin` (403 — a
 //! browser page must not drive the broker, MCP's DNS-rebinding rule
-//! taken to its strict form), bearer token (401, the same Argon2id
-//! path and semaphore as `/v1/*`), content type and size (400), then
-//! JSON-RPC. Everything before JSON-RPC answers with the `/v1/*` error
+//! taken to its strict form), the per-IP transport window (429, #200:
+//! charged before auth so bad tokens cost no Argon2id), bearer token
+//! (401, the same Argon2id path and semaphore as `/v1/*`), the
+//! per-agent transport window (429, #200), content type and size
+//! (400; 413 past the caps), then JSON-RPC. Everything before JSON-RPC answers with the `/v1/*` error
 //! body. JSON-RPC protocol errors use fixed messages ([`RpcError`]);
 //! tool errors are results with `isError: true` whose text is the
 //! [`ApiError`] body. No response here interpolates request data,
@@ -75,6 +77,7 @@ use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillArgs, FillOperation, FillTotpArgs, parse_fill};
 use super::grant::{GrantArgs, parse_grant};
 use super::http::{AppState, authenticate, bearer_token, error, json_response};
+use super::transport::ClientIp;
 use crate::lock::Clock;
 use tokio::time::Instant;
 
@@ -92,6 +95,45 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = [
 ];
 /// Largest accepted request body (bytes).
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Deepest accepted JSON nesting in a request body (#200). An
+/// explicit cap, well under `serde_json`'s implicit recursion limit,
+/// so a hostile body cannot spend the parser's stack; excess is 413.
+/// Counted by [`json_depth`], which scans the raw bytes *before* any
+/// JSON parser runs.
+pub const MAX_JSON_DEPTH: usize = 32;
+
+/// The nesting depth of a JSON text: the maximum number of
+/// simultaneously open `[` / `{`, ignoring brackets inside strings
+/// (and their escapes). Malformed input simply yields the depth seen
+/// so far; validity is the parser's call, not this scan's.
+pub fn json_depth(body: &[u8]) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
 /// Server name in `serverInfo`.
 pub const SERVER_NAME: &str = "kharond";
 
@@ -345,6 +387,18 @@ pub fn tool_definitions() -> Value {
     Value::Array(Tool::ALL.into_iter().map(Tool::definition).collect())
 }
 
+/// Every tool name, in [`Tool::ALL`] order — the registry the other
+/// layers validate against (per-agent allow-lists, #200).
+pub const TOOL_NAMES: [&str; 7] = {
+    let mut names = [""; 7];
+    let mut i = 0;
+    while i < Tool::ALL.len() {
+        names[i] = Tool::ALL[i].name();
+        i += 1;
+    }
+    names
+};
+
 // ------------------------------------------------------------- JSON-RPC
 
 /// JSON-RPC errors this server sends. Messages are literals.
@@ -586,6 +640,7 @@ async fn rpc<S, C>(
     headers: &HeaderMap,
     body: &[u8],
     received: Instant,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Reply
 where
     S: VaultView,
@@ -713,7 +768,13 @@ where
             id,
             era,
             object(json!({
-                "tools": tool_definitions(),
+                // Scope-filtered (#200): an agent with an allow-list
+                // sees only its tools. Unrestricted agents get the
+                // full registry (the mcp-tools.json snapshot).
+                "tools": Tool::ALL.into_iter()
+                    .filter(|t| broker.tool_allowed(agent, t.name()))
+                    .map(Tool::definition)
+                    .collect::<Vec<_>>(),
                 "ttlMs": CACHE_TTL_MS,
                 "cacheScope": "public",
             })),
@@ -730,23 +791,27 @@ where
                     .and_then(|pairs| {
                         parse_request(op, pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     })
-                    .and_then(|r| broker.dispatch(agent, r)),
+                    .and_then(|r| broker.dispatch_from(agent, r, client_ip)),
                 (None, Some(op)) => {
                     match fill_arguments(call.arguments).and_then(|raw| parse_fill(op, raw)) {
-                        Ok(r) => broker.fill(agent, r, received).await,
+                        Ok(r) => broker.fill_from(agent, r, received, client_ip).await,
                         Err(e) => Err(e),
                     }
                 }
                 (None, None) => match tool {
                     Tool::Context => {
                         match fill_arguments(call.arguments).and_then(parse_context_body) {
-                            Ok(()) => broker.context(agent, received).await,
+                            Ok(()) => broker.context_from(agent, received, client_ip).await,
                             Err(e) => Err(e),
                         }
                     }
                     Tool::RequestGrant => {
                         match fill_arguments(call.arguments).and_then(parse_grant) {
-                            Ok(r) => broker.request_grant(agent, r, received).await,
+                            Ok(r) => {
+                                broker
+                                    .request_grant_from(agent, r, received, client_ip)
+                                    .await
+                            }
                             Err(e) => Err(e),
                         }
                     }
@@ -795,19 +860,45 @@ where
             Detail::BrowserOriginRefused,
         ));
     }
+    // Transport budgets (#200): the per-IP window is charged before
+    // auth, so a bad-token flood is refused before it costs an
+    // Argon2id evaluation; the per-agent window after. The client IP
+    // is the admitting listener's call (see api::transport's
+    // contract); a handler invoked without one skips the IP window.
+    let client_ip = req.extensions().get::<ClientIp>().map(|c| c.0);
+    if let Some(ip) = client_ip
+        && !state.broker.transport_ip_admit(ip, received)
+    {
+        return error(ApiError::RATE_LIMITED);
+    }
     let token = bearer_token(&req);
     let (parts, body) = req.into_parts();
     let agent = match authenticate(&state, token).await {
         Ok(a) => a,
         Err(e) => return error(e),
     };
+    if !state.broker.transport_agent_admit(&agent, received) {
+        return error(ApiError::RATE_LIMITED);
+    }
     if !is_json(&parts.headers) {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
     }
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
-    match rpc(&state.broker, &agent, &parts.headers, &bytes, received).await {
+    if json_depth(&bytes) > MAX_JSON_DEPTH {
+        return error(ApiError::JSON_TOO_DEEP);
+    }
+    match rpc(
+        &state.broker,
+        &agent,
+        &parts.headers,
+        &bytes,
+        received,
+        client_ip,
+    )
+    .await
+    {
         Reply::Accepted => Response::builder()
             .status(StatusCode::ACCEPTED)
             .body(axum::body::Body::empty())
@@ -826,6 +917,18 @@ mod tests {
         assert!(!is_version_shaped("2026-07-2x"));
         assert!(!is_version_shaped("2026-07-288"));
         assert!(!is_version_shaped("hunter2hun"));
+    }
+
+    #[test]
+    fn json_depth_counts_nesting_not_string_brackets() {
+        assert_eq!(json_depth(b"{}"), 1);
+        assert_eq!(json_depth(b"42"), 0);
+        assert_eq!(json_depth(b"[[[{}]]]"), 4);
+        assert_eq!(json_depth(br#"{"a":"[[[{"}"#), 1);
+        assert_eq!(json_depth(br#"{"a":"\"[[["}"#), 1);
+        assert_eq!(json_depth(b"[[[]"), 3, "malformed input still scans");
+        let deep = "[".repeat(MAX_JSON_DEPTH + 1);
+        assert_eq!(json_depth(deep.as_bytes()), MAX_JSON_DEPTH + 1);
     }
 
     #[test]

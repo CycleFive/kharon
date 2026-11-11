@@ -714,7 +714,9 @@ impl OwnerUi {
                 None,
             ),
             Err(e) => {
-                if e == crate::owner::OwnerFailure::UnlockFailed {
+                // A scope refusal is audited exactly like a wrong
+                // password; only the owner-facing code differs (#243).
+                if e.is_auth_failure() {
                     self.audit.auth_failed("unlock_failed");
                 }
                 respond(unlock_status(&e), e.code(), None)
@@ -1115,7 +1117,7 @@ struct UnlockBody {
 fn unlock_status(e: &crate::owner::OwnerFailure) -> StatusCode {
     use crate::owner::OwnerFailure as F;
     match e {
-        F::UnlockFailed => StatusCode::BAD_REQUEST,
+        F::UnlockFailed | F::ScopeTooBroad => StatusCode::BAD_REQUEST,
         F::AlreadyUnlocked => StatusCode::CONFLICT,
         F::MlockUnavailable | F::ProcessDumpable | F::AuditFailed => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1768,7 +1770,11 @@ document.getElementById("unlock").addEventListener("submit", async (ev) => {
   if (!r.ok) {
     let code = "error";
     try { code = (await r.json()).error || code; } catch (e) {}
-    err.textContent = "Not done: " + code;
+    // #243: the one refusal the owner can fix gets its hint (the
+    // same text as owner::SCOPE_TOO_BROAD_HINT, pinned by a test).
+    err.textContent = code === "scope_too_broad"
+      ? "Not done: scope_too_broad: the kharon account can see items or organizations outside its kharon organization (personal-vault items count). Move or delete them in Bitwarden, then unlock again."
+      : "Not done: " + code;
     return;
   }
   setLocked(false);
@@ -1947,6 +1953,10 @@ mod tests {
             self.seen.lock().unwrap().push(password.to_string());
             if self.already.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(crate::owner::OwnerFailure::AlreadyUnlocked);
+            }
+            // #243: the account's scope is too broad (REQ-CRY-008).
+            if password.as_str() == "scope" {
+                return Err(crate::owner::OwnerFailure::ScopeTooBroad);
             }
             if password.as_str() == "right horse" {
                 Ok(())
@@ -2744,6 +2754,23 @@ mod tests {
         );
         assert_eq!(*rig.audit.0.lock().unwrap(), ["unlock_failed"]);
         assert_eq!(unlock.seen.lock().unwrap().len(), 1);
+    }
+
+    /// #243: a scope refusal reaches the owner as its own code (and
+    /// the page carries the hint for it), while the audit still
+    /// records `unlock_failed`, as for a wrong password.
+    #[test]
+    fn unlock_scope_refusal_is_named_for_the_owner_and_audited_as_before() {
+        let (rig, _unlock) = ApprovalsRig::with_unlock();
+        let (id, key) = rig.begin();
+        let (status, out) = rig.post("/owner/unlock", &ApprovalsRig::sealed(&id, &key, "scope"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out.contains("\"error\":\"scope_too_broad\""), "{out}");
+        assert_eq!(*rig.audit.0.lock().unwrap(), ["unlock_failed"]);
+        assert!(
+            SHELL_PAGE.contains(crate::owner::SCOPE_TOO_BROAD_HINT),
+            "the unlock page shows the hint for scope_too_broad"
+        );
     }
 
     #[test]

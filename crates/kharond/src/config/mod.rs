@@ -717,6 +717,11 @@ pub struct AgentConfig {
     /// Argon2id PHC hash of the path-B tunnel credential. Set only when
     /// `cdp.via = agent_connector`. Not an agent API token.
     pub connector_token_hash: Option<Redacted<String>>,
+    /// Tool allow-list (#200): the MCP tool names this agent's token
+    /// may call (`kharon_status`, `kharon_fill`, …). `None` = every
+    /// tool. Validated against the tool registry when the daemon
+    /// builds the token store, not here.
+    pub tools: Option<Vec<String>>,
     /// Validated CDP endpoint (REQ-ARCH-002).
     pub cdp: CdpEndpoint,
 }

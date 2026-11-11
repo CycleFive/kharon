@@ -126,6 +126,8 @@ struct RawAgent {
     token_hash: String,
     #[serde(default)]
     connector_token_hash: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
     cdp: RawCdp,
 }
 
@@ -724,6 +726,7 @@ fn validate_agent(id: &str, a: RawAgent) -> Result<AgentConfig, ConfigError> {
     Ok(AgentConfig {
         token_hash: Redacted::new(a.token_hash),
         connector_token_hash,
+        tools: a.tools,
         cdp,
     })
 }

@@ -41,9 +41,11 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
+use axum::serve::IncomingStream;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
@@ -59,6 +61,7 @@ use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillOperation, parse_fill};
 use super::grant::{ApprovalPrompt, parse_grant};
 use super::mcp::{MAX_BODY_BYTES, is_json};
+use super::transport::ClientIp;
 use crate::lock::Clock;
 
 /// The OpenAPI 3.1 document for this transport.
@@ -84,6 +87,24 @@ impl<S: VaultView, C: Clock> AppState<S, C> {
     }
 }
 
+/// The TCP peer of an `[api]` connection: the client itself (the
+/// tailnet authenticates the path). Mirrors the one in
+/// [`super::public`]; the two listeners name their own peers.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Peer(std::net::SocketAddr);
+
+impl Connected<IncomingStream<'_, TcpListener>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
 /// The `/v1` router over `broker`.
 pub fn router<S, C>(broker: Arc<Broker<S, C>>) -> Router
 where
@@ -101,7 +122,11 @@ where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
-    axum::serve(listener, router(broker)).await
+    axum::serve(
+        listener,
+        router(broker).into_make_service_with_connect_info::<Peer>(),
+    )
+    .await
 }
 
 /// [`serve`], returning once `shutdown` resolves and in-flight
@@ -116,9 +141,12 @@ where
     C: Clock + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, router(broker))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        router(broker).into_make_service_with_connect_info::<Peer>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// Path B agent API (REQ-DEP-006): the same router over TLS. Plain HTTP
@@ -134,9 +162,12 @@ where
     C: Clock + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(TlsListener::new(listener, tls), router(broker))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        TlsListener::new(listener, tls),
+        router(broker).into_make_service_with_connect_info::<Peer>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// TCP listener that completes a TLS handshake before axum sees the stream.
@@ -278,11 +309,19 @@ pub const CONTEXT_PATH: &str = "/v1/context";
 /// `POST /v1/grants` (#20).
 pub const GRANTS_PATH: &str = "/v1/grants";
 
-async fn handle<S, C>(State(state): State<Arc<AppState<S, C>>>, req: Request) -> Response
+async fn handle<S, C>(
+    State(state): State<Arc<AppState<S, C>>>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
+    mut req: Request,
+) -> Response
 where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
+    // This listener's peer is the client (#200). CF-Connecting-IP is
+    // honoured only on [public_ingress]; here a spoofed header is
+    // ignored by construction — the extension is the peer, full stop.
+    req.extensions_mut().insert(ClientIp(peer.ip()));
     let received = Instant::now();
     let route = match req.uri().path() {
         "/v1/status" => Route::Status,
@@ -311,6 +350,7 @@ where
     // `!Send`.
     let token = bearer_token(&req);
     let query = req.uri().query().map(str::to_owned);
+    let client_ip = req.extensions().get::<ClientIp>().map(|c| c.0);
     drop(req);
     let agent = match authenticate(&state, token).await {
         Ok(a) => a,
@@ -322,7 +362,7 @@ where
         Route::OpenApi => unreachable!("handled above"),
     };
     let api_req = parse_query(op, query.as_deref().unwrap_or(""));
-    let outcome = api_req.and_then(|r| state.broker.dispatch(&agent, r));
+    let outcome = api_req.and_then(|r| state.broker.dispatch_from(&agent, r, client_ip));
     match outcome {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
@@ -357,16 +397,21 @@ where
     if !is_json(&parts.headers) {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
     }
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
     let fill_req = match parse_fill(op, &bytes) {
         Ok(r) => r,
         Err(e) => return error(e),
     };
     drop(bytes);
-    match state.broker.fill(&agent, fill_req, received).await {
+    match state
+        .broker
+        .fill_from(&agent, fill_req, received, client_ip)
+        .await
+    {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
     }
@@ -397,9 +442,10 @@ where
         Err(e) => return error(e),
     };
     let json = is_json(&parts.headers);
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
     if !bytes.is_empty() && !json {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
@@ -407,7 +453,7 @@ where
     if let Err(e) = parse_context_body(&bytes) {
         return error(e);
     }
-    match state.broker.context(&agent, received).await {
+    match state.broker.context_from(&agent, received, client_ip).await {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
     }
@@ -547,9 +593,10 @@ where
     if !is_json(&parts.headers) {
         return error(ApiError::bad_request(Detail::UnsupportedContentType));
     }
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
     drop(parts);
     let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error(ApiError::bad_request(Detail::BodyTooLarge));
+        return error(ApiError::BODY_TOO_LARGE);
     };
     let grant_req = match parse_grant(&bytes) {
         Ok(r) => r,
@@ -558,7 +605,7 @@ where
     drop(bytes);
     match state
         .broker
-        .request_grant(&agent, grant_req, received)
+        .request_grant_from(&agent, grant_req, received, client_ip)
         .await
     {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),

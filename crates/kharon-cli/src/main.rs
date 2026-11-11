@@ -603,13 +603,26 @@ fn owner_command(command: &Command) -> ExitCode {
         }
         Ok(reply) => {
             let code = reply["error"].as_str().unwrap_or("unknown");
-            eprintln!("kharon: daemon refused [{code}]");
+            eprintln!("{}", refusal_line(code));
             ExitCode::FAILURE
         }
         Err(e) => {
             eprintln!("kharon: {e}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// The stderr line for a daemon refusal: the fixed code, plus a hint
+/// for the codes the owner can act on (#243). The code comes from the
+/// daemon's fixed set, never from a peer.
+fn refusal_line(code: &str) -> String {
+    match code {
+        "scope_too_broad" => format!(
+            "kharon: daemon refused [{code}]: {}",
+            kharond::owner::SCOPE_TOO_BROAD_HINT
+        ),
+        _ => format!("kharon: daemon refused [{code}]"),
     }
 }
 
@@ -907,6 +920,24 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn scope_refusal_line_carries_the_owner_hint_other_codes_do_not() {
+        let line = refusal_line("scope_too_broad");
+        assert!(
+            line.starts_with("kharon: daemon refused [scope_too_broad]: "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(kharond::owner::SCOPE_TOO_BROAD_HINT),
+            "{line}"
+        );
+        assert_eq!(
+            refusal_line("unlock_failed"),
+            "kharon: daemon refused [unlock_failed]",
+            "a wrong password gets no hint: it stays indistinguishable"
+        );
+    }
 
     #[test]
     fn req_dep_007_master_password_has_at_least_128_bits() {

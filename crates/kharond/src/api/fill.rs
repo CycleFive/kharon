@@ -59,6 +59,16 @@ pub enum FillOperation {
     FillTotp,
 }
 
+impl FillOperation {
+    /// The MCP tool that runs this operation (allow-lists, #200).
+    pub const fn tool_name(self) -> &'static str {
+        match self {
+            Self::Fill => "kharon_fill",
+            Self::FillTotp => "kharon_fill_totp",
+        }
+    }
+}
+
 // ------------------------------------------------------------ wire types
 
 /// SPEC §4 `FillRequest`: the `POST /v1/fill` body and the

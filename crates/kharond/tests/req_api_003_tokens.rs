@@ -117,7 +117,7 @@ fn req_api_003_token_store_has_no_plaintext_token() {
 
     // And the stored hash is what authenticates the token.
     let config = Config::load(&path).unwrap();
-    let store = TokenStore::from_agents(&config.agents).unwrap();
+    let store = TokenStore::from_agents(&config.agents, &kharond::api::mcp::TOOL_NAMES).unwrap();
     assert_eq!(store.authenticate(&token).unwrap(), "assistant");
     assert!(
         store

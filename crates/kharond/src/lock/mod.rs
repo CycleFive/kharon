@@ -4,9 +4,14 @@
 //! The broker boots locked and stays locked until the owner unlocks
 //! it (REQ-MEM-005). [`LockController`] owns the one unlocked
 //! session — the key material produced by an unlock — and the two
-//! timers that end it: idle (default 30m since the last activity)
-//! and absolute (default 12h since unlock) (REQ-MEM-004). The
-//! timers are enforced at the fill gate itself
+//! timers that end it: idle (default 30m since the last owner
+//! unlock, fill, or grant-issuing approval) and absolute (default
+//! 12h since unlock) (REQ-MEM-004, #215). Agent-only traffic does
+//! not reset the idle timer. A live grant
+//! ([`LockController::hold_idle_for_grant`]) defers the idle lock
+//! until that grant is consumed or its own TTL elapses, and no
+//! longer; an explicit lock, panic, and the absolute timer are not
+//! deferred. The timers are enforced at the fill gate itself
 //! ([`LockController::require_unlocked`]), not only by
 //! [`LockController::poll`]: an expired session is locked before it
 //! can be handed out, and activity can never revive one (review
@@ -113,7 +118,8 @@ pub use hardening::{
 /// config via [`LockPolicy::from`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockPolicy {
-    /// Lock after this much time with no fill activity.
+    /// Lock after this much time with no unlock, fill, or
+    /// grant-issue activity (REQ-MEM-004, #215).
     pub idle_lock: Duration,
     /// Lock this long after unlock, however active.
     pub max_unlocked: Duration,
@@ -163,7 +169,8 @@ pub struct AuditError;
 pub enum LockReason {
     /// Owner action (`kharon lock`, web UI, `kharon panic`).
     Manual,
-    /// No fill activity for `idle_lock` (REQ-MEM-004).
+    /// No unlock, fill, or grant-issue activity for `idle_lock`,
+    /// and no live grant is deferring it (REQ-MEM-004, #215).
     IdleTimeout,
     /// `max_unlocked` elapsed since unlock (REQ-MEM-004).
     AbsoluteTimeout,
@@ -313,6 +320,14 @@ struct Unlocked<S> {
     last_activity_at: Duration,
 }
 
+/// An issued grant that defers the idle lock until `expires_at`
+/// (REQ-MEM-004, #215). `expires_at` is a reading of the
+/// controller's own clock, the same timeline as the grant TTL.
+struct IdleHold {
+    grant_id: String,
+    expires_at: Duration,
+}
+
 /// The audit sink signature: fallible, so REQ-AUD-003's fail-closed
 /// rule can be enforced at the transitions it governs.
 type EventSink = Box<dyn FnMut(LockEvent) -> Result<(), AuditError> + Send>;
@@ -335,6 +350,11 @@ pub struct LockController<S: ZeroizeOnDrop, C: Clock = SystemClock> {
     unlocked: Option<Unlocked<S>>,
     sink: Option<EventSink>,
     lock_hook: Option<LockHook>,
+    /// Live grants whose TTL defers the idle lock (#215). Survives a
+    /// lock: grants do too (REQ-MEM-007), and a re-unlock still
+    /// defers while one of them is unconsumed and unexpired. Panic
+    /// and revocation clear the entries whose grants are gone.
+    idle_holds: Vec<IdleHold>,
 }
 
 impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
@@ -348,6 +368,7 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
             unlocked: None,
             sink: None,
             lock_hook: None,
+            idle_holds: Vec::new(),
         }
     }
 
@@ -409,11 +430,52 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
         let now = self.clock.now();
         if now.saturating_sub(u.unlocked_at) >= self.policy.max_unlocked {
             Some(LockReason::AbsoluteTimeout)
-        } else if now.saturating_sub(u.last_activity_at) >= self.policy.idle_lock {
+        } else if now.saturating_sub(u.last_activity_at) >= self.policy.idle_lock
+            && !self.idle_deferred(now)
+        {
             Some(LockReason::IdleTimeout)
         } else {
             None
         }
+    }
+
+    /// Whether a recorded grant still defers the idle lock at `now`.
+    /// A hold matches only while `now < expires_at`, the same bound
+    /// as [`crate::api::grant::Grant::is_live`], so the deferral ends
+    /// at the grant's own TTL and never runs past it (#215).
+    fn idle_deferred(&self, now: Duration) -> bool {
+        self.idle_holds.iter().any(|h| now < h.expires_at)
+    }
+
+    /// Defer the idle lock until `expires_at` for `grant_id`
+    /// (REQ-MEM-004, #215). `expires_at` is a reading of this
+    /// controller's clock. Re-recording the same id replaces the
+    /// deadline. The absolute timer, [`Self::lock`], and panic do
+    /// not consult holds. A hold does not revive a session that has
+    /// already locked.
+    pub(crate) fn hold_idle_for_grant(&mut self, grant_id: &str, expires_at: Duration) {
+        if let Some(h) = self.idle_holds.iter_mut().find(|h| h.grant_id == grant_id) {
+            h.expires_at = expires_at;
+        } else {
+            self.idle_holds.push(IdleHold {
+                grant_id: grant_id.to_owned(),
+                expires_at,
+            });
+        }
+    }
+
+    /// Drop the idle deferral for `grant_id` (consumed, revoked, or
+    /// rolled back). An idle timeout that has already elapsed then
+    /// locks on the next check.
+    pub(crate) fn release_idle_hold(&mut self, grant_id: &str) {
+        self.idle_holds.retain(|h| h.grant_id != grant_id);
+    }
+
+    /// Drop every idle deferral. Panic does this after revoking
+    /// every grant, so a later unlock is not deferred by a grant
+    /// that no longer exists.
+    pub(crate) fn clear_idle_holds(&mut self) {
+        self.idle_holds.clear();
     }
 
     /// Attempt to unlock. See the module docs for the ordering:
@@ -474,11 +536,15 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
         Ok(())
     }
 
-    /// Record fill activity: resets the idle timer (REQ-MEM-004).
-    /// A no-op while locked — and a no-op that *locks* on an
-    /// already-expired session: activity arriving after the idle or
-    /// absolute deadline must not revive the unlock (review #50,
-    /// blocking item 1).
+    /// Record activity that resets the idle timer (REQ-MEM-004,
+    /// #215): a fill, or the owner approval that issues a grant.
+    /// Unlock resets the same timer by starting it
+    /// ([`Self::unlock`]). A no-op while locked — and a no-op that
+    /// *locks* on an already-expired session: activity arriving
+    /// after the idle or absolute deadline must not revive the
+    /// unlock (review #50, blocking item 1). A live grant hold means
+    /// the idle deadline has not elapsed, so activity during the
+    /// hold still resets the timer.
     pub fn touch_activity(&mut self) {
         if let Some(reason) = self.expiry_reason() {
             self.lock(reason);
@@ -568,7 +634,8 @@ impl<S: ZeroizeOnDrop, C: Clock> LockController<S, C> {
     /// unlocked session in place). Runs the same expiry check as
     /// [`Self::require_unlocked`] first, so an expired session is
     /// locked rather than refreshed. It is **not** activity: a sync
-    /// never resets the idle timer (REQ-MEM-004 counts fills only).
+    /// never resets the idle timer (REQ-MEM-004, #215: a sync is not
+    /// an unlock, a fill, or a grant-issuing approval).
     pub fn with_session_mut<R>(&mut self, f: impl FnOnce(&mut S) -> R) -> Result<R, LockedError> {
         if let Some(reason) = self.expiry_reason() {
             self.lock(reason);

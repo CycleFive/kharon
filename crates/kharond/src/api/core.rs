@@ -481,7 +481,7 @@ fn dropped_request_entry(req: &GrantRequest, detail: &'static str) -> Entry {
 /// is appended best effort: the request is already gone, so there is
 /// nobody to fail, and a lost append leaves the orphan `fill_dispatch`
 /// for the verifier.
-struct DispatchGuard<'b> {
+struct DispatchGuard<'b, S: VaultView, C: Clock> {
     plan: FillPlan,
     plan_wiped: Option<&'b PlanWipedHook>,
     audit: &'b Arc<Mutex<Box<dyn AuditSink>>>,
@@ -489,19 +489,40 @@ struct DispatchGuard<'b> {
     /// The grant store and the grant whose use this fill spent at
     /// admission (REQ-APR-008).
     grants: &'b Mutex<GrantStore>,
+    /// Restores the idle deferral when the use comes back (#215).
+    /// Taken only after the store guard drops.
+    lock: &'b Mutex<LockController<S, C>>,
+    grant_clock: &'b dyn Clock,
     grant_id: String,
 }
 
-impl Drop for DispatchGuard<'_> {
+impl<S: VaultView, C: Clock> Drop for DispatchGuard<'_, S, C> {
     fn drop(&mut self) {
         // REQ-APR-008 (#151): every way a fill ends passes through
         // here (outcome, deadline before dispatch, dropped handler).
-        // If no field value ever left the broker, the use comes back.
+        // If no field value ever left the broker, the use comes back,
+        // and the grant defers the idle lock again (#215). The store
+        // guard is dropped before the controller is taken: fill
+        // admission holds them in the other order.
         if !self.plan.values_sent.get() {
-            self.grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .refund(&self.grant_id);
+            let restored = {
+                let mut store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+                if store.refund(&self.grant_id) {
+                    let now = self.grant_clock.now();
+                    store
+                        .grant(&self.grant_id)
+                        .filter(|g| g.is_live(now))
+                        .map(|g| g.expires_at)
+                } else {
+                    None
+                }
+            };
+            if let Some(expires_at) = restored {
+                self.lock
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .hold_idle_for_grant(&self.grant_id, expires_at);
+            }
         }
         for f in &mut self.plan.fields {
             f.value.zeroize();
@@ -935,8 +956,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let result = {
             let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
             // The gate (`require_unlocked` is the only way to get
-            // `&S`, #54): it enforces the timers. Listing
-            // is not fill activity, so it does not touch the idle timer.
+            // `&S`, #54): it enforces the timers. Listing is not
+            // idle activity (REQ-MEM-004, #215), so it does not
+            // touch the timer.
             lock.require_unlocked().map(|session| {
                 session
                     .vault()
@@ -1134,6 +1156,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     audit: &self.audit,
                     abort_entry: None,
                     grants: &self.grants,
+                    lock: &self.lock,
+                    grant_clock: self.grant_clock.as_ref(),
                     grant_id: grant_id.clone(),
                 };
                 // #118: the engine converts what remains of this
@@ -1552,6 +1576,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// the request is pending again and no grant exists
     /// (REQ-AUD-003 fail-closed, as for unlock).
     ///
+    /// The approval is idle activity (REQ-MEM-004, #215): on success
+    /// it resets the idle timer, and the issued grant defers the
+    /// idle lock until it is consumed or its own TTL elapses. An
+    /// already-expired session is locked by the poll below and is
+    /// not revived (review #50); the grant is still issued, and the
+    /// deferral applies to the next unlock. The hold is recorded
+    /// before the append returns, while this call still holds the
+    /// controller, so a poll cannot idle-lock in the gap between
+    /// the grant existing and the reset.
+    ///
     /// #193: the grant must not be *usable* before that entry is
     /// durable, not merely unreported. The grant-store lock is
     /// therefore held across the append: every consuming path
@@ -1561,11 +1595,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// append is in flight — it waits, and then sees the grant
     /// only if the append succeeded (on failure the rollback also
     /// runs under the lock, so it never sees a grant at all). The
-    /// append itself only takes the audit lock, so holding the
-    /// store across it cannot deadlock. The REQ-REV-004 revision
-    /// is read *before* the store lock is taken, because the fill
-    /// paths take the lock controller before the grant store —
-    /// taking them in the opposite order here would invert that.
+    /// append itself only takes the audit lock. The controller is
+    /// held across the same append, taken *before* the store: that
+    /// is the fill path's order (controller, then store, then
+    /// audit), so the two locks cannot deadlock. The REQ-REV-004
+    /// revision is read under that controller hold, before the
+    /// store lock.
     pub fn approve_grant_request(
         &self,
         request_id: &str,
@@ -1578,21 +1613,26 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // approval fails closed with it.
         self.expire_grant_requests()?;
         let now = self.grant_now();
-        // REQ-REV-004: pin the item revision at issuance. Read it
-        // before the grant store is locked (see above); the terms'
+        // Held across the store and the append (see the doc comment).
+        // Poll first: an idle or absolute timeout that has already
+        // elapsed locks here, and the approval below does not revive
+        // it (#50). A live grant from an earlier approval still
+        // defers that idle check.
+        let mut ctrl = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        ctrl.poll();
+        let session_open = !ctrl.is_locked();
+        // REQ-REV-004: pin the item revision at issuance. The terms'
         // item scope is the grant's scope once issued, and an
         // item-scoped grant for a different item than the request's
         // is refused by the store, so this is the revision the
         // issued grant would have pinned.
         let pinned_revision = match &terms.scope {
-            GrantScope::Item(item_id) => {
-                let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-                lock.require_unlocked()
-                    .ok()
-                    .and_then(|s| s.vault().get(item_id).ok())
-                    .and_then(|i| i.revision().map(str::to_owned))
-            }
-            GrantScope::Collection(_) => None,
+            GrantScope::Item(item_id) if session_open => ctrl
+                .require_unlocked()
+                .ok()
+                .and_then(|s| s.vault().get(item_id).ok())
+                .and_then(|i| i.revision().map(str::to_owned)),
+            _ => None,
         };
         let mut store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
         let grant = store.approve(request_id, terms, channel, now)?;
@@ -1600,6 +1640,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             store.pin_revision(&grant.id, pinned_revision);
         }
         let grant = store.grant(&grant.id).cloned().unwrap_or(grant);
+        // Before the store lock can drop, and before the append
+        // returns: a poll on another thread cannot observe the grant
+        // without this hold, because it needs the controller we hold.
+        ctrl.hold_idle_for_grant(&grant.id, grant.expires_at);
         let entry = Entry::new(Event::GrantIssue)
             .agent_id(grant.agent_id.clone())
             .grant_id(grant.id.clone())
@@ -1616,7 +1660,15 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // failure, after the rollback has removed it again.
         if self.append(entry).is_err() {
             store.rollback_approval(request_id, &grant.id);
+            ctrl.release_idle_hold(&grant.id);
             return Err(GrantError::AuditFailed);
+        }
+        // The grant exists. Reset the idle timer from this approval.
+        // Skipped when the opening poll locked an already-expired
+        // session: touch on a locked controller is a no-op, and the
+        // hold above waits for the next unlock.
+        if !ctrl.is_locked() {
+            ctrl.touch_activity();
         }
         Ok(grant.view(now))
     }
@@ -1768,6 +1820,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// `channel` that asked); an audit failure restores the grant.
     /// `false` when no such grant exists.
     pub fn revoke_grant(&self, grant_id: &str, channel: Channel) -> Result<bool, GrantError> {
+        // Controller before the store: the fill path's order. The
+        // idle hold drops in the same hold as the revoke, so a poll
+        // cannot keep deferring for a grant that is already gone.
+        let mut ctrl = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let Some(grant) = self
             .grants
             .lock()
@@ -1781,6 +1837,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .revoke(grant_id);
+        ctrl.release_idle_hold(grant_id);
         let entry = Entry::new(Event::GrantRevoke)
             .agent_id(grant.agent_id.clone())
             .grant_id(grant.id.clone())
@@ -1794,7 +1851,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             self.grants
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .restore_grant(grant);
+                .restore_grant(grant.clone());
+            ctrl.hold_idle_for_grant(&grant.id, grant.expires_at);
             return Err(GrantError::AuditFailed);
         }
         Ok(true)
@@ -1812,11 +1870,15 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// `grant_request` denial (detail `agent_revoked`) per dropped
     /// pending request (#196).
     pub fn revoke_agent(&self, agent_id: &str) -> Result<usize, GrantError> {
+        let mut ctrl = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let removed = self
             .grants
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .revoke_agent(agent_id);
+        for grant in &removed.grants {
+            ctrl.release_idle_hold(&grant.id);
+        }
         self.rates
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1833,11 +1895,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             };
             if self.append(entry).is_err() {
                 // Best-effort restore of this one grant; the agent
-                // stays revoked (fail closed on the token).
+                // stays revoked (fail closed on the token). The idle
+                // hold comes back with it (#215).
                 self.grants
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .restore_grant(grant.clone());
+                ctrl.hold_idle_for_grant(&grant.id, grant.expires_at);
                 return Err(GrantError::AuditFailed);
             }
         }
@@ -1933,7 +1997,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     fn lock_audited(&self, reason: LockReason) {
         let transitioned = {
             let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-            lock.lock(reason)
+            let transitioned = lock.lock(reason);
+            // Panic revokes every grant before this lock. Drop the
+            // idle holds with the session, or the next unlock would
+            // defer for grants that no longer exist (#215).
+            if matches!(reason, LockReason::Panic) {
+                lock.clear_idle_holds();
+            }
+            transitioned
         };
         if !transitioned && matches!(reason, LockReason::Panic | LockReason::RollbackDetected) {
             let _ = self.append(reason.audit_entry());
@@ -1968,12 +2039,25 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// Invalidate per-item grants whose item is gone or whose pinned
     /// revision no longer matches (REQ-REV-003). Audited per grant.
     pub fn invalidate_grants_for_vault(&self, vault: &Vault) -> Result<usize, GrantError> {
+        let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.invalidate_grants_with(&mut lock, vault)
+    }
+
+    /// [`Self::invalidate_grants_for_vault`] for a caller that already
+    /// holds the controller (the live-sync task). Taking it again
+    /// would deadlock. Removed grants drop their idle holds on `lock`.
+    pub(crate) fn invalidate_grants_with(
+        &self,
+        lock: &mut crate::lock::LockController<S, C>,
+        vault: &Vault,
+    ) -> Result<usize, GrantError> {
         let removed = self
             .grants
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .invalidate_for_vault(vault);
         for grant in &removed {
+            lock.release_idle_hold(&grant.id);
             let entry = Entry::new(Event::GrantRevoke)
                 .agent_id(grant.agent_id.clone())
                 .grant_id(grant.id.clone())
@@ -2058,7 +2142,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// the reply. A dropped handler appends `aborted`/`handler_dropped`
     /// best effort. A refusal before the browser (no backend for the
     /// agent, expired before dispatch) writes only the outcome entry.
-    /// Not fill activity: does not reset the idle timer.
+    /// Not idle activity (REQ-MEM-004, #215): does not reset the
+    /// timer. Tab navigation never reaches the broker, so it cannot
+    /// reset the timer either.
     pub async fn context(&self, agent: &AgentId, received: Instant) -> Result<Outcome, ApiError> {
         self.context_from(agent, received, None).await
     }
@@ -2284,8 +2370,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         req: &FillRequest,
     ) -> Result<(FillPlan, u64, String), Unresolved> {
         let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-        // The fill gate first (REQ-MEM-007), then fill activity resets
-        // the idle timer (REQ-MEM-004; a no-op that locks if expired).
+        // The fill gate first (REQ-MEM-007), then a fill resets the
+        // idle timer (REQ-MEM-004, #215; a no-op that locks if the
+        // session is already expired).
         if lock.require_unlocked().is_err() {
             return Err(Unresolved::Locked);
         }
@@ -2338,7 +2425,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             FillOperation::FillTotp => GrantAction::Totp,
         };
         let now = self.grant_now();
-        let admitted = {
+        // `(grant id, spent)`. `spent` means this admission used the
+        // grant's last use, so its idle hold has to drop. The drop
+        // happens after `item` (borrowed from the session inside
+        // `lock`) is no longer in use: releasing it here would borrow
+        // `lock` mutably while that session borrow is still live.
+        let (admitted, spent) = {
             let mut store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
             match &req.grant_id {
                 Some(gid) => {
@@ -2356,7 +2448,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     if !ok {
                         return refuse(FillStatus::GrantDenied);
                     }
-                    gid.clone()
+                    let spent = !store.grant(gid).is_some_and(|g| g.is_live(now));
+                    (gid.clone(), spent)
                 }
                 None => {
                     let rev = item.revision();
@@ -2378,7 +2471,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                         Some(gid) => {
                             let consumed = store.consume(&gid, now);
                             debug_assert!(consumed);
-                            gid
+                            let spent = !store.grant(&gid).is_some_and(|g| g.is_live(now));
+                            (gid, spent)
                         }
                         None => {
                             // A live grant that fails only on revision
@@ -2404,50 +2498,68 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             }
         };
 
-        let decrypt_all = || -> Result<Vec<FieldFill>, Unresolved> {
-            let decrypt_failed = Unresolved::Refused(FillStatus::DecryptFailed);
-            let mut fields = Vec::with_capacity(req.fields.len());
-            for (kind, selector) in &req.fields {
-                let value = match kind {
-                    FieldKind::Username => {
-                        Zeroizing::new(item.username().unwrap_or_default().to_owned())
-                    }
-                    FieldKind::Password => {
-                        match session.decrypt_secret(&req.item_id, SecretField::Password) {
-                            Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
-                            Err(_) => return Err(decrypt_failed),
+        let decrypted = {
+            let decrypt_all = || -> Result<Vec<FieldFill>, Unresolved> {
+                let decrypt_failed = Unresolved::Refused(FillStatus::DecryptFailed);
+                let mut fields = Vec::with_capacity(req.fields.len());
+                for (kind, selector) in &req.fields {
+                    let value = match kind {
+                        FieldKind::Username => {
+                            Zeroizing::new(item.username().unwrap_or_default().to_owned())
                         }
-                    }
-                    FieldKind::Totp => {
-                        let mut seed = match session.decrypt_secret(&req.item_id, SecretField::Totp)
-                        {
-                            Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
-                            Err(_) => return Err(decrypt_failed),
-                        };
-                        let seed = Secret::new(std::mem::take(&mut *seed));
-                        totp_code(&self.clock_skew, seed, SystemTime::now())
-                            .map_err(|o| Unresolved::Refused(FillStatus::Engine(o)))?
-                    }
-                };
-                fields.push(FieldFill {
-                    kind: *kind,
-                    selector: selector.clone(),
-                    value,
-                });
-            }
-            Ok(fields)
+                        FieldKind::Password => {
+                            match session.decrypt_secret(&req.item_id, SecretField::Password) {
+                                Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
+                                Err(_) => return Err(decrypt_failed),
+                            }
+                        }
+                        FieldKind::Totp => {
+                            let mut seed =
+                                match session.decrypt_secret(&req.item_id, SecretField::Totp) {
+                                    Ok(b) => into_text(b).map_err(Unresolved::Refused)?,
+                                    Err(_) => return Err(decrypt_failed),
+                                };
+                            let seed = Secret::new(std::mem::take(&mut *seed));
+                            totp_code(&self.clock_skew, seed, SystemTime::now())
+                                .map_err(|o| Unresolved::Refused(FillStatus::Engine(o)))?
+                        }
+                    };
+                    fields.push(FieldFill {
+                        kind: *kind,
+                        selector: selector.clone(),
+                        value,
+                    });
+                }
+                Ok(fields)
+            };
+            decrypt_all()
         };
-        let fields = match decrypt_all() {
+        let fields = match decrypted {
             Ok(fields) => fields,
             Err(refused) => {
                 // REQ-APR-008 (#151): refused after admission, before
                 // any value could leave the broker, so the use spent
                 // at admission comes back. Values decrypted so far are
                 // `Zeroizing` and were wiped with the partial list.
-                self.grants
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .refund(&admitted);
+                // A use that comes back is unconsumed again, so the
+                // idle deferral comes back with it (#215).
+                let restored = {
+                    let mut store = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+                    if store.refund(&admitted) {
+                        let now = self.grant_now();
+                        store
+                            .grant(&admitted)
+                            .filter(|g| g.is_live(now))
+                            .map(|g| g.expires_at)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(expires_at) = restored {
+                    lock.hold_idle_for_grant(&admitted, expires_at);
+                } else if spent {
+                    lock.release_idle_hold(&admitted);
+                }
                 return Err(refused);
             }
         };
@@ -2470,6 +2582,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             deadline: None,
             values_sent: ValuesSent::new(),
         };
+        // `item` was the last borrow of the session. A spent grant
+        // no longer defers the idle lock; an unlimited grant stays
+        // live and keeps the hold recorded at approval (#215).
+        if spent {
+            lock.release_idle_hold(&admitted);
+        }
         Ok((plan, generation, admitted))
     }
 }

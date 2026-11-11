@@ -9,10 +9,10 @@ use serde::Deserialize;
 use url::Url;
 
 use super::{
-    AgentConfig, ApiConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config, ConfigError,
-    ConnectorConfig, DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind,
-    MemoryConfig, NtfyConfig, OwnerUiConfig, PolicyConfig, PublicIngressConfig, Redacted, Source,
-    TlsMaterial, parse_duration, tunnel_from_config,
+    AccessConfig, AgentConfig, ApiConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config,
+    ConfigError, ConnectorConfig, DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind,
+    JwksSource, MemoryConfig, NtfyConfig, OwnerUiConfig, PolicyConfig, PublicIngressConfig,
+    Redacted, Source, TlsMaterial, parse_duration, tunnel_from_config,
 };
 use crate::api::token::{HashProblem, ParamFloor, check_token_hash};
 use crate::cdp::{CdpEndpoint, CertSha256};
@@ -89,6 +89,8 @@ struct RawPublicIngress {
     tls_cert_file: Option<PathBuf>,
     #[serde(default)]
     tls_key_file: Option<PathBuf>,
+    #[serde(default)]
+    public_host: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -97,7 +99,19 @@ struct RawOwnerUi {
     listen: String,
     #[serde(default)]
     rp_id: Option<String>,
-    origin: String,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    public_origin: Option<String>,
+    #[serde(default)]
+    access: Option<RawAccess>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAccess {
+    team_domain: String,
+    audience: String,
 }
 
 #[derive(Deserialize)]
@@ -427,7 +441,21 @@ fn validate_public_ingress(raw: RawPublicIngress) -> Result<PublicIngressConfig,
     if !listen.ip().is_loopback() && tls.is_none() {
         return Err(ConfigError::PublicIngressPlainHttpNonLoopback);
     }
-    Ok(PublicIngressConfig { listen, tls })
+    let public_host = raw
+        .public_host
+        .map(|host| {
+            if valid_rp_id(&host) {
+                Ok(host.to_ascii_lowercase())
+            } else {
+                Err(ConfigError::PublicIngressPublicHost)
+            }
+        })
+        .transpose()?;
+    Ok(PublicIngressConfig {
+        listen,
+        tls,
+        public_host,
+    })
 }
 
 /// Two configured addresses contend for one socket when they are equal
@@ -520,16 +548,74 @@ fn validate_owner_ui(raw: RawOwnerUi) -> Result<OwnerUiConfig, ConfigError> {
     if !listen.ip().is_loopback() {
         return Err(ConfigError::OwnerUiNotLoopback);
     }
-    let rp_id = raw.rp_id.unwrap_or_else(|| "localhost".to_owned());
-    if !valid_rp_id(&rp_id) {
-        return Err(ConfigError::OwnerUiRpId);
-    }
-    let origin = canonical_origin(&raw.origin, &rp_id, listen.port())?;
+    let (rp_id, origin, public) = match (raw.origin, raw.public_origin) {
+        (Some(origin), None) => {
+            let rp_id = raw.rp_id.unwrap_or_else(|| "localhost".to_owned());
+            if !valid_rp_id(&rp_id) {
+                return Err(ConfigError::OwnerUiRpId);
+            }
+            let origin = canonical_origin(&origin, &rp_id, listen.port())?;
+            (rp_id, origin, false)
+        }
+        (None, Some(public_origin)) => {
+            let (rp_id, origin) = canonical_public_origin(&public_origin, raw.rp_id)?;
+            (rp_id, origin, true)
+        }
+        _ => return Err(ConfigError::OwnerUiOriginChoice),
+    };
+    let access = match raw.access {
+        None => None,
+        Some(_) if !public => return Err(ConfigError::OwnerUiAccessNeedsPublicOrigin),
+        Some(access) => Some(validate_access(access)?),
+    };
     Ok(OwnerUiConfig {
         listen,
         rp_id,
         origin,
+        public,
+        access,
     })
+}
+
+fn validate_access(raw: RawAccess) -> Result<AccessConfig, ConfigError> {
+    let team_domain = raw.team_domain.to_ascii_lowercase();
+    if !valid_rp_id(&team_domain) || !team_domain.ends_with(".cloudflareaccess.com") {
+        return Err(ConfigError::OwnerUiAccess);
+    }
+    let aud = &raw.audience;
+    if aud.is_empty() || aud.len() > 128 || !aud.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(ConfigError::OwnerUiAccess);
+    }
+    Ok(AccessConfig {
+        team_domain,
+        audience: raw.audience,
+        jwks: JwksSource::TeamCerts,
+    })
+}
+
+/// `public_origin`: https, a bare domain origin; `rp_id` defaults to its
+/// host and must equal it. The listen port plays no part.
+fn canonical_public_origin(
+    raw: &str,
+    rp_id: Option<String>,
+) -> Result<(String, String), ConfigError> {
+    let bad = ConfigError::OwnerUiPublicOrigin;
+    let url = Url::parse(raw).map_err(|_| bad.clone())?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(bad);
+    }
+    let host = url.host_str().ok_or_else(|| bad.clone())?;
+    if !valid_rp_id(host) || rp_id.as_deref().is_some_and(|id| id != host) {
+        return Err(bad);
+    }
+    let port = url.port_or_known_default().ok_or(bad)?;
+    Ok((host.to_owned(), serialize_origin("https", host, port)))
 }
 
 fn valid_rp_id(s: &str) -> bool {

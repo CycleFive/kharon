@@ -433,6 +433,25 @@ pub enum ConfigError {
     /// `owner_ui.rp_id` is not a domain name.
     #[error("`owner_ui.rp_id` must be a domain name (not an IP address)")]
     OwnerUiRpId,
+    /// Neither or both of `owner_ui.origin` and `owner_ui.public_origin`.
+    #[error("`[owner_ui]` needs exactly one of `origin` and `public_origin`")]
+    OwnerUiOriginChoice,
+    /// `owner_ui.public_origin` is not a bare https origin on a domain.
+    #[error(
+        "`owner_ui.public_origin` must be an https URL whose host is a domain equal to `rp_id`, with no userinfo, path, query, or fragment"
+    )]
+    OwnerUiPublicOrigin,
+    /// `[owner_ui.access]` without `public_origin`.
+    #[error("`[owner_ui.access]` needs `owner_ui.public_origin`")]
+    OwnerUiAccessNeedsPublicOrigin,
+    /// `[owner_ui.access]` has a bad team domain or audience.
+    #[error(
+        "`[owner_ui.access]` needs a `team_domain` ending in .cloudflareaccess.com and an `audience` of 1-128 ASCII alphanumerics"
+    )]
+    OwnerUiAccess,
+    /// `public_ingress.public_host` is not a bare hostname.
+    #[error("`public_ingress.public_host` must be a bare domain name")]
+    PublicIngressPublicHost,
     /// `public_ingress.listen` is not `<ip>:<port>` with an IP literal.
     #[error("`public_ingress.listen` must be an IP literal and port, e.g. \"100.64.0.1:8790\"")]
     PublicIngressListenInvalid,
@@ -529,6 +548,11 @@ impl ConfigError {
             Self::OwnerUiOrigin => "owner_ui_origin",
             Self::OwnerUiOriginPort => "owner_ui_origin_port",
             Self::OwnerUiRpId => "owner_ui_rp_id",
+            Self::OwnerUiOriginChoice => "owner_ui_origin_choice",
+            Self::OwnerUiPublicOrigin => "owner_ui_public_origin",
+            Self::OwnerUiAccessNeedsPublicOrigin => "owner_ui_access_needs_public_origin",
+            Self::OwnerUiAccess => "owner_ui_access",
+            Self::PublicIngressPublicHost => "public_ingress_public_host",
             Self::PublicIngressListenInvalid => "public_ingress_listen_invalid",
             Self::PublicIngressWildcardBind => "public_ingress_wildcard_bind",
             Self::PublicIngressListenNotUnicast => "public_ingress_listen_not_unicast",
@@ -894,14 +918,50 @@ pub struct OwnerUiConfig {
     pub listen: SocketAddr,
     /// WebAuthn relying party id. A domain, default `localhost`.
     pub rp_id: String,
-    /// Browser origin from the config file, canonicalized.
+    /// Canonical browser origin. In public mode this is the public origin.
     pub origin: String,
+    /// True when `public_origin` was set: the UI is behind the edge.
+    pub public: bool,
+    /// Optional Cloudflare Access check (public mode only).
+    pub access: Option<AccessConfig>,
+}
+
+/// `[owner_ui.access]`: the Access application that fronts the owner UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessConfig {
+    /// `<team>.cloudflareaccess.com`.
+    pub team_domain: String,
+    /// The Access application's AUD tag.
+    pub audience: String,
+    /// Where signing keys come from.
+    pub jwks: JwksSource,
+}
+
+/// Where Access signing keys come from. No config key selects `TestStatic`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwksSource {
+    /// Fetched from the team's `/cdn-cgi/access/certs`.
+    TeamCerts,
+    /// A fixed JWKS document, for tests only.
+    TestStatic(String),
 }
 
 impl OwnerUiConfig {
+    /// Host and port of `origin` (port is the scheme default when absent).
+    pub fn authority(&self) -> (String, u16) {
+        let Ok(url) = Url::parse(&self.origin) else {
+            return (self.rp_id.clone(), if self.public { 443 } else { 80 });
+        };
+        let host = url.host_str().unwrap_or(&self.rp_id).to_owned();
+        (host, url.port_or_known_default().unwrap_or(80))
+    }
+
     /// Origin for a listener that bound `port` (the file's port when
     /// it was fixed, the kernel's port when the file said 0).
     pub fn origin_for_bound_port(&self, port: u16) -> String {
+        if self.public {
+            return self.origin.clone();
+        }
         let Ok(url) = Url::parse(&self.origin) else {
             return self.origin.clone();
         };
@@ -955,6 +1015,9 @@ pub struct PublicIngressConfig {
     /// Certificate the edge pins (`originRequest.caPool`). Required
     /// unless `listen` is loopback.
     pub tls: Option<TlsMaterial>,
+    /// Hostname the edge serves this listener under, lower-case. When set,
+    /// requests for any other `Host` are refused.
+    pub public_host: Option<String>,
 }
 
 /// `[api]`.

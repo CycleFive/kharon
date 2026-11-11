@@ -17,6 +17,28 @@ use std::path::Path;
 
 use super::entry::{Entry, Event};
 
+/// Read the log at `path` entry by entry, in order, handing each
+/// parsed [`Entry`] to `f`. A missing log reads as empty; a line
+/// that does not parse is an error — the daemon calls this on the
+/// chain [`AuditLog::open`](super::AuditLog) has just verified, so a
+/// bad line means corruption the verify missed, and the reader
+/// should fail closed rather than skip state.
+pub fn replay_entries(path: &Path, mut f: impl FnMut(&Entry)) -> io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: Entry = serde_json::from_str(line).map_err(io::Error::other)?;
+        f(&entry);
+    }
+    Ok(())
+}
+
 /// A grant request whose creation has no later resolution in the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedRequest {

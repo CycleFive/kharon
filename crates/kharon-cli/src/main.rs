@@ -87,7 +87,7 @@ enum Command {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
-    /// Revoke a grant, or an agent until the daemon restarts (REQ-REV-001).
+    /// Revoke a grant, or an agent durably (REQ-REV-001).
     #[command(subcommand)]
     Revoke(RevokeCommand),
     /// Clear an agent's suspension (REQ-RL-002). Does not un-revoke.
@@ -183,12 +183,15 @@ enum RevokeCommand {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
-    /// Revoke an agent's token and grants until the daemon restarts.
+    /// Revoke an agent's token and grants, durably (REQ-REV-001).
     ///
-    /// The flag is in-memory for the life of the process. `kharon
-    /// unsuspend` does not clear it, and there is no un-revoke
-    /// command. The token hash stays in the token store, so
-    /// restarting the daemon lets the agent authenticate again.
+    /// The revocation is recorded in the audit log, bound to the
+    /// fingerprint of the agent's configured token hash, and is
+    /// rebuilt at every daemon start: restarting does not clear
+    /// it. `kharon unsuspend` does not clear it either, and there
+    /// is no un-revoke command. To restore an agent, rotate its
+    /// token: `kharon token mint`, replace `token_hash` in the
+    /// config, and restart.
     Agent {
         /// Agent id.
         id: String,

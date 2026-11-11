@@ -33,6 +33,7 @@ pub mod meta;
 pub mod notify;
 pub mod public;
 pub mod rate;
+pub mod revocation;
 pub mod rollback;
 pub mod surface;
 pub mod token;

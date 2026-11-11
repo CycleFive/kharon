@@ -193,10 +193,29 @@ impl RateLimiter {
         self.agents.remove(agent);
     }
 
+    /// Mark the agent suspended without touching its streak or
+    /// windows. The startup rebuild (REQ-REV-001 durability, #132)
+    /// uses this: the log says the agent was suspended and never
+    /// owner-reset.
+    pub fn suspend(&mut self, agent: &str) {
+        self.suspended.insert(agent.to_owned());
+    }
+
+    /// Mark the agent revoked without the runtime side effects of
+    /// [`Self::revoke_agent`] (suspension, window reset). The startup
+    /// rebuild (#132) uses this: suspension comes from the log's own
+    /// `suspended` / `unsuspended` fold, and there are no windows to
+    /// clear in a fresh limiter.
+    pub fn mark_revoked(&mut self, agent: &str) {
+        self.revoked.insert(agent.to_owned());
+    }
+
     /// Clear revocation so a reconfigured token can authenticate
     /// again. Suspension is cleared too (owner reset). Not wired to
     /// the owner socket: `unsuspend` does not call this, so a
-    /// revoked agent stays revoked until the daemon process exits.
+    /// revoked agent stays revoked for the life of the process —
+    /// and, since #132, across restarts too, until the token is
+    /// rotated in config.
     pub fn clear_revocation(&mut self, agent: &str) {
         self.revoked.remove(agent);
         self.unsuspend(agent);

@@ -270,6 +270,15 @@ pub struct Entry {
     /// Age in whole seconds of the session a `connector_replaced` evicted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_session_secs: Option<u64>,
+    /// Fingerprint of the agent's `token_hash` (the Argon2id PHC string)
+    /// at revoke time: SHA-256 of the PHC string, hex, truncated to 32
+    /// chars (only on `token_revoke`, #132). The startup rebuild
+    /// (REQ-REV-001) revokes the agent only while the configured hash
+    /// still fingerprints the same; rotating the hash lifts it. The PHC
+    /// string carries a random salt and already sits in the config file,
+    /// so the fingerprint exposes nothing usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_fingerprint: Option<String>,
 }
 
 impl Entry {
@@ -298,6 +307,7 @@ impl Entry {
             client_ip: None,
             suppressed: None,
             old_session_secs: None,
+            token_fingerprint: None,
         }
     }
 
@@ -390,6 +400,13 @@ impl Entry {
     /// Age in seconds of the session a `connector_replaced` evicted.
     pub fn old_session_secs(mut self, v: u64) -> Self {
         self.old_session_secs = Some(v);
+        self
+    }
+
+    /// Fingerprint of the revoked token's `token_hash` (only on
+    /// `token_revoke`, #132).
+    pub fn token_fingerprint(mut self, v: impl Into<String>) -> Self {
+        self.token_fingerprint = Some(v.into());
         self
     }
 

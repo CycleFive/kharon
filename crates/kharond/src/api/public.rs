@@ -89,6 +89,31 @@ pub fn client_ip(headers: &HeaderMap, public_ingress: bool) -> Option<IpAddr> {
     value.trim().parse().ok()
 }
 
+/// True when the request carries exactly one `Host` header equal, ASCII
+/// case-insensitively, to `host` or `host:port`. `host` is lower-case.
+///
+/// Both HTTP/1.1-only listeners (the owner UI and `[public_ingress]`)
+/// use this in public mode (#208): a request the edge did not route
+/// for the published name is refused before anything else looks at it.
+pub fn host_matches(headers: &HeaderMap, host: &str, port: u16) -> bool {
+    let mut values = headers.get_all(axum::http::header::HOST).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(v), None) => match v.to_str() {
+            Ok(v) => v,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    let value = value.to_ascii_lowercase();
+    match value.strip_prefix(host) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix(':')
+            .is_some_and(|p| p == port.to_string()),
+        None => false,
+    }
+}
+
 /// Request extension: this request arrived on the public-ingress
 /// listener (#198), not the tailnet `[api]` listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +136,13 @@ impl Connected<IncomingStream<'_, TlsListener>> for Peer {
 }
 
 /// The public-ingress router over `broker`. `ws` mounts `GET /connector`;
-/// without it the route answers 404.
-pub fn router<S, C>(broker: Arc<Broker<S, C>>, ws: Option<Arc<WsEntry>>) -> Router
+/// without it the route answers 404. With `public_host` set, a request
+/// whose `Host` is not that host (bare or `:443`) gets the same 404.
+pub fn router<S, C>(
+    broker: Arc<Broker<S, C>>,
+    ws: Option<Arc<WsEntry>>,
+    public_host: Option<Arc<str>>,
+) -> Router
 where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
@@ -121,7 +151,9 @@ where
         .fallback(
             move |state: State<Arc<AppState<S, C>>>,
                   ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
-                  req: Request| { handle(state, ws.clone(), peer, req) },
+                  req: Request| {
+                handle(state, ws.clone(), public_host.clone(), peer, req)
+            },
         )
         .with_state(AppState::new(broker))
 }
@@ -132,6 +164,7 @@ pub async fn serve_with_shutdown<S, C, F>(
     listener: TcpListener,
     broker: Arc<Broker<S, C>>,
     ws: Option<Arc<WsEntry>>,
+    public_host: Option<Arc<str>>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -141,7 +174,7 @@ where
 {
     axum::serve(
         listener,
-        router(broker, ws).into_make_service_with_connect_info::<Peer>(),
+        router(broker, ws, public_host).into_make_service_with_connect_info::<Peer>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -155,6 +188,7 @@ pub async fn serve_tls_with_shutdown<S, C, F>(
     tls: Arc<rustls::ServerConfig>,
     broker: Arc<Broker<S, C>>,
     ws: Option<Arc<WsEntry>>,
+    public_host: Option<Arc<str>>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -164,7 +198,7 @@ where
 {
     axum::serve(
         TlsListener::new(listener, tls),
-        router(broker, ws).into_make_service_with_connect_info::<Peer>(),
+        router(broker, ws, public_host).into_make_service_with_connect_info::<Peer>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -189,6 +223,7 @@ fn admit(method: &Method, path: &str) -> Option<Admit> {
 async fn handle<S, C>(
     State(state): State<Arc<AppState<S, C>>>,
     ws: Option<Arc<WsEntry>>,
+    public_host: Option<Arc<str>>,
     peer: SocketAddr,
     mut req: Request,
 ) -> Response
@@ -196,6 +231,13 @@ where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
+    // Before routing, auth, audit or the body: a foreign Host is an
+    // unknown route.
+    if let Some(host) = &public_host
+        && !host_matches(req.headers(), host, 443)
+    {
+        return not_found();
+    }
     match admit(req.method(), req.uri().path()) {
         Some(Admit::Mcp) => {
             req.extensions_mut().insert(PublicIngress);
@@ -223,6 +265,26 @@ fn not_found() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_matches_one_exact_host() {
+        let with = |values: &[&str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(axum::http::header::HOST, v.parse().unwrap());
+            }
+            h
+        };
+        let m = |h: &HeaderMap| host_matches(h, "kharon.example.com", 443);
+        assert!(!m(&HeaderMap::new()), "no header");
+        assert!(!m(&with(&["kharon.example.com", "kharon.example.com"])));
+        assert!(m(&with(&["kharon.example.com"])));
+        assert!(m(&with(&["KHARON.example.com"])));
+        assert!(m(&with(&["kharon.example.com:443"])));
+        assert!(!m(&with(&["kharon.example.com:8790"])));
+        assert!(!m(&with(&["kharon.example.com."])));
+        assert!(!m(&with(&["evil.example.com"])));
+    }
 
     #[test]
     fn client_ip_is_honoured_only_on_public_ingress() {

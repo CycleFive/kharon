@@ -188,6 +188,11 @@ impl OwnerAudit for NoAudit {
 pub struct OwnerUi {
     rp_id: String,
     origin: String,
+    /// Behind the edge (`[owner_ui] public_origin`, #208).
+    public: bool,
+    /// Host and port of `origin`: the only `Host` public mode serves.
+    host: String,
+    port: u16,
     secure_cookie: bool,
     shell: Arc<dyn OwnerShell>,
     audit: Arc<dyn OwnerAudit>,
@@ -226,6 +231,14 @@ struct Enroll {
     expires: Instant,
 }
 
+/// What [`OwnerUi::open_with`] needs beyond the stores.
+pub struct OwnerUiOptions {
+    pub rp_id: String,
+    pub origin: String,
+    /// Public mode: behind the edge (#208).
+    pub public: bool,
+}
+
 impl OwnerUi {
     /// Open the passkey store under `data_dir` and build the UI.
     /// `origin` is the browser origin exactly as `clientDataJSON`
@@ -240,12 +253,47 @@ impl OwnerUi {
         audit: Arc<dyn OwnerAudit>,
         approvals: Arc<dyn OwnerApprovals>,
     ) -> std::io::Result<Arc<Self>> {
-        let origin = origin.into();
+        Self::open_with(
+            data_dir,
+            OwnerUiOptions {
+                rp_id: rp_id.into(),
+                origin: origin.into(),
+                public: false,
+            },
+            shell,
+            audit,
+            approvals,
+        )
+    }
+
+    /// [`Self::open`] with the public-mode switch (#208).
+    pub fn open_with(
+        data_dir: &Path,
+        opts: OwnerUiOptions,
+        shell: Arc<dyn OwnerShell>,
+        audit: Arc<dyn OwnerAudit>,
+        approvals: Arc<dyn OwnerApprovals>,
+    ) -> std::io::Result<Arc<Self>> {
+        let OwnerUiOptions {
+            rp_id,
+            origin,
+            public,
+        } = opts;
         let secure_cookie = origin.starts_with("https://");
+        let (host, port) = match url::Url::parse(&origin) {
+            Ok(u) => (
+                u.host_str().unwrap_or(&rp_id).to_ascii_lowercase(),
+                u.port_or_known_default().unwrap_or(80),
+            ),
+            Err(_) => (rp_id.to_ascii_lowercase(), if public { 443 } else { 80 }),
+        };
         let passkeys = PasskeyStore::load(data_dir)?;
         Ok(Arc::new(Self {
-            rp_id: rp_id.into(),
+            rp_id,
             origin,
+            public,
+            host,
+            port,
             secure_cookie,
             shell,
             audit,
@@ -265,6 +313,11 @@ impl OwnerUi {
     /// [`Self::open`]). Returns `false` if one was already set.
     pub fn set_unlocker(&self, unlocker: Arc<dyn OwnerUnlock>) -> bool {
         self.unlocker.set(unlocker).is_ok()
+    }
+
+    /// True when the UI is behind the edge (`public_origin`, #208).
+    pub fn is_public(&self) -> bool {
+        self.public
     }
 
     /// The origin assertions are checked against.
@@ -345,6 +398,14 @@ fn router(ui: Arc<OwnerUi>, redeem: Arc<dyn ApprovalRedeemer>) -> Router {
 }
 
 async fn handle(State(state): State<Arc<OwnerServer>>, req: Request) -> Response {
+    // Public mode: a request not addressed to the published name is
+    // refused before routing, the ntfy redeem branch and the body.
+    // Never audited: a stranger must not be able to grow the log.
+    if state.ui.public
+        && !crate::api::public::host_matches(req.headers(), &state.ui.host, state.ui.port)
+    {
+        return respond(StatusCode::MISDIRECTED_REQUEST, "misdirected", None);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     if path.starts_with(OWNER_APPROVE_PREFIX) || path.starts_with(OWNER_DENY_PREFIX) {

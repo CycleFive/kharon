@@ -23,6 +23,12 @@ pub struct Http<'a> {
     pub bearer: Option<&'a str>,
     pub content_type: Option<&'a str>,
     pub body: &'a str,
+    /// `Host` header value; defaults to `localhost`.
+    pub host: &'a str,
+    /// Extra raw headers, in order.
+    pub headers: Vec<(&'a str, &'a str)>,
+    /// POST without an `Origin` header.
+    pub no_origin: bool,
 }
 
 impl<'a> Http<'a> {
@@ -34,6 +40,9 @@ impl<'a> Http<'a> {
             bearer: None,
             content_type: None,
             body: "",
+            host: "localhost",
+            headers: Vec::new(),
+            no_origin: false,
         }
     }
 
@@ -45,6 +54,9 @@ impl<'a> Http<'a> {
             bearer: None,
             content_type,
             body,
+            host: "localhost",
+            headers: Vec::new(),
+            no_origin: false,
         }
     }
 
@@ -55,6 +67,21 @@ impl<'a> Http<'a> {
 
     pub fn bearer(mut self, bearer: &'a str) -> Self {
         self.bearer = Some(bearer);
+        self
+    }
+
+    pub fn host(mut self, host: &'a str) -> Self {
+        self.host = host;
+        self
+    }
+
+    pub fn header(mut self, name: &'a str, value: &'a str) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+
+    pub fn without_origin(mut self) -> Self {
+        self.no_origin = true;
         self
     }
 }
@@ -75,13 +102,19 @@ pub async fn http(addr: std::net::SocketAddr, origin: &str, req: Http<'_>) -> Ra
         .content_type
         .map(|t| format!("Content-Type: {t}\r\nContent-Length: {}\r\n", body.len()))
         .unwrap_or_default();
-    let origin = if method == "POST" {
+    let host = req.host;
+    let extra: String = req
+        .headers
+        .iter()
+        .map(|(n, v)| format!("{n}: {v}\r\n"))
+        .collect();
+    let origin = if method == "POST" && !req.no_origin {
         format!("Origin: {origin}\r\n")
     } else {
         String::new()
     };
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{origin}{cookie}{bearer}{ctype}Connection: close\r\n\r\n{body}"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{origin}{extra}{cookie}{bearer}{ctype}Connection: close\r\n\r\n{body}"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

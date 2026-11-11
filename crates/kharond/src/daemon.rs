@@ -758,6 +758,8 @@ pub struct Daemon {
 
 /// `[public_ingress]` bound at startup (#198).
 struct PublicIngressRuntime {
+    /// `[public_ingress] public_host`: the one `Host` served (#208).
+    public_host: Option<Arc<str>>,
     listener: TcpListener,
     tls: Option<Arc<rustls::ServerConfig>>,
     addr: SocketAddr,
@@ -978,6 +980,7 @@ async fn bind_public_ingress(cfg: &Config) -> Result<Option<PublicIngressRuntime
     let listener = TcpListener::bind(public.listen).await.map_err(bind_err)?;
     let addr = listener.local_addr().map_err(bind_err)?;
     Ok(Some(PublicIngressRuntime {
+        public_host: public.public_host.as_deref().map(Arc::from),
         listener,
         tls,
         addr,
@@ -1070,10 +1073,13 @@ async fn bind_owner_ui(
             kind: e.kind().to_string(),
         })?;
     let origin = ui_cfg.origin_for_bound_port(addr.port());
-    let ui = crate::owner_ui::OwnerUi::open(
+    let ui = crate::owner_ui::OwnerUi::open_with(
         &cfg.data_dir,
-        ui_cfg.rp_id.clone(),
-        origin.clone(),
+        crate::owner_ui::OwnerUiOptions {
+            rp_id: ui_cfg.rp_id.clone(),
+            origin: origin.clone(),
+            public: ui_cfg.public,
+        },
         Arc::new(DaemonShell {
             broker: Arc::clone(broker),
         }),
@@ -1253,13 +1259,20 @@ impl Daemon {
                             tls,
                             broker,
                             ws,
+                            rt.public_host,
                             stopped,
                         )
                         .await
                     }
                     None => {
-                        crate::api::public::serve_with_shutdown(rt.listener, broker, ws, stopped)
-                            .await
+                        crate::api::public::serve_with_shutdown(
+                            rt.listener,
+                            broker,
+                            ws,
+                            rt.public_host,
+                            stopped,
+                        )
+                        .await
                     }
                 };
             })

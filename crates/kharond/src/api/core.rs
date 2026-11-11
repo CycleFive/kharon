@@ -1022,14 +1022,25 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             FillOperation::Fill => Event::Fill,
             FillOperation::FillTotp => Event::FillTotp,
         };
+        // #240: every fill entry names the grant the call presented,
+        // refusals included, so a denial traces from the log alone.
+        // Only a minted-id shape is recorded (REQ-AUD-004). An admitted
+        // grant overrides it on the outcome, and it is the same grant
+        // whenever one was presented.
+        let presented = req
+            .grant_id
+            .as_deref()
+            .filter(|g| super::grant::is_grant_id_shaped(g));
         let base = |e: Event| {
-            stamp(
-                Entry::new(e)
-                    .agent_id(agent.0.clone())
-                    .item_id(req.item_id.clone())
-                    .request_id(request_id.clone()),
-                &client_ip,
-            )
+            let entry = Entry::new(e)
+                .agent_id(agent.0.clone())
+                .item_id(req.item_id.clone())
+                .request_id(request_id.clone());
+            let entry = match presented {
+                Some(g) => entry.grant_id(g.to_owned()),
+                None => entry,
+            };
+            stamp(entry, &client_ip)
         };
         // The live origin the engine read, if the fill got that far
         // (REQ-AUD-003†, #67); copied into the outcome entry.
@@ -1138,6 +1149,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     )?;
                     guard.abort_entry = Some(
                         base(Event::FillAborted)
+                            .grant_id(grant_id.clone())
                             .result("aborted")
                             .detail_code("handler_dropped"),
                     );

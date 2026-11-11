@@ -952,6 +952,24 @@ async fn req_apr_009_signed_in_actions_are_never_throttled() {
     )
     .await;
     assert_eq!(begin.status, 429, "{}", begin.body);
+    // The owner's decisions still reach the broker: an unknown id gets
+    // the route's own answer, not the throttle's.
+    for (path, body) in [
+        ("/owner/approvals/approve", r#"{"request_id":"nope"}"#),
+        ("/owner/approvals/deny", r#"{"request_id":"nope"}"#),
+        ("/owner/grants/revoke", r#"{"grant_id":"nope"}"#),
+    ] {
+        let r = http(
+            run.ui,
+            PUBLIC_ORIGIN,
+            pub_post(path, body)
+                .cookie(&cookie)
+                .header("CF-Connecting-IP", SRC_A),
+        )
+        .await;
+        assert_ne!(r.status, 429, "{path}: {}", r.body);
+        assert_eq!(r.status, 404, "{path}: {}", r.body);
+    }
     let logout = http(
         run.ui,
         PUBLIC_ORIGIN,

@@ -1512,11 +1512,27 @@ When the failing leg is `upgrade`, the status is printed as received:
 
 Point the agent harness at `https://203.0.113.4:8787` with its agent
 API token, and trust the broker certificate there. The connector does
-not carry that token. CI checks this script the same way as path (A)
-(`req_arch_001_agent_host_docs`) and fills through the connector
-against a CDP stub (`req_arch_002_agent_connector`).
+not carry that token. The idle-lock contract in
+[Running the agent](#running-the-agent) applies on this path too: the
+broker locks 30 minutes after the latest fill, unlock, or grant
+approval, and a re-unlock needs a new browser context. CI checks this
+script the same way as path (A) (`req_arch_001_agent_host_docs`) and
+fills through the connector against a CDP stub
+(`req_arch_002_agent_connector`).
 
 ### Running the agent
+
+The broker locks 30 minutes after the latest of a fill, the owner
+unlocking, or the owner approving a grant. `kharon_context`, status,
+list, search, `kharon_request_grant`, and moving between tabs do not
+postpone that. A grant the owner has issued, and that the agent has
+not used up and that has not expired, holds the lock off until that
+grant is used up or its own lifetime ends, whichever comes first, and
+not beyond that. The owner's lock and panic still take effect at once.
+
+A lock closes the browser context. After the owner unlocks again, call
+`kharon_context` and use the new `browser_context_id`. A fill aimed at
+the previous context comes back `target_not_owned`.
 
 Run the agent as its own user, not `browser` and not in the
 `browser` group, and have it connect to CDP on loopback, for example

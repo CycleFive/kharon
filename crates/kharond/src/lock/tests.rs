@@ -699,3 +699,111 @@ fn req_cry_009_background_sync_access_is_not_activity_and_respects_expiry() {
     );
     assert!(c.is_locked(), "the expired session was locked");
 }
+
+#[test]
+fn req_mem_004_live_grant_defers_idle_until_its_ttl_and_not_past_it() {
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    c.hold_idle_for_grant("g_live", Duration::from_secs(45 * 60));
+    clock.advance(Duration::from_secs(30 * 60));
+    assert_eq!(c.poll(), None, "idle is deferred while the grant is live");
+    assert!(c.require_unlocked().is_ok());
+    clock.advance(Duration::from_secs(15 * 60 - 1));
+    assert_eq!(c.poll(), None, "still inside the grant TTL");
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        c.poll(),
+        Some(LockReason::IdleTimeout),
+        "deferral ends at the grant TTL, not later"
+    );
+    assert!(c.is_locked());
+}
+
+#[test]
+fn req_mem_004_releasing_a_grant_hold_allows_an_elapsed_idle_lock() {
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    c.hold_idle_for_grant("g_once", Duration::from_secs(2 * 60 * 60));
+    clock.advance(Duration::from_secs(40 * 60));
+    assert_eq!(c.poll(), None);
+    c.release_idle_hold("g_once");
+    assert_eq!(
+        c.poll(),
+        Some(LockReason::IdleTimeout),
+        "consuming the grant ends the deferral immediately"
+    );
+}
+
+#[test]
+fn req_mem_004_grant_hold_does_not_defer_absolute_manual_or_panic() {
+    let clock = Arc::new(ManualClock::new());
+    let policy = LockPolicy {
+        max_unlocked: Duration::from_secs(60 * 60),
+        ..LockPolicy::default()
+    };
+    let mut c = LockController::new(policy, clock.clone(), Box::new(StaticHardening::all_ok()));
+    unlock_ok(&mut c);
+    c.hold_idle_for_grant("g_long", Duration::from_secs(5 * 60 * 60));
+    // Activity inside the idle window, so only the absolute timer can fire.
+    clock.advance(Duration::from_secs(20 * 60));
+    c.touch_activity();
+    clock.advance(Duration::from_secs(40 * 60));
+    assert_eq!(
+        c.poll(),
+        Some(LockReason::AbsoluteTimeout),
+        "a live grant does not defer the absolute timer"
+    );
+
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    c.hold_idle_for_grant("g_long", Duration::from_secs(2 * 60 * 60));
+    clock.advance(Duration::from_secs(40 * 60));
+    assert_eq!(c.poll(), None, "idle would have fired; the grant holds it");
+    assert!(c.lock(LockReason::Manual), "owner lock is immediate");
+    assert!(c.is_locked());
+
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    c.hold_idle_for_grant("g_long", Duration::from_secs(2 * 60 * 60));
+    clock.advance(Duration::from_secs(40 * 60));
+    assert!(c.lock(LockReason::Panic), "panic is immediate");
+    assert!(c.is_locked());
+}
+
+#[test]
+fn req_mem_004_activity_after_the_idle_deadline_does_not_revive() {
+    let clock = Arc::new(ManualClock::new());
+    let mut c = LockController::new(
+        LockPolicy::default(),
+        clock.clone(),
+        Box::new(StaticHardening::all_ok()),
+    );
+    unlock_ok(&mut c);
+    clock.advance(Duration::from_secs(30 * 60));
+    c.touch_activity();
+    assert!(c.is_locked(), "a late fill must not revive the session");
+    // Recording a hold afterwards does not unlock.
+    c.hold_idle_for_grant("g_late", Duration::from_secs(60 * 60));
+    assert!(c.is_locked());
+    assert_eq!(c.poll(), None);
+}

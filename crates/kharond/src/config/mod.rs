@@ -765,7 +765,8 @@ pub enum GrantKind {
 /// `[policy]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyConfig {
-    /// Idle lock since last fill. Default 30m.
+    /// Idle lock since the latest unlock, fill, or grant issue.
+    /// Default 30m.
     pub idle_lock: Duration,
     /// Absolute unlocked lifetime. Default 12h.
     pub max_unlocked: Duration,

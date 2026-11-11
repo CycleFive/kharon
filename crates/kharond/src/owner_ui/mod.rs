@@ -364,6 +364,9 @@ impl OwnerUi {
             public,
             access,
         } = opts;
+        // The Access gate exists only behind the edge. Config already
+        // refuses `access` without `public_origin`; this is a second guard.
+        let access = access.filter(|_| public);
         let secure_cookie = origin.starts_with("https://");
         let (host, port) = crate::config::origin_authority(&origin, &rp_id, public);
         let passkeys = PasskeyStore::load(data_dir)?;

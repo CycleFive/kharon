@@ -1230,3 +1230,103 @@ async fn req_apr_009_without_access_config_nothing_changes() {
     assert_eq!(r.status, 200, "{}", r.body);
     run.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_a_session_without_a_token_is_refused() {
+    let key = AccessKey::generate("k1");
+    let run = start_public_with_access(&key).await;
+    let token = access_token(&key);
+
+    // Enroll and sign in, every call carrying the token.
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
+    let mut auth = VirtAuth::new();
+    let opts = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/options", "")
+            .bearer(&enroll)
+            .header("Cf-Access-Jwt-Assertion", &token),
+    )
+    .await;
+    assert_eq!(opts.status, 200, "{}", opts.body);
+    let opts: Json = serde_json::from_str(&opts.body).unwrap();
+    auth.user_handle = b64url_dec(opts["publicKey"]["user"]["id"].as_str().unwrap());
+    let reg = auth.registration(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    let body = json!({"ceremony_id": opts["ceremony_id"], "credential": reg}).to_string();
+    let done = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/finish", &body).header("Cf-Access-Jwt-Assertion", &token),
+    )
+    .await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    let opts = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/login/options", "").header("Cf-Access-Jwt-Assertion", &token),
+    )
+    .await;
+    assert_eq!(opts.status, 200, "{}", opts.body);
+    let opts: Json = serde_json::from_str(&opts.body).unwrap();
+    let r = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/login/finish", &login_body(&mut auth, &opts))
+            .header("Cf-Access-Jwt-Assertion", &token),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let cookie = set_cookie(&r, "__Host-kharon_owner")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // The session alone is not enough; the token alone is not either.
+    let r = http(
+        run.ui,
+        &run.origin,
+        Http::get("/owner/session")
+            .host(PUBLIC_HOST)
+            .cookie(&cookie),
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("access_denied"), "{}", r.body);
+    let r = http(
+        run.ui,
+        &run.origin,
+        Http::get("/owner/session")
+            .host(PUBLIC_HOST)
+            .cookie(&cookie)
+            .header("Cf-Access-Jwt-Assertion", &token),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_access_is_checked_before_origin() {
+    let key = AccessKey::generate("k1");
+    let run = start_public_with_access(&key).await;
+    let r = http(
+        run.ui,
+        EVIL,
+        pub_post("/owner/login/finish", "{}").header("CF-Connecting-IP", SRC_A),
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("access_denied"), "{}", r.body);
+    assert!(!r.body.contains("\"origin\""), "{}", r.body);
+    let fails = run.auth_fails();
+    assert_eq!(fails.len(), 1, "{fails:?}");
+    assert_eq!(fails[0].detail_code.as_deref(), Some("access"), "{fails:?}");
+    run.shutdown().await;
+}

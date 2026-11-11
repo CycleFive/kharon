@@ -77,13 +77,14 @@ pub use self::approvals::{
 pub use self::unlock::OwnerUnlock;
 
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use rand::RngCore;
@@ -108,6 +109,35 @@ pub const CEREMONY_TTL: Duration = Duration::from_secs(120);
 /// Cookie that carries the session token. The token itself is not
 /// stored; the server keeps its SHA-256.
 const SESSION_COOKIE: &str = "kharon_owner";
+
+/// The session cookie in public mode: the `__Host-` prefix makes a
+/// browser refuse it unless it is `Secure`, has `Path=/` and no `Domain`,
+/// so a sibling subdomain cannot set or shadow it (#208).
+const HOST_SESSION_COOKIE: &str = "__Host-kharon_owner";
+
+/// A route (or family of routes) that takes no `Origin` and no Access
+/// login in public mode.
+pub enum EdgeExempt {
+    /// Every path starting with this.
+    Prefix(&'static str),
+    /// Exactly this path.
+    Exact(&'static str),
+}
+
+/// The one list of routes that take no `Origin` and no Access login:
+/// the ntfy redeem routes, whose clients are not browsers.
+pub const EDGE_EXEMPT: &[EdgeExempt] = &[
+    EdgeExempt::Prefix(OWNER_APPROVE_PREFIX),
+    EdgeExempt::Prefix(OWNER_DENY_PREFIX),
+];
+
+/// True when `path` is on [`EDGE_EXEMPT`].
+pub fn edge_exempt(path: &str) -> bool {
+    EDGE_EXEMPT.iter().any(|e| match e {
+        EdgeExempt::Prefix(p) => path.starts_with(p),
+        EdgeExempt::Exact(x) => path == *x,
+    })
+}
 
 /// Fixed routes this UI serves (no token in the path). Tests assert
 /// none of them is a password login. ntfy redeem is the
@@ -171,16 +201,24 @@ impl OwnerShell for StaticShell {
 /// Where `owner_auth_fail` entries go. Best effort: a failed append
 /// does not turn a refusal into a success.
 pub trait OwnerAudit: Send + Sync + 'static {
-    /// Record a failed owner-UI authentication attempt. `detail` is
-    /// a fixed code, never request data.
-    fn auth_failed(&self, detail: &'static str);
+    /// Record a failed owner-UI authentication attempt.
+    fn auth_failed(&self, failure: AuthFailure);
+}
+
+/// One failed owner-UI authentication attempt, as the audit sink sees it.
+pub struct AuthFailure {
+    /// A fixed code, never request data.
+    pub detail: &'static str,
+    /// The source address, in public mode only (`None` locally). It is
+    /// audit data; it never decides anything (REQ-API-010).
+    pub client_ip: Option<IpAddr>,
 }
 
 /// Audit sink that discards. Tests that don't care use this.
 pub struct NoAudit;
 
 impl OwnerAudit for NoAudit {
-    fn auth_failed(&self, _detail: &'static str) {}
+    fn auth_failed(&self, _failure: AuthFailure) {}
 }
 
 /// The owner UI's state: passkeys, ceremonies, sessions, enrollment
@@ -188,7 +226,14 @@ impl OwnerAudit for NoAudit {
 pub struct OwnerUi {
     rp_id: String,
     origin: String,
+    /// Behind the edge (`[owner_ui] public_origin`, #208).
+    public: bool,
+    /// Host and port of `origin`: the only `Host` public mode serves.
+    host: String,
+    port: u16,
     secure_cookie: bool,
+    /// [`HOST_SESSION_COOKIE`] in public mode, else [`SESSION_COOKIE`].
+    cookie_name: &'static str,
     shell: Arc<dyn OwnerShell>,
     audit: Arc<dyn OwnerAudit>,
     approvals: Arc<dyn OwnerApprovals>,
@@ -226,6 +271,14 @@ struct Enroll {
     expires: Instant,
 }
 
+/// What [`OwnerUi::open_with`] needs beyond the stores.
+pub struct OwnerUiOptions {
+    pub rp_id: String,
+    pub origin: String,
+    /// Public mode: behind the edge (#208).
+    pub public: bool,
+}
+
 impl OwnerUi {
     /// Open the passkey store under `data_dir` and build the UI.
     /// `origin` is the browser origin exactly as `clientDataJSON`
@@ -240,13 +293,47 @@ impl OwnerUi {
         audit: Arc<dyn OwnerAudit>,
         approvals: Arc<dyn OwnerApprovals>,
     ) -> std::io::Result<Arc<Self>> {
-        let origin = origin.into();
+        Self::open_with(
+            data_dir,
+            OwnerUiOptions {
+                rp_id: rp_id.into(),
+                origin: origin.into(),
+                public: false,
+            },
+            shell,
+            audit,
+            approvals,
+        )
+    }
+
+    /// [`Self::open`] with the public-mode switch (#208).
+    pub fn open_with(
+        data_dir: &Path,
+        opts: OwnerUiOptions,
+        shell: Arc<dyn OwnerShell>,
+        audit: Arc<dyn OwnerAudit>,
+        approvals: Arc<dyn OwnerApprovals>,
+    ) -> std::io::Result<Arc<Self>> {
+        let OwnerUiOptions {
+            rp_id,
+            origin,
+            public,
+        } = opts;
         let secure_cookie = origin.starts_with("https://");
+        let (host, port) = crate::config::origin_authority(&origin, &rp_id, public);
         let passkeys = PasskeyStore::load(data_dir)?;
         Ok(Arc::new(Self {
-            rp_id: rp_id.into(),
+            rp_id,
             origin,
+            public,
+            host,
+            port,
             secure_cookie,
+            cookie_name: if public {
+                HOST_SESSION_COOKIE
+            } else {
+                SESSION_COOKIE
+            },
             shell,
             audit,
             approvals,
@@ -265,6 +352,11 @@ impl OwnerUi {
     /// [`Self::open`]). Returns `false` if one was already set.
     pub fn set_unlocker(&self, unlocker: Arc<dyn OwnerUnlock>) -> bool {
         self.unlocker.set(unlocker).is_ok()
+    }
+
+    /// True when the UI is behind the edge (`public_origin`, #208).
+    pub fn is_public(&self) -> bool {
+        self.public
     }
 
     /// The origin assertions are checked against.
@@ -321,7 +413,11 @@ pub async fn serve(
     ui: Arc<OwnerUi>,
     redeem: Arc<dyn ApprovalRedeemer>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(ui, redeem)).await
+    axum::serve(
+        listener,
+        router(ui, redeem).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 /// [`serve`], returning once `shutdown` resolves.
@@ -334,9 +430,12 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, router(ui, redeem))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        router(ui, redeem).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 fn router(ui: Arc<OwnerUi>, redeem: Arc<dyn ApprovalRedeemer>) -> Router {
@@ -344,10 +443,25 @@ fn router(ui: Arc<OwnerUi>, redeem: Arc<dyn ApprovalRedeemer>) -> Router {
     Router::new().fallback(handle).with_state(state)
 }
 
-async fn handle(State(state): State<Arc<OwnerServer>>, req: Request) -> Response {
+async fn handle(
+    State(state): State<Arc<OwnerServer>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    // Public mode: a request not addressed to the published name is
+    // refused before routing, the ntfy redeem branch and the body.
+    // Never audited: a stranger must not be able to grow the log.
+    if state.ui.public
+        && !crate::api::public::host_matches(req.headers(), &state.ui.host, state.ui.port)
+    {
+        return respond(StatusCode::MISDIRECTED_REQUEST, "misdirected", None);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    if path.starts_with(OWNER_APPROVE_PREFIX) || path.starts_with(OWNER_DENY_PREFIX) {
+    // The ntfy redeem routes: on `EDGE_EXEMPT`, so they take no `Origin`.
+    // Later checks that must skip them (the Access check) consult the
+    // same list.
+    if edge_exempt(&path) {
         let redeem = Arc::clone(&state.redeem);
         return dispatch_owner_approval(redeem, method, path).await;
     }
@@ -356,6 +470,9 @@ async fn handle(State(state): State<Arc<OwnerServer>>, req: Request) -> Response
     let cookie = header_str(&headers, header::COOKIE);
     let origin = header_str(&headers, header::ORIGIN);
     let authorization = header_str(&headers, header::AUTHORIZATION);
+    let client_ip = ui
+        .public
+        .then(|| crate::api::public::client_ip(&headers, true).unwrap_or_else(|| peer.ip()));
     let content_type = header_str(&headers, header::CONTENT_TYPE);
     let (_parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
@@ -371,6 +488,7 @@ async fn handle(State(state): State<Arc<OwnerServer>>, req: Request) -> Response
             authorization,
             content_type,
             body: bytes,
+            client_ip,
         })
     })
     .await;
@@ -388,12 +506,47 @@ struct Incoming {
     authorization: Option<String>,
     content_type: Option<String>,
     body: Vec<u8>,
+    /// Public mode only: `CF-Connecting-IP` under REQ-API-010's rule,
+    /// else the TCP peer.
+    client_ip: Option<IpAddr>,
+}
+
+/// What a recorded failure knows about its request.
+struct FailureCtx {
+    client_ip: Option<IpAddr>,
 }
 
 impl OwnerUi {
+    /// The only place an owner-UI auth failure is recorded.
+    fn fail(&self, req: &Incoming, detail: &'static str) {
+        self.record_failure(
+            FailureCtx {
+                client_ip: req.client_ip,
+            },
+            detail,
+        );
+    }
+
+    /// [`Self::fail`] for failures raised before an [`Incoming`] exists.
+    fn record_failure(&self, ctx: FailureCtx, detail: &'static str) {
+        self.audit.auth_failed(AuthFailure {
+            detail,
+            client_ip: ctx.client_ip,
+        });
+    }
+
     fn dispatch(&self, req: Incoming) -> Response {
-        if req.method == Method::POST && req.origin.as_deref().is_some_and(|o| o != self.origin) {
-            self.audit.auth_failed("origin");
+        let origin_refused = if self.public {
+            // Public mode: a POST names the public origin, or it is on
+            // the exemption list (#208).
+            req.method == Method::POST
+                && !edge_exempt(&req.path)
+                && req.origin.as_deref() != Some(self.origin.as_str())
+        } else {
+            req.method == Method::POST && req.origin.as_deref().is_some_and(|o| o != self.origin)
+        };
+        if origin_refused {
+            self.fail(&req, "origin");
             return respond(StatusCode::FORBIDDEN, "origin", None);
         }
         let allowed = match req.path.as_str() {
@@ -499,11 +652,11 @@ impl OwnerUi {
     /// body with unknown keys refused.
     fn gate_owner_post(&self, req: &Incoming) -> Option<Response> {
         if req.origin.as_deref() != Some(self.origin.as_str()) {
-            self.audit.auth_failed("origin");
+            self.fail(req, "origin");
             return Some(respond(StatusCode::FORBIDDEN, "origin", None));
         }
         if !self.session_alive(req.cookie.as_deref()) {
-            self.audit.auth_failed("no_session");
+            self.fail(req, "no_session");
             return Some(respond(StatusCode::UNAUTHORIZED, "unauthenticated", None));
         }
         if req.body.is_empty() {
@@ -637,7 +790,7 @@ impl OwnerUi {
         if self.unlocker.get().is_none() {
             return respond(StatusCode::NOT_IMPLEMENTED, "unknown_op", None);
         }
-        let Some(session) = session_hash(req.cookie.as_deref()) else {
+        let Some(session) = session_hash(self.cookie_name, req.cookie.as_deref()) else {
             return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
         };
         let id = b64url_encode(&random_bytes::<16>());
@@ -682,7 +835,7 @@ impl OwnerUi {
         let Some(unlocker) = self.unlocker.get() else {
             return respond(StatusCode::NOT_IMPLEMENTED, "unknown_op", None);
         };
-        let session = session_hash(req.cookie.as_deref());
+        let session = session_hash(self.cookie_name, req.cookie.as_deref());
         let attempt = {
             let mut guard = self
                 .unlock_attempts
@@ -704,7 +857,7 @@ impl OwnerUi {
                 a.open(&client_pub, &nonce, ciphertext).ok()
             });
         let Some(password) = password else {
-            self.audit.auth_failed("unlock_failed");
+            self.fail(req, "unlock_failed");
             return respond(StatusCode::BAD_REQUEST, "unlock_failed", None);
         };
         match unlocker.unlock(password) {
@@ -717,7 +870,7 @@ impl OwnerUi {
                 // A scope refusal is audited exactly like a wrong
                 // password; only the owner-facing code differs (#243).
                 if e.is_auth_failure() {
-                    self.audit.auth_failed("unlock_failed");
+                    self.fail(req, "unlock_failed");
                 }
                 respond(unlock_status(&e), e.code(), None)
             }
@@ -766,7 +919,7 @@ impl OwnerUi {
             return err;
         }
         if !self.registration_authorized(req) {
-            self.audit.auth_failed("bad_enroll_token");
+            self.fail(req, "bad_enroll_token");
             return respond(StatusCode::UNAUTHORIZED, "bad_enroll_token", None);
         }
         let user_handle = {
@@ -806,35 +959,35 @@ impl OwnerUi {
             return err;
         }
         if req.body.is_empty() {
-            self.audit.auth_failed("no_assertion");
+            self.fail(req, "no_assertion");
             return respond(StatusCode::UNAUTHORIZED, "no_assertion", None);
         }
         let Some(value) = json_object(&req.body) else {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         };
         let Some(cred) = credential_response(&value, CeremonyKind::Login) else {
-            self.audit.auth_failed("no_assertion");
+            self.fail(req, "no_assertion");
             return respond(StatusCode::UNAUTHORIZED, "no_assertion", None);
         };
         let Some(ceremony_id) = value.get("ceremony_id").and_then(|v| v.as_str()) else {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         };
         let Some(ceremony) = self.take_ceremony(ceremony_id, CeremonyKind::Login) else {
-            self.audit.auth_failed("bad_assertion");
+            self.fail(req, "bad_assertion");
             return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
         };
         let verified = {
             let store = self.passkeys.lock().unwrap_or_else(|p| p.into_inner());
             let Some(known) = store.credentials().iter().find(|c| c.id == cred.id) else {
                 drop(store);
-                self.audit.auth_failed("bad_assertion");
+                self.fail(req, "bad_assertion");
                 return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
             };
             if let Some(handle) = &cred.user_handle
                 && !ct_eq(handle, store.user_handle())
             {
                 drop(store);
-                self.audit.auth_failed("bad_assertion");
+                self.fail(req, "bad_assertion");
                 return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
             }
             webauthn::verify_assertion(webauthn::Assertion {
@@ -851,7 +1004,7 @@ impl OwnerUi {
         let new_count = match verified {
             Ok(n) => n,
             Err(_) => {
-                self.audit.auth_failed("bad_assertion");
+                self.fail(req, "bad_assertion");
                 return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
             }
         };
@@ -862,7 +1015,7 @@ impl OwnerUi {
             .set_sign_count(&cred.id, new_count)
             .is_err()
         {
-            self.audit.auth_failed("bad_assertion");
+            self.fail(req, "bad_assertion");
             return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
         }
         let cookie = self.issue_session();
@@ -878,21 +1031,21 @@ impl OwnerUi {
             return err;
         }
         if req.body.is_empty() {
-            self.audit.auth_failed("no_assertion");
+            self.fail(req, "no_assertion");
             return respond(StatusCode::UNAUTHORIZED, "no_assertion", None);
         }
         let Some(value) = json_object(&req.body) else {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         };
         let Some(cred) = credential_response(&value, CeremonyKind::Register) else {
-            self.audit.auth_failed("no_assertion");
+            self.fail(req, "no_assertion");
             return respond(StatusCode::UNAUTHORIZED, "no_assertion", None);
         };
         let Some(ceremony_id) = value.get("ceremony_id").and_then(|v| v.as_str()) else {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         };
         let Some(ceremony) = self.take_ceremony(ceremony_id, CeremonyKind::Register) else {
-            self.audit.auth_failed("bad_assertion");
+            self.fail(req, "bad_assertion");
             return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
         };
         let registered = webauthn::verify_registration(
@@ -905,12 +1058,12 @@ impl OwnerUi {
         let registered = match registered {
             Ok(r) if r.credential_id == cred.id => r,
             _ => {
-                self.audit.auth_failed("bad_assertion");
+                self.fail(req, "bad_assertion");
                 return respond(StatusCode::UNAUTHORIZED, "bad_assertion", None);
             }
         };
         if self.store_credential(registered).is_err() {
-            self.audit.auth_failed("bad_assertion");
+            self.fail(req, "bad_assertion");
             return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
         }
         // Registration is not a login. No session cookie.
@@ -929,7 +1082,7 @@ impl OwnerUi {
         json_body(
             StatusCode::OK,
             json!({"ok": true}).to_string(),
-            Some(clear_cookie(self.secure_cookie)),
+            Some(clear_cookie(self.cookie_name, self.secure_cookie)),
         )
     }
 
@@ -949,7 +1102,7 @@ impl OwnerUi {
         }
         match serde_json::from_slice::<Value>(&req.body) {
             Ok(v) if json_has_password_key(&v) => {
-                self.audit.auth_failed("password_rejected");
+                self.fail(req, "password_rejected");
                 Some(respond(StatusCode::BAD_REQUEST, "password_rejected", None))
             }
             Ok(_) => None,
@@ -1040,11 +1193,11 @@ impl OwnerUi {
             hash,
             expires: now + SESSION_TTL,
         });
-        session_cookie(&token, self.secure_cookie)
+        session_cookie(self.cookie_name, &token, self.secure_cookie)
     }
 
     fn session_alive(&self, cookie_header: Option<&str>) -> bool {
-        let Some(hash) = session_hash(cookie_header) else {
+        let Some(hash) = session_hash(self.cookie_name, cookie_header) else {
             return false;
         };
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -1056,7 +1209,7 @@ impl OwnerUi {
     /// Remove the session that matches this cookie, expired or not.
     /// Other sessions stay. A missing or unknown cookie is a no-op.
     fn revoke_session(&self, cookie_header: Option<&str>) {
-        let Some(hash) = session_hash(cookie_header) else {
+        let Some(hash) = session_hash(self.cookie_name, cookie_header) else {
             return;
         };
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -1248,8 +1401,8 @@ fn header_str(headers: &axum::http::HeaderMap, name: header::HeaderName) -> Opti
         .map(str::to_owned)
 }
 
-fn session_hash(cookie_header: Option<&str>) -> Option<[u8; 32]> {
-    let token = cookie_value(cookie_header, SESSION_COOKIE)?;
+fn session_hash(name: &str, cookie_header: Option<&str>) -> Option<[u8; 32]> {
+    let token = cookie_value(cookie_header, name)?;
     Some(sha256(token.as_bytes()))
 }
 
@@ -1257,7 +1410,9 @@ fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
     let header = header?;
     for part in header.split(';') {
         let part = part.trim();
-        let (k, v) = part.split_once('=')?;
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         if k.trim() == name {
             return Some(v.trim().to_owned());
         }
@@ -1265,9 +1420,9 @@ fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
     None
 }
 
-fn session_cookie(token: &str, secure: bool) -> String {
+fn session_cookie(name: &str, token: &str, secure: bool) -> String {
     let mut c = format!(
-        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        "{name}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         SESSION_TTL.as_secs()
     );
     if secure {
@@ -1276,8 +1431,8 @@ fn session_cookie(token: &str, secure: bool) -> String {
     c
 }
 
-fn clear_cookie(secure: bool) -> String {
-    let mut c = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+fn clear_cookie(name: &str, secure: bool) -> String {
+    let mut c = format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
     if secure {
         c.push_str("; Secure");
     }
@@ -1826,6 +1981,34 @@ mod tests {
     }
 
     #[test]
+    fn a_nameless_cookie_part_does_not_hide_the_rest() {
+        assert_eq!(
+            cookie_value(Some("x; name=v"), "name").as_deref(),
+            Some("v")
+        );
+        assert_eq!(
+            cookie_value(Some("name=v; x"), "name").as_deref(),
+            Some("v")
+        );
+        assert_eq!(cookie_value(Some("x; y"), "name"), None);
+    }
+
+    #[test]
+    fn edge_exempt_lists_only_the_ntfy_redeem_routes() {
+        for path in ["/owner/approve/abc", "/owner/deny/abc"] {
+            assert!(edge_exempt(path), "{path}");
+        }
+        for path in [
+            "/owner/approvals/approve",
+            "/owner/login/finish",
+            "/",
+            "/oauth/token",
+        ] {
+            assert!(!edge_exempt(path), "{path}");
+        }
+    }
+
+    #[test]
     fn req_apr_005_session_at_most_15_min() {
         let dir = tempfile::tempdir().unwrap();
         let ui = OwnerUi::open(
@@ -1877,6 +2060,7 @@ mod tests {
             authorization: None,
             content_type: Some("application/json".into()),
             body: br#"{"password":"hunter2","ceremony_id":"x"}"#.to_vec(),
+            client_ip: None,
         });
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
@@ -1910,6 +2094,7 @@ mod tests {
             authorization: None,
             content_type: None,
             body: Vec::new(),
+            client_ip: None,
         });
         assert_eq!(response.status(), StatusCode::OK);
         let cleared = response
@@ -1935,6 +2120,7 @@ mod tests {
             authorization: None,
             content_type: None,
             body: Vec::new(),
+            client_ip: None,
         });
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
@@ -2067,8 +2253,8 @@ mod tests {
     struct FailCodes(Mutex<Vec<&'static str>>);
 
     impl OwnerAudit for FailCodes {
-        fn auth_failed(&self, detail: &'static str) {
-            self.0.lock().unwrap().push(detail);
+        fn auth_failed(&self, failure: AuthFailure) {
+            self.0.lock().unwrap().push(failure.detail);
         }
     }
 
@@ -2130,6 +2316,7 @@ mod tests {
                 authorization: None,
                 content_type: content_type.map(str::to_owned),
                 body: body.as_bytes().to_vec(),
+                client_ip: None,
             });
             let status = response.status();
             let bytes = futures_body(response);
@@ -2805,6 +2992,7 @@ mod tests {
             authorization: None,
             content_type: Some("application/json".into()),
             body: body.as_bytes().to_vec(),
+            client_ip: None,
         });
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let (status, _) = rig.post("/owner/unlock", &body);

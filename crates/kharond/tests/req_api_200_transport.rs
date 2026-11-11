@@ -24,6 +24,7 @@ async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
         listener,
         broker,
         None,
+        None,
         std::future::pending(),
     ));
     addr

@@ -50,12 +50,20 @@ const REFUSED: &[(&str, &str)] = &[
 ];
 
 async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
+    serve_public_for(broker, None).await
+}
+
+async fn serve_public_for(
+    broker: Arc<TestBroker>,
+    public_host: Option<&str>,
+) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(kharond::api::public::serve_with_shutdown(
         listener,
         broker,
         None,
+        public_host.map(Arc::from),
         std::future::pending(),
     ));
     addr
@@ -126,6 +134,46 @@ async fn public_ingress_refuses_everything_else_even_with_a_valid_token() {
     // the 404s above are the listener's allow-list, not a dead broker.
     let api = api_support::serve_http(h.broker.clone()).await;
     assert_eq!(get(api, "/v1/status", Some(&h.alpha)).await.status, 200);
+}
+
+#[tokio::test]
+async fn public_host_refuses_a_foreign_host_with_the_uniform_404() {
+    let h = Harness::new(false);
+    let with_host = |host: &str, method: &str, target: &str| {
+        let body = if method == "POST" { "{}" } else { "" };
+        format!(
+            "{method} {target} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+
+    let addr = serve_public_for(h.broker.clone(), Some("kharon.example.com")).await;
+    let unknown = raw_request(
+        addr,
+        with_host("kharon.example.com", "GET", "/nope").as_bytes(),
+    )
+    .await;
+    assert_not_found(unknown.status, &unknown.body, "GET /nope");
+    let foreign = raw_request(
+        addr,
+        with_host("evil.example.com", "POST", "/mcp").as_bytes(),
+    )
+    .await;
+    assert_not_found(foreign.status, &foreign.body, "foreign Host");
+    assert_eq!(foreign.body, unknown.body, "the same 404 body");
+    for host in ["kharon.example.com", "KHARON.example.com:443"] {
+        let r = raw_request(addr, with_host(host, "POST", "/mcp").as_bytes()).await;
+        assert_eq!(r.status, 401, "{host}: {}", r.body);
+    }
+
+    // No public_host: any Host reaches auth.
+    let addr = serve_public_for(h.broker.clone(), None).await;
+    let r = raw_request(
+        addr,
+        with_host("evil.example.com", "POST", "/mcp").as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 401, "{}", r.body);
 }
 
 /// An export-mode config with `[api]` on loopback and `public` appended.

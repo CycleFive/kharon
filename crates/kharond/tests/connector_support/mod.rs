@@ -216,6 +216,7 @@ pub async fn rig_with_deadline(hash_argon: Argon2<'static>, deadline: Option<Dur
         listener,
         harness.broker.clone(),
         Some(Arc::clone(&ws)),
+        None,
         std::future::pending(),
     ));
     Rig {

@@ -334,3 +334,189 @@ fn connector_listen_only_unchanged() {
     assert_eq!(connector.listen, Some("127.0.0.1:8789".parse().unwrap()));
     assert!(!connector.websocket);
 }
+
+/// Config with an `[owner_ui]` body (and optional extra tables) on the
+/// spec example.
+fn owner_ui_config(body: &str) -> String {
+    format!("{}\n[owner_ui]\n{body}\n", spec_example())
+}
+
+fn owner_ui_err(body: &str) -> ConfigError {
+    Config::from_toml_str(&owner_ui_config(body)).unwrap_err()
+}
+
+#[test]
+fn owner_ui_public_origin_enables_public_mode() {
+    let cfg = Config::from_toml_str(&owner_ui_config(
+        "listen = \"127.0.0.1:8788\"\npublic_origin = \"https://kharon-owner.example.com\"",
+    ))
+    .unwrap();
+    let ui = cfg.owner_ui.unwrap();
+    assert!(ui.public);
+    assert_eq!(ui.origin, "https://kharon-owner.example.com");
+    assert_eq!(ui.rp_id, "kharon-owner.example.com");
+    assert_eq!(ui.authority(), ("kharon-owner.example.com".to_owned(), 443));
+    assert_eq!(ui.access, None);
+}
+
+#[test]
+fn owner_ui_local_mode_is_not_public() {
+    let cfg = Config::from_toml_str(&owner_ui_config(
+        "listen = \"127.0.0.1:8788\"\norigin = \"http://localhost:8788\"",
+    ))
+    .unwrap();
+    let ui = cfg.owner_ui.unwrap();
+    assert!(!ui.public);
+    assert_eq!(ui.access, None);
+    assert_eq!(ui.authority(), ("localhost".to_owned(), 8788));
+}
+
+#[test]
+fn owner_ui_public_origin_normalizes_ports() {
+    let load = |origin: &str| {
+        Config::from_toml_str(&owner_ui_config(&format!(
+            "listen = \"127.0.0.1:8788\"\npublic_origin = \"{origin}\""
+        )))
+        .unwrap()
+        .owner_ui
+        .unwrap()
+    };
+    let ui = load("https://o.example.com:443");
+    assert_eq!(ui.origin, "https://o.example.com");
+    assert_eq!(ui.authority().1, 443);
+    let ui = load("https://o.example.com:8443");
+    assert_eq!(ui.origin, "https://o.example.com:8443");
+    assert_eq!(ui.authority().1, 8443);
+}
+
+#[test]
+fn owner_ui_public_mode_ignores_the_listen_port() {
+    for listen in ["127.0.0.1:0", "127.0.0.1:8788"] {
+        let cfg = Config::from_toml_str(&owner_ui_config(&format!(
+            "listen = \"{listen}\"\npublic_origin = \"https://o.example.com\""
+        )))
+        .unwrap();
+        let ui = cfg.owner_ui.unwrap();
+        assert_eq!(ui.origin_for_bound_port(54321), "https://o.example.com");
+    }
+}
+
+#[test]
+fn owner_ui_needs_exactly_one_origin() {
+    let both = owner_ui_err(
+        "listen = \"127.0.0.1:8788\"\norigin = \"http://localhost:8788\"\npublic_origin = \"https://o.example.com\"",
+    );
+    assert_eq!(both, ConfigError::OwnerUiOriginChoice);
+    assert_eq!(both.code(), "owner_ui_origin_choice");
+    let neither = owner_ui_err("listen = \"127.0.0.1:8788\"");
+    assert_eq!(neither, ConfigError::OwnerUiOriginChoice);
+}
+
+#[test]
+fn owner_ui_public_origin_must_be_https_and_bare() {
+    for origin in [
+        "http://o.example.com",
+        "https://203.0.113.7",
+        "https://o.example.com/x",
+        "https://u@o.example.com",
+        "https://o.example.com?x=1",
+        "https://o.example.com:0",
+    ] {
+        let err = owner_ui_err(&format!(
+            "listen = \"127.0.0.1:8788\"\npublic_origin = \"{origin}\""
+        ));
+        assert_eq!(err, ConfigError::OwnerUiPublicOrigin, "{origin}");
+        assert_eq!(err.code(), "owner_ui_public_origin");
+    }
+    let err = owner_ui_err(
+        "listen = \"127.0.0.1:8788\"\nrp_id = \"example.com\"\npublic_origin = \"https://o.example.com\"",
+    );
+    assert_eq!(err, ConfigError::OwnerUiPublicOrigin);
+}
+
+#[test]
+fn owner_ui_access_needs_public_mode() {
+    let err = owner_ui_err(
+        "listen = \"127.0.0.1:8788\"\norigin = \"http://localhost:8788\"\n[owner_ui.access]\nteam_domain = \"t.cloudflareaccess.com\"\naudience = \"abc123\"",
+    );
+    assert_eq!(err, ConfigError::OwnerUiAccessNeedsPublicOrigin);
+    assert_eq!(err.code(), "owner_ui_access_needs_public_origin");
+}
+
+fn public_access(access: &str) -> String {
+    format!(
+        "listen = \"127.0.0.1:8788\"\npublic_origin = \"https://o.example.com\"\n[owner_ui.access]\n{access}"
+    )
+}
+
+#[test]
+fn owner_ui_access_is_validated() {
+    for access in [
+        "team_domain = \"evil.example.com\"\naudience = \"abc123\"",
+        "team_domain = \"cloudflareaccess.com\"\naudience = \"abc123\"",
+        "team_domain = \".cloudflareaccess.com\"\naudience = \"abc123\"",
+        "team_domain = \"t.cloudflareaccess.com\"\naudience = \"\"",
+        "team_domain = \"t.cloudflareaccess.com\"\naudience = \"a b\"",
+    ] {
+        let err = owner_ui_err(&public_access(access));
+        assert_eq!(err, ConfigError::OwnerUiAccess, "{access}");
+        assert_eq!(err.code(), "owner_ui_access");
+    }
+    let cfg = Config::from_toml_str(&owner_ui_config(&public_access(
+        "team_domain = \"t.cloudflareaccess.com\"\naudience = \"abc123\"",
+    )))
+    .unwrap();
+    assert_eq!(
+        cfg.owner_ui.unwrap().access,
+        Some(AccessConfig {
+            team_domain: "t.cloudflareaccess.com".to_owned(),
+            audience: "abc123".to_owned(),
+            jwks: JwksSource::TeamCerts,
+        })
+    );
+    let mixed = Config::from_toml_str(&owner_ui_config(&public_access(
+        "team_domain = \"T.CloudflareAccess.com\"\naudience = \"abc123\"",
+    )))
+    .unwrap();
+    assert_eq!(
+        mixed.owner_ui.unwrap().access.unwrap().team_domain,
+        "t.cloudflareaccess.com"
+    );
+}
+
+#[test]
+fn owner_ui_access_has_no_jwks_key() {
+    let base = "team_domain = \"t.cloudflareaccess.com\"\naudience = \"abc123\"";
+    Config::from_toml_str(&owner_ui_config(&public_access(base))).unwrap();
+    for extra in ["jwks = \"{}\"", "jwks_url = \"https://x\""] {
+        let body = public_access(&format!("{base}\n{extra}"));
+        assert!(
+            Config::from_toml_str(&owner_ui_config(&body)).is_err(),
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn public_ingress_public_host_is_optional_and_validated() {
+    let load = |extra: &str| {
+        Config::from_toml_str(&format!(
+            "{}\n[public_ingress]\nlisten = \"127.0.0.1:8790\"\n{extra}\n",
+            spec_example()
+        ))
+    };
+    assert_eq!(load("").unwrap().public_ingress.unwrap().public_host, None);
+    assert_eq!(
+        load("public_host = \"Kharon.Example.com\"")
+            .unwrap()
+            .public_ingress
+            .unwrap()
+            .public_host,
+        Some("kharon.example.com".to_owned())
+    );
+    for bad in ["https://x", "203.0.113.7", "a b"] {
+        let err = load(&format!("public_host = \"{bad}\"")).unwrap_err();
+        assert_eq!(err, ConfigError::PublicIngressPublicHost, "{bad}");
+        assert_eq!(err.code(), "public_ingress_public_host");
+    }
+}

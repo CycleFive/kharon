@@ -122,6 +122,7 @@ async fn rig_with(sink: &ConnectorAudit) -> Rig {
         listener,
         harness.broker.clone(),
         Some(ws),
+        None,
         std::future::pending(),
     ));
     Rig {

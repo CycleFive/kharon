@@ -15,7 +15,7 @@ mod api_support;
 use std::sync::Arc;
 
 use api_support::{Harness, TestBroker, mcp_call, raw_request};
-use kharond::api::transport::PER_IP_PER_MINUTE;
+use kharond::api::transport::{PER_AGENT_PER_MINUTE, PER_IP_PER_MINUTE};
 
 async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -63,6 +63,52 @@ async fn public_ingress_keys_the_ip_window_by_the_honoured_header() {
     assert_eq!(
         r.status, 401,
         "no header: the edge peer's budget, untouched"
+    );
+}
+
+/// One authenticated `POST /mcp` (`tools/list`) from claimed
+/// address `cf_ip` with `token`.
+fn agent_post(cf_ip: &str, token: &str) -> Vec<u8> {
+    let payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}";
+    format!(
+        "POST /mcp HTTP/1.1\r\nHost: kharon.test\r\nAuthorization: Bearer {token}\r\nCF-Connecting-IP: {cf_ip}\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    )
+    .into_bytes()
+}
+
+/// Duet's R2 on PR #238: the per-agent window's *wiring* — only the
+/// `TransportLimits` unit test covered 240/min, so removing
+/// `transport_agent_admit` from the `/mcp` handler failed no test.
+/// End to end on public ingress (REQ-RL-005's AC): one token spread
+/// across five claimed addresses (48 each, under the per-IP 60/min)
+/// answers 240 authenticated requests, and the 241st — from a sixth
+/// address whose per-IP budget is fresh — is 429 `rate_limited`.
+/// Another agent from that same sixth address is still admitted:
+/// the budget that ran out is the agent's, not the address's.
+#[tokio::test]
+async fn public_ingress_agent_window_refuses_the_241st_request() {
+    let h = Harness::new(false);
+    let addr = serve_public(h.broker.clone()).await;
+    let ips = [
+        "198.51.100.11",
+        "198.51.100.12",
+        "198.51.100.13",
+        "198.51.100.14",
+        "198.51.100.15",
+    ];
+    for i in 0..PER_AGENT_PER_MINUTE {
+        let r = raw_request(addr, &agent_post(ips[(i as usize) % ips.len()], &h.alpha)).await;
+        assert_eq!(r.status, 200, "request {i} must be admitted: {}", r.body);
+    }
+    let r = raw_request(addr, &agent_post("198.51.100.16", &h.alpha)).await;
+    assert_eq!(r.status, 429, "the 241st request is out of budget");
+    assert_eq!(r.json()["error"], "rate_limited", "{}", r.body);
+    let r = raw_request(addr, &agent_post("198.51.100.16", &h.beta)).await;
+    assert_eq!(
+        r.status, 200,
+        "beta's agent budget is untouched: {}",
+        r.body
     );
 }
 

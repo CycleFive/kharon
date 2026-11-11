@@ -639,3 +639,85 @@ async fn req_apr_009_odd_ceremony_ids_are_refused_cleanly() {
     }
     run.shutdown().await;
 }
+
+/// A `webauthn.get` assertion with the counter at 0, the way a synced
+/// passkey signs. `VirtAuth::assertion` always bumps the counter, which
+/// would let the WebAuthn counter rule refuse a replay on its own.
+fn zero_count_assertion(auth: &mut VirtAuth, challenge: &str) -> Json {
+    use aws_lc_rs::rand::SystemRandom;
+    use sha2::{Digest, Sha256};
+    auth.sign_count = 0;
+    let client = auth.client_data("webauthn.get", challenge, PUBLIC_ORIGIN);
+    let data = auth.auth_data(PUBLIC_HOST, false);
+    let mut message = data.clone();
+    message.extend_from_slice(&Sha256::digest(client.as_bytes()));
+    let sig = auth.key.sign(&SystemRandom::new(), &message).unwrap();
+    json!({
+        "id": owner_ui_support::b64url(&auth.cred_id),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": owner_ui_support::b64url(client.as_bytes()),
+            "authenticatorData": owner_ui_support::b64url(&data),
+            "signature": owner_ui_support::b64url(sig.as_ref()),
+            "userHandle": owner_ui_support::b64url(&auth.user_handle),
+        },
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_only_the_used_set_refuses_a_replay() {
+    let run = start_public().await;
+    let mut auth = enroll_public(&run).await;
+
+    // Login: the counter stays 0, so the WebAuthn counter rule accepts
+    // the replay and only the used-set can refuse it.
+    let opts = login_options(&run, "198.51.100.1").await;
+    let assertion =
+        zero_count_assertion(&mut auth, opts["publicKey"]["challenge"].as_str().unwrap());
+    let body = json!({"ceremony_id": opts["ceremony_id"], "credential": assertion}).to_string();
+    let first = finish(&run, &body).await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let again = finish(&run, &body).await;
+    assert_eq!(again.status, 401, "{}", again.body);
+    assert!(
+        again.body.contains(r#""error":"bad_assertion""#),
+        "{}",
+        again.body
+    );
+    assert!(!has_session_cookie(&again));
+
+    // Register: a replayed finish must not store the credential again.
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
+    let opts = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/options", "").bearer(&enroll),
+    )
+    .await;
+    assert_eq!(opts.status, 200, "{}", opts.body);
+    let opts: Json = serde_json::from_str(&opts.body).unwrap();
+    let mut second = VirtAuth::new();
+    second.cred_id = vec![0x22; 16];
+    second.user_handle = auth.user_handle.clone();
+    let reg = second.registration(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    let body = json!({"ceremony_id": opts["ceremony_id"], "credential": reg}).to_string();
+    let post = |body: String| {
+        let ui = run.ui;
+        async move { http(ui, PUBLIC_ORIGIN, pub_post("/owner/register/finish", &body)).await }
+    };
+    let first = post(body.clone()).await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let again = post(body).await;
+    assert_eq!(again.status, 401, "{}", again.body);
+    assert!(
+        again.body.contains(r#""error":"bad_assertion""#),
+        "{}",
+        again.body
+    );
+    run.shutdown().await;
+}

@@ -9,6 +9,7 @@
 //! finish burns the token in [`UsedOnce`] (only successes, so a
 //! stranger can't fill it).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,8 @@ pub(crate) struct Sealer {
     key: RwLock<Zeroizing<[u8; 32]>>,
     /// Token expiry is milliseconds since this instant.
     epoch: Instant,
+    /// Bumped by every [`Sealer::rotate`].
+    generation: AtomicU64,
 }
 
 /// A token that opened: its claims, its single-use id, its expiry.
@@ -58,6 +61,8 @@ pub(crate) struct Opened<T> {
     /// SHA-256 of the whole token.
     pub id: [u8; 32],
     pub expires: Instant,
+    /// [`Sealer::generation`] when the token opened.
+    pub generation: u64,
 }
 
 fn fresh_key() -> Zeroizing<[u8; 32]> {
@@ -71,12 +76,19 @@ impl Sealer {
         Self {
             key: RwLock::new(fresh_key()),
             epoch: Instant::now(),
+            generation: AtomicU64::new(0),
         }
     }
 
     /// Replace the key: every token sealed before this stops opening.
     pub fn rotate(&self) {
         *self.key.write().unwrap_or_else(|p| p.into_inner()) = fresh_key();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many times the key has been replaced.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     fn mac(&self, payload: &[u8]) -> HmacSha256 {
@@ -119,6 +131,9 @@ impl Sealer {
         token: &str,
         now: Instant,
     ) -> Option<Opened<T>> {
+        // Read before the MAC: a rotation after this read bumps the
+        // generation, and one before it makes the MAC fail.
+        let generation = self.generation();
         if token.len() > MAX_TOKEN_LEN {
             return None;
         }
@@ -138,6 +153,7 @@ impl Sealer {
             claims: envelope.c,
             id: Sha256::digest(token.as_bytes()).into(),
             expires: self.epoch + Duration::from_millis(envelope.exp),
+            generation,
         })
     }
 }
@@ -166,8 +182,20 @@ impl UsedOnce {
 
     /// Drop expired entries, then insert `id` if absent: one lock,
     /// one step, so two finishes of one token cannot both win.
-    pub fn burn(&self, id: [u8; 32], expires: Instant, now: Instant) -> Burn {
+    /// `still_current` runs while the lock is held; `false` (the key
+    /// was rotated since the token opened) refuses like a replay.
+    pub fn burn(
+        &self,
+        id: [u8; 32],
+        expires: Instant,
+        now: Instant,
+        still_current: impl FnOnce() -> bool,
+    ) -> Burn {
         let mut ids = self.ids.lock().unwrap_or_else(|p| p.into_inner());
+        // Evaluated under the lock: see `OwnerUi::invalidate_sealed`.
+        if !still_current() {
+            return Burn::Replayed;
+        }
         ids.retain(|(_, exp)| *exp > now);
         if ids.iter().any(|(seen, _)| *seen == id) {
             return Burn::Replayed;
@@ -300,11 +328,11 @@ mod tests {
         let u = UsedOnce::new();
         let now = Instant::now();
         let exp = now + TTL;
-        assert_eq!(u.burn([1; 32], exp, now), Burn::Fresh);
-        assert_eq!(u.burn([1; 32], exp, now), Burn::Replayed);
-        assert_eq!(u.burn([2; 32], exp, now), Burn::Fresh);
+        assert_eq!(u.burn([1; 32], exp, now, || true), Burn::Fresh);
+        assert_eq!(u.burn([1; 32], exp, now, || true), Burn::Replayed);
+        assert_eq!(u.burn([2; 32], exp, now, || true), Burn::Fresh);
         u.clear();
-        assert_eq!(u.burn([1; 32], exp, now), Burn::Fresh);
+        assert_eq!(u.burn([1; 32], exp, now, || true), Burn::Fresh);
     }
 
     #[test]
@@ -313,10 +341,37 @@ mod tests {
         let now = Instant::now();
         let exp = now + TTL;
         for i in 0..MAX_USED {
-            assert_eq!(u.burn([i as u8; 32], exp, now), Burn::Fresh);
+            assert_eq!(u.burn([i as u8; 32], exp, now, || true), Burn::Fresh);
         }
-        assert_eq!(u.burn([200; 32], exp, now), Burn::Full);
-        assert_eq!(u.burn([0; 32], exp, now), Burn::Replayed);
-        assert_eq!(u.burn([200; 32], exp + TTL, now + TTL), Burn::Fresh);
+        assert_eq!(u.burn([200; 32], exp, now, || true), Burn::Full);
+        assert_eq!(u.burn([0; 32], exp, now, || true), Burn::Replayed);
+        assert_eq!(
+            u.burn([200; 32], exp + TTL, now + TTL, || true),
+            Burn::Fresh
+        );
+    }
+
+    #[test]
+    fn a_token_opened_before_rotate_cannot_burn_after_it() {
+        let s = Sealer::new();
+        let u = UsedOnce::new();
+        let now = Instant::now();
+        let token = s.seal("login", &claims("old"), TTL, now);
+        let opened = open_login(&s, &token, now).unwrap();
+        // A panic lands between the open and the burn.
+        s.rotate();
+        u.clear();
+        assert_eq!(
+            u.burn(opened.id, opened.expires, now, || s.generation()
+                == opened.generation),
+            Burn::Replayed
+        );
+        let token = s.seal("login", &claims("new"), TTL, now);
+        let opened = open_login(&s, &token, now).unwrap();
+        assert_eq!(
+            u.burn(opened.id, opened.expires, now, || s.generation()
+                == opened.generation),
+            Burn::Fresh
+        );
     }
 }

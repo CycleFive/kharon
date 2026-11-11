@@ -1170,6 +1170,11 @@ impl OwnerUi {
         // a token sealed under the old key could still open in the gap,
         // be burned into the just-emptied set, and sign in. After the
         // rotation nothing old opens, so the clear can't re-admit it.
+        // A token that opened BEFORE the rotation is caught by the
+        // generation: `burn` checks it under the used-set's own lock,
+        // so a burn that takes the lock after `clear` sees the bump,
+        // one before `clear` sees it too or ran wholly before the
+        // rotation, and either way the panic's `clear` empties it.
         self.sealer.rotate();
         self.used.clear();
     }
@@ -1206,7 +1211,11 @@ impl OwnerUi {
         req: &Incoming,
         opened: &sealed::Opened<CeremonyClaims>,
     ) -> Option<Response> {
-        match self.used.burn(opened.id, opened.expires, Instant::now()) {
+        let current = || self.sealer.generation() == opened.generation;
+        match self
+            .used
+            .burn(opened.id, opened.expires, Instant::now(), current)
+        {
             Burn::Fresh => None,
             Burn::Replayed => {
                 self.fail(req, "bad_assertion");
@@ -3327,5 +3336,43 @@ mod tests {
         .unwrap();
         let (status, reply) = post_ui(&ui, "/owner/login/finish", &body);
         assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+
+    #[test]
+    fn a_ceremony_opened_before_a_panic_cannot_burn_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = OwnerUi::open(
+            dir.path(),
+            "localhost",
+            ORIGIN,
+            Arc::new(StaticShell(ShellView {
+                locked: true,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        let ceremony = ui.begin(CeremonyKind::Login);
+        let (_, opened) = ui
+            .open_ceremony(&ceremony.id, CeremonyKind::Login)
+            .expect("opens");
+        ui.invalidate_sealed();
+        let req = Incoming {
+            method: Method::POST,
+            path: "/owner/login/finish".into(),
+            cookie: None,
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            content_type: None,
+            body: Vec::new(),
+            client_ip: None,
+        };
+        let refused = ui.burn_ceremony(&req, &opened).expect("refused");
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            ui.open_ceremony(&ceremony.id, CeremonyKind::Login)
+                .is_none()
+        );
     }
 }

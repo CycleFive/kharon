@@ -540,8 +540,14 @@ impl Drop for Chromium {
 }
 
 fn launch_chromium(bin: &Path) -> Chromium {
+    // Five of these tests launch together. Starting them one at a time
+    // keeps a busy runner from missing the DevTools deadline, and the
+    // stderr pipe is drained so a full buffer cannot stall the browser.
+    static LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _launch = LAUNCH.lock().unwrap_or_else(|p| p.into_inner());
+
     let profile = tempfile::tempdir().unwrap();
-    let child = Command::new(bin)
+    let mut child = Command::new(bin)
         .args([
             "--headless=new",
             "--no-sandbox",
@@ -568,8 +574,32 @@ fn launch_chromium(bin: &Path) -> Chromium {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("cannot launch Chromium at {}: {e}", bin.display()));
+    let stderr = child.stderr.take().unwrap();
+    let log = Arc::new(std::sync::Mutex::new(String::new()));
+    let log_task = Arc::clone(&log);
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut tmp = [0u8; 4096];
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut buf = log_task.lock().unwrap_or_else(|p| p.into_inner());
+                    buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                    if buf.len() > 4096 {
+                        let mut drop_to = buf.len() - 4096;
+                        while drop_to < buf.len() && !buf.is_char_boundary(drop_to) {
+                            drop_to += 1;
+                        }
+                        buf.drain(..drop_to);
+                    }
+                }
+            }
+        }
+    });
+    let stderr_tail = || log.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let port_file = profile.path().join("DevToolsActivePort");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let ws = loop {
         if let Ok(text) = std::fs::read_to_string(&port_file) {
             let mut lines = text.lines();
@@ -577,7 +607,17 @@ fn launch_chromium(bin: &Path) -> Chromium {
                 break format!("ws://127.0.0.1:{port}{path}");
             }
         }
-        assert!(Instant::now() < deadline, "Chromium never opened DevTools");
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "Chromium exited {status} before DevTools opened; stderr: {}",
+                stderr_tail()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Chromium never opened DevTools; stderr: {}",
+            stderr_tail()
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     Chromium {

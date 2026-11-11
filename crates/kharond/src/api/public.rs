@@ -74,6 +74,11 @@ pub const CF_CONNECTING_IP: &str = "cf-connecting-ip";
 /// it: no allow-list, no exemption from a token or the passkey, no
 /// choice of mode.
 ///
+/// A `None` is not a throttle key. The owner UI audits such a
+/// request with its TCP peer and does not throttle it (REQ-APR-009):
+/// behind the tunnel every header-less request shares one peer, and
+/// one shared bucket would let a stranger lock the owner out.
+///
 /// Returns `None` when the request is not public-ingress, the
 /// header is absent, appears more than once, or does not parse as
 /// one IP address (v4 or v6).

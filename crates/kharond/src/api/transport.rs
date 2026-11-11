@@ -162,7 +162,7 @@ impl TransportLimits {
 /// The throttle key for a client address: IPv4 unchanged, an
 /// IPv4-mapped IPv6 address as its IPv4 address, any other IPv6
 /// address truncated to its /64 (host bits zeroed).
-fn ip_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn ip_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

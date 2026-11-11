@@ -374,6 +374,13 @@ impl OwnerOps for DaemonOwner {
         .unwrap_or(false)
     }
 
+    fn owner_ui_without_edge_address(&self) -> Option<u64> {
+        self.owner_ui
+            .as_ref()
+            .filter(|ui| ui.is_public())
+            .map(|ui| ui.requests_without_edge_address())
+    }
+
     async fn is_locked(&self) -> bool {
         let broker = Arc::clone(&self.broker);
         tokio::task::spawn_blocking(move || {
@@ -1160,7 +1167,22 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
         if let Some(ip) = failure.client_ip {
             entry = entry.client_ip(ip.to_string());
         }
-        let _ = self.broker.append_audit(entry);
+        if let Some(n) = failure.suppressed {
+            entry = entry.suppressed(n);
+        }
+        if self.broker.append_audit(entry).is_err() {
+            eprintln!("kharond: owner_ui audit append failed");
+        }
+    }
+
+    fn suppressed_only(&self, count: u64) {
+        let entry = Entry::new(Event::OwnerAuthFail)
+            .channel("web_ui")
+            .result("suppressed_only")
+            .suppressed(count);
+        if self.broker.append_audit(entry).is_err() {
+            eprintln!("kharond: owner_ui audit append failed");
+        }
     }
 }
 
@@ -1273,6 +1295,12 @@ impl Daemon {
         });
         let owner_ops = Arc::clone(&self.owner_ops);
         let owner = tokio::spawn(crate::owner::serve(self.owner_listener, self.owner_ops));
+        // Public mode only: the audit ceiling's count needs flushing.
+        let public_ui = self
+            .owner_ui
+            .as_ref()
+            .map(|(_, ui)| Arc::clone(ui))
+            .filter(|ui| ui.is_public());
         let owner_ui = self.owner_ui.map(|(listener, ui)| {
             let broker = Arc::clone(&self.broker);
             let redeem: Arc<dyn crate::api::http::ApprovalRedeemer> = broker;
@@ -1331,6 +1359,12 @@ impl Daemon {
                 housekeeping_rx,
             ))
         });
+        let ui_housekeeping = public_ui.as_ref().map(|ui| {
+            tokio::spawn(owner_ui_housekeeping(
+                Arc::clone(ui),
+                housekeeping_stop.subscribe(),
+            ))
+        });
         let served = match (self.listener, self.api_tls) {
             (Some((listener, _)), Some(tls)) => {
                 http::serve_tls_with_shutdown(listener, tls, self.broker, shutdown).await
@@ -1376,6 +1410,9 @@ impl Daemon {
         if let Some(task) = housekeeping {
             let _ = task.await;
         }
+        if let Some(task) = ui_housekeeping {
+            let _ = task.await;
+        }
         // The last refusal count leaves before the exit checkpoint
         // anchors the tail (#219).
         if let Some(line) = ws.as_ref().and_then(|ws| ws.take_refusal_line()) {
@@ -1401,6 +1438,9 @@ impl Daemon {
         // the same blocking task, so the checkpoint covers them. A failing
         // sink only prints a line; it cannot hang this.
         let _ = tokio::task::spawn_blocking(move || {
+            if let Some(ui) = public_ui {
+                ui.drain_audit();
+            }
             if let Some(hub) = shutdown_hub {
                 hub.flush_audit_all();
             }
@@ -1449,6 +1489,41 @@ pub async fn connector_housekeeping(
         }
     }
 }
+
+/// Owner-UI housekeeping, public mode only: every
+/// [`OWNER_UI_AUDIT_FLUSH_PERIOD`] write the count of a closed audit
+/// window (#208 D6), so a flood's suppressed count reaches the log within
+/// 75 s. Each flush runs on the blocking pool: the sink fsyncs. Returns
+/// once `stop` is true; shutdown signals and awaits this task, like
+/// [`connector_housekeeping`], so no flush runs behind the final one.
+pub async fn owner_ui_housekeeping(
+    ui: Arc<crate::owner_ui::OwnerUi>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut flush = tokio::time::interval(OWNER_UI_AUDIT_FLUSH_PERIOD);
+    flush.tick().await;
+    loop {
+        tokio::select! {
+            _ = flush.tick() => {
+                let ui = Arc::clone(&ui);
+                let _ = tokio::task::spawn_blocking(move || {
+                    ui.flush_audit(std::time::Instant::now());
+                })
+                .await;
+            }
+            changed = stop.changed() => {
+                // A dropped sender also ends the task.
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// How often a closed owner-UI audit window is flushed (#208 D6): one
+/// 60 s window plus one period is the 75 s bound.
+pub const OWNER_UI_AUDIT_FLUSH_PERIOD: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How often the refused-WebSocket-upgrade count is logged (#199).
 pub const WS_REFUSAL_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);

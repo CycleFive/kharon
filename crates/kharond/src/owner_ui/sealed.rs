@@ -244,8 +244,12 @@ impl UsedOnce {
         Burn::Fresh
     }
 
-    fn clear(&self) {
-        self.ids.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    /// Run `f` while holding the used-set's lock, then empty the set.
+    /// No burn can interleave between `f` and the clear.
+    fn clear_after(&self, f: impl FnOnce()) {
+        let mut ids = self.ids.lock().unwrap_or_else(|p| p.into_inner());
+        f();
+        ids.clear();
     }
 }
 
@@ -294,16 +298,15 @@ impl Sealed {
 
     /// A panic: every outstanding token stops working at once.
     pub fn invalidate(&self) {
-        // Rotate BEFORE clearing. The rotation makes every old token
-        // fail to open and bumps the generation in the same step as the
-        // key, so a token opened earlier is refused by `burn` from then
-        // on. Clearing second therefore can't re-admit anything. With
-        // the order reversed, an old token could open and burn into the
-        // just-emptied set. The only burn that can precede the rotation
-        // belongs to a finish that began before the panic, and the
-        // `clear` that follows empties it.
-        self.sealer.rotate();
-        self.used.clear();
+        // The rotation happens inside the used-set's lock, the lock
+        // `burn` takes first (used-set, then key; no path takes them
+        // the other way round). So no burn can fall between the
+        // rotation and the clear: a token sealed under the new key
+        // cannot burn and then be dropped by `clear`. A burn that
+        // finished before this took the lock belongs to a finish that
+        // began before the panic, and the clear empties it. Any token
+        // opened earlier is refused by `burn` from the rotation on.
+        self.used.clear_after(|| self.sealer.rotate());
     }
 }
 
@@ -370,13 +373,18 @@ mod tests {
         // Every other spelling of the MAC's last character: base64 must
         // be canonical, or a replay could hide behind a new token id.
         let last = token.len() - 1;
-        for c in b'A'..=b'Z' {
+        // The whole alphabet, so the non-canonical siblings (same top
+        // four bits) are covered whatever the real last character is.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        assert_eq!(alphabet.len(), 64);
+        for &c in alphabet {
+            if c == token.as_bytes()[last] {
+                continue;
+            }
             let mut t = token.as_bytes().to_vec();
             t[last] = c;
             let t = String::from_utf8(t).unwrap();
-            if t != token {
-                assert!(open_login(&s, &t, now).is_none(), "{t}");
-            }
+            assert!(open_login(&s, &t, now).is_none(), "{t}");
         }
         // The payload of one token with the MAC of another.
         let other = s.seal("login", &claims("xyz"), TTL, now);
@@ -426,7 +434,7 @@ mod tests {
         assert_eq!(u.burn([1; 32], exp, now, || true), Burn::Fresh);
         assert_eq!(u.burn([1; 32], exp, now, || true), Burn::Replayed);
         assert_eq!(u.burn([2; 32], exp, now, || true), Burn::Fresh);
-        u.clear();
+        u.clear_after(|| {});
         assert_eq!(u.burn([1; 32], exp, now, || true), Burn::Fresh);
     }
 
@@ -455,7 +463,7 @@ mod tests {
         let opened = open_login(&s, &token, now).unwrap();
         // A panic lands between the open and the burn.
         s.rotate();
-        u.clear();
+        u.clear_after(|| {});
         assert_eq!(
             u.burn(opened.id, opened.expires, now, || s.generation()
                 == opened.generation),
@@ -486,6 +494,17 @@ mod tests {
         s.invalidate();
         let again = s.open::<Claims>("login", &new, now);
         assert!(again.is_none(), "a burned token must not reopen");
+    }
+
+    #[test]
+    fn a_token_sealed_after_invalidate_burns_once() {
+        let s = Sealed::new();
+        let now = Instant::now();
+        s.invalidate();
+        let token = s.seal("login", &claims("new"), TTL, now);
+        let opened = s.open::<Claims>("login", &token, now).unwrap();
+        assert_eq!(s.burn(&opened, now), Burn::Fresh);
+        assert_eq!(s.burn(&opened, now), Burn::Replayed);
     }
 
     #[test]

@@ -20,7 +20,11 @@
 //!   session, password sealed to a per-attempt key) are the only ways
 //!   in, and both reach the same `OwnerOps::unlock`.
 //! - `{"op":"lock"}` — lock now, destroying the session.
-//! - `{"op":"status"}` — `{"ok":true,"locked":<bool>}`.
+//! - `{"op":"status"}` — `{"ok":true,"locked":<bool>}`, plus
+//!   `"owner_ui_without_edge_address":<n>` when a public owner UI is
+//!   configured: how many of its requests arrived without a usable
+//!   `CF-Connecting-IP` (they are not throttled; a count that grows
+//!   means the edge is not sending the header).
 //! - `{"op":"revoke_grant","grant_id":"g_…"}` — REQ-REV-001.
 //! - `{"op":"revoke_agent","agent_id":"…"}` — REQ-REV-001 (token +
 //!   grants). In-memory until the daemon process exits; `unsuspend`
@@ -99,7 +103,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use zeroize::{Zeroize, Zeroizing};
@@ -139,6 +143,12 @@ pub trait OwnerOps: Send + Sync + 'static {
 
     /// Whether the broker is currently locked.
     fn is_locked(&self) -> impl Future<Output = bool> + Send;
+
+    /// A public owner UI's count of requests without a usable
+    /// `CF-Connecting-IP`; `None` when there is no public owner UI.
+    fn owner_ui_without_edge_address(&self) -> Option<u64> {
+        None
+    }
 
     /// Record an `owner_auth_fail` audit entry (rejected peer or
     /// failed unlock attempt), best effort. `detail` is a fixed
@@ -651,7 +661,7 @@ async fn dispatch_line<O: OwnerOps>(
             ops.lock().await;
             ok_response(Some(true))
         }
-        "status" => ok_response(Some(ops.is_locked().await)),
+        "status" => status_response(ops.is_locked().await, ops.owner_ui_without_edge_address()),
         "grants" => {
             let pending: Vec<serde_json::Value> = ops
                 .pending_grants()
@@ -817,6 +827,27 @@ fn ok_response(locked: Option<bool>) -> String {
         Some(locked) => format!("{{\"ok\":true,\"locked\":{locked}}}\n"),
         None => "{\"ok\":true}\n".to_owned(),
     }
+}
+
+/// The `status` reply.
+#[derive(Serialize)]
+struct StatusReply {
+    ok: bool,
+    locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_ui_without_edge_address: Option<u64>,
+}
+
+fn status_response(locked: bool, without_edge_address: Option<u64>) -> String {
+    let reply = StatusReply {
+        ok: true,
+        locked,
+        owner_ui_without_edge_address: without_edge_address,
+    };
+    // Plain fields: serializing cannot fail.
+    let mut line = serde_json::to_string(&reply).unwrap_or_else(|_| "{\"ok\":true}".to_owned());
+    line.push('\n');
+    line
 }
 
 fn error_response(code: &str) -> String {

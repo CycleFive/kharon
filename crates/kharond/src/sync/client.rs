@@ -194,7 +194,7 @@ pub struct TlsTrust {
     pub extra_ca_pem: Option<Vec<u8>>,
 }
 
-fn tls_config(trust: &TlsTrust) -> Result<rustls::ClientConfig, SyncError> {
+pub(crate) fn tls_config(trust: &TlsTrust) -> Result<rustls::ClientConfig, SyncError> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();

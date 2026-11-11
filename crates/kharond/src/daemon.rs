@@ -620,6 +620,12 @@ pub enum StartupError {
         /// `std::io::ErrorKind` rendering. No file contents.
         kind: String,
     },
+    /// The owner UI's Access check could not be set up.
+    #[error("cannot set up the owner UI Access check: {kind}")]
+    OwnerUiAccess {
+        /// `std::io::ErrorKind` rendering. No key material.
+        kind: String,
+    },
     /// A configured TLS certificate or key could not be loaded.
     #[error("tls material: {reason}")]
     TlsMaterial {
@@ -705,6 +711,7 @@ impl StartupError {
             Self::Bind { .. } => "bind",
             Self::OwnerUiBind { .. } => "owner_ui_bind",
             Self::OwnerUiStore { .. } => "owner_ui_store",
+            Self::OwnerUiAccess { .. } => "owner_ui_access",
             Self::TlsMaterial { .. } => "tls_material",
             Self::ConnectorBind { .. } => "connector_bind",
             Self::PublicIngressBind { .. } => "public_ingress_bind",
@@ -729,7 +736,7 @@ impl StartupError {
             | Self::OwnerUiBind { .. }
             | Self::ConnectorBind { .. }
             | Self::PublicIngressBind { .. } => EX_UNAVAILABLE,
-            Self::TlsMaterial { .. } => EX_CONFIG,
+            Self::TlsMaterial { .. } | Self::OwnerUiAccess { .. } => EX_CONFIG,
         }
     }
 }
@@ -1097,12 +1104,25 @@ async fn bind_owner_ui(
             kind: e.kind().to_string(),
         })?;
     let origin = ui_cfg.origin_for_bound_port(addr.port());
+    let access = ui_cfg
+        .access
+        .as_ref()
+        .map(crate::owner_ui::access::AccessVerifier::new)
+        .transpose()
+        .map_err(|e| StartupError::OwnerUiAccess {
+            kind: e.kind().to_string(),
+        })?;
+    // Fill the key cache before the first visitor (public mode only).
+    if let Some(verifier) = access.as_ref().filter(|_| ui_cfg.public) {
+        verifier.warm();
+    }
     let ui = crate::owner_ui::OwnerUi::open_with(
         &cfg.data_dir,
         crate::owner_ui::OwnerUiOptions {
             rp_id: ui_cfg.rp_id.clone(),
             origin: origin.clone(),
             public: ui_cfg.public,
+            access,
         },
         Arc::new(DaemonShell {
             broker: Arc::clone(broker),

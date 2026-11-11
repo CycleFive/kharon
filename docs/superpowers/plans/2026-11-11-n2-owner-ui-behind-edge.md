@@ -21,7 +21,7 @@
 - **Before each PR:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, all clean.
 - **No version bump** (the workspace is `0.0.0`). No new crates. No force-push.
 - **Commits** end with `Claude-Session: <session url>` then `Co-Authored-By: Claude & Lothrop (cycle.five@proton.me)`, and no other `Co-Authored-By`.
-- **Values fixed by the design:** throttle 10 failures / 600 s / source, table 1024; audit ceiling 20 itemized / 60 s; throttle trips 5 itemized / 60 s; ceremony TTL 120 s (existing `CEREMONY_TTL`); used-set 64; sealed token ≤ 4096 bytes; JWKS refetch spacing 60 s, max age 24 h, timeout 5 s, body ≤ 64 KiB; JWT clock leeway 60 s.
+- **Values fixed by the design:** throttle 10 failures / 600 s / source, table 1024; audit ceiling 20 itemized / 60 s; throttle trips 5 itemized / 60 s; ceremony TTL 120 s (existing `CEREMONY_TTL`); used-set 64; sealed token ≤ 4096 bytes; JWKS refetch spacing 60 s (5 s while the cache is empty), max age 24 h, timeout 5 s, body ≤ 64 KiB; JWT clock leeway 60 s.
 
 ## Pull requests
 

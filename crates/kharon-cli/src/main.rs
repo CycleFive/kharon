@@ -599,6 +599,14 @@ fn owner_command(command: &Command) -> ExitCode {
                     }
                 }
             }
+            if let Some(n) = reply["owner_ui_without_edge_address"]
+                .as_u64()
+                .filter(|n| *n > 0)
+            {
+                println!(
+                    "owner UI: {n} requests without a usable CF-Connecting-IP (not throttled)"
+                );
+            }
             ExitCode::SUCCESS
         }
         Ok(reply) => {

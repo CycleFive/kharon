@@ -374,6 +374,13 @@ impl OwnerOps for DaemonOwner {
         .unwrap_or(false)
     }
 
+    fn owner_ui_without_edge_address(&self) -> Option<u64> {
+        self.owner_ui
+            .as_ref()
+            .filter(|ui| ui.is_public())
+            .map(|ui| ui.requests_without_edge_address())
+    }
+
     async fn is_locked(&self) -> bool {
         let broker = Arc::clone(&self.broker);
         tokio::task::spawn_blocking(move || {

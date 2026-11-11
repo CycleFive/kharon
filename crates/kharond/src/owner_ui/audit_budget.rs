@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 /// Entries itemized in one window.
 pub(crate) const ITEMIZED_PER_WINDOW: u32 = 20;
+/// `throttled` trip entries itemized in one window, outside the
+/// [`ITEMIZED_PER_WINDOW`] (Nyx's ruling on #253: wrong-`Origin` noise
+/// must not hide a trip).
+pub(crate) const TRIPS_PER_WINDOW: u32 = 5;
 /// A fixed window, starting at the first admitted failure.
 pub(crate) const AUDIT_WINDOW: Duration = Duration::from_secs(60);
 
@@ -22,6 +26,8 @@ struct Window {
     start: Option<Instant>,
     /// Entries itemized in this window.
     written: u32,
+    /// Trip entries itemized in this window.
+    trips: u32,
     /// Failures counted and not yet logged.
     pending: u64,
 }
@@ -55,18 +61,43 @@ impl AuditBudget {
             .is_some_and(|s| now.saturating_duration_since(s) >= AUDIT_WINDOW)
     }
 
+    /// Open a new window when `now` starts one; the previous window's
+    /// count, taken once, for the first entry written in it.
+    fn roll(w: &mut Window, now: Instant) -> Option<u64> {
+        if w.start.is_some() && !Self::closed(w, now) {
+            return None;
+        }
+        let carried = Some(std::mem::take(&mut w.pending)).filter(|n| *n > 0);
+        w.start = Some(now);
+        w.written = 0;
+        w.trips = 0;
+        carried
+    }
+
     /// One session-less failure at `now`. The first `Write` of a new window
     /// carries the previous window's count, if any.
     pub fn admit(&self, now: Instant) -> Verdict {
         let mut w = self.lock();
-        let mut carried = None;
-        if w.start.is_none() || Self::closed(&w, now) {
-            carried = Some(std::mem::take(&mut w.pending)).filter(|n| *n > 0);
-            w.start = Some(now);
-            w.written = 0;
-        }
+        let carried = Self::roll(&mut w, now);
         if w.written < ITEMIZED_PER_WINDOW {
             w.written += 1;
+            Verdict::Write {
+                suppressed: carried,
+            }
+        } else {
+            w.pending += 1;
+            Verdict::Suppress
+        }
+    }
+
+    /// One `throttled` trip entry: its own allowance of
+    /// [`TRIPS_PER_WINDOW`], same window and same pending count. A trip
+    /// never uses one of the 20.
+    pub fn admit_trip(&self, now: Instant) -> Verdict {
+        let mut w = self.lock();
+        let carried = Self::roll(&mut w, now);
+        if w.trips < TRIPS_PER_WINDOW {
+            w.trips += 1;
             Verdict::Write {
                 suppressed: carried,
             }
@@ -140,6 +171,34 @@ mod tests {
             b.admit(t0 + AUDIT_WINDOW),
             Verdict::Write { suppressed: None }
         );
+    }
+
+    #[test]
+    fn trips_have_their_own_allowance() {
+        let b = AuditBudget::new();
+        let t0 = Instant::now();
+        for i in 1..=20 {
+            assert_eq!(b.admit(t0), Verdict::Write { suppressed: None }, "{i}");
+        }
+        for i in 1..=5 {
+            assert_eq!(b.admit_trip(t0), Verdict::Write { suppressed: None }, "{i}");
+        }
+        assert_eq!(b.admit_trip(t0), Verdict::Suppress);
+        assert_eq!(b.admit(t0), Verdict::Suppress);
+        assert_eq!(b.drain(), Some(2));
+    }
+
+    #[test]
+    fn a_trip_can_open_a_window_and_carry_the_count() {
+        let (b, t0) = flooded();
+        let later = t0 + AUDIT_WINDOW;
+        assert_eq!(
+            b.admit_trip(later),
+            Verdict::Write {
+                suppressed: Some(5)
+            }
+        );
+        assert_eq!(b.admit(later), Verdict::Write { suppressed: None });
     }
 
     #[test]

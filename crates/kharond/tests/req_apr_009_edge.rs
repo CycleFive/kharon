@@ -1036,3 +1036,38 @@ async fn req_apr_009_local_mode_itemizes_every_failure() {
     assert!(fails.iter().all(|f| f.suppressed.is_none()), "{fails:?}");
     run.shutdown().await;
 }
+
+// ---- Requests without the edge header (Nyx's ruling on #253) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_requests_without_the_edge_header_are_never_throttled() {
+    let run = start_public().await;
+    for i in 0..15 {
+        let r = http(run.ui, PUBLIC_ORIGIN, pub_post("/owner/login/finish", "{}")).await;
+        assert_eq!(r.status, 401, "{i}: {}", r.body);
+    }
+    let fails = run.auth_fails();
+    assert_eq!(fails.len(), 15, "{fails:?}");
+    assert!(
+        fails
+            .iter()
+            .all(|f| f.client_ip.as_deref() == Some("127.0.0.1")),
+        "{fails:?}"
+    );
+    // The operator can see it: the status op carries the count.
+    let status = owner_op(&run.socket, &json!({"op":"status"}));
+    assert_eq!(status["owner_ui_without_edge_address"], 15, "{status}");
+    // A source the edge names still trips at its 11th.
+    throttle(&run, SRC_A).await;
+    assert_eq!(garbage_from(&run, SRC_A).await.status, 429);
+    run.shutdown().await;
+
+    let local = start_local().await;
+    let status = owner_op(&local.socket, &json!({"op":"status"}));
+    assert!(
+        status.get("owner_ui_without_edge_address").is_none(),
+        "{status}"
+    );
+    assert_eq!(status["ok"], true);
+    local.shutdown().await;
+}

@@ -258,6 +258,8 @@ pub struct OwnerUi {
     audit_budget: audit_budget::AuditBudget,
     /// Set once the missing-`CF-Connecting-IP` warning has been printed.
     peer_fallback_warned: std::sync::atomic::AtomicBool,
+    /// Public-mode requests that fell back to the TCP peer.
+    without_edge_address: std::sync::atomic::AtomicU64,
     enroll: Mutex<Vec<Enroll>>,
     /// The web unlock backend (slice 5b). Set once, after the daemon
     /// has built its owner ops; unset → the unlock routes answer
@@ -379,6 +381,7 @@ impl OwnerUi {
             throttle: throttle::FailureThrottle::new(),
             audit_budget: audit_budget::AuditBudget::new(),
             peer_fallback_warned: std::sync::atomic::AtomicBool::new(false),
+            without_edge_address: std::sync::atomic::AtomicU64::new(0),
             enroll: Mutex::new(Vec::new()),
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
@@ -509,8 +512,12 @@ async fn handle(
     let cookie = header_str(&headers, header::COOKIE);
     let origin = header_str(&headers, header::ORIGIN);
     let authorization = header_str(&headers, header::AUTHORIZATION);
+    let edge_ip = ui
+        .public
+        .then(|| crate::api::public::client_ip(&headers, true))
+        .flatten();
     let client_ip = ui.public.then(|| {
-        crate::api::public::client_ip(&headers, true).unwrap_or_else(|| {
+        edge_ip.unwrap_or_else(|| {
             ui.note_peer_fallback();
             peer.ip()
         })
@@ -531,6 +538,7 @@ async fn handle(
             content_type,
             body: bytes,
             client_ip,
+            throttle_key: edge_ip,
         })
     })
     .await;
@@ -549,17 +557,36 @@ struct Incoming {
     content_type: Option<String>,
     body: Vec<u8>,
     /// Public mode only: `CF-Connecting-IP` under REQ-API-010's rule,
-    /// else the TCP peer.
+    /// else the TCP peer. Audit data.
     client_ip: Option<IpAddr>,
+    /// Public mode only: the address, when it came from a usable
+    /// `CF-Connecting-IP`. It keys the throttle. `None` means exempt:
+    /// behind the tunnel the peer is cloudflared, so if the edge stripped
+    /// the header every visitor would share one bucket (#253).
+    throttle_key: Option<IpAddr>,
 }
 
 /// The detail code of a refused `Origin`: always capped by the audit
 /// ceiling (D6) and never counted by the throttle (D5).
 const ORIGIN_REFUSED: &str = "origin";
 
+/// How an `owner_auth_fail` entry meets the public audit ceiling (D6).
+#[derive(Clone, Copy)]
+enum Admit {
+    /// Always itemized, outside the ceiling.
+    Exempt,
+    /// Counts against the 20 a window.
+    Budget,
+    /// A `throttled` trip: its own allowance of 5 a window.
+    Trip,
+}
+
 /// What a recorded failure knows about its request.
 struct FailureCtx {
+    /// The address for audit.
     client_ip: Option<IpAddr>,
+    /// The address for the throttle; see [`Incoming::throttle_key`].
+    throttle_key: Option<IpAddr>,
     /// The request was on one of [`throttle::THROTTLED_ROUTES`].
     throttled_route: bool,
     /// The request carried a live session.
@@ -573,6 +600,7 @@ impl OwnerUi {
             Instant::now(),
             FailureCtx {
                 client_ip: req.client_ip,
+                throttle_key: req.throttle_key,
                 throttled_route: throttle::THROTTLED_ROUTES.contains(&req.path.as_str()),
                 has_session: self.session_alive(req.cookie.as_deref()),
             },
@@ -590,19 +618,23 @@ impl OwnerUi {
             now,
             detail,
             ctx.client_ip,
-            ctx.has_session && detail != ORIGIN_REFUSED,
+            if ctx.has_session && detail != ORIGIN_REFUSED {
+                Admit::Exempt
+            } else {
+                Admit::Budget
+            },
         );
         // A wrong `Origin` is never counted: a page the owner visits
         // sends those from the owner's own address (D5). Counting does
         // not depend on whether the entry was itemized.
-        if let Some(ip) = ctx.client_ip
+        if let Some(ip) = ctx.throttle_key
             && self.public
             && ctx.throttled_route
             && detail != ORIGIN_REFUSED
             && self.throttle.record(ip, now) == throttle::Counted::Tripped
         {
             // Session-less in the budget's eyes, like any other entry.
-            self.write_failure(now, "throttled", ctx.client_ip, false);
+            self.write_failure(now, "throttled", ctx.client_ip, Admit::Trip);
         }
     }
 
@@ -613,15 +645,18 @@ impl OwnerUi {
         now: Instant,
         detail: &'static str,
         client_ip: Option<IpAddr>,
-        exempt: bool,
+        admit: Admit,
     ) {
-        let suppressed = if self.public && !exempt {
-            match self.audit_budget.admit(now) {
-                audit_budget::Verdict::Write { suppressed } => suppressed,
-                audit_budget::Verdict::Suppress => return,
-            }
-        } else {
-            None
+        let verdict = match admit {
+            _ if !self.public => None,
+            Admit::Exempt => None,
+            Admit::Budget => Some(self.audit_budget.admit(now)),
+            Admit::Trip => Some(self.audit_budget.admit_trip(now)),
+        };
+        let suppressed = match verdict {
+            Some(audit_budget::Verdict::Write { suppressed }) => suppressed,
+            Some(audit_budget::Verdict::Suppress) => return,
+            None => None,
         };
         self.audit.auth_failed(AuthFailure {
             detail,
@@ -630,17 +665,28 @@ impl OwnerUi {
         });
     }
 
-    /// A public-mode request had no usable `CF-Connecting-IP`, so the TCP
-    /// peer keys the throttle. If the edge strips the header, every
-    /// visitor shares the tunnel's address and the throttle is one shared
-    /// bucket: say so once per process. Returns whether this call printed.
+    /// How many public-mode requests had no usable `CF-Connecting-IP`.
+    /// Such requests are audited with the peer address and are not
+    /// throttled; a count that grows means the edge is not sending it.
+    pub fn requests_without_edge_address(&self) -> u64 {
+        self.without_edge_address
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A public-mode request had no usable `CF-Connecting-IP`: count it,
+    /// and say so once per process. It is audited with the TCP peer and
+    /// exempt from the throttle (if the edge strips the header, every
+    /// visitor would share the tunnel's key). Returns whether this call
+    /// printed.
     fn note_peer_fallback(&self) -> bool {
+        self.without_edge_address
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let first = !self
             .peer_fallback_warned
             .swap(true, std::sync::atomic::Ordering::Relaxed);
         if first {
             eprintln!(
-                "kharond: owner UI request without a usable CF-Connecting-IP; the failure throttle keys on the tunnel's address until the edge sends it"
+                "kharond: owner UI request without a usable CF-Connecting-IP; such requests are not throttled until the edge sends it"
             );
         }
         first
@@ -663,7 +709,7 @@ impl OwnerUi {
 
     /// A completed sign-in or unlock clears the source's failure count.
     fn forgive(&self, req: &Incoming) {
-        if let Some(ip) = req.client_ip {
+        if let Some(ip) = req.throttle_key {
             self.throttle.clear(ip);
         }
     }
@@ -682,7 +728,7 @@ impl OwnerUi {
             self.fail(&req, "origin");
             return respond(StatusCode::FORBIDDEN, "origin", None);
         }
-        if let Some(ip) = req.client_ip
+        if let Some(ip) = req.throttle_key
             && self.public
             && throttle::THROTTLED_ROUTES.contains(&req.path.as_str())
             && let Some(left) = self.throttle.blocked(ip, Instant::now())
@@ -2255,6 +2301,7 @@ mod tests {
             content_type: Some("application/json".into()),
             body: br#"{"password":"hunter2","ceremony_id":"x"}"#.to_vec(),
             client_ip: None,
+            throttle_key: None,
         });
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
@@ -2289,6 +2336,7 @@ mod tests {
             content_type: None,
             body: Vec::new(),
             client_ip: None,
+            throttle_key: None,
         });
         assert_eq!(response.status(), StatusCode::OK);
         let cleared = response
@@ -2315,6 +2363,7 @@ mod tests {
             content_type: None,
             body: Vec::new(),
             client_ip: None,
+            throttle_key: None,
         });
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
@@ -2536,6 +2585,7 @@ mod tests {
                 content_type: content_type.map(str::to_owned),
                 body: body.as_bytes().to_vec(),
                 client_ip: self.client_ip,
+                throttle_key: self.client_ip,
             });
             let status = response.status();
             let bytes = futures_body(response);
@@ -3252,6 +3302,7 @@ mod tests {
             content_type: Some("application/json".into()),
             body: body.as_bytes().to_vec(),
             client_ip: None,
+            throttle_key: None,
         });
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let (status, _) = rig.post("/owner/unlock", &body);
@@ -3461,6 +3512,7 @@ mod tests {
             content_type: (!body.is_empty()).then(|| "application/json".to_owned()),
             body: body.to_vec(),
             client_ip: None,
+            throttle_key: None,
         });
         let status = response.status();
         (status, futures_body(response))
@@ -3562,6 +3614,7 @@ mod tests {
             content_type: None,
             body: Vec::new(),
             client_ip: None,
+            throttle_key: None,
         };
         let refused = ui.burn_ceremony(&req, &opened).expect("refused");
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
@@ -3625,6 +3678,7 @@ mod tests {
             content_type: Some("application/json".into()),
             body: body.as_bytes().to_vec(),
             client_ip: None,
+            throttle_key: None,
         }
     }
 
@@ -3679,15 +3733,20 @@ mod tests {
         for _ in 0..10 {
             let mut req = post("/owner/login/finish", None, PUBLIC, "{}");
             req.client_ip = Some(ip);
+            req.throttle_key = Some(ip);
             assert_eq!(ui.dispatch(req).status(), StatusCode::UNAUTHORIZED);
         }
         // The budget is spent, yet the tenth failure tripped the throttle.
         let mut req = post("/owner/login/finish", None, PUBLIC, "{}");
         req.client_ip = Some(ip);
+        req.throttle_key = Some(ip);
         assert_eq!(ui.dispatch(req).status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(rec.itemized.lock().unwrap().len(), 20);
-        // Ten failures plus the `throttled` entry were counted.
-        assert_eq!(ui.audit_budget.drain(), Some(11));
+        // The ten failures were counted, not itemized; the trip has its own
+        // allowance and is the 21st entry.
+        let got = rec.itemized.lock().unwrap().clone();
+        assert_eq!(got.len(), 21, "{got:?}");
+        assert_eq!(got[20].0, "throttled");
+        assert_eq!(ui.audit_budget.drain(), Some(10));
     }
 
     #[test]
@@ -3712,6 +3771,7 @@ mod tests {
         let (ui, _dir) = public_ui(rec.clone());
         let ctx = || FailureCtx {
             client_ip: None,
+            throttle_key: None,
             throttled_route: false,
             has_session: false,
         };
@@ -3735,5 +3795,31 @@ mod tests {
         assert!(ui.note_peer_fallback());
         assert!(!ui.note_peer_fallback());
         assert!(!ui.note_peer_fallback());
+    }
+
+    /// Reviewer's probe: wrong-`Origin` noise spends the budget, and a
+    /// throttle trip must still be itemized (D6, Nyx's ruling).
+    #[test]
+    fn a_throttle_trip_is_itemized_when_wrong_origin_noise_spent_the_budget() {
+        let rec = Arc::new(Recorder::default());
+        let (ui, _dir) = public_ui(rec.clone());
+        for _ in 0..20 {
+            let r = ui.dispatch(post(
+                "/owner/login/finish",
+                None,
+                "https://sibling.example.com",
+                "{}",
+            ));
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
+        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        for _ in 0..10 {
+            let mut req = post("/owner/login/finish", None, PUBLIC, "{}");
+            req.client_ip = Some(ip);
+            req.throttle_key = Some(ip);
+            ui.dispatch(req);
+        }
+        let got = rec.itemized.lock().unwrap().clone();
+        assert!(got.iter().any(|(d, _)| *d == "throttled"), "{got:?}");
     }
 }

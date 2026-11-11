@@ -12,6 +12,10 @@ This document records the calls #208 leaves to the builder. Where it says
 something the owner decided. The implementation plan is
 [`../plans/2026-11-11-n2-owner-ui-behind-edge.md`](../plans/2026-11-11-n2-owner-ui-behind-edge.md).
 
+Revised after Nyx's review of PR #253: D4 and D5 (a request without a usable
+`CF-Connecting-IP` has no throttle key and is exempt from the throttle) and D6
+(`throttled` entries have their own allowance of 5 a minute).
+
 ## What this is for
 
 Today the owner UI only works on loopback: the owner reaches it over an SSH
@@ -181,14 +185,18 @@ In public mode the source address of an owner-UI request is `CF-Connecting-IP`
 as parsed by #200's `api::public::client_ip`, and the TCP peer when that
 header is absent or unusable. In local mode there is none.
 
-Behind the tunnel the TCP peer is always loopback, so every request with no
-usable header shares one key. Such a request comes from a local process or a
-misconfigured edge, never from a normal visitor, so one shared key is the
-right treatment. The owner listener has no peer address today; this adds it.
+Behind the tunnel the TCP peer is always loopback. A request with no usable
+header is audited with that peer address but has **no throttle key**: it is
+exempt from the throttle (Nyx's ruling on PR #253). If the edge ever strips
+the header (Cloudflare offers a "remove visitor IP headers" transform), every
+visitor would otherwise share the tunnel's key, and any stranger could lock
+the owner out of web sign-in. The owner listener has no peer address today;
+this adds it.
 
 It is used for two things only, as that helper's contract requires: the
-throttle key (D5) and the `client_ip` field on `owner_auth_fail` audit entries.
-It never decides whether a request is authenticated.
+throttle key (D5), when the edge supplied it, and the `client_ip` field on
+`owner_auth_fail` audit entries. It never decides whether a request is
+authenticated.
 
 ### D5. Throttling failed attempts
 
@@ -207,6 +215,14 @@ Public mode only. Local mode has no throttle.
   forge `Origin`, so everything that does count was sent either by the real
   UI or by a client that isn't a browser, from its own address. The throttle
   check runs after the `Origin` check for the same reason.
+- **Only an address the edge named is throttled.** The key is a usable
+  `CF-Connecting-IP`. A request without one (D4) is not checked, counted or
+  cleared, so a stripped header cannot turn D5 into one shared bucket. It is
+  still audited (inside D6's ceiling). To keep it visible to operations,
+  the daemon prints one warning per process, and `OwnerUi` counts such
+  requests; the owner socket's `status` op reports the count as
+  `owner_ui_without_edge_address` when a public UI is configured, and
+  `kharon status` prints it when it is non-zero.
 - **The limit.** 10 failures in a fixed 10-minute window, per source. The
   window starts at the first failure, and `Retry-After` counts to its end. Sources are
   keyed as #200 keys them: an IPv4 address, or an IPv6 /64.
@@ -251,7 +267,7 @@ it never counts a wrong `Origin`, and sources are cheap anyway.
 
 So in public mode at most **20 `owner_auth_fail` entries are itemized per
 minute**, across all sources. Twenty, not ten, so that one source running
-into its throttle (ten failures and the `throttled` entry) is itemized in full. Failures past that are still refused, still
+into its throttle (ten failures) is itemized in full; its `throttled` trip entry has its own allowance (below). Failures past that are still refused, still
 counted toward D5, and tallied. The tally is written as `suppressed` on the
 next itemized entry, or within 75 seconds by a `suppressed_only` entry from the
 daemon's existing 15-second flush tick, and at shutdown. This is the mechanism
@@ -279,11 +295,13 @@ daemon's existing 15-second flush tick, and at shutdown. This is the mechanism
   detail.
 - At most one `suppressed_only` entry is written per closed window.
 - When a source trips its throttle, one `owner_auth_fail` with detail
-  `throttled` is written (within the ceiling), so the log shows the throttle
-  engaging. This answers Nyx's note on #208 that public probing is otherwise
+  `throttled` is written, so the log shows the throttle engaging. Trips have
+  their own allowance of **5 per window**, outside the 20 (Nyx's ruling on
+  PR #253), so wrong-`Origin` noise cannot spend the budget and hide a trip.
+  Past 5 they are counted like any other entry. This answers Nyx's note on #208 that public probing is otherwise
   visible only in Cloudflare's logs.
-- Worst case under a sustained flood is 21 entries a minute: about 30,000 a
-  day, roughly 10 MB. Filling a disk that way takes years, and the operator can add an
+- Worst case under a sustained flood is 26 entries a minute (20, 5 trips and
+  one `suppressed_only`): about 37,000 a day, roughly 12 MB. Filling a disk that way takes years, and the operator can add an
   edge rate-limit rule long before.
 
 ### D7. Sign-in ceremonies carry their own state (AC5)

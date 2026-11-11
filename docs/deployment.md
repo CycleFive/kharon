@@ -157,6 +157,18 @@ not contacted, so this mint does not append `token_create` to the
 audit log (SPEC §7). `kharon revoke agent` still appends
 `token_revoke` while the daemon is running.
 
+Revocation and suspension are durable (REQ-REV-001, REQ-RL-002):
+both live in the audit log and are rebuilt at every daemon start,
+so restarting the daemon clears neither. A revocation is bound to
+the fingerprint of the agent's `token_hash` at revoke time. To
+restore a revoked agent, rotate its token — mint a new one as
+above, replace `[agents.<id>] token_hash` with the new hash, and
+restart; the new token authenticates and the old one stays
+refused. There is no un-revoke operation. A suspension (five
+consecutive `origin_mismatch` fills) likewise survives restarts
+and clears only when the owner runs `kharon unsuspend <id>`; that
+reset is itself a log entry, so it survives restarts too.
+
 The hash must meet the production Argon2id floor (m = 19456 KiB,
 t = 2, p = 1). `kharon token mint` uses that floor. A weaker
 `token_hash` is refused at startup (`token_hash_weak_params`).

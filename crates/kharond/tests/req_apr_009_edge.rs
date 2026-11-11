@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kharond::audit::{Entry, Event};
-use kharond::config::Config;
+use kharond::config::{AccessConfig, Config, JwksSource};
 use kharond::daemon;
 use kharond::lock::StaticHardening;
-use owner_ui_support::{Http, VirtAuth, b64url_dec, http};
+use owner_ui_support::{AccessClaims, AccessKey, Http, VirtAuth, b64url_dec, http};
 use serde_json::{Value as Json, json};
 
 const TOKEN_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$CANARYhashCANARYhash";
@@ -44,6 +44,38 @@ async fn start_public() -> Running {
     .await
 }
 
+const ACCESS_TEAM: &str = "test.cloudflareaccess.com";
+const ACCESS_AUD: &str = "aud123";
+
+/// A public-mode daemon with the Access check on, trusting `key`.
+async fn start_public_with_access(key: &AccessKey) -> Running {
+    start_with_access(
+        &format!(
+            "[owner_ui]\nlisten = \"127.0.0.1:0\"\nrp_id = \"{PUBLIC_HOST}\"\npublic_origin = \"{PUBLIC_ORIGIN}\"\n"
+        ),
+        Some(AccessConfig {
+            team_domain: ACCESS_TEAM.into(),
+            audience: ACCESS_AUD.into(),
+            jwks: JwksSource::TestStatic(key.jwks()),
+        }),
+    )
+    .await
+}
+
+/// A token the daemon accepts: right issuer and audience, an hour left.
+fn access_token(key: &AccessKey) -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    key.sign_jwt(&AccessClaims {
+        iss: &format!("https://{ACCESS_TEAM}"),
+        aud: ACCESS_AUD,
+        exp,
+    })
+}
+
 /// A daemon with today's local owner UI.
 async fn start_local() -> Running {
     start_with(
@@ -53,6 +85,12 @@ async fn start_local() -> Running {
 }
 
 async fn start_with(owner_ui: &str) -> Running {
+    start_with_access(owner_ui, None).await
+}
+
+/// `start_with`, with `[owner_ui.access]` set in Rust: no TOML key can
+/// choose the test key source.
+async fn start_with_access(owner_ui: &str, access: Option<AccessConfig>) -> Running {
     let data = tempfile::tempdir().unwrap();
     let text = format!(
         r#"mode = "export"
@@ -72,7 +110,10 @@ listen = "127.0.0.1:0"
         data = data.path().display(),
         export = fixture().display(),
     );
-    let cfg = Config::from_toml_str(&text).unwrap();
+    let mut cfg = Config::from_toml_str(&text).unwrap();
+    if let Some(access) = access {
+        cfg.owner_ui.as_mut().expect("owner UI configured").access = Some(access);
+    }
     let d = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
         .await
         .unwrap();
@@ -1070,4 +1111,122 @@ async fn req_apr_009_requests_without_the_edge_header_are_never_throttled() {
     );
     assert_eq!(status["ok"], true);
     local.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_access_gates_every_route_but_the_exempt_ones() {
+    let key = AccessKey::generate("k1");
+    let run = start_public_with_access(&key).await;
+    let token = access_token(&key);
+
+    let r = http(run.ui, &run.origin, Http::get("/").host(PUBLIC_HOST)).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("access_denied"), "{}", r.body);
+    let r = http(
+        run.ui,
+        &run.origin,
+        Http::get("/")
+            .host(PUBLIC_HOST)
+            .header("Cf-Access-Jwt-Assertion", &token),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    let r = http(run.ui, &run.origin, pub_post("/owner/login/options", "{}")).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("access_denied"), "{}", r.body);
+
+    // The ntfy redeem routes are on the exemption list: no token needed.
+    let r = http(
+        run.ui,
+        &run.origin,
+        Http::post("/owner/approve/AAAA", None, "")
+            .host(PUBLIC_HOST)
+            .without_origin(),
+    )
+    .await;
+    assert_eq!(r.status, 410, "{}", r.body);
+
+    // The Host check still comes first, token or not.
+    for tokens in [&[][..], &[token.as_str()][..]] {
+        let mut req = Http::get("/").host("evil.example.com");
+        for t in tokens {
+            req = req.header("Cf-Access-Jwt-Assertion", t);
+        }
+        let r = http(run.ui, &run.origin, req).await;
+        assert_eq!(r.status, 421, "{}", r.body);
+    }
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_access_is_not_a_login() {
+    let key = AccessKey::generate("k1");
+    let run = start_public_with_access(&key).await;
+    let token = access_token(&key);
+    let r = http(
+        run.ui,
+        &run.origin,
+        Http::get("/owner/session")
+            .host(PUBLIC_HOST)
+            .header("Cf-Access-Jwt-Assertion", &token),
+    )
+    .await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_access_refusals_are_audited_not_throttled() {
+    let key = AccessKey::generate("k1");
+    let run = start_public_with_access(&key).await;
+    for i in 0..15 {
+        let r = http(
+            run.ui,
+            &run.origin,
+            pub_post("/owner/login/finish", "{}").header("CF-Connecting-IP", SRC_A),
+        )
+        .await;
+        assert_eq!(r.status, 403, "{i}: {}", r.body);
+    }
+    let fails = run.auth_fails();
+    assert_eq!(fails.len(), 15, "{fails:?}");
+    for f in &fails {
+        assert_eq!(f.detail_code.as_deref(), Some("access"), "{f:?}");
+        assert_eq!(f.client_ip.as_deref(), Some(SRC_A), "{f:?}");
+    }
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_a_refused_token_is_never_logged() {
+    let key = AccessKey::generate("k1");
+    let run = start_public_with_access(&key).await;
+    let junk = "aaaabbbbccccddddeeee.ffffgggghhhhiiiijjjj.kkkkllllmmmmnnnnoooo";
+    let r = http(
+        run.ui,
+        &run.origin,
+        Http::get("/")
+            .host(PUBLIC_HOST)
+            .header("Cf-Access-Jwt-Assertion", junk),
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(!r.body.contains("aaaabbbb"), "{}", r.body);
+    assert_eq!(run.auth_fails().len(), 1);
+    for part in junk.split('.') {
+        assert!(
+            !run.audit().contains(part),
+            "token part reached the audit log"
+        );
+    }
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_without_access_config_nothing_changes() {
+    let run = start_public().await;
+    let r = http(run.ui, &run.origin, Http::get("/").host(PUBLIC_HOST)).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    run.shutdown().await;
 }

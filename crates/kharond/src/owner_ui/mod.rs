@@ -66,6 +66,7 @@
 //! Responses use fixed error codes only (REQ-API-006). Failed login
 //! and enrollment attempts are audited as `owner_auth_fail`.
 
+pub mod access;
 mod approvals;
 mod audit_budget;
 mod sealed;
@@ -242,6 +243,8 @@ pub struct OwnerUi {
     host: String,
     port: u16,
     secure_cookie: bool,
+    /// The optional Cloudflare Access check (public mode only, D9).
+    access: Option<Arc<access::AccessVerifier>>,
     /// [`HOST_SESSION_COOKIE`] in public mode, else [`SESSION_COOKIE`].
     cookie_name: &'static str,
     shell: Arc<dyn OwnerShell>,
@@ -315,6 +318,8 @@ pub struct OwnerUiOptions {
     pub origin: String,
     /// Public mode: behind the edge (#208).
     pub public: bool,
+    /// The Access check, when `[owner_ui.access]` is set (public mode).
+    pub access: Option<Arc<access::AccessVerifier>>,
 }
 
 impl OwnerUi {
@@ -337,6 +342,7 @@ impl OwnerUi {
                 rp_id: rp_id.into(),
                 origin: origin.into(),
                 public: false,
+                access: None,
             },
             shell,
             audit,
@@ -356,6 +362,7 @@ impl OwnerUi {
             rp_id,
             origin,
             public,
+            access,
         } = opts;
         let secure_cookie = origin.starts_with("https://");
         let (host, port) = crate::config::origin_authority(&origin, &rp_id, public);
@@ -367,6 +374,7 @@ impl OwnerUi {
             host,
             port,
             secure_cookie,
+            access,
             cookie_name: if public {
                 HOST_SESSION_COOKIE
             } else {
@@ -500,10 +508,10 @@ async fn handle(
     }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    // The ntfy redeem routes: on `EDGE_EXEMPT`, so they take no `Origin`.
-    // Later checks that must skip them (the Access check) consult the
-    // same list.
-    if edge_exempt(&path) {
+    let exempt = edge_exempt(&path);
+    // The ntfy redeem routes: on `EDGE_EXEMPT`, so they take no `Origin`
+    // and no Access token.
+    if exempt {
         let redeem = Arc::clone(&state.redeem);
         return dispatch_owner_approval(redeem, method, path).await;
     }
@@ -522,6 +530,33 @@ async fn handle(
             peer.ip()
         })
     });
+    // Access (D9): after the Host check, before the body is read or
+    // anything routes. Exempt routes returned above: their clients are
+    // not browsers behind Access.
+    if let Some(verifier) = ui.access.as_ref()
+        && verifier
+            .verify(&headers, std::time::SystemTime::now())
+            .await
+            .is_err()
+    {
+        let audit_ui = Arc::clone(&ui);
+        // Never counted by the throttle: not a sign-in attempt. Audited
+        // within the ceiling, on the blocking pool like every append.
+        let _ = tokio::task::spawn_blocking(move || {
+            audit_ui.record_failure(
+                Instant::now(),
+                FailureCtx {
+                    client_ip,
+                    throttle_key: None,
+                    throttled_route: false,
+                    has_session: false,
+                },
+                ACCESS_REFUSED,
+            );
+        })
+        .await;
+        return respond(StatusCode::FORBIDDEN, "access_denied", None);
+    }
     let content_type = header_str(&headers, header::CONTENT_TYPE);
     let (_parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
@@ -580,6 +615,10 @@ enum Admit {
     /// A `throttled` trip: its own allowance of 5 a window.
     Trip,
 }
+
+/// The detail code of a refused Access token (D9): audited within the
+/// ceiling, never counted by the throttle.
+const ACCESS_REFUSED: &str = "access";
 
 /// What a recorded failure knows about its request.
 struct FailureCtx {
@@ -2542,6 +2581,7 @@ mod tests {
                     rp_id: rp_id.into(),
                     origin: origin.into(),
                     public,
+                    access: None,
                 },
                 Arc::new(StaticShell(ShellView {
                     locked: false,
@@ -3656,6 +3696,7 @@ mod tests {
                 rp_id: "owner.example.com".into(),
                 origin: PUBLIC.into(),
                 public: true,
+                access: None,
             },
             Arc::new(StaticShell(ShellView {
                 locked: false,

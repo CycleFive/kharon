@@ -17,6 +17,7 @@ pub mod push;
 mod vault;
 pub mod wire;
 
+pub(crate) use client::tls_config;
 pub use client::{
     ApiKey, CLIENT_NAME, CLIENT_VERSION, DEVICE_NAME, DEVICE_TYPE, Endpoints, MAX_RESPONSE_BYTES,
     SyncClient, TlsTrust, device_identifier,

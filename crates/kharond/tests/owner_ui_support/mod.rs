@@ -317,3 +317,118 @@ pub async fn register_and_sign_in(ui: std::net::SocketAddr, origin: &str, token:
     assert_eq!(ok.status, 200, "{}", ok.body);
     session_cookie(&ok).expect("session cookie")
 }
+
+/// A software Cloudflare Access signing key: RS256 tokens and the
+/// JWKS document that publishes the key. Generated per test run.
+pub struct AccessKey {
+    pair: aws_lc_rs::signature::RsaKeyPair,
+    pub kid: String,
+}
+
+#[derive(serde::Serialize)]
+struct AccessJwtHeader<'a> {
+    alg: &'a str,
+    kid: &'a str,
+    typ: &'a str,
+}
+
+/// The claims an Access token carries, as the check reads them.
+#[derive(serde::Serialize)]
+pub struct AccessClaims<'a> {
+    pub iss: &'a str,
+    pub aud: &'a str,
+    pub exp: u64,
+}
+
+#[derive(serde::Serialize)]
+struct AccessJwk<'a> {
+    kid: &'a str,
+    kty: &'a str,
+    n: String,
+    e: String,
+}
+
+#[derive(serde::Serialize)]
+struct AccessJwks<'a> {
+    keys: Vec<AccessJwk<'a>>,
+}
+
+impl AccessKey {
+    pub fn generate(kid: &str) -> Self {
+        Self {
+            pair: aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+                .unwrap(),
+            kid: kid.to_owned(),
+        }
+    }
+
+    /// The JWKS document with this one key.
+    pub fn jwks(&self) -> String {
+        let (n, e) = rsa_components(self.pair.public_key().as_ref());
+        serde_json::to_string(&AccessJwks {
+            keys: vec![AccessJwk {
+                kid: &self.kid,
+                kty: "RSA",
+                n: b64url(&n),
+                e: b64url(&e),
+            }],
+        })
+        .unwrap()
+    }
+
+    /// An RS256 token over `claims`, under this key's `kid`.
+    pub fn sign_jwt(&self, claims: &AccessClaims<'_>) -> String {
+        let header = serde_json::to_vec(&AccessJwtHeader {
+            alg: "RS256",
+            kid: &self.kid,
+            typ: "JWT",
+        })
+        .unwrap();
+        let payload = serde_json::to_vec(claims).unwrap();
+        let input = format!("{}.{}", b64url(&header), b64url(&payload));
+        let mut sig = vec![0u8; self.pair.public_modulus_len()];
+        self.pair
+            .sign(
+                &aws_lc_rs::signature::RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                input.as_bytes(),
+                &mut sig,
+            )
+            .unwrap();
+        format!("{input}.{}", b64url(&sig))
+    }
+}
+
+/// The modulus and exponent of a PKCS#1 `RSAPublicKey` DER, without
+/// leading zeros (the form a JWK carries).
+fn rsa_components(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn len(d: &[u8], i: &mut usize) -> usize {
+        let b = d[*i];
+        *i += 1;
+        if b < 0x80 {
+            return b as usize;
+        }
+        let n = (b & 0x7f) as usize;
+        let v = d[*i..*i + n]
+            .iter()
+            .fold(0usize, |a, x| (a << 8) | *x as usize);
+        *i += n;
+        v
+    }
+    fn int(d: &[u8], i: &mut usize) -> Vec<u8> {
+        assert_eq!(d[*i], 0x02);
+        *i += 1;
+        let l = len(d, i);
+        let v = d[*i..*i + l].to_vec();
+        *i += l;
+        let skip = v.iter().take_while(|b| **b == 0).count();
+        v[skip..].to_vec()
+    }
+    let mut i = 0;
+    assert_eq!(der[i], 0x30);
+    i += 1;
+    let _ = len(der, &mut i);
+    let n = int(der, &mut i);
+    let e = int(der, &mut i);
+    (n, e)
+}

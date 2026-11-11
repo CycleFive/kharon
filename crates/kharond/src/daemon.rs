@@ -1097,12 +1097,21 @@ async fn bind_owner_ui(
             kind: e.kind().to_string(),
         })?;
     let origin = ui_cfg.origin_for_bound_port(addr.port());
+    let access = ui_cfg
+        .access
+        .as_ref()
+        .map(crate::owner_ui::access::AccessVerifier::new)
+        .transpose()
+        .map_err(|e| StartupError::OwnerUiStore {
+            kind: e.kind().to_string(),
+        })?;
     let ui = crate::owner_ui::OwnerUi::open_with(
         &cfg.data_dir,
         crate::owner_ui::OwnerUiOptions {
             rp_id: ui_cfg.rp_id.clone(),
             origin: origin.clone(),
             public: ui_cfg.public,
+            access,
         },
         Arc::new(DaemonShell {
             broker: Arc::clone(broker),

@@ -95,8 +95,14 @@ listen = "127.0.0.1:0"
 
 impl Running {
     async fn shutdown(mut self) {
+        self.stop().await;
+    }
+
+    /// Stop the daemon and wait for its final audit flush; the data
+    /// directory stays, so the log can still be read.
+    async fn stop(&mut self) {
         self.stop.take().unwrap().send(()).unwrap();
-        self.server.await.unwrap().unwrap();
+        (&mut self.server).await.unwrap().unwrap();
     }
 
     /// The raw audit log (empty when nothing was written yet).
@@ -1009,5 +1015,50 @@ async fn req_apr_009_local_mode_is_never_throttled() {
         .await;
         assert_eq!(r.status, 401, "{i}: {}", r.body);
     }
+    run.shutdown().await;
+}
+
+// ---- The audit ceiling (D6) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_a_flood_of_failures_is_itemized_twenty_a_minute() {
+    let mut run = start_public().await;
+    for i in 0..200 {
+        // A different source each time, so D5's throttle stays out of it.
+        let ip = format!("203.0.{}.{}", i / 250, i % 250 + 1);
+        let r = garbage_from(&run, &ip).await;
+        assert_eq!(r.status, 401, "{i}: {}", r.body);
+    }
+    let itemized = |run: &Running| {
+        run.auth_fails()
+            .iter()
+            .filter(|e| e.result.as_deref() == Some("denied"))
+            .count()
+    };
+    assert_eq!(itemized(&run), 20);
+    run.stop().await;
+    let fails = run.auth_fails();
+    assert_eq!(itemized(&run), 20, "{fails:?}");
+    let last = fails.last().expect("entries");
+    assert_eq!(last.result.as_deref(), Some("suppressed_only"), "{last:?}");
+    assert_eq!(last.suppressed, Some(180), "{last:?}");
+    assert!(last.client_ip.is_none(), "{last:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_local_mode_itemizes_every_failure() {
+    let run = start_local().await;
+    for i in 0..30 {
+        let r = http(
+            run.ui,
+            &run.origin,
+            Http::post("/owner/login/finish", Some("application/json"), "{}"),
+        )
+        .await;
+        assert_eq!(r.status, 401, "{i}: {}", r.body);
+    }
+    let fails = run.auth_fails();
+    assert_eq!(fails.len(), 30, "{fails:?}");
+    assert!(fails.iter().all(|f| f.suppressed.is_none()), "{fails:?}");
     run.shutdown().await;
 }

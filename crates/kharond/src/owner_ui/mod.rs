@@ -67,6 +67,7 @@
 //! and enrollment attempts are audited as `owner_auth_fail`.
 
 mod approvals;
+mod audit_budget;
 mod sealed;
 mod store;
 pub mod throttle;
@@ -206,6 +207,9 @@ impl OwnerShell for StaticShell {
 pub trait OwnerAudit: Send + Sync + 'static {
     /// Record a failed owner-UI authentication attempt.
     fn auth_failed(&self, failure: AuthFailure);
+    /// Record the count of failures the audit ceiling (D6) did not
+    /// itemize, as a `suppressed_only` entry.
+    fn suppressed_only(&self, count: u64);
 }
 
 /// One failed owner-UI authentication attempt, as the audit sink sees it.
@@ -215,6 +219,8 @@ pub struct AuthFailure {
     /// The source address, in public mode only (`None` locally). It is
     /// audit data; it never decides anything (REQ-API-010).
     pub client_ip: Option<IpAddr>,
+    /// Failures counted and not itemized since the last entry (D6).
+    pub suppressed: Option<u64>,
 }
 
 /// Audit sink that discards. Tests that don't care use this.
@@ -222,6 +228,7 @@ pub struct NoAudit;
 
 impl OwnerAudit for NoAudit {
     fn auth_failed(&self, _failure: AuthFailure) {}
+    fn suppressed_only(&self, _count: u64) {}
 }
 
 /// The owner UI's state: passkeys, sealed ceremony tokens (nothing
@@ -247,6 +254,8 @@ pub struct OwnerUi {
     sessions: Mutex<Vec<Session>>,
     /// Failed sign-in, enroll and unlock attempts per source (D5).
     throttle: throttle::FailureThrottle,
+    /// Caps the `owner_auth_fail` entries a stranger can cause (D6).
+    audit_budget: audit_budget::AuditBudget,
     enroll: Mutex<Vec<Enroll>>,
     /// The web unlock backend (slice 5b). Set once, after the daemon
     /// has built its owner ops; unset → the unlock routes answer
@@ -366,6 +375,7 @@ impl OwnerUi {
             sealed: Sealed::new(),
             sessions: Mutex::new(Vec::new()),
             throttle: throttle::FailureThrottle::new(),
+            audit_budget: audit_budget::AuditBudget::new(),
             enroll: Mutex::new(Vec::new()),
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
@@ -542,6 +552,8 @@ struct FailureCtx {
     client_ip: Option<IpAddr>,
     /// The request was on one of [`throttle::THROTTLED_ROUTES`].
     throttled_route: bool,
+    /// The request carried a live session.
+    has_session: bool,
 }
 
 impl OwnerUi {
@@ -551,6 +563,7 @@ impl OwnerUi {
             FailureCtx {
                 client_ip: req.client_ip,
                 throttled_route: throttle::THROTTLED_ROUTES.contains(&req.path.as_str()),
+                has_session: self.session_alive(req.cookie.as_deref()),
             },
             detail,
         );
@@ -558,22 +571,55 @@ impl OwnerUi {
 
     /// [`Self::fail`] for failures raised before an [`Incoming`] exists.
     fn record_failure(&self, ctx: FailureCtx, detail: &'static str) {
-        self.audit.auth_failed(AuthFailure {
-            detail,
-            client_ip: ctx.client_ip,
-        });
+        // A failure that passed the `Origin` check behind a live session
+        // is always itemized: a stranger cannot make one (D6). A wrong
+        // `Origin` is capped either way: a same-site sibling page can
+        // send one with the owner's cookie.
+        self.write_failure(detail, ctx.client_ip, ctx.has_session && detail != "origin");
         // A wrong `Origin` is never counted: a page the owner visits
-        // sends those from the owner's own address (D5).
+        // sends those from the owner's own address (D5). Counting does
+        // not depend on whether the entry was itemized.
         if let Some(ip) = ctx.client_ip
             && self.public
             && ctx.throttled_route
             && detail != "origin"
             && self.throttle.record(ip, Instant::now()) == throttle::Counted::Tripped
         {
-            self.audit.auth_failed(AuthFailure {
-                detail: "throttled",
-                client_ip: ctx.client_ip,
-            });
+            // Session-less in the budget's eyes, like any other entry.
+            self.write_failure("throttled", ctx.client_ip, false);
+        }
+    }
+
+    /// Append one `owner_auth_fail` entry, or count it when the public
+    /// ceiling is spent. Local mode and `exempt` entries always write.
+    fn write_failure(&self, detail: &'static str, client_ip: Option<IpAddr>, exempt: bool) {
+        let suppressed = if self.public && !exempt {
+            match self.audit_budget.admit(Instant::now()) {
+                audit_budget::Verdict::Write { suppressed } => suppressed,
+                audit_budget::Verdict::Suppress => return,
+            }
+        } else {
+            None
+        };
+        self.audit.auth_failed(AuthFailure {
+            detail,
+            client_ip,
+            suppressed,
+        });
+    }
+
+    /// Write the count of a closed audit window, if any (D6). The
+    /// daemon's housekeeping tick calls this.
+    pub fn flush_audit(&self, now: Instant) {
+        if let Some(count) = self.audit_budget.flush(now) {
+            self.audit.suppressed_only(count);
+        }
+    }
+
+    /// Write whatever count is pending, window closed or not. Shutdown.
+    pub fn drain_audit(&self) {
+        if let Some(count) = self.audit_budget.drain() {
+            self.audit.suppressed_only(count);
         }
     }
 
@@ -2352,6 +2398,8 @@ mod tests {
         fn auth_failed(&self, failure: AuthFailure) {
             self.0.lock().unwrap().push(failure.detail);
         }
+
+        fn suppressed_only(&self, _count: u64) {}
     }
 
     const ORIGIN: &str = "http://localhost:9";
@@ -3406,5 +3454,140 @@ mod tests {
             ui.open_ceremony(&ceremony.id, CeremonyKind::Login)
                 .is_none()
         );
+    }
+
+    // ---- The audit ceiling (D6) ----
+
+    /// Records every entry the UI asks the sink for.
+    #[derive(Default)]
+    struct Recorder {
+        itemized: Mutex<Vec<(&'static str, Option<u64>)>>,
+        summaries: Mutex<Vec<u64>>,
+    }
+
+    impl OwnerAudit for Recorder {
+        fn auth_failed(&self, failure: AuthFailure) {
+            self.itemized
+                .lock()
+                .unwrap()
+                .push((failure.detail, failure.suppressed));
+        }
+
+        fn suppressed_only(&self, count: u64) {
+            self.summaries.lock().unwrap().push(count);
+        }
+    }
+
+    const PUBLIC: &str = "https://owner.example.com";
+
+    fn public_ui(audit: Arc<Recorder>) -> (Arc<OwnerUi>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = OwnerUi::open_with(
+            dir.path(),
+            OwnerUiOptions {
+                rp_id: "owner.example.com".into(),
+                origin: PUBLIC.into(),
+                public: true,
+            },
+            Arc::new(StaticShell(ShellView {
+                locked: false,
+                pending: 0,
+            })),
+            audit,
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        (ui, dir)
+    }
+
+    fn post(path: &str, cookie: Option<&str>, origin: &str, body: &str) -> Incoming {
+        Incoming {
+            method: Method::POST,
+            path: path.into(),
+            cookie: cookie.map(str::to_owned),
+            origin: Some(origin.into()),
+            authorization: None,
+            content_type: Some("application/json".into()),
+            body: body.as_bytes().to_vec(),
+            client_ip: None,
+        }
+    }
+
+    #[test]
+    fn req_apr_009_session_failures_are_always_itemized() {
+        let rec = Arc::new(Recorder::default());
+        let (ui, _dir) = public_ui(rec.clone());
+        for _ in 0..40 {
+            let r = ui.dispatch(post("/owner/login/finish", None, PUBLIC, "{}"));
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        }
+        let cookie = ui.issue_session().split(';').next().unwrap().to_owned();
+        let r = ui.dispatch(post(
+            "/owner/approvals/approve",
+            Some(&cookie),
+            PUBLIC,
+            r#"{"password":"x"}"#,
+        ));
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let got = rec.itemized.lock().unwrap().clone();
+        assert_eq!(got.len(), 21, "{got:?}");
+        assert_eq!(got[20], ("password_rejected", None));
+    }
+
+    #[test]
+    fn req_apr_009_wrong_origin_with_a_session_is_still_capped() {
+        let rec = Arc::new(Recorder::default());
+        let (ui, _dir) = public_ui(rec.clone());
+        let cookie = ui.issue_session().split(';').next().unwrap().to_owned();
+        for _ in 0..40 {
+            let r = ui.dispatch(post(
+                "/owner/approvals/approve",
+                Some(&cookie),
+                "https://sibling.example.com",
+                "{}",
+            ));
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
+        let got = rec.itemized.lock().unwrap().clone();
+        assert_eq!(got.len(), 20, "{got:?}");
+        assert!(got.iter().all(|(d, _)| *d == "origin"));
+    }
+
+    #[test]
+    fn a_suppressed_failure_still_counts_toward_the_throttle() {
+        let rec = Arc::new(Recorder::default());
+        let (ui, _dir) = public_ui(rec.clone());
+        for _ in 0..20 {
+            ui.dispatch(post("/owner/login/finish", None, PUBLIC, "{}"));
+        }
+        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        for _ in 0..10 {
+            let mut req = post("/owner/login/finish", None, PUBLIC, "{}");
+            req.client_ip = Some(ip);
+            assert_eq!(ui.dispatch(req).status(), StatusCode::UNAUTHORIZED);
+        }
+        // The budget is spent, yet the tenth failure tripped the throttle.
+        let mut req = post("/owner/login/finish", None, PUBLIC, "{}");
+        req.client_ip = Some(ip);
+        assert_eq!(ui.dispatch(req).status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rec.itemized.lock().unwrap().len(), 20);
+        // Ten failures plus the `throttled` entry were counted.
+        assert_eq!(ui.audit_budget.drain(), Some(11));
+    }
+
+    #[test]
+    fn flush_and_drain_write_the_count_once() {
+        let rec = Arc::new(Recorder::default());
+        let (ui, _dir) = public_ui(rec.clone());
+        for _ in 0..25 {
+            ui.dispatch(post("/owner/login/finish", None, PUBLIC, "{}"));
+        }
+        let t0 = Instant::now();
+        ui.flush_audit(t0);
+        assert!(rec.summaries.lock().unwrap().is_empty());
+        ui.flush_audit(t0 + audit_budget::AUDIT_WINDOW);
+        ui.flush_audit(t0 + audit_budget::AUDIT_WINDOW);
+        ui.drain_audit();
+        assert_eq!(*rec.summaries.lock().unwrap(), vec![5]);
     }
 }

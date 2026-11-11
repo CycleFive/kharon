@@ -16,6 +16,10 @@ Revised after Nyx's review of PR #253: D4 and D5 (a request without a usable
 `CF-Connecting-IP` has no throttle key and is exempt from the throttle) and D6
 (`throttled` entries have their own allowance of 5 a minute).
 
+Revised with PR #256: D9's key handling (a background first fetch, a 5-second
+retry while the cache is empty, a stale cache never makes a request wait,
+unusable key-set entries are skipped, refusals are named in the log).
+
 ## What this is for
 
 Today the owner UI only works on loopback: the owner reaches it over an SSH
@@ -408,12 +412,20 @@ not on the exemption list must carry a valid `Cf-Access-Jwt-Assertion`:
 Refusal is `403 access_denied`, audited as `owner_auth_fail` / `access` within
 D6's ceiling. It does not count toward D5: it isn't a sign-in attempt.
 
-**Keys.** Fetched on first need, not at startup, so kharond never fails to
-start because Cloudflare is unreachable. An unknown `kid`, or a cache older
-than 24 hours, triggers a refetch, at most one per 60 seconds. If a refetch
-fails the old keys stay in use, so a JWKS outage doesn't lock the owner out.
-The fetch has a 5-second timeout, follows no redirects and reads at most
-64 KiB.
+**Keys.** kharond starts a first fetch in the background at startup and never
+waits for it, so it never fails to start because Cloudflare is unreachable.
+Until a key set has been fetched, every gated route is refused. An unknown
+`kid`, or a cache older than 24 hours, triggers a refetch: at most one per
+60 seconds once a key set is loaded, and one per 5 seconds while the cache is
+still empty, so a blip at startup doesn't refuse everyone for a minute. A
+request whose `kid` is in a stale cache is verified with the cached key while
+the refresh runs in the background; only an unknown `kid` waits for a fetch.
+If a refetch fails the old keys stay in use, so a JWKS outage after the first
+fetch doesn't lock the owner out. An entry in the key set that isn't a
+complete RSA key is skipped; it never rejects the set. The fetch has a
+5-second timeout, follows no redirects and reads at most 64 KiB. Each failed
+fetch and the first refusal of each kind are named in the log with fixed
+text, never with token data.
 
 **The test override can't be set from a file.** The JWKS source is a field of
 the validated config (`JwksSource::TeamCerts`, the default, or

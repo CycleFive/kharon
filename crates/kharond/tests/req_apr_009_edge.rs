@@ -416,13 +416,28 @@ fn pub_post<'a>(path: &'a str, body: &'a str) -> Http<'a> {
 /// Enrol a software passkey through the owner socket's code. Returns it
 /// with the user handle already set.
 async fn enroll_public(run: &Running) -> VirtAuth {
+    enroll_public_via(run, None).await
+}
+
+/// [`enroll_public`], with every call arriving from `ip`.
+async fn enroll_public_from(run: &Running, ip: &str) -> VirtAuth {
+    enroll_public_via(run, Some(ip)).await
+}
+
+async fn enroll_public_via(run: &Running, ip: Option<&str>) -> VirtAuth {
+    fn from<'a>(req: Http<'a>, ip: Option<&'a str>) -> Http<'a> {
+        match ip {
+            Some(ip) => req.header("CF-Connecting-IP", ip),
+            None => req,
+        }
+    }
     let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
     let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
     let mut auth = VirtAuth::new();
     let opts = http(
         run.ui,
         PUBLIC_ORIGIN,
-        pub_post("/owner/register/options", "").bearer(&enroll),
+        from(pub_post("/owner/register/options", "").bearer(&enroll), ip),
     )
     .await;
     assert_eq!(opts.status, 200, "{}", opts.body);
@@ -437,7 +452,7 @@ async fn enroll_public(run: &Running) -> VirtAuth {
     let done = http(
         run.ui,
         PUBLIC_ORIGIN,
-        pub_post("/owner/register/finish", &body),
+        from(pub_post("/owner/register/finish", &body), ip),
     )
     .await;
     assert_eq!(done.status, 200, "{}", done.body);
@@ -800,7 +815,7 @@ async fn throttle(run: &Running, ip: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn req_apr_009_ten_failures_throttle_that_source_only() {
     let run = start_public().await;
-    enroll_public_from(&run, SRC_B).await;
+    let mut auth_b = enroll_public_from(&run, SRC_B).await;
     throttle(&run, SRC_A).await;
 
     let blocked = garbage_from(&run, SRC_A).await;
@@ -826,7 +841,8 @@ async fn req_apr_009_ten_failures_throttle_that_source_only() {
     )
     .await;
     assert_eq!(home.status, 200, "{}", home.body);
-    assert_eq!(login_options_status(&run, SRC_B).await, 200);
+    // Another source still signs in, all the way to a session.
+    sign_in_from(&run, &mut auth_b, SRC_B).await;
 
     let fails = run.auth_fails();
     let from_a = |detail: &str| {
@@ -845,16 +861,6 @@ async fn req_apr_009_ten_failures_throttle_that_source_only() {
         "the 429 or B's call was audited: {fails:?}"
     );
     run.shutdown().await;
-}
-
-async fn login_options_status(run: &Running, ip: &str) -> u16 {
-    http(
-        run.ui,
-        PUBLIC_ORIGIN,
-        pub_post("/owner/login/options", "").header("CF-Connecting-IP", ip),
-    )
-    .await
-    .status
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -880,38 +886,6 @@ async fn req_apr_009_wrong_origin_never_counts() {
     .await;
     assert_eq!(ok.status, 200, "{}", ok.body);
     run.shutdown().await;
-}
-
-/// [`enroll_public`], with every call arriving from `ip`.
-async fn enroll_public_from(run: &Running, ip: &str) -> VirtAuth {
-    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
-    let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
-    let mut auth = VirtAuth::new();
-    let opts = http(
-        run.ui,
-        PUBLIC_ORIGIN,
-        pub_post("/owner/register/options", "")
-            .bearer(&enroll)
-            .header("CF-Connecting-IP", ip),
-    )
-    .await;
-    assert_eq!(opts.status, 200, "{}", opts.body);
-    let opts: Json = serde_json::from_str(&opts.body).unwrap();
-    auth.user_handle = b64url_dec(opts["publicKey"]["user"]["id"].as_str().unwrap());
-    let reg = auth.registration(
-        opts["publicKey"]["challenge"].as_str().unwrap(),
-        PUBLIC_ORIGIN,
-        PUBLIC_HOST,
-    );
-    let body = json!({"ceremony_id": opts["ceremony_id"], "credential": reg}).to_string();
-    let done = http(
-        run.ui,
-        PUBLIC_ORIGIN,
-        pub_post("/owner/register/finish", &body).header("CF-Connecting-IP", ip),
-    )
-    .await;
-    assert_eq!(done.status, 200, "{}", done.body);
-    auth
 }
 
 /// Sign in from `ip`; the session cookie pair.

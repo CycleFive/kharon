@@ -1163,7 +1163,9 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
         if let Some(n) = failure.suppressed {
             entry = entry.suppressed(n);
         }
-        let _ = self.broker.append_audit(entry);
+        if self.broker.append_audit(entry).is_err() {
+            eprintln!("kharond: owner_ui audit append failed");
+        }
     }
 
     fn suppressed_only(&self, count: u64) {
@@ -1171,7 +1173,9 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
             .channel("web_ui")
             .result("suppressed_only")
             .suppressed(count);
-        let _ = self.broker.append_audit(entry);
+        if self.broker.append_audit(entry).is_err() {
+            eprintln!("kharond: owner_ui audit append failed");
+        }
     }
 }
 

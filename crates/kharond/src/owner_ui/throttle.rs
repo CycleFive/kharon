@@ -55,6 +55,11 @@ impl FailureThrottle {
     }
 
     /// Time left in the window when `ip` has reached the limit.
+    ///
+    /// `blocked` and [`Self::record`] are separate steps: concurrent
+    /// requests from one source can each pass this check before any of
+    /// them is counted. The overshoot is bounded by the requests in
+    /// flight and is accepted (D5).
     pub fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
         let sources = self.lock();
         let (start, failures) = sources.get(&ip_key(ip))?;

@@ -70,7 +70,7 @@ mod approvals;
 mod audit_budget;
 mod sealed;
 mod store;
-pub mod throttle;
+mod throttle;
 pub mod unlock;
 mod webauthn;
 
@@ -256,6 +256,8 @@ pub struct OwnerUi {
     throttle: throttle::FailureThrottle,
     /// Caps the `owner_auth_fail` entries a stranger can cause (D6).
     audit_budget: audit_budget::AuditBudget,
+    /// Set once the missing-`CF-Connecting-IP` warning has been printed.
+    peer_fallback_warned: std::sync::atomic::AtomicBool,
     enroll: Mutex<Vec<Enroll>>,
     /// The web unlock backend (slice 5b). Set once, after the daemon
     /// has built its owner ops; unset → the unlock routes answer
@@ -376,6 +378,7 @@ impl OwnerUi {
             sessions: Mutex::new(Vec::new()),
             throttle: throttle::FailureThrottle::new(),
             audit_budget: audit_budget::AuditBudget::new(),
+            peer_fallback_warned: std::sync::atomic::AtomicBool::new(false),
             enroll: Mutex::new(Vec::new()),
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
@@ -506,9 +509,12 @@ async fn handle(
     let cookie = header_str(&headers, header::COOKIE);
     let origin = header_str(&headers, header::ORIGIN);
     let authorization = header_str(&headers, header::AUTHORIZATION);
-    let client_ip = ui
-        .public
-        .then(|| crate::api::public::client_ip(&headers, true).unwrap_or_else(|| peer.ip()));
+    let client_ip = ui.public.then(|| {
+        crate::api::public::client_ip(&headers, true).unwrap_or_else(|| {
+            ui.note_peer_fallback();
+            peer.ip()
+        })
+    });
     let content_type = header_str(&headers, header::CONTENT_TYPE);
     let (_parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
@@ -547,6 +553,10 @@ struct Incoming {
     client_ip: Option<IpAddr>,
 }
 
+/// The detail code of a refused `Origin`: always capped by the audit
+/// ceiling (D6) and never counted by the throttle (D5).
+const ORIGIN_REFUSED: &str = "origin";
+
 /// What a recorded failure knows about its request.
 struct FailureCtx {
     client_ip: Option<IpAddr>,
@@ -560,6 +570,7 @@ impl OwnerUi {
     /// The only place an owner-UI auth failure is recorded.
     fn fail(&self, req: &Incoming, detail: &'static str) {
         self.record_failure(
+            Instant::now(),
             FailureCtx {
                 client_ip: req.client_ip,
                 throttled_route: throttle::THROTTLED_ROUTES.contains(&req.path.as_str()),
@@ -570,31 +581,42 @@ impl OwnerUi {
     }
 
     /// [`Self::fail`] for failures raised before an [`Incoming`] exists.
-    fn record_failure(&self, ctx: FailureCtx, detail: &'static str) {
+    fn record_failure(&self, now: Instant, ctx: FailureCtx, detail: &'static str) {
         // A failure that passed the `Origin` check behind a live session
         // is always itemized: a stranger cannot make one (D6). A wrong
         // `Origin` is capped either way: a same-site sibling page can
         // send one with the owner's cookie.
-        self.write_failure(detail, ctx.client_ip, ctx.has_session && detail != "origin");
+        self.write_failure(
+            now,
+            detail,
+            ctx.client_ip,
+            ctx.has_session && detail != ORIGIN_REFUSED,
+        );
         // A wrong `Origin` is never counted: a page the owner visits
         // sends those from the owner's own address (D5). Counting does
         // not depend on whether the entry was itemized.
         if let Some(ip) = ctx.client_ip
             && self.public
             && ctx.throttled_route
-            && detail != "origin"
-            && self.throttle.record(ip, Instant::now()) == throttle::Counted::Tripped
+            && detail != ORIGIN_REFUSED
+            && self.throttle.record(ip, now) == throttle::Counted::Tripped
         {
             // Session-less in the budget's eyes, like any other entry.
-            self.write_failure("throttled", ctx.client_ip, false);
+            self.write_failure(now, "throttled", ctx.client_ip, false);
         }
     }
 
     /// Append one `owner_auth_fail` entry, or count it when the public
     /// ceiling is spent. Local mode and `exempt` entries always write.
-    fn write_failure(&self, detail: &'static str, client_ip: Option<IpAddr>, exempt: bool) {
+    fn write_failure(
+        &self,
+        now: Instant,
+        detail: &'static str,
+        client_ip: Option<IpAddr>,
+        exempt: bool,
+    ) {
         let suppressed = if self.public && !exempt {
-            match self.audit_budget.admit(Instant::now()) {
+            match self.audit_budget.admit(now) {
                 audit_budget::Verdict::Write { suppressed } => suppressed,
                 audit_budget::Verdict::Suppress => return,
             }
@@ -606,6 +628,22 @@ impl OwnerUi {
             client_ip,
             suppressed,
         });
+    }
+
+    /// A public-mode request had no usable `CF-Connecting-IP`, so the TCP
+    /// peer keys the throttle. If the edge strips the header, every
+    /// visitor shares the tunnel's address and the throttle is one shared
+    /// bucket: say so once per process. Returns whether this call printed.
+    fn note_peer_fallback(&self) -> bool {
+        let first = !self
+            .peer_fallback_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        if first {
+            eprintln!(
+                "kharond: owner UI request without a usable CF-Connecting-IP; the failure throttle keys on the tunnel's address until the edge sends it"
+            );
+        }
+        first
     }
 
     /// Write the count of a closed audit window, if any (D6). The
@@ -1702,10 +1740,16 @@ function credToJSON(cred) {
   if (r.attestationObject) response.attestationObject = bufToB64url(r.attestationObject);
   return { id: cred.id, type: cred.type, response: response };
 }
+function tooMany(resp) {
+  const secs = Number(resp.headers.get("retry-after"));
+  const mins = Math.ceil((secs > 0 ? secs : 600) / 60);
+  return "Too many failed attempts from this network. Try again in " + mins + " min.";
+}
 window.kharonSignIn = async function () {
   const err = document.getElementById("err");
   err.textContent = "";
   const opt = await fetch("/owner/login/options", { method: "POST", credentials: "same-origin" });
+  if (opt.status === 429) { err.textContent = tooMany(opt); return false; }
   if (!opt.ok) { err.textContent = "Sign-in is not available"; return false; }
   const data = await opt.json();
   let cred;
@@ -1721,6 +1765,7 @@ window.kharonSignIn = async function () {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ ceremony_id: data.ceremony_id, credential: credToJSON(cred) })
   });
+  if (fin.status === 429) { err.textContent = tooMany(fin); return false; }
   if (!fin.ok) { err.textContent = "Sign-in refused"; return false; }
   return true;
 };
@@ -1784,6 +1829,11 @@ function credToJSON(cred) {
     }
   };
 }
+function tooMany(resp) {
+  const secs = Number(resp.headers.get("retry-after"));
+  const mins = Math.ceil((secs > 0 ? secs : 600) / 60);
+  return "Too many failed attempts from this network. Try again in " + mins + " min.";
+}
 window.kharonRegister = async function (code) {
   const err = document.getElementById("err");
   err.textContent = "";
@@ -1792,6 +1842,7 @@ window.kharonRegister = async function (code) {
     credentials: "same-origin",
     headers: { "authorization": "Bearer " + code }
   });
+  if (opt.status === 429) { err.textContent = tooMany(opt); return false; }
   if (!opt.ok) { err.textContent = "Enrollment code refused"; return false; }
   const data = await opt.json();
   let cred;
@@ -1807,6 +1858,7 @@ window.kharonRegister = async function (code) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ ceremony_id: data.ceremony_id, credential: credToJSON(cred) })
   });
+  if (fin.status === 429) { err.textContent = tooMany(fin); return false; }
   if (!fin.ok) { err.textContent = "Registration refused"; return false; }
   document.getElementById("done").hidden = false;
   return true;
@@ -2405,6 +2457,10 @@ mod tests {
     const ORIGIN: &str = "http://localhost:9";
 
     struct ApprovalsRig {
+        /// The `Origin` the rig's posts carry.
+        origin: &'static str,
+        /// The source address of its requests (public mode only).
+        client_ip: Option<IpAddr>,
         ui: Arc<OwnerUi>,
         fake: Arc<FakeApprovals>,
         audit: Arc<FailCodes>,
@@ -2414,13 +2470,30 @@ mod tests {
 
     impl ApprovalsRig {
         fn new() -> Self {
+            Self::build(false)
+        }
+
+        /// A public-mode UI whose requests come from `198.51.100.9`.
+        fn public() -> Self {
+            Self::build(true)
+        }
+
+        fn build(public: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let fake = Arc::new(FakeApprovals::default());
             let audit = Arc::new(FailCodes::default());
-            let ui = OwnerUi::open(
+            let (rp_id, origin) = if public {
+                ("owner.example.com", PUBLIC)
+            } else {
+                ("localhost", ORIGIN)
+            };
+            let ui = OwnerUi::open_with(
                 dir.path(),
-                "localhost",
-                ORIGIN,
+                OwnerUiOptions {
+                    rp_id: rp_id.into(),
+                    origin: origin.into(),
+                    public,
+                },
                 Arc::new(StaticShell(ShellView {
                     locked: false,
                     pending: 1,
@@ -2431,6 +2504,8 @@ mod tests {
             .unwrap();
             let cookie = ui.issue_session().split(';').next().unwrap().to_owned();
             Self {
+                origin,
+                client_ip: public.then(|| "198.51.100.9".parse().unwrap()),
                 ui,
                 fake,
                 audit,
@@ -2460,7 +2535,7 @@ mod tests {
                 authorization: None,
                 content_type: content_type.map(str::to_owned),
                 body: body.as_bytes().to_vec(),
-                client_ip: None,
+                client_ip: self.client_ip,
             });
             let status = response.status();
             let bytes = futures_body(response);
@@ -2472,7 +2547,7 @@ mod tests {
                 Method::POST,
                 path,
                 true,
-                Some(ORIGIN),
+                Some(self.origin),
                 Some("application/json"),
                 body,
             )
@@ -3104,6 +3179,46 @@ mod tests {
         );
     }
 
+    /// D5: a throttled source is told to wait, not that sign-in is broken
+    /// or that its enrollment code was refused.
+    #[test]
+    fn the_sign_in_and_enroll_pages_explain_a_429() {
+        for (name, page) in [("login", LOGIN_PAGE), ("enroll", ENROLL_PAGE)] {
+            assert!(
+                page.contains("Too many failed attempts from this network. Try again in "),
+                "{name} page"
+            );
+            assert!(page.contains(".status === 429"), "{name} page");
+            assert!(page.contains("retry-after"), "{name} page");
+        }
+    }
+
+    /// D5: a completed unlock clears the source's count, so nine typos
+    /// before it and nine after never add up to a 429.
+    #[test]
+    fn a_successful_unlock_clears_the_throttle_count() {
+        let (rig, _unlock) = {
+            let rig = ApprovalsRig::public();
+            let unlock = Arc::new(FakeUnlock::default());
+            assert!(rig.ui.set_unlocker(unlock.clone()));
+            (rig, unlock)
+        };
+        let attempt = |password: &str| {
+            let (id, key) = rig.begin();
+            rig.post("/owner/unlock", &ApprovalsRig::sealed(&id, &key, password))
+        };
+        for i in 0..9 {
+            let (status, out) = attempt("wrong");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{i}: {out}");
+        }
+        let (status, out) = attempt("right horse");
+        assert_eq!(status, StatusCode::OK, "{out}");
+        for i in 0..9 {
+            let (status, out) = attempt("wrong");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "after: {i}: {out}");
+        }
+    }
+
     #[test]
     fn unlock_state_refusals_are_not_auth_failures() {
         let (rig, unlock) = ApprovalsRig::with_unlock();
@@ -3589,5 +3704,36 @@ mod tests {
         ui.flush_audit(t0 + audit_budget::AUDIT_WINDOW);
         ui.drain_audit();
         assert_eq!(*rec.summaries.lock().unwrap(), vec![5]);
+    }
+
+    #[test]
+    fn the_carried_count_reaches_the_next_windows_first_entry() {
+        let rec = Arc::new(Recorder::default());
+        let (ui, _dir) = public_ui(rec.clone());
+        let ctx = || FailureCtx {
+            client_ip: None,
+            throttled_route: false,
+            has_session: false,
+        };
+        let t = Instant::now();
+        for _ in 0..25 {
+            ui.record_failure(t, ctx(), "no_assertion");
+        }
+        let later = t + audit_budget::AUDIT_WINDOW;
+        ui.record_failure(later, ctx(), "no_assertion");
+        ui.record_failure(later, ctx(), "no_assertion");
+        let got = rec.itemized.lock().unwrap().clone();
+        assert_eq!(got.len(), 22, "{got:?}");
+        assert_eq!(got[20].1, Some(5));
+        assert_eq!(got[21].1, None);
+        assert!(got[..20].iter().all(|(_, n)| n.is_none()));
+    }
+
+    #[test]
+    fn the_missing_header_warning_is_printed_once() {
+        let (ui, _dir) = public_ui(Arc::new(Recorder::default()));
+        assert!(ui.note_peer_fallback());
+        assert!(!ui.note_peer_fallback());
+        assert!(!ui.note_peer_fallback());
     }
 }

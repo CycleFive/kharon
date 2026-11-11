@@ -244,6 +244,12 @@ pub enum OwnerFailure {
     /// Derivation failed (wrong password, sync error, export auth
     /// failure — not distinguished, REQ-API-006).
     UnlockFailed,
+    /// The account sees items or organizations outside the kharon
+    /// organization (REQ-CRY-008), so unlock was refused before the
+    /// password was used. Owner surfaces name it (#243). The audit
+    /// records it exactly like [`Self::UnlockFailed`] (see
+    /// [`Self::is_auth_failure`]).
+    ScopeTooBroad,
     /// The op is not implemented by this owner (test doubles).
     Unsupported,
     /// No grant request with that id (grant ops, #20).
@@ -265,6 +271,7 @@ impl OwnerFailure {
             Self::ProcessDumpable => "process_dumpable",
             Self::AuditFailed => "audit_failed",
             Self::UnlockFailed => "unlock_failed",
+            Self::ScopeTooBroad => "scope_too_broad",
             Self::Unsupported => "unknown_op",
             Self::NotFound => "not_found",
             Self::NotPending => "not_pending",
@@ -272,7 +279,20 @@ impl OwnerFailure {
             Self::InvalidTerms => "invalid_terms",
         }
     }
+
+    /// Whether this unlock failure is audited as `owner_auth_fail`
+    /// (`unlock_failed`). A scope refusal is, exactly like a wrong
+    /// password: only the owner-facing code differs (#243), so the
+    /// log and the agent side learn nothing new. State refusals
+    /// (already unlocked, mlock, audit) are not auth failures.
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(self, Self::UnlockFailed | Self::ScopeTooBroad)
+    }
 }
+
+/// The owner-facing hint for [`OwnerFailure::ScopeTooBroad`] (#243),
+/// shared by the CLI and the owner UI's unlock page.
+pub const SCOPE_TOO_BROAD_HINT: &str = "the kharon account can see items or organizations outside its kharon organization (personal-vault items count). Move or delete them in Bitwarden, then unlock again.";
 
 /// A parsed request line. The `password` field is deliberately
 /// *not* in this struct: it is hand-decoded from the raw line (see
@@ -616,11 +636,11 @@ async fn dispatch_line<O: OwnerOps>(
                 Err(e) => {
                     // A failed *authentication* (wrong password,
                     // unreachable server, bad export — the one
-                    // indistinguishable bucket) is audited as
-                    // `owner_auth_fail`. State refusals
-                    // (already unlocked, mlock, audit) are not
-                    // auth failures and are not recorded as one.
-                    if e == OwnerFailure::UnlockFailed {
+                    // indistinguishable bucket — and the scope
+                    // refusal, #243) is audited as `owner_auth_fail`.
+                    // State refusals (already unlocked, mlock, audit)
+                    // are not auth failures and are not recorded as one.
+                    if e.is_auth_failure() {
                         ops.auth_failed("unlock_failed").await;
                     }
                     error_response(e.code())
@@ -906,6 +926,21 @@ mod tests {
         let reply = dispatch(req, password, ops.clone()).await;
         assert_eq!(&*reply, &error_response("already_unlocked"));
         assert!(ops.auth_failed.lock().unwrap().is_empty());
+    }
+
+    /// #243: the owner learns the unlock was refused for scope
+    /// (REQ-CRY-008), while the audit records it exactly as before,
+    /// as `owner_auth_fail` / `unlock_failed`.
+    #[tokio::test]
+    async fn scope_refusal_has_its_own_owner_code_and_the_same_audit() {
+        let (req, password) = request(br#"{"op":"unlock","password":"x"}"#);
+        let ops = Arc::new(MockOps {
+            unlock_err: Some(OwnerFailure::ScopeTooBroad),
+            ..MockOps::default()
+        });
+        let reply = dispatch(req, password, Arc::clone(&ops)).await;
+        assert_eq!(&*reply, &error_response("scope_too_broad"));
+        assert_eq!(*ops.auth_failed.lock().unwrap(), ["unlock_failed"]);
     }
 
     #[test]

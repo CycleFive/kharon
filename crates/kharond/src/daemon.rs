@@ -255,6 +255,19 @@ impl DaemonOwner {
             UnlockError::DeriveFailed(_) => OwnerFailure::UnlockFailed,
         }
     }
+
+    /// The owner code for a failure of [`LiveSync::prepare`], the
+    /// password-free network half of unlock (#243). Its REQ-CRY-008
+    /// scope check runs before the password is used, so naming that
+    /// refusal to the owner says nothing about the password. Every
+    /// other failure stays the indistinguishable `unlock_failed`
+    /// (REQ-API-006).
+    fn prepare_failure(e: &crate::sync::SyncError) -> OwnerFailure {
+        match e {
+            crate::sync::SyncError::ScopeTooBroad { .. } => OwnerFailure::ScopeTooBroad,
+            _ => OwnerFailure::UnlockFailed,
+        }
+    }
 }
 
 /// Why an export-mode derivation closure failed: the export
@@ -325,7 +338,7 @@ impl OwnerOps for DaemonOwner {
                 let client = bw.sync_client().map_err(|_| OwnerFailure::UnlockFailed)?;
                 let prepared = LiveSync::prepare(client, bw.scope(), bw.sync_policy())
                     .await
-                    .map_err(|_| OwnerFailure::UnlockFailed)?;
+                    .map_err(|e| Self::prepare_failure(&e))?;
                 let broker = Arc::clone(&self.broker);
                 tokio::task::spawn_blocking(move || {
                     let mut lock = broker
@@ -1679,6 +1692,37 @@ mod tests {
     use crate::api::core::{AuditSink, Request};
     use crate::lock::{AuditError, StaticHardening};
     use std::sync::Mutex;
+
+    /// #243: only the REQ-CRY-008 scope refusal from the password-free
+    /// network half of unlock gets its own owner code. Every other
+    /// failure stays the one indistinguishable `unlock_failed`.
+    #[test]
+    fn prepare_failure_names_only_the_scope_refusal() {
+        use crate::sync::SyncError;
+        assert_eq!(
+            DaemonOwner::prepare_failure(&SyncError::ScopeTooBroad {
+                other_orgs: 0,
+                outside_items: 1,
+            }),
+            OwnerFailure::ScopeTooBroad
+        );
+        for other in [
+            SyncError::Transport("connect"),
+            SyncError::Status {
+                endpoint: "/api/sync",
+                status: 500,
+            },
+            SyncError::ApiKey("invalid_client"),
+            SyncError::AccountMismatch,
+            SyncError::OrgNotVisible,
+        ] {
+            assert_eq!(
+                DaemonOwner::prepare_failure(&other),
+                OwnerFailure::UnlockFailed,
+                "{other:?}"
+            );
+        }
+    }
 
     /// An audit sink that records event names and can be told to
     /// refuse `export_loaded` appends (PR #81 review, item 6's

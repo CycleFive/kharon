@@ -340,3 +340,69 @@ async fn req_apr_004_panic_notifies_without_actions() {
     assert!(body.get("actions").is_none(), "{body}");
     assert_eq!(stub.count(), 1);
 }
+
+/// #208: behind the edge the action URLs name the public origin, not
+/// the loopback listener, and a public UI publishes even when its
+/// configured port is ephemeral.
+#[tokio::test]
+async fn req_apr_004_public_mode_action_urls_use_the_public_origin() {
+    let public = kharond::config::Config::from_toml_str(
+        r#"mode = "export"
+[export]
+file = "/nonexistent"
+[agents.alpha]
+token_hash = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$CANARYhashCANARYhash"
+cdp = { endpoint = "ws://127.0.0.1:9/devtools/browser" }
+[audit]
+checkpoint_local_only = true
+[owner_ui]
+listen = "127.0.0.1:0"
+rp_id = "kharon-owner.example.com"
+public_origin = "https://kharon-owner.example.com"
+"#,
+    )
+    .unwrap()
+    .owner_ui
+    .unwrap();
+    let base = kharond::daemon::approval_redeem_base(&public)
+        .expect("a public owner UI publishes on port 0");
+    assert_eq!(base, "https://kharon-owner.example.com");
+
+    let stub = stub_ntfy();
+    let ntfy = url::Url::parse(&format!("http://127.0.0.1:{}", stub.port)).unwrap();
+    let notifier = NtfyApprovalNotifier::new(&ntfy, "kharon-alerts", None, base).unwrap();
+    let rig = Rig::build(Some(Arc::new(notifier)));
+    let r = rig.fill("https://login.example.com").await;
+    assert_eq!(r["status"], "pending_approval", "{r}");
+
+    let requests = stub.wait_for(1);
+    let (_, _, body) = parse_request(&requests[0]);
+    for action in body["actions"].as_array().unwrap() {
+        let url = action["url"].as_str().unwrap();
+        assert!(
+            url.starts_with("https://kharon-owner.example.com/owner/"),
+            "{url}"
+        );
+    }
+
+    // Local mode on an ephemeral port has no stable base: unpublished.
+    let local = kharond::config::Config::from_toml_str(
+        r#"mode = "export"
+[export]
+file = "/nonexistent"
+[agents.alpha]
+token_hash = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$CANARYhashCANARYhash"
+cdp = { endpoint = "ws://127.0.0.1:9/devtools/browser" }
+[audit]
+checkpoint_local_only = true
+[owner_ui]
+listen = "127.0.0.1:0"
+rp_id = "localhost"
+origin = "http://localhost:1"
+"#,
+    )
+    .unwrap()
+    .owner_ui
+    .unwrap();
+    assert_eq!(kharond::daemon::approval_redeem_base(&local), None);
+}

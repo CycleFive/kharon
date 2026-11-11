@@ -751,6 +751,7 @@ pub struct Daemon {
     owner_ui: Option<(TcpListener, Arc<crate::owner_ui::OwnerUi>)>,
     owner_ui_addr: Option<SocketAddr>,
     owner_ui_origin: Option<String>,
+    owner_ui_public: bool,
     /// Bound public-ingress listener, when `[public_ingress]` is set
     /// (#198), with its TLS config when it speaks TLS.
     public_ingress: Option<PublicIngressRuntime>,
@@ -875,13 +876,14 @@ pub async fn start(
     // publish, so prompts stay unpublished in that shape. Building
     // the notifier reads its token file eagerly — an unreadable
     // token refuses startup here instead of silently never prompting.
-    let broker = match (&cfg.approval.ntfy, &cfg.owner_ui) {
-        (Some(ntfy), Some(ui)) if ui.listen.port() != 0 => {
+    let redeem_base = cfg.owner_ui.as_ref().and_then(approval_redeem_base);
+    let broker = match (&cfg.approval.ntfy, redeem_base) {
+        (Some(ntfy), Some(redeem_base)) => {
             let notifier = crate::api::NtfyApprovalNotifier::new(
                 &ntfy.url,
                 &ntfy.topic,
                 ntfy.token_file.as_deref(),
-                format!("http://{}", ui.listen),
+                redeem_base,
             )
             .map_err(|e| StartupError::ApprovalNotifierSetup {
                 kind: e.kind().to_string(),
@@ -960,6 +962,7 @@ pub async fn start(
         owner_ui,
         owner_ui_addr,
         owner_ui_origin,
+        owner_ui_public: cfg.owner_ui.as_ref().is_some_and(|ui| ui.public),
         public_ingress,
     })
 }
@@ -1094,6 +1097,20 @@ async fn bind_owner_ui(
     Ok((Some((listener, ui)), Some(addr), Some(origin)))
 }
 
+/// The base the ntfy approve/deny action URLs are joined onto, or
+/// `None` when the owner UI has no stable one. Behind the edge it is the
+/// public origin, whatever the configured listen port (#208); locally it
+/// is the loopback listener, which is stable only when its port is fixed.
+pub fn approval_redeem_base(ui: &crate::config::OwnerUiConfig) -> Option<String> {
+    if ui.public {
+        Some(ui.origin.clone())
+    } else if ui.listen.port() != 0 {
+        Some(format!("http://{}", ui.listen))
+    } else {
+        None
+    }
+}
+
 /// Shell facts from the live broker. Called on the UI's blocking
 /// thread: it takes the lock-controller mutex.
 struct DaemonShell {
@@ -1121,11 +1138,14 @@ struct DaemonUiAudit {
 }
 
 impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
-    fn auth_failed(&self, detail: &'static str) {
-        let entry = Entry::new(Event::OwnerAuthFail)
+    fn auth_failed(&self, failure: crate::owner_ui::AuthFailure) {
+        let mut entry = Entry::new(Event::OwnerAuthFail)
             .channel("web_ui")
             .result("denied")
-            .detail_code(detail);
+            .detail_code(failure.detail);
+        if let Some(ip) = failure.client_ip {
+            entry = entry.client_ip(ip.to_string());
+        }
         let _ = self.broker.append_audit(entry);
     }
 }
@@ -1179,6 +1199,11 @@ impl Daemon {
     /// The owner UI's bound address, when `[owner_ui]` is set.
     pub fn owner_ui_addr(&self) -> Option<SocketAddr> {
         self.owner_ui_addr
+    }
+
+    /// True when the owner UI is behind the edge (`public_origin`, #208).
+    pub fn owner_ui_public(&self) -> bool {
+        self.owner_ui_public
     }
 
     /// The WebAuthn origin the owner UI expects (`clientDataJSON`).

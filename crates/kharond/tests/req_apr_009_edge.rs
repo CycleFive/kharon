@@ -581,6 +581,7 @@ async fn req_apr_009_ceremony_kinds_do_not_cross() {
     )
     .await;
     assert_eq!(r.status, 401, "{}", r.body);
+    assert!(r.body.contains(r#""error":"bad_assertion""#), "{}", r.body);
     run.shutdown().await;
 }
 
@@ -719,5 +720,50 @@ async fn req_apr_009_only_the_used_set_refuses_a_replay() {
         "{}",
         again.body
     );
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_a_failed_register_finish_does_not_burn_the_ceremony() {
+    let run = start_public().await;
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
+    let opts = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/options", "").bearer(&enroll),
+    )
+    .await;
+    assert_eq!(opts.status, 200, "{}", opts.body);
+    let opts: Json = serde_json::from_str(&opts.body).unwrap();
+    let mut auth = VirtAuth::new();
+    auth.user_handle = b64url_dec(opts["publicKey"]["user"]["id"].as_str().unwrap());
+    let good = auth.registration(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    let post = |credential: &Json| {
+        let body = json!({"ceremony_id": opts["ceremony_id"], "credential": credential});
+        let body = body.to_string();
+        let ui = run.ui;
+        async move { http(ui, PUBLIC_ORIGIN, pub_post("/owner/register/finish", &body)).await }
+    };
+
+    // One attestation byte flipped: the CBOR header.
+    let mut bad = good.clone();
+    let mut raw = b64url_dec(good["response"]["attestationObject"].as_str().unwrap());
+    raw[0] ^= 0x01;
+    bad["response"]["attestationObject"] = json!(owner_ui_support::b64url(&raw));
+    let refused = post(&bad).await;
+    assert_eq!(refused.status, 401, "{}", refused.body);
+    assert!(
+        refused.body.contains(r#""error":"bad_assertion""#),
+        "{}",
+        refused.body
+    );
+
+    let ok = post(&good).await;
+    assert_eq!(ok.status, 200, "{}", ok.body);
     run.shutdown().await;
 }

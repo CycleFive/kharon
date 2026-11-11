@@ -95,7 +95,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
-use self::sealed::{Burn, Sealer, UsedOnce};
+use self::sealed::{Burn, Sealed};
 use self::store::PasskeyStore;
 use self::webauthn::{RegisteredCredential, b64url_decode, b64url_encode, ct_eq};
 use crate::api::http::{
@@ -223,8 +223,8 @@ impl OwnerAudit for NoAudit {
     fn auth_failed(&self, _failure: AuthFailure) {}
 }
 
-/// The owner UI's state: passkeys, ceremonies, sessions, enrollment
-/// codes. Cheap to clone via [`Arc`]; the server holds one.
+/// The owner UI's state: passkeys, sealed ceremony tokens (nothing
+/// stored per ceremony), sessions, enrollment codes. Cheap to clone via [`Arc`]; the server holds one.
 pub struct OwnerUi {
     rp_id: String,
     origin: String,
@@ -242,9 +242,7 @@ pub struct OwnerUi {
     passkeys: Mutex<PasskeyStore>,
     /// Seals and opens ceremony tokens (D7): nothing is stored at
     /// `options`.
-    sealer: Sealer,
-    /// Tokens that already finished a ceremony.
-    used: UsedOnce,
+    sealed: Sealed,
     sessions: Mutex<Vec<Session>>,
     enroll: Mutex<Vec<Enroll>>,
     /// The web unlock backend (slice 5b). Set once, after the daemon
@@ -362,8 +360,7 @@ impl OwnerUi {
             audit,
             approvals,
             passkeys: Mutex::new(passkeys),
-            sealer: Sealer::new(),
-            used: UsedOnce::new(),
+            sealed: Sealed::new(),
             sessions: Mutex::new(Vec::new()),
             enroll: Mutex::new(Vec::new()),
             unlocker: OnceLock::new(),
@@ -1166,17 +1163,7 @@ impl OwnerUi {
     /// later pending authorization sealed the same way) must stop
     /// working at once (REQ-OAU-005, REQ-REV-002).
     pub fn invalidate_sealed(&self) {
-        // Rotate BEFORE clearing the used-set. With the order reversed,
-        // a token sealed under the old key could still open in the gap,
-        // be burned into the just-emptied set, and sign in. After the
-        // rotation nothing old opens, so the clear can't re-admit it.
-        // A token that opened BEFORE the rotation is caught by the
-        // generation: `burn` checks it under the used-set's own lock,
-        // so a burn that takes the lock after `clear` sees the bump,
-        // one before `clear` sees it too or ran wholly before the
-        // rotation, and either way the panic's `clear` empties it.
-        self.sealer.rotate();
-        self.used.clear();
+        self.sealed.invalidate();
     }
 
     fn begin(&self, kind: CeremonyKind) -> Ceremony {
@@ -1186,7 +1173,7 @@ impl OwnerUi {
         };
         Ceremony {
             id: self
-                .sealer
+                .sealed
                 .seal(kind.purpose(), &claims, CEREMONY_TTL, Instant::now()),
             challenge,
         }
@@ -1199,7 +1186,7 @@ impl OwnerUi {
         kind: CeremonyKind,
     ) -> Option<(Vec<u8>, sealed::Opened<CeremonyClaims>)> {
         let opened = self
-            .sealer
+            .sealed
             .open::<CeremonyClaims>(kind.purpose(), token, Instant::now())?;
         let challenge = b64url_decode(&opened.claims.challenge).ok()?;
         Some((challenge, opened))
@@ -1211,11 +1198,7 @@ impl OwnerUi {
         req: &Incoming,
         opened: &sealed::Opened<CeremonyClaims>,
     ) -> Option<Response> {
-        let current = || self.sealer.generation() == opened.generation;
-        match self
-            .used
-            .burn(opened.id, opened.expires, Instant::now(), current)
-        {
+        match self.sealed.burn(opened, Instant::now()) {
             Burn::Fresh => None,
             Burn::Replayed => {
                 self.fail(req, "bad_assertion");

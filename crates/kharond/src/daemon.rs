@@ -491,22 +491,23 @@ impl OwnerOps for DaemonOwner {
 
     async fn panic_lock(&self) -> Result<(), OwnerFailure> {
         let broker = Arc::clone(&self.broker);
-        // Before the await too: a client that disconnects drops this
-        // future, and the blocking task still locks the broker.
-        // Rotating twice is harmless.
-        if let Some(ui) = &self.owner_ui {
+        // Invalidate before the spawn, and again inside the blocking
+        // task right after the broker's panic returns: that task runs
+        // to the end even if the owner-socket client disconnects and
+        // this future is dropped. Rotating twice is harmless.
+        let ui = self.owner_ui.clone();
+        if let Some(ui) = &ui {
             ui.invalidate_sealed();
         }
-        let outcome =
-            tokio::task::spawn_blocking(move || broker.panic_lock().map_err(map_grant_error))
-                .await
-                .unwrap_or(Err(OwnerFailure::AuditFailed));
-        // A panic ends the web UI's ceremonies in flight (D7), whether
-        // or not its own audit append succeeded.
-        if let Some(ui) = &self.owner_ui {
-            ui.invalidate_sealed();
-        }
-        outcome
+        tokio::task::spawn_blocking(move || {
+            let outcome = broker.panic_lock().map_err(map_grant_error);
+            if let Some(ui) = &ui {
+                ui.invalidate_sealed();
+            }
+            outcome
+        })
+        .await
+        .unwrap_or(Err(OwnerFailure::AuditFailed))
     }
 }
 

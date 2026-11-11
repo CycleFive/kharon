@@ -9,10 +9,10 @@
 //! finish burns the token in [`UsedOnce`] (only successes, so a
 //! stranger can't fill it).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use base64ct::{Base64UrlUnpadded, Encoding};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::de::DeserializeOwned;
@@ -20,12 +20,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::webauthn::{b64url_decode, b64url_encode};
+use super::webauthn::b64url_encode;
 
-/// Longest token [`Sealer::open`] looks at.
+/// The one size cap: the longest token [`Sealed::open`] looks at, and
+/// what [`Sealed::seal`] must stay under (keep claims small).
 pub(crate) const MAX_TOKEN_LEN: usize = 4096;
 /// Most live entries in [`UsedOnce`].
 pub(crate) const MAX_USED: usize = 64;
+/// Exclusive bound of the per-sealer expiry offset, in ms.
+const OFFSET_BOUND_MS: u64 = 1 << 40;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -45,14 +48,21 @@ struct EnvelopeIn<T> {
     c: T,
 }
 
+/// The key and how many times it has been replaced. They change
+/// together, under one lock.
+struct KeyState {
+    key: Zeroizing<[u8; 32]>,
+    generation: u64,
+}
+
 /// Seals and opens ceremony tokens under one in-memory key.
-pub(crate) struct Sealer {
+struct Sealer {
     /// Behind a lock so a panic can replace it through `&self`.
-    key: RwLock<Zeroizing<[u8; 32]>>,
-    /// Token expiry is milliseconds since this instant.
+    state: RwLock<KeyState>,
+    /// Token expiry is milliseconds since this instant, plus `offset_ms`.
     epoch: Instant,
-    /// Bumped by every [`Sealer::rotate`].
-    generation: AtomicU64,
+    /// Random, so `exp` does not reveal when the daemon started.
+    offset_ms: u64,
 }
 
 /// A token that opened: its claims, its single-use id, its expiry.
@@ -61,7 +71,7 @@ pub(crate) struct Opened<T> {
     /// SHA-256 of the whole token.
     pub id: [u8; 32],
     pub expires: Instant,
-    /// [`Sealer::generation`] when the token opened.
+    /// The key generation the token opened under.
     pub generation: u64,
 }
 
@@ -71,45 +81,64 @@ fn fresh_key() -> Zeroizing<[u8; 32]> {
     key
 }
 
+/// base64url, unpadded, canonical, alphabet-strict. No length cap of
+/// its own: the caller has checked [`MAX_TOKEN_LEN`].
+fn decode(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut buf = vec![0u8; s.len()];
+    let n = Base64UrlUnpadded::decode(s, &mut buf).ok()?.len();
+    buf.truncate(n);
+    Some(buf)
+}
+
 impl Sealer {
-    pub fn new() -> Self {
+    fn new() -> Self {
+        let mut raw = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut raw);
         Self {
-            key: RwLock::new(fresh_key()),
+            state: RwLock::new(KeyState {
+                key: fresh_key(),
+                generation: 0,
+            }),
             epoch: Instant::now(),
-            generation: AtomicU64::new(0),
+            offset_ms: u64::from_le_bytes(raw) % OFFSET_BOUND_MS,
         }
     }
 
     /// Replace the key: every token sealed before this stops opening.
-    pub fn rotate(&self) {
-        *self.key.write().unwrap_or_else(|p| p.into_inner()) = fresh_key();
-        self.generation.fetch_add(1, Ordering::SeqCst);
+    fn rotate(&self) {
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        state.key = fresh_key();
+        state.generation += 1;
     }
 
     /// How many times the key has been replaced.
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+    fn generation(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
     }
 
-    fn mac(&self, payload: &[u8]) -> HmacSha256 {
-        let key = self.key.read().unwrap_or_else(|p| p.into_inner());
-        let mut mac = HmacSha256::new_from_slice(key.as_ref()).expect("HMAC takes any key length");
+    fn mac(key: &KeyState, payload: &[u8]) -> HmacSha256 {
+        let mut mac =
+            HmacSha256::new_from_slice(key.key.as_ref()).expect("HMAC takes any key length");
         mac.update(payload);
         mac
     }
 
     fn millis(&self, at: Instant) -> u64 {
-        u64::try_from(at.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(at.saturating_duration_since(self.epoch).as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.offset_ms)
     }
 
     /// `base64url(payload) "." base64url(HMAC-SHA256(key, payload))`.
-    pub fn seal<T: Serialize>(
-        &self,
-        purpose: &str,
-        claims: &T,
-        ttl: Duration,
-        now: Instant,
-    ) -> String {
+    /// Callers keep `claims` small: a token over [`MAX_TOKEN_LEN`]
+    /// would never open.
+    fn seal<T: Serialize>(&self, purpose: &str, claims: &T, ttl: Duration, now: Instant) -> String {
         let exp = self
             .millis(now)
             .saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
@@ -119,21 +148,24 @@ impl Sealer {
             c: claims,
         })
         .expect("a derived Serialize of strings and integers cannot fail");
-        let tag = self.mac(&payload).finalize().into_bytes();
-        format!("{}.{}", b64url_encode(&payload), b64url_encode(&tag))
+        let tag = {
+            let state = self.state.read().unwrap_or_else(|p| p.into_inner());
+            Self::mac(&state, &payload).finalize().into_bytes()
+        };
+        let token = format!("{}.{}", b64url_encode(&payload), b64url_encode(&tag));
+        debug_assert!(token.len() <= MAX_TOKEN_LEN, "ceremony claims too large");
+        token
     }
 
     /// The claims, when `token` is ours, for `purpose`, and unexpired.
-    /// The MAC is checked (constant time) before the payload is parsed.
-    pub fn open<T: DeserializeOwned>(
+    /// The MAC is checked (constant time) before the payload is parsed,
+    /// and the generation is read under the same guard as the key.
+    fn open<T: DeserializeOwned>(
         &self,
         purpose: &str,
         token: &str,
         now: Instant,
     ) -> Option<Opened<T>> {
-        // Read before the MAC: a rotation after this read bumps the
-        // generation, and one before it makes the MAC fail.
-        let generation = self.generation();
         if token.len() > MAX_TOKEN_LEN {
             return None;
         }
@@ -142,24 +174,29 @@ impl Sealer {
         if parts.next().is_some() {
             return None;
         }
-        let payload = b64url_decode(payload).ok()?;
-        let tag = b64url_decode(tag).ok()?;
-        self.mac(&payload).verify_slice(&tag).ok()?;
+        let payload = decode(payload)?;
+        let tag = decode(tag)?;
+        let generation = {
+            let state = self.state.read().unwrap_or_else(|p| p.into_inner());
+            Self::mac(&state, &payload).verify_slice(&tag).ok()?;
+            state.generation
+        };
         let envelope: EnvelopeIn<T> = serde_json::from_slice(&payload).ok()?;
         if envelope.p != purpose || envelope.exp <= self.millis(now) {
             return None;
         }
+        let since_epoch = envelope.exp.saturating_sub(self.offset_ms);
         Some(Opened {
             claims: envelope.c,
             id: Sha256::digest(token.as_bytes()).into(),
-            expires: self.epoch + Duration::from_millis(envelope.exp),
+            expires: self.epoch.checked_add(Duration::from_millis(since_epoch))?,
             generation,
         })
     }
 }
 
 /// Ids of tokens that already finished a ceremony, until they expire.
-pub(crate) struct UsedOnce {
+struct UsedOnce {
     ids: Mutex<Vec<([u8; 32], Instant)>>,
 }
 
@@ -174,7 +211,7 @@ pub(crate) enum Burn {
 }
 
 impl UsedOnce {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             ids: Mutex::new(Vec::new()),
         }
@@ -184,7 +221,7 @@ impl UsedOnce {
     /// one step, so two finishes of one token cannot both win.
     /// `still_current` runs while the lock is held; `false` (the key
     /// was rotated since the token opened) refuses like a replay.
-    pub fn burn(
+    fn burn(
         &self,
         id: [u8; 32],
         expires: Instant,
@@ -207,8 +244,66 @@ impl UsedOnce {
         Burn::Fresh
     }
 
-    pub fn clear(&self) {
+    fn clear(&self) {
         self.ids.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+}
+
+/// The sealing key, its generation and the used-set, owned together so
+/// no caller can burn a token without the "still current" check.
+pub(crate) struct Sealed {
+    sealer: Sealer,
+    used: UsedOnce,
+}
+
+impl Sealed {
+    pub fn new() -> Self {
+        Self {
+            sealer: Sealer::new(),
+            used: UsedOnce::new(),
+        }
+    }
+
+    pub fn seal<T: Serialize>(
+        &self,
+        purpose: &str,
+        claims: &T,
+        ttl: Duration,
+        now: Instant,
+    ) -> String {
+        self.sealer.seal(purpose, claims, ttl, now)
+    }
+
+    pub fn open<T: DeserializeOwned>(
+        &self,
+        purpose: &str,
+        token: &str,
+        now: Instant,
+    ) -> Option<Opened<T>> {
+        self.sealer.open(purpose, token, now)
+    }
+
+    /// Record an opened token as used. A token opened under an older
+    /// key than the current one is refused as `Replayed`; the check
+    /// runs under the used-set's own lock.
+    pub fn burn<T>(&self, opened: &Opened<T>, now: Instant) -> Burn {
+        self.used.burn(opened.id, opened.expires, now, || {
+            self.sealer.generation() == opened.generation
+        })
+    }
+
+    /// A panic: every outstanding token stops working at once.
+    pub fn invalidate(&self) {
+        // Rotate BEFORE clearing. The rotation makes every old token
+        // fail to open and bumps the generation in the same step as the
+        // key, so a token opened earlier is refused by `burn` from then
+        // on. Clearing second therefore can't re-admit anything. With
+        // the order reversed, an old token could open and burn into the
+        // just-emptied set. The only burn that can precede the rotation
+        // belongs to a finish that began before the panic, and the
+        // `clear` that follows empties it.
+        self.sealer.rotate();
+        self.used.clear();
     }
 }
 
@@ -373,5 +468,48 @@ mod tests {
                 == opened.generation),
             Burn::Fresh
         );
+    }
+
+    #[test]
+    fn sealed_burn_refuses_a_token_opened_before_invalidate() {
+        let s = Sealed::new();
+        let now = Instant::now();
+        let old = s.seal("login", &claims("old"), TTL, now);
+        let opened = s.open::<Claims>("login", &old, now).unwrap();
+        s.invalidate();
+        assert_eq!(s.burn(&opened, now), Burn::Replayed);
+        assert!(s.open::<Claims>("login", &old, now).is_none());
+        let new = s.seal("login", &claims("new"), TTL, now);
+        let opened = s.open::<Claims>("login", &new, now).unwrap();
+        assert_eq!(s.burn(&opened, now), Burn::Fresh);
+        assert_eq!(s.burn(&opened, now), Burn::Replayed);
+        s.invalidate();
+        let again = s.open::<Claims>("login", &new, now);
+        assert!(again.is_none(), "a burned token must not reopen");
+    }
+
+    #[test]
+    fn a_large_token_seals_and_opens() {
+        let s = Sealer::new();
+        let now = Instant::now();
+        let token = s.seal("login", &claims(&"x".repeat(2300)), TTL, now);
+        assert!(token.len() > 3000 && token.len() <= MAX_TOKEN_LEN);
+        assert!(open_login(&s, &token, now).is_some());
+    }
+
+    #[test]
+    fn exp_does_not_reveal_the_start_time() {
+        let now = Instant::now();
+        let ttl_ms = u64::try_from(TTL.as_millis()).unwrap();
+        for _ in 0..2 {
+            let s = Sealer::new();
+            let token = s.seal("login", &claims("a"), TTL, now);
+            let payload = decode(token.split('.').next().unwrap()).unwrap();
+            let env: EnvelopeIn<Claims> = serde_json::from_slice(&payload).unwrap();
+            let plain =
+                u64::try_from(now.saturating_duration_since(s.epoch).as_millis()).unwrap() + ttl_ms;
+            assert_ne!(env.exp, plain, "exp is the bare uptime plus ttl");
+            assert!(s.offset_ms < OFFSET_BOUND_MS);
+        }
     }
 }

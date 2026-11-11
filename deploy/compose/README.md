@@ -79,7 +79,7 @@ path B.
   `--metrics` the container build binds every interface and serves
   `/metrics`, `/config`, `/diag` and pprof.
 - The default vault is the customer's own Bitwarden Password Manager
-  on Bitwarden cloud. The customer unlocks it (`kharon unlock`), and
+  on Bitwarden cloud. The customer unlocks it (from the owner web UI, or `kharon unlock` on the box), and
   kharond keeps the keys only in memory. The `vaultwarden` profile is
   for self-hosters: set `[bitwarden] server = "http://vaultwarden:80"`.
   Bitwarden Secrets Manager is not the default.
@@ -101,11 +101,11 @@ path B.
   `docker compose exec kharon kharon status`, or expect `401` from
   `POST /mcp` on `127.0.0.1:8790` inside the namespace. Nothing
   listens on 8787 now.
-- The owner UI is not published yet. Its loopback address is inside
-  the holder's namespace, so no SSH forward reaches it; #208 turns it
-  on. Until then the owner works through the CLI, below.
+- The owner UI is published on its own hostname, `kharon-owner.<domain>`.
+  See "Owner web UI" below. Its loopback address is inside the holder's
+  namespace, so an SSH forward does not reach it; the tunnel does.
 - ntfy approve/deny (`/owner/approve/<token>`, `/owner/deny/<token>`)
-  needs the owner UI, so it waits for #208 too. See the
+  go through the same hostname. See the
   [deployment guide](../../docs/deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
 - `memlock` is unlimited so `require_mlock` holds, and core dumps are
   off. `cap_add: IPC_LOCK` has no effect for a non-root uid; the
@@ -131,19 +131,54 @@ The CDP endpoint in `kharon.toml` is the agent host's CDP address
 so restarting Chromium needs no config change (see the
 [deployment guide](../../docs/deployment.md#pointing-kharond-at-the-browser)).
 
-## Owner actions until #208
+## Owner web UI
 
-Approve and deny through the owner socket, with the CLI inside the
-container:
+The example `kharon.toml` turns on `[owner_ui]` with
+`public_origin = "https://kharon-owner.example.com"`. Use your own
+hostname there. Then:
+
+1. In the Cloudflare dashboard (Networking, Tunnels, your tunnel,
+   Routes, Add route, Published application), publish
+   `kharon-owner.<domain>` with Service URL `http://127.0.0.1:8788`.
+   Set nothing under additional settings: no HTTP Host Header, no
+   HTTP/2 to origin. See "Publishing the owner UI" in the
+   [deployment guide](../../docs/deployment.md#publishing-the-owner-ui).
+2. Restart kharond so it reads the config: `docker compose restart kharon`.
+3. Enroll the first passkey. Open `https://kharon-owner.<domain>/enroll`
+   first. The code works once and for 120 seconds, so have the page
+   ready, then run:
+
+   ```sh
+   docker compose exec kharon kharon passkey-enroll
+   ```
+
+   Send the owner the code it prints (43 characters) as a message they
+   can paste from; it works once, for 120 seconds. They enter it and follow the browser's passkey prompt (run
+   the command again if it expired). After that, sign in at
+   `https://kharon-owner.<domain>/`.
+
+The CLI stays as the fallback for whoever has a shell on the box. On a
+managed deploy that is the operator, who can approve, deny, revoke or
+panic on the owner's instruction. A throttled owner waits out the window
+the page shows, or signs in from another network. A CLI unlock means
+the owner giving the operator the master password: a last resort. A
+lost passkey is not fixed by the CLI: `passkey-enroll` adds a passkey
+but nothing removes one, so see "A lost passkey" in the
+[deployment guide](../../docs/deployment.md#a-lost-passkey). The CLI
+talks to the owner socket inside the container:
 
 ```sh
 docker compose exec kharon kharon grants                       # pending requests
 docker compose exec kharon kharon approve gr_… [--kind once|per-origin|standing]
 docker compose exec kharon kharon deny gr_…
 docker compose exec kharon kharon panic                        # lock, zeroize, revoke all
+docker compose exec kharon kharon status                       # also prints the owner-UI counter below
 ```
 
-#208 publishes the web UI.
+If `kharon status` prints `owner UI: N requests without a usable
+CF-Connecting-IP (not throttled)` and N keeps growing, the edge is not
+sending that header and sign-in has lost its per-address throttle. See
+the deployment guide.
 
 Verify the audit log with `--data` set to the audit directory,
 `<data_dir>/audit`, not `<data_dir>` (`--data /data` fails on

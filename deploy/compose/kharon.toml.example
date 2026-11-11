@@ -54,6 +54,8 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 # docs/deployment.md, "Public gateway".
 [public_ingress]
 listen = "127.0.0.1:8790"
+# Set this on any published deploy: requests for another Host get 404.
+# public_host = "kharon.example.com"
 
 [approval]
 # ntfy is both the approval-prompt channel (REQ-APR-004) and the
@@ -63,15 +65,27 @@ listen = "127.0.0.1:8790"
 # [audit] checkpoint_local_only = true is set instead — local-only
 # checkpoints are a temporary pilot posture, not the release one.
 ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit" }
-# token_file = "/run/secrets/ntfy_token"   # if the topic needs auth
+# token_file = "/run/secrets/ntfy_token"
+# With a published owner UI the topic MUST be private (set token_file, use a
+# reserved topic): the Approve/Deny links in its messages work from anywhere.
 
-# Owner web UI (REQ-APR-005). Left off under compose: its loopback is
-# inside the holder's network namespace, out of reach of an SSH
-# forward. Use the CLI (`docker compose exec kharon kharon ...`).
-# Publishing it behind the edge is #208. Sign-in would be a passkey
-# (`kharon passkey-enroll`); ntfy http actions (REQ-APR-004) POST to
-# its listen address, e.g. http://127.0.0.1:8788/owner/approve/<token>.
-# [owner_ui]
-# listen = "127.0.0.1:8788"
-# rp_id = "localhost"
-# origin = "http://localhost:8788"
+# Owner web UI (REQ-APR-005, #208). The owner signs in with a passkey,
+# unlocks, approves and denies from a browser at its own hostname. The
+# listener stays on loopback inside the holder's namespace; the tunnel
+# route `kharon-owner.example.com` -> http://127.0.0.1:8788 is how the
+# browser gets there. `public_origin` is the switch for public mode
+# (Host check, Origin rule, throttle, `__Host-` cookie); a plain
+# `origin = ...` is local mode, for an SSH forward on a host-networked
+# box; never route the tunnel to it. rp_id defaults
+# to the host of `public_origin`. ntfy approve/deny actions are built
+# on this origin. See docs/deployment.md, "Publishing the owner UI".
+[owner_ui]
+listen = "127.0.0.1:8788"
+public_origin = "https://kharon-owner.example.com"
+
+# Optional second line: Cloudflare Access in front of the owner
+# hostname. `audience` is the Access application's AUD tag, not its
+# Client ID. kharond fetches the keys from the team domain over HTTPS.
+# [owner_ui.access]
+# team_domain = "myteam.cloudflareaccess.com"
+# audience = "paste-the-AUD-tag-here"

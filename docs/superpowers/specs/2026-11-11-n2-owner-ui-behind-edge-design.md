@@ -20,6 +20,9 @@ Revised with PR #256: D9's key handling (a background first fetch, a 5-second
 retry while the cache is empty, a stale cache never makes a request wait,
 unusable key-set entries are skipped, refusals are named in the log).
 
+Revised with PR #257: D10's Access bypass is a separate path-scoped
+application, and the ntfy topic must be private in public mode.
+
 ## What this is for
 
 Today the owner UI only works on loopback: the owner reaches it over an SSH
@@ -457,10 +460,14 @@ origin (`https://kharon-owner.example.com/owner/approve/<token>`), not on the
 listen address. The "port 0 means no stable address, so publish nothing" rule
 then applies to local mode only.
 
-With Access on, Access would block ntfy's background POST. `deployment.md`
-gives the bypass policy for `/owner/approve/*` and `/owner/deny/*`, whose
-single-use 120-second tokens already protect them. Those routes are on D3's
-list, so kharond's own Access check skips them too.
+With Access on, Access would block the POST the ntfy app on the owner's phone
+sends when a button is tapped. `deployment.md` describes a separate,
+path-scoped Access application for `/owner/approve/*` and `/owner/deny/*`
+with one Bypass policy (a policy on the owner application has no path and
+would open the whole hostname). Those routes' single-use 120-second tokens
+already protect them, and they are on D3's list, so kharond's own Access
+check skips them too. Because the action URL is now public, whoever can read
+the ntfy topic can redeem it: the topic has to be private (SPEC §2.4).
 
 ### D11. SPEC
 

@@ -280,13 +280,7 @@ impl OwnerUi {
             public,
         } = opts;
         let secure_cookie = origin.starts_with("https://");
-        let (host, port) = match url::Url::parse(&origin) {
-            Ok(u) => (
-                u.host_str().unwrap_or(&rp_id).to_ascii_lowercase(),
-                u.port_or_known_default().unwrap_or(80),
-            ),
-            Err(_) => (rp_id.to_ascii_lowercase(), if public { 443 } else { 80 }),
-        };
+        let (host, port) = crate::config::origin_authority(&origin, &rp_id, public);
         let passkeys = PasskeyStore::load(data_dir)?;
         Ok(Arc::new(Self {
             rp_id,

@@ -947,14 +947,21 @@ pub enum JwksSource {
     TestStatic(String),
 }
 
+/// Host and port of an owner UI `origin`: the port is the scheme
+/// default when the origin names none. An origin that does not parse
+/// falls back to `rp_id` and the mode's default port.
+pub fn origin_authority(origin: &str, rp_id: &str, public: bool) -> (String, u16) {
+    let Ok(url) = Url::parse(origin) else {
+        return (rp_id.to_ascii_lowercase(), if public { 443 } else { 80 });
+    };
+    let host = url.host_str().unwrap_or(rp_id).to_ascii_lowercase();
+    (host, url.port_or_known_default().unwrap_or(80))
+}
+
 impl OwnerUiConfig {
     /// Host and port of `origin` (port is the scheme default when absent).
     pub fn authority(&self) -> (String, u16) {
-        let Ok(url) = Url::parse(&self.origin) else {
-            return (self.rp_id.clone(), if self.public { 443 } else { 80 });
-        };
-        let host = url.host_str().unwrap_or(&self.rp_id).to_owned();
-        (host, url.port_or_known_default().unwrap_or(80))
+        origin_authority(&self.origin, &self.rp_id, self.public)
     }
 
     /// Origin for a listener that bound `port` (the file's port when

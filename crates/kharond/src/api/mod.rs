@@ -36,6 +36,7 @@ pub mod rate;
 pub mod rollback;
 pub mod surface;
 pub mod token;
+pub mod transport;
 
 pub use self::core::{
     AgentId, AuditSink, Broker, ContextResult, FillSync, Outcome, Request, StatusBody, SyncFetch,

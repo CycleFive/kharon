@@ -256,6 +256,13 @@ pub struct Entry {
     /// `connector_auth_fail` / `connector_replaced`, #199).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<SessionTransport>,
+    /// Effective client address of the call that produced this entry
+    /// (only on agent-call entries written by a network transport,
+    /// #200). On `[public_ingress]` it is the `CF-Connecting-IP`
+    /// address — audit is one of its two sanctioned uses (see
+    /// `api::public::client_ip`); on `[api]`, the connection peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
     /// Events of this kind and agent dropped by the rate limiter since the
     /// previous entry (only on the connector events, #199).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,6 +295,7 @@ impl Entry {
             field_count: None,
             live_origin: None,
             transport: None,
+            client_ip: None,
             suppressed: None,
             old_session_secs: None,
         }
@@ -365,6 +373,11 @@ impl Entry {
     /// The connector transport (`tls` or `ws`).
     pub fn transport(mut self, v: SessionTransport) -> Self {
         self.transport = Some(v);
+        self
+    }
+
+    pub fn client_ip(mut self, v: impl Into<String>) -> Self {
+        self.client_ip = Some(v.into());
         self
     }
 

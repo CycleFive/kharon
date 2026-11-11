@@ -602,6 +602,19 @@ async fn req_api_001_transport_gate() {
         &big,
     )
     .await;
-    assert_eq!(r.status, 400);
-    assert_eq!(r.json(), ApiError::bad_request(Detail::BodyTooLarge).body());
+    // #200: body excess is 413, not 400.
+    assert_eq!(r.status, 413);
+    assert_eq!(r.json(), ApiError::BODY_TOO_LARGE.body());
+    // #200: JSON nested past the depth cap is 413 too, refused
+    // before any parser runs on it.
+    let deep = "[".repeat(40) + &"]".repeat(40);
+    let r = post_mcp_raw(
+        addr,
+        Some(&h.alpha),
+        &[("Content-Type", "application/json")],
+        &deep,
+    )
+    .await;
+    assert_eq!(r.status, 413);
+    assert_eq!(r.json(), ApiError::JSON_TOO_DEEP.body());
 }

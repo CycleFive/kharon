@@ -96,6 +96,12 @@ pub fn check_dedicated_scope(
 
 /// Startup check (REQ-CRY-008 "refuses to start"): log in with the API
 /// key, sync, and check scope. Needs no master password.
+///
+/// The daemon calls this before binding listeners. `SyncError::ScopeTooBroad`
+/// refuses startup. Any other error — the server was unreachable, or
+/// the payload could not be judged — does not: the daemon logs a
+/// warning and still starts, and unlock plus every sync run the same
+/// check before they succeed.
 pub async fn preflight(
     client: &mut SyncClient,
     organization_id: &str,

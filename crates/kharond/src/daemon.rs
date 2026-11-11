@@ -27,31 +27,40 @@
 //!    kept for every unlock (REQ-EXP-004 load-once: re-reading the
 //!    file at unlock would let a replaced file take effect without
 //!    a restart).
-//! 7. Fill backend: each agent's `cdp` endpoint (REQ-API-008). No
+//! 7. REQ-CRY-008 dedicated-org preflight, sync mode only
+//!    ([`startup_scope_check`]), before any listener is bound. A
+//!    reachable account that can see another org or an item outside
+//!    `organization_id` refuses startup with
+//!    [`StartupError::ScopeTooBroad`] and nothing listens. An
+//!    unreachable server logs a warning and startup continues; the
+//!    same check still runs inside unlock and every sync before
+//!    those succeed.
+//! 8. Fill backend: each agent's `cdp` endpoint (REQ-API-008). No
 //!    browser I/O here: an agent's connection and browser context
 //!    (REQ-ARCH-005) are made by its first fill, so startup does not
 //!    depend on the browser being reachable.
-//! 8. Owner socket (issue #11): the unix-socket unlock channel
+//! 9. Owner socket (issue #11): the unix-socket unlock channel
 //!    ([`crate::owner`]) is bound under `data_dir`. When `[owner_ui]`
 //!    is set, that loopback listener also serves ntfy redeem
 //!    (`/owner/approve/<token>`, `/owner/deny/<token>`; REQ-DEP-006,
 //!    #136). The agent API listener (when `[api]` is set) is bound last
 //!    and leaves those paths unrouted; with no `[api]` the public
 //!    ingress is last.
-//! 9. Public ingress (#198), when `[public_ingress]` is set: a
-//!    separate listener for a public edge (cloudflared) that serves
-//!    `POST /mcp` only ([`crate::api::public`]). It is bound just
-//!    before the agent API, and is the last listener bound when there
-//!    is no `[api]`.
+//! 10. Public ingress (#198), when `[public_ingress]` is set: a
+//!     separate listener for a public edge (cloudflared) that serves
+//!     `POST /mcp` only ([`crate::api::public`]). It is bound just
+//!     before the agent API, and is the last listener bound when there
+//!     is no `[api]`.
 //!
 //! [`Daemon::run`] serves until the shutdown future resolves; dropping
 //! the broker drops the lock controller, which zeroizes any session.
 //! In `mode = "sync"` every unlock also starts the REQ-CRY-009 live
 //! sync ([`live_sync`]: poll ≤ 5 min plus notifications-hub push,
-//! applied in place, ending with the session), and the daemon runs
-//! the REQ-API-007 clock probe in the
-//! background (see [`clock_probe`]): startup is not delayed by, and
-//! does not depend on, the Vaultwarden server being reachable.
+//! applied in place, ending with the session). The REQ-API-007 clock
+//! probe ([`clock_probe`]) runs in the background and does not block
+//! startup. The scope preflight does contact the server, but only a
+//! measured too-broad scope refuses startup; an unreachable server
+//! does not.
 
 use std::future::Future;
 use std::io;
@@ -648,6 +657,19 @@ pub enum StartupError {
         /// `std::io::ErrorKind` rendering.
         kind: String,
     },
+    /// REQ-CRY-008: the kharon account can see another organization
+    /// or an item outside `organization_id`. Counts only: no ids,
+    /// names, or secrets. A deployment misconfiguration, so compose
+    /// crash-loops on [`EX_CONFIG`] with this as the last log line.
+    #[error(
+        "ScopeTooBroad: account sees {other_orgs} other organization(s) and {outside_items} item(s) outside organization_id"
+    )]
+    ScopeTooBroad {
+        /// Organizations in the profile other than `organization_id`.
+        other_orgs: usize,
+        /// Ciphers that are personal or belong to another organization.
+        outside_items: usize,
+    },
 }
 
 /// Path B accept task plus the hub the CDP backend dials through.
@@ -715,6 +737,7 @@ impl StartupError {
             Self::TlsMaterial { .. } => "tls_material",
             Self::ConnectorBind { .. } => "connector_bind",
             Self::PublicIngressBind { .. } => "public_ingress_bind",
+            Self::ScopeTooBroad { .. } => "scope_too_broad",
         }
     }
 
@@ -736,7 +759,9 @@ impl StartupError {
             | Self::OwnerUiBind { .. }
             | Self::ConnectorBind { .. }
             | Self::PublicIngressBind { .. } => EX_UNAVAILABLE,
-            Self::TlsMaterial { .. } | Self::OwnerUiAccess { .. } => EX_CONFIG,
+            Self::TlsMaterial { .. } | Self::OwnerUiAccess { .. } | Self::ScopeTooBroad { .. } => {
+                EX_CONFIG
+            }
         }
     }
 }
@@ -759,6 +784,66 @@ pub fn check(cfg: &Config) -> Result<Option<SocketAddr>, StartupError> {
         return Err(StartupError::OffHostCheckpointNotConfigured);
     }
     Ok(cfg.api.as_ref().map(|a| a.listen))
+}
+
+/// REQ-CRY-008 (#245): API-key scope check, before any listener is
+/// bound. `ScopeTooBroad` refuses startup. An unreachable server (or
+/// any result that is not a measured too-broad scope) logs a warning
+/// and lets startup continue — a Vaultwarden outage must not
+/// crash-loop the broker. Unlock (`LiveSync::prepare`) and every
+/// sync still run the check before they succeed: a too-broad scope
+/// refuses that unlock (`scope_too_broad` / audit `owner_auth_fail`),
+/// and a widening after unlock locks with audit `scope_widened`.
+///
+/// `--check` does not call this. It must not touch the network.
+async fn startup_scope_check(bw: &BitwardenConfig) -> Result<(), StartupError> {
+    let mut client = match bw.sync_client() {
+        Ok(client) => client,
+        Err(e) => {
+            warn_scope_check_skipped(&format!("cannot build the sync client ({e})"));
+            return Ok(());
+        }
+    };
+    match crate::sync::preflight(&mut client, &bw.organization_id, bw.allow_extra_orgs).await {
+        Ok(()) => Ok(()),
+        Err(SyncError::ScopeTooBroad {
+            other_orgs,
+            outside_items,
+        }) => Err(StartupError::ScopeTooBroad {
+            other_orgs,
+            outside_items,
+        }),
+        Err(e) if scope_check_unreachable(&e) => {
+            warn_scope_check_skipped(&format!("the Bitwarden server is unreachable ({e})"));
+            Ok(())
+        }
+        Err(e) => {
+            // The server answered, but not with a measured too-broad
+            // scope (auth, missing org, malformed payload). Do not
+            // invent a ScopeTooBroad; unlock still refuses one.
+            warn_scope_check_skipped(&format!("the scope check did not complete ({e})"));
+            Ok(())
+        }
+    }
+}
+
+/// Transport, TLS, and 5xx: the scope was not measured. A proxy in
+/// front of a down Vaultwarden answers 502/503, which must not block
+/// startup any more than a refused connection does.
+fn scope_check_unreachable(err: &SyncError) -> bool {
+    match err {
+        SyncError::Transport(_) | SyncError::Tls(_) => true,
+        SyncError::Status { status, .. } if *status >= 500 => true,
+        _ => false,
+    }
+}
+
+fn warn_scope_check_skipped(why: &str) {
+    eprintln!(
+        "kharond: warning: REQ-CRY-008 startup scope check skipped ({why}). \
+         Starting anyway; the check runs before the first unlock or sync succeeds. \
+         A too-broad scope still refuses unlock, and a widening locks with scope_widened."
+    );
 }
 
 /// An assembled daemon: locked broker plus bound listeners.
@@ -871,6 +956,13 @@ pub async fn start(
         SystemClock,
         hardening,
     );
+    // REQ-CRY-008 (#245): judge the account before any listener
+    // exists, so a too-broad scope never accepts an agent. Export
+    // mode has no server to ask. An unreachable server does not
+    // refuse startup; unlock and live sync still run the check.
+    if let Source::Sync(bw) = &cfg.source {
+        startup_scope_check(bw).await?;
+    }
     let connector = bind_connector(cfg).await?;
     let api_tls = match cfg.api.as_ref().and_then(|api| api.tls.as_ref()) {
         Some(material) => Some(load_tls_material(material)?),

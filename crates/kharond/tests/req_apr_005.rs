@@ -1424,7 +1424,11 @@ async fn req_apr_005_chromium_approve_click() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let empty = cdp
-            .eval(&session, "document.getElementById('rows').children.length")
+            .eval(
+                &session,
+                "(() => { const el = document.getElementById('rows'); \
+                 return el ? el.children.length : -1; })()",
+            )
             .await;
         if empty == json!(0) {
             break;
@@ -1663,7 +1667,8 @@ async fn req_apr_005_chromium_revoke_click() {
         let n = cdp
             .eval(
                 &session,
-                "document.getElementById('grant-rows').children.length",
+                "(() => { const el = document.getElementById('grant-rows'); \
+                 return el ? el.children.length : -1; })()",
             )
             .await;
         if n == json!(0) {
@@ -1833,13 +1838,20 @@ async fn req_apr_005_chromium_panic_click() {
     let _ = cdp
         .eval_navigating(&session, &format!("location.assign({:?})", rig.origin))
         .await;
-    // Wait for the shell (the grants list shows the grant).
+    // Wait for the shell (the grants list shows the grant). Poll
+    // for `#grant-rows` itself first (#247): on an interim document
+    // during the navigation above the element does not exist yet,
+    // and reading `.children` off `null` throws inside the page —
+    // an eval exception, not a CDP navigation race, so
+    // `eval_navigating` cannot retry it. The guard returns -1
+    // until the element exists; only then is `.children` read.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let n = cdp
             .eval_navigating(
                 &session,
-                "document.getElementById('grant-rows').children.length",
+                "(() => { const el = document.getElementById('grant-rows'); \
+                 return el ? el.children.length : -1; })()",
             )
             .await
             .unwrap_or(Json::Null);
@@ -1888,8 +1900,10 @@ async fn req_apr_005_chromium_panic_click() {
         let state = cdp
             .eval(
                 &session,
-                "JSON.stringify([document.getElementById('grant-rows').children.length, \
-                 document.getElementById('locked').textContent])",
+                "JSON.stringify([(() => { const el = document.getElementById('grant-rows'); \
+                 return el ? el.children.length : -1; })(), \
+                 (() => { const el = document.getElementById('locked'); \
+                 return el ? el.textContent : null; })()])",
             )
             .await;
         let state: Json = serde_json::from_str(state.as_str().unwrap_or("[]")).unwrap();

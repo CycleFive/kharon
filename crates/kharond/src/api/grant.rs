@@ -923,6 +923,17 @@ fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", hex::encode(rand::random::<[u8; 16]>()))
 }
 
+/// Whether `s` has the exact shape [`new_id`] mints for a grant:
+/// `g_` and 32 lowercase hex digits. A fill's presented `grant_id` is
+/// copied into audit only in this shape (#240). Anything else is
+/// agent-supplied free text that names no grant, and REQ-AUD-004
+/// keeps it out of the chain.
+pub fn is_grant_id_shaped(s: &str) -> bool {
+    s.strip_prefix("g_").is_some_and(|hex| {
+        hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 // ------------------------------------------------------------ wire types
 
 /// SPEC §4 `kharon_request_grant` arguments / `POST /v1/grants`
@@ -1046,6 +1057,20 @@ mod tests {
     use super::*;
 
     const NOW: Duration = Duration::from_secs(1_000);
+
+    #[test]
+    fn grant_id_shape_is_exactly_what_new_id_mints() {
+        for _ in 0..64 {
+            assert!(is_grant_id_shaped(&new_id("g")));
+            assert!(!is_grant_id_shaped(&new_id("gr")), "a request id");
+        }
+        for not in ["", "g_", "g_abc", "G_0123456789abcdef0123456789abcdef"] {
+            assert!(!is_grant_id_shaped(not), "{not:?}");
+        }
+        assert!(!is_grant_id_shaped(&format!("g_{}", "F".repeat(32))));
+        assert!(!is_grant_id_shaped(&format!("g_{}", "f".repeat(31))));
+        assert!(!is_grant_id_shaped(&format!("g_{} ", "f".repeat(32))));
+    }
 
     fn store() -> GrantStore {
         GrantStore::new(true)

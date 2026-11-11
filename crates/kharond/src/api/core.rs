@@ -939,11 +939,24 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             FillOperation::Fill => Event::Fill,
             FillOperation::FillTotp => Event::FillTotp,
         };
+        // #240: every fill entry names the grant the call presented,
+        // refusals included, so a denial traces from the log alone.
+        // Only a minted-id shape is recorded (REQ-AUD-004). An admitted
+        // grant overrides it on the outcome, and it is the same grant
+        // whenever one was presented.
+        let presented = req
+            .grant_id
+            .as_deref()
+            .filter(|g| super::grant::is_grant_id_shaped(g));
         let base = |e: Event| {
-            Entry::new(e)
+            let entry = Entry::new(e)
                 .agent_id(agent.0.clone())
                 .item_id(req.item_id.clone())
-                .request_id(request_id.clone())
+                .request_id(request_id.clone());
+            match presented {
+                Some(g) => entry.grant_id(g.to_owned()),
+                None => entry,
+            }
         };
         // The live origin the engine read, if the fill got that far
         // (REQ-AUD-003†, #67); copied into the outcome entry.

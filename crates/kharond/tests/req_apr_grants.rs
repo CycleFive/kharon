@@ -744,3 +744,154 @@ async fn req_apr_request_grant_transports_agree() {
     assert_eq!(tools.len(), 7);
     assert!(tools.iter().any(|t| t["name"] == "kharon_request_grant"));
 }
+
+// ------------------------------------------------- #240: presented grant
+
+/// A password fill on the fixture origin that presents `grant_id`.
+async fn fill_presenting(rig: &Rig, grant_id: &str) -> Result<Outcome, kharond::api::ApiError> {
+    let req = parse_fill(
+        kharond::api::FillOperation::Fill,
+        json!({
+            "item_id": ITEM_A,
+            "target": {"cdp_target_id": "tab-1", "expected_origin": "https://login.example.com"},
+            "fields": [{"kind": "password"}],
+            "grant_id": grant_id,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    rig.broker.fill(&rig.agent(), req, Instant::now()).await
+}
+
+/// The last `fill` outcome entry in the log.
+fn last_fill_entry(rig: &Rig) -> Entry {
+    rig.audit_entries()
+        .into_iter()
+        .rev()
+        .find(|e| e.event == kharond::audit::Event::Fill)
+        .expect("a fill entry")
+}
+
+/// A per-origin, 60 s grant for alpha on the fixture item and origin.
+fn issue_per_origin(rig: &Rig) -> String {
+    let mut store = rig.broker.grant_store().lock().unwrap();
+    store
+        .issue(
+            "alpha",
+            ITEM_A,
+            GrantAction::Fill,
+            "https://login.example.com",
+            &GrantTerms {
+                scope: kharond::api::GrantScope::Item(ITEM_A.to_owned()),
+                kind: kharond::config::GrantKind::PerOrigin,
+                ttl: Some(Duration::from_secs(60)),
+                max_uses: None,
+            },
+            Channel::Cli,
+            None,
+            rig.clock.now(),
+        )
+        .unwrap()
+        .id
+}
+
+/// #240 (REQ-AUD-003): a refused fill names the grant it presented,
+/// so a denial traces from the log alone — the #201 restart case,
+/// where the presented grant died with the restart, included.
+#[tokio::test]
+async fn req_aud_003_refused_fill_names_the_presented_grant() {
+    let rig = Rig::new("https://login.example.com/signin");
+    // An expired grant, presented by name.
+    let expired = issue_per_origin(&rig);
+    rig.clock.advance(Duration::from_secs(61));
+    // A well-shaped id the store has never seen (a grant that died
+    // with a restart looks exactly like this).
+    let unknown = format!("g_{}", "0123456789abcdef".repeat(2));
+    for gid in [expired.as_str(), unknown.as_str()] {
+        match fill_presenting(&rig, gid).await {
+            Ok(Outcome::Fill(r)) => {
+                let v = serde_json::to_value(r).unwrap();
+                assert_eq!(v["detail"], "grant_denied", "{v}");
+            }
+            other => panic!("expected a fill outcome, got {other:?}"),
+        }
+        let e = last_fill_entry(&rig);
+        assert_eq!(e.result.as_deref(), Some("denied"));
+        assert_eq!(e.detail_code.as_deref(), Some("grant_denied"));
+        assert_eq!(e.grant_id.as_deref(), Some(gid), "the denial names {gid}");
+    }
+    assert!(rig.fake.seen().is_empty(), "no refused fill reached CDP");
+}
+
+/// #240 / REQ-AUD-004: only a value shaped like a minted grant id
+/// (`g_` + 32 lowercase hex) is copied into the log. Free text in
+/// `grant_id` cannot name a grant, and must not ride into the chain.
+#[tokio::test]
+async fn req_aud_004_a_malformed_presented_grant_id_is_not_recorded() {
+    let rig = Rig::new("https://login.example.com/signin");
+    for junk in [
+        "g_does_not_exist",
+        "hunter2-not-a-grant",
+        &format!("g_{}", "A".repeat(32)),
+        &format!("g_{}", "a".repeat(33)),
+        &format!("gr_{}", "a".repeat(32)),
+    ] {
+        match fill_presenting(&rig, junk).await {
+            Ok(Outcome::Fill(r)) => {
+                let v = serde_json::to_value(r).unwrap();
+                assert_eq!(v["detail"], "grant_denied", "{v}");
+            }
+            other => panic!("expected a fill outcome, got {other:?}"),
+        }
+        assert_eq!(last_fill_entry(&rig).grant_id, None, "{junk} was recorded");
+        let log = serde_json::to_string(&rig.audit_entries()).unwrap();
+        assert!(!log.contains(junk), "{junk} reached the audit log");
+    }
+}
+
+/// #240: the lock gate refuses before any grant check, and its entry
+/// still names the presented grant.
+#[tokio::test]
+async fn req_aud_003_locked_fill_names_the_presented_grant() {
+    let rig = Rig::new("https://login.example.com/signin");
+    let gid = issue_per_origin(&rig);
+    rig.broker
+        .lock_controller()
+        .lock()
+        .unwrap()
+        .lock(LockReason::Manual);
+    let out = fill_presenting(&rig, &gid).await;
+    assert!(
+        matches!(out, Err(ref e) if *e == kharond::api::ApiError::LOCKED),
+        "{out:?}"
+    );
+    let e = last_fill_entry(&rig);
+    assert_eq!(e.result.as_deref(), Some("locked"));
+    assert_eq!(e.grant_id.as_deref(), Some(gid.as_str()));
+}
+
+/// #240: an admitted fill that presented its grant names it on both
+/// transitions, as before.
+#[tokio::test]
+async fn req_aud_003_admitted_fill_names_the_presented_grant_on_both_entries() {
+    let rig = Rig::new("https://login.example.com/signin");
+    let gid = issue_per_origin(&rig);
+    match fill_presenting(&rig, &gid).await {
+        Ok(Outcome::Fill(r)) => {
+            let v = serde_json::to_value(r).unwrap();
+            assert_eq!(v["status"], "filled", "{v}");
+        }
+        other => panic!("expected a fill outcome, got {other:?}"),
+    }
+    let entries = rig.audit_entries();
+    let dispatch = entries
+        .iter()
+        .find(|e| e.event == kharond::audit::Event::FillDispatch)
+        .expect("a dispatch entry");
+    assert_eq!(dispatch.grant_id.as_deref(), Some(gid.as_str()));
+    assert_eq!(
+        last_fill_entry(&rig).grant_id.as_deref(),
+        Some(gid.as_str())
+    );
+}

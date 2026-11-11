@@ -767,3 +767,229 @@ async fn req_apr_009_a_failed_register_finish_does_not_burn_the_ceremony() {
     assert_eq!(ok.status, 200, "{}", ok.body);
     run.shutdown().await;
 }
+
+// ---- The failure throttle (D5, AC4) ----
+
+const SRC_A: &str = "198.51.100.10";
+const SRC_B: &str = "198.51.100.20";
+
+/// One garbage `login/finish` from `ip`.
+async fn garbage_from(run: &Running, ip: &str) -> api_support::RawResponse {
+    http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/login/finish", "{}").header("CF-Connecting-IP", ip),
+    )
+    .await
+}
+
+/// Ten garbage finishes from `ip`: every one a 401.
+async fn throttle(run: &Running, ip: &str) {
+    for i in 1..=10 {
+        let r = garbage_from(run, ip).await;
+        assert_eq!(r.status, 401, "failure {i}: {}", r.body);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_ten_failures_throttle_that_source_only() {
+    let run = start_public().await;
+    enroll_public_from(&run, SRC_B).await;
+    throttle(&run, SRC_A).await;
+
+    let blocked = garbage_from(&run, SRC_A).await;
+    assert_eq!(blocked.status, 429, "{}", blocked.body);
+    assert!(
+        blocked.body.contains(r#""error":"rate_limited""#),
+        "{}",
+        blocked.body
+    );
+    let after: u64 = blocked
+        .header("retry-after")
+        .expect("Retry-After")
+        .parse()
+        .unwrap();
+    assert!((1..=600).contains(&after), "{after}");
+
+    let home = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        Http::get("/")
+            .host(PUBLIC_HOST)
+            .header("CF-Connecting-IP", SRC_A),
+    )
+    .await;
+    assert_eq!(home.status, 200, "{}", home.body);
+    assert_eq!(login_options_status(&run, SRC_B).await, 200);
+
+    let fails = run.auth_fails();
+    let from_a = |detail: &str| {
+        fails
+            .iter()
+            .filter(|f| {
+                f.client_ip.as_deref() == Some(SRC_A) && f.detail_code.as_deref() == Some(detail)
+            })
+            .count()
+    };
+    assert_eq!(from_a("no_assertion"), 10, "{fails:?}");
+    assert_eq!(from_a("throttled"), 1, "{fails:?}");
+    assert_eq!(
+        fails.len(),
+        11,
+        "the 429 or B's call was audited: {fails:?}"
+    );
+    run.shutdown().await;
+}
+
+async fn login_options_status(run: &Running, ip: &str) -> u16 {
+    http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/login/options", "").header("CF-Connecting-IP", ip),
+    )
+    .await
+    .status
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_wrong_origin_never_counts() {
+    let run = start_public().await;
+    for i in 0..30 {
+        let r = http(
+            run.ui,
+            EVIL,
+            pub_post("/owner/login/finish", "{}").header("CF-Connecting-IP", SRC_A),
+        )
+        .await;
+        assert_eq!(r.status, 403, "{i}: {}", r.body);
+    }
+    let mut auth = enroll_public_from(&run, SRC_A).await;
+    let opts = login_options(&run, SRC_A).await;
+    let ok = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/login/finish", &login_body(&mut auth, &opts))
+            .header("CF-Connecting-IP", SRC_A),
+    )
+    .await;
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    run.shutdown().await;
+}
+
+/// [`enroll_public`], with every call arriving from `ip`.
+async fn enroll_public_from(run: &Running, ip: &str) -> VirtAuth {
+    let minted = owner_op(&run.socket, &json!({"op":"passkey_enroll"}));
+    let enroll = minted["enroll_token"].as_str().unwrap().to_owned();
+    let mut auth = VirtAuth::new();
+    let opts = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/options", "")
+            .bearer(&enroll)
+            .header("CF-Connecting-IP", ip),
+    )
+    .await;
+    assert_eq!(opts.status, 200, "{}", opts.body);
+    let opts: Json = serde_json::from_str(&opts.body).unwrap();
+    auth.user_handle = b64url_dec(opts["publicKey"]["user"]["id"].as_str().unwrap());
+    let reg = auth.registration(
+        opts["publicKey"]["challenge"].as_str().unwrap(),
+        PUBLIC_ORIGIN,
+        PUBLIC_HOST,
+    );
+    let body = json!({"ceremony_id": opts["ceremony_id"], "credential": reg}).to_string();
+    let done = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/register/finish", &body).header("CF-Connecting-IP", ip),
+    )
+    .await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    auth
+}
+
+/// Sign in from `ip`; the session cookie pair.
+async fn sign_in_from(run: &Running, auth: &mut VirtAuth, ip: &str) -> String {
+    let opts = login_options(run, ip).await;
+    let r = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/login/finish", &login_body(auth, &opts)).header("CF-Connecting-IP", ip),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    set_cookie(&r, "__Host-kharon_owner")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_signed_in_actions_are_never_throttled() {
+    let run = start_public().await;
+    let mut auth = enroll_public_from(&run, SRC_A).await;
+    let cookie = sign_in_from(&run, &mut auth, SRC_A).await;
+    throttle(&run, SRC_A).await;
+
+    let approvals = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        Http::get("/owner/approvals")
+            .host(PUBLIC_HOST)
+            .cookie(&cookie)
+            .header("CF-Connecting-IP", SRC_A),
+    )
+    .await;
+    assert_eq!(approvals.status, 200, "{}", approvals.body);
+    let begin = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/unlock/begin", "{}")
+            .cookie(&cookie)
+            .header("CF-Connecting-IP", SRC_A),
+    )
+    .await;
+    assert_eq!(begin.status, 429, "{}", begin.body);
+    let logout = http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post("/owner/logout", "")
+            .cookie(&cookie)
+            .header("CF-Connecting-IP", SRC_A),
+    )
+    .await;
+    assert_eq!(logout.status, 200, "{}", logout.body);
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_a_success_clears_the_count() {
+    let run = start_public().await;
+    let mut auth = enroll_public_from(&run, SRC_A).await;
+    for _ in 0..9 {
+        assert_eq!(garbage_from(&run, SRC_A).await.status, 401);
+    }
+    sign_in_from(&run, &mut auth, SRC_A).await;
+    for i in 0..9 {
+        let r = garbage_from(&run, SRC_A).await;
+        assert_eq!(r.status, 401, "{i}: {}", r.body);
+    }
+    run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_local_mode_is_never_throttled() {
+    let run = start_local().await;
+    for i in 0..30 {
+        let r = http(
+            run.ui,
+            &run.origin,
+            Http::post("/owner/login/finish", Some("application/json"), "{}"),
+        )
+        .await;
+        assert_eq!(r.status, 401, "{i}: {}", r.body);
+    }
+    run.shutdown().await;
+}

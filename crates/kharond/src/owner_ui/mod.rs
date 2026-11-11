@@ -69,6 +69,7 @@
 mod approvals;
 mod sealed;
 mod store;
+pub mod throttle;
 pub mod unlock;
 mod webauthn;
 
@@ -244,6 +245,8 @@ pub struct OwnerUi {
     /// `options`.
     sealed: Sealed,
     sessions: Mutex<Vec<Session>>,
+    /// Failed sign-in, enroll and unlock attempts per source (D5).
+    throttle: throttle::FailureThrottle,
     enroll: Mutex<Vec<Enroll>>,
     /// The web unlock backend (slice 5b). Set once, after the daemon
     /// has built its owner ops; unset → the unlock routes answer
@@ -362,6 +365,7 @@ impl OwnerUi {
             passkeys: Mutex::new(passkeys),
             sealed: Sealed::new(),
             sessions: Mutex::new(Vec::new()),
+            throttle: throttle::FailureThrottle::new(),
             enroll: Mutex::new(Vec::new()),
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
@@ -536,6 +540,8 @@ struct Incoming {
 /// What a recorded failure knows about its request.
 struct FailureCtx {
     client_ip: Option<IpAddr>,
+    /// The request was on one of [`throttle::THROTTLED_ROUTES`].
+    throttled_route: bool,
 }
 
 impl OwnerUi {
@@ -544,6 +550,7 @@ impl OwnerUi {
         self.record_failure(
             FailureCtx {
                 client_ip: req.client_ip,
+                throttled_route: throttle::THROTTLED_ROUTES.contains(&req.path.as_str()),
             },
             detail,
         );
@@ -555,6 +562,26 @@ impl OwnerUi {
             detail,
             client_ip: ctx.client_ip,
         });
+        // A wrong `Origin` is never counted: a page the owner visits
+        // sends those from the owner's own address (D5).
+        if let Some(ip) = ctx.client_ip
+            && self.public
+            && ctx.throttled_route
+            && detail != "origin"
+            && self.throttle.record(ip, Instant::now()) == throttle::Counted::Tripped
+        {
+            self.audit.auth_failed(AuthFailure {
+                detail: "throttled",
+                client_ip: ctx.client_ip,
+            });
+        }
+    }
+
+    /// A completed sign-in or unlock clears the source's failure count.
+    fn forgive(&self, req: &Incoming) {
+        if let Some(ip) = req.client_ip {
+            self.throttle.clear(ip);
+        }
     }
 
     fn dispatch(&self, req: Incoming) -> Response {
@@ -570,6 +597,13 @@ impl OwnerUi {
         if origin_refused {
             self.fail(&req, "origin");
             return respond(StatusCode::FORBIDDEN, "origin", None);
+        }
+        if let Some(ip) = req.client_ip
+            && self.public
+            && throttle::THROTTLED_ROUTES.contains(&req.path.as_str())
+            && let Some(left) = self.throttle.blocked(ip, Instant::now())
+        {
+            return rate_limited(left);
         }
         let allowed = match req.path.as_str() {
             "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants"
@@ -887,11 +921,14 @@ impl OwnerUi {
             return respond(StatusCode::BAD_REQUEST, "unlock_failed", None);
         };
         match unlocker.unlock(password) {
-            Ok(()) => json_body(
-                StatusCode::OK,
-                json!({"ok": true, "locked": false}).to_string(),
-                None,
-            ),
+            Ok(()) => {
+                self.forgive(req);
+                json_body(
+                    StatusCode::OK,
+                    json!({"ok": true, "locked": false}).to_string(),
+                    None,
+                )
+            }
             Err(e) => {
                 // A scope refusal is audited exactly like a wrong
                 // password; only the owner-facing code differs (#243).
@@ -1047,6 +1084,7 @@ impl OwnerUi {
             self.fail(req, "bad_assertion");
             return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
         }
+        self.forgive(req);
         let cookie = self.issue_session();
         json_body(
             StatusCode::OK,
@@ -1515,6 +1553,17 @@ fn html(body: &str) -> Response {
         body.to_owned(),
         None,
     )
+}
+
+/// `429` for a source over the failure limit; `Retry-After` counts to
+/// the end of its window, rounded up, at least one second.
+fn rate_limited(left: Duration) -> Response {
+    let seconds = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    let mut response = respond(StatusCode::TOO_MANY_REQUESTS, "rate_limited", None);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
+    response
 }
 
 fn method_not_allowed(allow: &'static str) -> Response {

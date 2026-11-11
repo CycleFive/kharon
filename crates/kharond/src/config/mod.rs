@@ -908,10 +908,11 @@ pub struct Config {
     pub public_ingress: Option<PublicIngressConfig>,
 }
 
-/// `[owner_ui]` (REQ-APR-005). Loopback only. `origin` is what the
-/// browser puts in `clientDataJSON` (`http://localhost:8787`, no
-/// path). When `listen`'s port is 0, [`Self::origin_for_bound_port`]
-/// substitutes the port the kernel chose.
+/// `[owner_ui]` (REQ-APR-005). The listener is always loopback. `origin`
+/// is what the browser puts in `clientDataJSON`: the local origin
+/// (`http://localhost:8787`) in local mode, or the public origin when
+/// `public` is true. In local mode, when `listen`'s port is 0,
+/// [`Self::origin_for_bound_port`] substitutes the port the kernel chose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerUiConfig {
     /// Loopback listen address. Port 0 is ephemeral.

@@ -452,6 +452,8 @@ fn public_access(access: &str) -> String {
 fn owner_ui_access_is_validated() {
     for access in [
         "team_domain = \"evil.example.com\"\naudience = \"abc123\"",
+        "team_domain = \"cloudflareaccess.com\"\naudience = \"abc123\"",
+        "team_domain = \".cloudflareaccess.com\"\naudience = \"abc123\"",
         "team_domain = \"t.cloudflareaccess.com\"\naudience = \"\"",
         "team_domain = \"t.cloudflareaccess.com\"\naudience = \"a b\"",
     ] {
@@ -471,14 +473,22 @@ fn owner_ui_access_is_validated() {
             jwks: JwksSource::TeamCerts,
         })
     );
+    let mixed = Config::from_toml_str(&owner_ui_config(&public_access(
+        "team_domain = \"T.CloudflareAccess.com\"\naudience = \"abc123\"",
+    )))
+    .unwrap();
+    assert_eq!(
+        mixed.owner_ui.unwrap().access.unwrap().team_domain,
+        "t.cloudflareaccess.com"
+    );
 }
 
 #[test]
 fn owner_ui_access_has_no_jwks_key() {
+    let base = "team_domain = \"t.cloudflareaccess.com\"\naudience = \"abc123\"";
+    Config::from_toml_str(&owner_ui_config(&public_access(base))).unwrap();
     for extra in ["jwks = \"{}\"", "jwks_url = \"https://x\""] {
-        let body = public_access(&format!(
-            "team_domain = \"t.cloudflareaccess.com\"\naudience = \"abc123\"\n{extra}"
-        ));
+        let body = public_access(&format!("{base}\n{extra}"));
         assert!(
             Config::from_toml_str(&owner_ui_config(&body)).is_err(),
             "{extra}"

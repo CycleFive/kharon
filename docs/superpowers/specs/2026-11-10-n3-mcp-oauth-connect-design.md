@@ -318,9 +318,9 @@ A "customer-only approvals" mode, where the socket can only lock, panic or re-en
 A builder read this design cold, and asked these questions. Each answer is the design's call (A13 onwards in the assumptions).
 
 **I1. The consent ceremony and how the authorize request survives sign-in.**
-- `/oauth/authorize` validates the request (D6 step 2), stores it server-side as a **pending authorization**, and redirects to `/oauth/consent/<id>`. `<id>` is 128 random bits.
-- The record holds the parsed request: client, redirect, challenge, state, resource and scopes. It lives for 10 minutes and is single use.
-- These records sit in the bounded, non-evictable ceremony table from #208 AC5, capped per source. Nothing about the request rides in a cookie or survives a restart.
+- `/oauth/authorize` validates the request (D6 step 2), seals it as a **pending authorization**, and redirects to `/oauth/consent/<token>`. The token is #208's sealed state token (its design, D7): the record below as typed JSON, with an HMAC under a key kharond makes at start and keeps only in memory.
+- The token holds the parsed request: client, redirect, challenge, state, resource and scopes. It lives for 10 minutes and is single use: its hash is recorded as used when consent succeeds. That hash is the *pending id* below. Every value in it came from the authorize URL in the same browser, so it needs integrity, not secrecy.
+- Nothing is stored at authorize, so no number of strangers can fill a table or evict a pending Connect (#208 AC5). *Amended 2026-11-11 with #208's design: this replaced "the bounded, non-evictable ceremony table, capped per source", which a bounded table cannot deliver against many sources.* Nothing about the request rides in a cookie, and nothing survives a restart, because the key does not.
 - The consent page follows the existing owner UI's pattern: the shell page plus inline JS calling JSON endpoints. WebAuthn needs JS anyway.
 - The fresh assertion is a new ceremony kind, `consent`. Its WebAuthn challenge is `SHA-256(pending-id ‖ consent-nonce ‖ 32 random bytes)`, so the assertion commits to that one authorize request.
 - The consent POST returns `{"redirect": "<url>"}`, and the page navigates there. kharond never puts a code in a `Location` header that the browser follows on its own.
@@ -362,7 +362,7 @@ A builder read this design cold, and asked these questions. Each answer is the d
   - After 30 s, presenting a retired token is reuse, and kills the Connect.
   - The cost: a thief racing inside those 30 s gets one pair. The legitimate client's next refresh then presents a retired token, which trips the kill. Detection is delayed, never lost.
 
-**I6. Sequencing against #208.** N3 is implemented **after #208 merges**. It builds on #208's public origin, its `__Host-` cookie, its named exemption list and its ceremony table, with no interim loopback-only variant. The E2E (follow-up 8) extends #225's fake-edge pattern to both hostnames.
+**I6. Sequencing against #208.** N3 is implemented **after #208 merges**. It builds on #208's public origin, its `__Host-` cookie, its named exemption list and its sealed state tokens (I1), with no interim loopback-only variant. The E2E (follow-up 8) extends #225's fake-edge pattern to both hostnames.
 
 **I7. The audit field mapping.**
 - New events use the existing `Entry` fields: `agent_id` = the `c-…` id, `origin` = the client's CIMD hostname, `channel` = `web_ui` or `cli`, `detail_code` from an enum.

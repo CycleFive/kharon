@@ -72,7 +72,7 @@ optional Access check apply.
 | `Origin` on POST | refused if present and different | required and equal on every POST, bar the exemption list |
 | Source address | not recorded | `CF-Connecting-IP`, else the TCP peer |
 | Throttle | none | 10 failures per 10 min per source |
-| Audit of failures | every one | 20 itemized per minute, the rest counted |
+| Audit of failures | every one | 20 itemized per minute plus 5 throttle trips, the rest counted |
 | Session cookie | `kharon_owner` | `__Host-kharon_owner`, `Secure` |
 | Access check | n/a | optional |
 
@@ -567,7 +567,7 @@ crosses a module boundary or appears on the wire.
 | A2 | 421 on the owner UI, 404 on `[public_ingress]`. | One status constant each. |
 | A3 | 10 failures / 10 min / source; table of 1024. | Constants. |
 | A4 | Unlock failures count toward the throttle. | Drop two routes from a list. |
-| A5 | 20 itemized audit entries a minute in public mode. | A constant. |
+| A5 | 20 itemized audit entries a minute in public mode, plus 5 throttle trips. | Two constants. |
 | A6 | Ceremonies are sealed tokens; N3's pending authorization follows. | A per-source table, which can't meet AC5 as written. |
 | A7 | Access refusals are audited but don't count toward the throttle. | One call. |
 | A8 | The JWKS test override is code-only, with no TOML key. | A test-named key. |

@@ -978,6 +978,16 @@ pub async fn start(
         // allow_standing` says so.
         .with_grant_policy(crate::api::GrantPolicy::from(&cfg.policy))
         .with_rate_policy(crate::api::rate::RatePolicy::from(&cfg.policy))
+        // REQ-REV-001 durability (#132): revocation and suspension
+        // live in the audit log, not in memory. Fold the log just
+        // verified and rebuild both into the rate limiter before
+        // anything is served: a revoked token stays refused (until
+        // it is rotated in config), a suspension stands until the
+        // owner resets it.
+        .with_durable_state(
+            crate::api::revocation::DurableState::from_log(&audit_dir.join("audit.jsonl"))
+                .map_err(OpenError::Io)?,
+        )
         // REQ-API-009 `fill_deadline` and the fill origin policy.
         .with_fill_policy(FillPolicy::from(&cfg.policy))
         // REQ-API-008: each agent's configured CDP endpoint,

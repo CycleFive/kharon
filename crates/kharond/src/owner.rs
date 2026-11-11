@@ -27,9 +27,10 @@
 //!   means the edge is not sending the header).
 //! - `{"op":"revoke_grant","grant_id":"g_…"}` — REQ-REV-001.
 //! - `{"op":"revoke_agent","agent_id":"…"}` — REQ-REV-001 (token +
-//!   grants). In-memory until the daemon process exits; `unsuspend`
-//!   does not clear it, and there is no un-revoke op. The token hash
-//!   stays in the store, so a restart accepts the token again.
+//!   grants). Durable (#132): the `token_revoke` entry binds the
+//!   revocation to the configured token's fingerprint, so a restart
+//!   keeps refusing the same token; `unsuspend` does not clear it,
+//!   and there is no un-revoke op. Recovery is token rotation.
 //! - `{"op":"unsuspend","agent_id":"…"}` — REQ-RL-002 owner reset of
 //!   a suspension. Does not restore a revoked token.
 //! - `{"op":"panic"}` — REQ-REV-002.

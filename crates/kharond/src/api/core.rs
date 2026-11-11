@@ -627,6 +627,17 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         self
     }
 
+    /// Apply durable revoke / suspension state rebuilt from the
+    /// audit log at startup (#132; see
+    /// [`crate::api::revocation::DurableState`]). Builder step: the
+    /// daemon folds the verified log before constructing the broker
+    /// and applies the state here, before anything is served.
+    pub fn with_durable_state(mut self, state: crate::api::revocation::DurableState) -> Self {
+        let rates = self.rates.get_mut().unwrap_or_else(|p| p.into_inner());
+        state.apply(rates, &self.tokens);
+        self
+    }
+
     /// The rate / suspension gate (tests seed and inspect).
     pub fn rate_limiter(&self) -> &Mutex<RateLimiter> {
         &self.rates
@@ -1790,13 +1801,16 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 
     /// Revoke an agent: drop its grants/requests and refuse its
-    /// token until the daemon process exits (REQ-REV-001). The flag
-    /// is in-memory; [`Self::unsuspend_agent`] does not clear it,
-    /// and there is no un-revoke op. The token hash stays in the
-    /// store, so a restart accepts the token again. Audited as
-    /// `token_revoke` + per-grant `grant_revoke` + a `grant_request`
-    /// denial (detail `agent_revoked`) per dropped pending request
-    /// (#196).
+    /// token (REQ-REV-001). The revocation is durable (#132): the
+    /// `token_revoke` entry below carries the fingerprint of the
+    /// agent's configured `token_hash`, and the startup rebuild
+    /// revokes the agent again on every restart for as long as that
+    /// hash is configured. [`Self::unsuspend_agent`] does not clear
+    /// it and there is no un-revoke op; recovery is rotating the
+    /// token (mint a new one, replace `token_hash`, restart).
+    /// Audited as `token_revoke` + per-grant `grant_revoke` + a
+    /// `grant_request` denial (detail `agent_revoked`) per dropped
+    /// pending request (#196).
     pub fn revoke_agent(&self, agent_id: &str) -> Result<usize, GrantError> {
         let removed = self
             .grants
@@ -1838,13 +1852,22 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let entry = Entry::new(Event::TokenRevoke)
             .agent_id(agent_id.to_owned())
             .result("revoked");
+        // #132: bind the revocation to the token this daemon has
+        // configured for the agent, so the startup rebuild can tell
+        // "same token, still revoked" from "rotated, let it in". An
+        // agent the store does not configure writes no fingerprint
+        // (agent-bound, as before fingerprints existed).
+        let entry = match self.tokens.token_fingerprint(agent_id) {
+            Some(fp) => entry.token_fingerprint(fp),
+            None => entry,
+        };
         self.append(entry).map_err(|_| GrantError::AuditFailed)?;
         Ok(removed.grants.len())
     }
 
     /// Clear an agent's suspension (REQ-RL-002 owner reset). Does
-    /// not restore a revoked token; revocation lasts until the
-    /// daemon process exits.
+    /// not restore a revoked token; a revocation lasts until the
+    /// token is rotated (mint, new `token_hash`, restart; #132).
     pub fn unsuspend_agent(&self, agent_id: &str) -> Result<(), GrantError> {
         self.rates
             .lock()

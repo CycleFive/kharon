@@ -50,5 +50,5 @@ pub use log::{
     AppendError, AuditConfig, AuditLog, DEFAULT_CHECKPOINT_EVERY, DEFAULT_CHECKPOINT_PERIOD,
     OpenError,
 };
-pub use requests::{UnresolvedRequest, unresolved_grant_requests};
+pub use requests::{UnresolvedRequest, replay_entries, unresolved_grant_requests};
 pub use verify::{TAIL_KEEP, VerifyError, VerifyOutcome, verify};

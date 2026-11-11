@@ -390,6 +390,16 @@ impl TokenStore {
         self.hashes.keys().map(String::as_str)
     }
 
+    /// The `token_hash` fingerprint of `agent`'s configured hash
+    /// (REQ-REV-001, #132): what the startup rebuild compares a
+    /// `token_revoke` entry's recorded fingerprint against. `None`
+    /// for an agent this store does not configure.
+    pub fn token_fingerprint(&self, agent: &str) -> Option<String> {
+        self.hashes
+            .get(agent)
+            .map(|h| super::revocation::token_fingerprint(&h.to_string()))
+    }
+
     /// Verify a presented bearer token; returns the agent id it
     /// authenticates. CPU-bound (one Argon2id evaluation): async
     /// callers run it on a blocking thread.

@@ -1149,6 +1149,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     )?;
                     guard.abort_entry = Some(
                         base(Event::FillAborted)
+                            .grant_id(grant_id.clone())
                             .result("aborted")
                             .detail_code("handler_dropped"),
                     );

@@ -216,6 +216,34 @@ async fn req_aud_003_dropped_fill_writes_fill_aborted_and_wipes_the_plan() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn req_aud_003_dropped_fill_names_the_spent_grant_on_fill_aborted() {
+    // #240: a fill that presented no grant names the one it spent on
+    // every entry, the abort included — the pair must agree.
+    fixture_vault();
+    let r = harness(FakeAnswer::Stall);
+    let agent = r.h.broker.authenticate(&r.h.alpha).unwrap();
+    let req = parse_fill(FillOperation::Fill, body().as_bytes()).unwrap();
+    assert!(req.grant_id.is_none(), "this fill presents no grant");
+    {
+        let fut = r.h.broker.fill(&agent, req, Instant::now());
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("a stalled fill cannot finish"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    let e = entries(&r);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!(e[0]["event"], "fill_dispatch");
+    let spent = e[0]["grant_id"]
+        .as_str()
+        .expect("dispatch names the spent grant");
+    assert!(spent.starts_with("g_"), "{spent}");
+    assert_eq!(e[1]["event"], "fill_aborted");
+    assert_eq!(e[1]["grant_id"], spent, "{e:?}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn req_aud_003_dropped_fill_with_a_failing_log_still_wipes() {
     // The abort append is best effort: a refused append is swallowed
     // (nobody is left to tell) and the orphan dispatch is the evidence.

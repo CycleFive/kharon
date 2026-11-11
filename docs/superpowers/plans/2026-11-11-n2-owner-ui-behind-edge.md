@@ -28,7 +28,7 @@
 | PR | Tasks | Reviewer | Closes ACs |
 |---|---|---|---|
 | A | 1, 2, 3 | Muse | 1, 2, 3, 6, 8 (code) |
-| B | 4 | Muse | 5 |
+| B | 4 | Nyx **and** Muse (it replaces sign-in in both modes) | 5 |
 | C | 5, 6 | Muse | 4 |
 | D | 7 | Muse | 7 |
 | E | 8, 9 | Nyx **and** Muse (SPEC §2) | 9, 10, docs of 2 and 8 |
@@ -240,6 +240,9 @@ pub(crate) struct Sealer { /* key: Zeroizing<[u8; 32]>, epoch: Instant */ }
 pub(crate) struct Opened<T> { pub claims: T, pub id: [u8; 32], pub expires: Instant }
 impl Sealer {
     pub fn new() -> Self;   // key from OsRng; epoch = Instant::now()
+    /// Replace the key: every token sealed before this stops opening.
+    /// Takes `&self`, so the key sits behind a lock.
+    pub fn rotate(&self);
     pub fn seal<T: Serialize>(&self, purpose: &str, claims: &T, ttl: Duration, now: Instant) -> String;
     pub fn open<T: DeserializeOwned>(&self, purpose: &str, token: &str, now: Instant) -> Option<Opened<T>>;
 }
@@ -251,12 +254,17 @@ impl UsedOnce {
     pub fn new() -> Self;
     /// Drop expired entries, then insert `id` if absent — one lock, one step.
     pub fn burn(&self, id: [u8; 32], expires: Instant, now: Instant) -> Burn;
+    pub fn clear(&self);
 }
 
 // owner_ui/mod.rs
 #[derive(Serialize, Deserialize)]
 struct CeremonyClaims { challenge: String }      // base64url of 32 random bytes
 impl CeremonyKind { fn purpose(self) -> &'static str }   // "login" | "register"
+impl OwnerUi {
+    /// A panic happened: rotate the sealing key and clear the used-set.
+    pub fn invalidate_sealed(&self);
+}
 ```
 
 **Token format.** `payload = JSON {"p": <purpose>, "exp": <u64 ms since the Sealer's epoch>, "c": <claims>}` from a typed envelope struct. `token = b64url(payload) + "." + b64url(HMAC-SHA256(key, payload))`. `id = SHA-256(token)`.
@@ -265,7 +273,10 @@ impl CeremonyKind { fn purpose(self) -> &'static str }   // "login" | "register"
 
 **Flow.** `login_options` / `register_options` return the token as `ceremony_id` and the challenge as before: the wire shape doesn't change. `login_finish`: open the token (`None` → `fail("bad_assertion")`, 401) → verify the assertion against the token's challenge (failure → `fail("bad_assertion")`, 401, **token not burned**) → `used.burn(id, expires, now)`: `Replayed` → `fail("bad_assertion")`, 401; `Full` → 429 `rate_limited`, no audit; `Fresh` → store the sign count and issue the session. `register_finish` is the same, with `burn` before `store_credential`. This applies in both modes.
 
+**Panic.** Both panic paths call `invalidate_sealed()`, whether the panic itself returned `Ok` or `Err`: the web route (`OwnerUi::panic`, `mod.rs` ~l.610, after `self.approvals.panic()`), and the CLI's (`DaemonOwner::panic_lock`, `daemon.rs` ~l.492, when `owner_ui` is `Some`). `register/options` keeps consuming the enrollment code; do not move that check to `finish`.
+
 - [ ] **Step 1: Write the failing tests.**
+  - `sealed.rs` unit `rotate_kills_every_outstanding_token`: a token sealed before `rotate()` → `None`; one sealed after → opens.
   - `sealed.rs` units: `sealed_round_trips_and_checks_purpose` (opens as `login` with equal claims; as `register` → `None`); `sealed_expires` (`Some` at `now + ttl − 1 ms`, `None` at `now + ttl`); `sealed_rejects_tampering` (a changed character in each part; payload of one token with MAC of another; truncated; a third `.`-part; 4097 bytes; non-ASCII → all `None`); `sealed_tokens_from_another_key_do_not_open`; `used_once_burns_once` (`Fresh` then `Replayed`); `used_once_forgets_expired_entries_and_reports_full` (64 live ids → the 65th is `Full`; once they expire, `Fresh`).
   - `mod.rs` unit `req_apr_009_ceremony_creation_stores_nothing`: 100,000 `POST /owner/login/options` through `dispatch` (a passkey is enrolled) all return 200, and a ceremony obtained before them still finishes: the following `login/finish` with a valid assertion → 200.
   - `req_apr_009_edge.rs`:
@@ -273,6 +284,7 @@ impl CeremonyKind { fn purpose(self) -> &'static str }   // "login" | "register"
     - `req_apr_009_a_used_ceremony_cannot_be_replayed`: after a successful sign-in, the identical `login/finish` body → 401 `bad_assertion` and no `Set-Cookie`.
     - `req_apr_009_a_failed_finish_does_not_burn_the_ceremony`: a finish with one signature byte flipped → 401; a correct finish with the same `ceremony_id` → 200.
     - `req_apr_009_ceremony_kinds_do_not_cross`: a `register` ceremony's id sent to `login/finish` → 401 `bad_assertion`.
+    - `req_apr_009_panic_ends_ceremonies_in_flight`: the owner calls `login/options`, then a panic runs through the owner socket (the `panic` op, sent as `req_apr_005.rs::owner_op` sends ops). `login/finish` with a valid assertion for that ceremony → 401 `bad_assertion`. A new ceremony then signs in → 200. Repeat with the web route: a signed-in session starts a second ceremony, sends `POST /owner/panic` with `{"confirm": true}`, and that ceremony's finish → 401.
     - `req_apr_009_odd_ceremony_ids_are_refused_cleanly`: `ceremony_id` of 5,000 `a`s, of `"é.é"`, and of a 43-character old-style id → each 401 `bad_assertion`.
 - [ ] **Step 2:** `cargo test -p kharond --lib owner_ui::` and `--test req_apr_009_edge`; the new tests fail.
 - [ ] **Step 3: Implement.**
@@ -372,7 +384,7 @@ pub const OWNER_UI_AUDIT_FLUSH_PERIOD: Duration = Duration::from_secs(15);
 pub async fn owner_ui_housekeeping(ui: Arc<OwnerUi>, stop: tokio::sync::watch::Receiver<bool>);
 ```
 
-`record_failure`, public mode: `ctx.has_session` → write, outside the budget. Otherwise `admit`: `Write { suppressed }` → `auth_failed(AuthFailure { suppressed, .. })`; `Suppress` → write nothing. A suppressed failure still counts toward the throttle. Local mode writes every failure.
+`record_failure`, public mode: `ctx.has_session && detail != "origin"` → write, outside the budget. Otherwise — every session-less failure, and every `origin` failure with or without a session — `admit`: `Write { suppressed }` → `auth_failed(AuthFailure { suppressed, .. })`; `Suppress` → write nothing. A suppressed failure still counts toward the throttle. Local mode writes every failure.
 
 `DaemonUiAudit::auth_failed` adds `.suppressed(n)` when set. `suppressed_only` writes `Entry::new(Event::OwnerAuthFail).channel("web_ui").result("suppressed_only").suppressed(count)`.
 
@@ -381,6 +393,7 @@ pub async fn owner_ui_housekeeping(ui: Arc<OwnerUi>, stop: tokio::sync::watch::R
 - [ ] **Step 1: Write the failing tests.**
   - `audit_budget.rs` units: `twenty_are_itemized_then_the_rest_are_counted` (admits 1–20 → `Write { suppressed: None }`; 21–25 → `Suppress`); `the_count_rides_on_the_next_windows_first_entry` (after those, an admit at +60 s → `Write { suppressed: Some(5) }`, the next → `Write { suppressed: None }`); `flush_reports_a_closed_window_once` (inside the window → `None`; at +60 s → `Some(5)`; again → `None`); `drain_reports_pending_inside_a_window`.
   - `mod.rs` unit `req_apr_009_session_failures_are_always_itemized`: with a recording `OwnerAudit`, public UI: 40 session-less failures, then one failure on a request with a live session → the recorder holds 20 + 1 entries.
+  - `mod.rs` unit `req_apr_009_wrong_origin_with_a_session_is_still_capped`: public UI, 40 POSTs to `/owner/approvals/approve` carrying a live session and `Origin: https://sibling.example.com` → each 403 `origin`; the recorder holds 20 entries.
   - `req_apr_009_edge.rs`:
     - `req_apr_009_a_flood_of_failures_is_itemized_twenty_a_minute`: 200 garbage `login/finish` from 200 different sources → exactly 20 `owner_auth_fail` with result `denied`. Shut the daemon down. The log's last `owner_auth_fail` has result `suppressed_only` and `suppressed == 180`. (The 200 requests finish well inside one 60 s window.)
     - `req_apr_009_local_mode_itemizes_every_failure`: 30 failures in local mode → 30 entries, none with `suppressed`.
@@ -460,12 +473,12 @@ Design: D12. **Files:** `deploy/compose/kharon.toml.example` (~l.68–77), `depl
 
 - **Example config:** `[owner_ui]` on, with `listen = "127.0.0.1:8788"` and `public_origin = "https://kharon-owner.example.com"`; a commented `[owner_ui.access]` block; a commented `public_host` under `[public_ingress]`.
 - **README:** replace "Owner actions until #208" with "Owner web UI": the tunnel route `kharon-owner.<domain>` → `http://127.0.0.1:8788`; first passkey (`docker compose exec kharon kharon passkey-enroll`, then open `https://kharon-owner.<domain>/enroll`); the CLI commands kept as the fallback. Remove both "waits for #208" notes.
-- **`deployment.md`**, a new section "Publishing the owner UI": the two modes; never set `httpHostHeader` or `http2Origin` on these routes; optional Access (application on the owner hostname, where the AUD tag is, the two config keys); the Access **bypass** policy for `/owner/approve/*` and `/owner/deny/*` when ntfy is on; the throttle (10 failures, 10 minutes, per address) and recovery through the CLI; re-enroll the passkey when the RP ID changes.
+- **`deployment.md`**, a new section "Publishing the owner UI": the two modes; never set `httpHostHeader` or `http2Origin` on these routes; optional Access (application on the owner hostname, where the AUD tag is, the two config keys); the Access **bypass** policy for `/owner/approve/*` and `/owner/deny/*` when ntfy is on; the throttle (10 failures, 10 minutes, per address) and recovery through the CLI; re-enroll the passkey when the RP ID changes; and "set `[public_ingress] public_host` on any published deploy".
 - **E2E:** the E2E kharond config turns on `[owner_ui]` with `public_origin = "https://kharon-owner.e2e.test"`. Three probes from the fake-edge container, written the way that test's existing `/mcp` probes are.
 
 - [ ] **Step 1: Write the failing tests.**
   - `req_dep_006_compose_package.rs` `req_dep_006_compose_example_publishes_the_owner_ui`: the example, loaded the way that file already loads it, has `owner_ui.public == true` and `owner_ui.listen == 127.0.0.1:8788`.
-  - the same file, `compose_docs_no_longer_wait_for_208`: `README.md` contains neither `until #208` nor `waits for #208`; `docs/deployment.md` contains `httpHostHeader` and `/owner/approve/*`.
+  - the same file, `compose_docs_no_longer_wait_for_208`: `README.md` contains neither `until #208` nor `waits for #208`; `docs/deployment.md` contains `httpHostHeader`, `/owner/approve/*` and `public_host`.
   - `req_dep_002_compose_e2e.rs`, in the existing probe step: `GET http://127.0.0.1:8788/` with `Host: kharon-owner.e2e.test` → 200; with `Host: other.test` → 421; `POST /owner/login/options` with the right `Host` and no `Origin` → 403.
 - [ ] **Step 2:** `cargo test -p kharond --test req_dep_006_compose_package` fails.
 - [ ] **Step 3: Write** the config, README and docs, and the E2E config and probes.
@@ -494,15 +507,15 @@ Add the row after `REQ-APR-008`. Each PR adds its tagged sentences to both colum
 **Requirement column**
 
 - **A (Task 3):** "**Owner UI behind the edge (#208).** With `[owner_ui] public_origin` set (https; exactly one of `origin` and `public_origin`), the UI is in public mode: it still listens on loopback and the edge reaches it by placement (REQ-DEP-006). **Host:** every request carries one `Host` naming the public host, bare or with the origin's port, else `421 misdirected`, unaudited. **Origin:** every POST carries `Origin` equal to the public origin, else `403 origin`. The only exemptions are on one named list: the ntfy redeem routes (REQ-APR-004), and REQ-OAU-008's two. **Source:** the client address is `CF-Connecting-IP` under REQ-API-010's rule (throttling and audit only, never auth), else the TCP peer; `owner_auth_fail` records it as `client_ip`. **Cookie:** `__Host-kharon_owner`, `Secure; HttpOnly; SameSite=Strict; Path=/`. Local mode (`origin`) has none of these."
-- **B (Task 4):** "**Ceremonies (both modes):** a sign-in or enrollment challenge is not stored. The client carries it as a token authenticated with an HMAC under a key made at start and kept in memory, holding the purpose, an expiry 120 s ahead and the challenge. No unauthenticated request, from any number of sources, can evict or block another client's ceremony. A ceremony that completed cannot complete again."
+- **B (Task 4):** "**Ceremonies (both modes):** a sign-in or enrollment challenge is not stored. The client carries it as a token authenticated with an HMAC under a key made at start and kept in memory, holding the purpose, an expiry 120 s ahead and the challenge. No unauthenticated request, from any number of sources, can evict or block another client's ceremony. A ceremony that completed cannot complete again. A panic replaces the key, ending every ceremony in flight."
 - **C (Task 5):** "**Throttle:** a source (an IPv4 address or an IPv6 /64) with 10 failures in 10 minutes on the sign-in, enroll and unlock routes gets `429 rate_limited` on those routes until the window ends. A refused `Origin` never counts, so a cross-site page cannot throttle the owner's own address. A success clears the count. The table holds 1024 sources and forgets the oldest when full; there is no shared bucket. Signed-in actions are never throttled."
-- **D (Task 6):** "**Audit ceiling:** at most 20 `owner_auth_fail` entries a minute are itemized for requests without a live session; the rest are counted and the count is logged (`suppressed`) within 75 s. A failure behind a live session is always itemized."
+- **D (Task 6):** "**Audit ceiling:** at most 20 `owner_auth_fail` entries a minute are itemized for requests without a live session; the rest are counted and the count is logged (`suppressed`) within 75 s. A failure behind a live session that passed the `Origin` check is always itemized; a refused `Origin` is never exempt, because a same-site sibling page can send one with the owner's cookie."
 - **E (Task 7):** "**Access (optional, `[owner_ui.access]`):** every route not on the exemption list requires a `Cf-Access-Jwt-Assertion` that verifies (RS256) against the team's keys, with `iss`, `aud` and `exp` checked. An unknown key id triggers at most one refetch a minute. No config key can replace the key source."
 
 **Acceptance column**
 
 - **A:** "Foreign `Host` → 421 on every route, redeem included. POST without the public `Origin` → 403 on login, register and logout; the redeem routes take none. `owner_auth_fail` carries the `CF-Connecting-IP` address. The session cookie is `__Host-`-prefixed and `Secure`."
-- **B:** "The owner signs in after thousands of `login/options` from other sources. Replaying a completed finish → 401."
+- **B:** "The owner signs in after thousands of `login/options` from other sources. Replaying a completed finish → 401. A ceremony begun before a panic → 401 after it."
 - **C:** "The 11th failure from one source → 429 there, while another source signs in. Thirty wrong-`Origin` POSTs do not throttle. A throttled source's live session still approves."
-- **D:** "200 failures from 200 sources → 20 itemized entries and a count of 180."
+- **D:** "200 failures from 200 sources → 20 itemized entries and a count of 180. 40 wrong-`Origin` POSTs with a live session → 20 itemized."
 - **E:** "No token → 403 on owner routes and not on the redeem routes; a valid token is not a session; a `jwks` key in the file is refused."

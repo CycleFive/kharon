@@ -163,7 +163,7 @@ The state file holds:
 - for each live token, its SHA-256 hash, kind (access or refresh), expiry, refresh family id and parent;
 - the revoked flag.
 
-It holds no plaintext token and **no code**. Authorization codes and pending authorizations (I1) live only in memory, so they don't survive a restart. At 60 s and 10 min that is harmless. Tokens are 256-bit random values (`kh_at_…`, `kh_rt_…`), so a hash at rest reveals nothing usable. SHA-256, not Argon2id, is right for high-entropy random tokens, and it keeps the per-request check cheap.
+It holds no plaintext token and **no code**. Authorization codes live only in memory, and pending authorizations (I1) are sealed under a key that does, so neither survives a restart. At 60 s and 10 min that is harmless. Tokens are 256-bit random values (`kh_at_…`, `kh_rt_…`), so a hash at rest reveals nothing usable. SHA-256, not Argon2id, is right for high-entropy random tokens, and it keeps the per-request check cheap.
 
 **This departs from #132's accepted "no new store, rebuild from audit".**
 - That position is about agents that exist in `kharon.toml`: their revoke state can be recomputed from the config hash plus the audit log.
@@ -195,7 +195,7 @@ From Q5 and Nyx's ruling.
 - **Disconnect** in the owner UI, `kharon revoke agent <c-id>` on the owner socket, or a client's call to `POST /oauth/revoke` with its **refresh** token, ends the whole Connect: the identity and all its tokens, at once. Disconnect and the socket revoke also revoke the identity's live grants, as REQ-REV-001 does for "token + grants".
 - `POST /oauth/revoke` with an **access** token ends only that access token. RFC 7009 allows either kind.
 - It takes effect on the next request (REQ-REV-001) and is durable, because the state file records it.
-- **Panic** (REQ-REV-002) revokes every Connect identity as well as locking. It also clears every pending authorization and unredeemed code, so a consent begun before the panic can't be completed after it.
+- **Panic** (REQ-REV-002) revokes every Connect identity as well as locking. It also clears every pending authorization and unredeemed code, so a consent begun before the panic can't be completed after it. Pending authorizations are sealed tokens (I1), so "clearing" them means the panic replaces the sealing key, which #208 builds; codes are cleared from memory.
   - After a panic, the customer re-clicks Connect on every dashboard. The panic confirmation text and the deployment doc say so (follow-up 7).
   - An ordinary lock (idle or manual) leaves Connects, pending authorizations and codes alone. A Connect doesn't need the vault.
 
@@ -252,7 +252,7 @@ The flow, after the dashboard's MCP client has discovered the AS through D1:
    - The POST carries the ceremony result and a one-time consent nonce bound to the authorize request.
    - It needs `Origin` equal to the owner origin and the `SameSite=Strict` session cookie, as every owner POST does today.
 6. On success, kharond issues the code (in memory, carrying everything the identity needs; D4) and the page navigates to `redirect_uri?code=…&state=…&iss=https://kharon-owner.twkr.io` (I1). Nothing is persisted yet.
-7. **Deny** redirects with `error=access_denied`, `state` and `iss`, and creates nothing.
+7. **Deny** redirects with `error=access_denied`, `state` and `iss`, and creates nothing. It records the pending authorization as used (I1), so it can't be approved afterwards.
 8. **Token exchange.** The dashboard backend sends `POST /oauth/token` with `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `code_verifier` and `resource`. A valid redemption **creates the identity (D3) and writes `oauth_connect`** (ordering in I5), then issues the first token pair.
    - This endpoint is on **#208's named exemption list**. Like the ntfy redeem routes, it can pass neither the owner `Origin` rule nor a Cloudflare Access login.
    - It answers JSON, `Cache-Control: no-store`, with this body:
@@ -319,8 +319,8 @@ A builder read this design cold, and asked these questions. Each answer is the d
 
 **I1. The consent ceremony and how the authorize request survives sign-in.**
 - `/oauth/authorize` validates the request (D6 step 2), seals it as a **pending authorization**, and redirects to `/oauth/consent/<token>`. The token is #208's sealed state token (its design, D7): the record below as typed JSON, with an HMAC under a key kharond makes at start and keeps only in memory.
-- The token holds the parsed request: client, redirect, challenge, state, resource and scopes. It lives for 10 minutes and is single use: its hash is recorded as used when consent succeeds. That hash is the *pending id* below. Every value in it came from the authorize URL in the same browser, so it needs integrity, not secrecy.
-- Nothing is stored at authorize, so no number of strangers can fill a table or evict a pending Connect (#208 AC5). *Amended 2026-11-11 with #208's design: this replaced "the bounded, non-evictable ceremony table, capped per source", which a bounded table cannot deliver against many sources.* Nothing about the request rides in a cookie, and nothing survives a restart, because the key does not.
+- The token holds the parsed request: client, redirect, challenge, state, resource and scopes. It lives for 10 minutes and is single use: its hash is recorded as used when the owner approves or denies. A deny is a decision, so a denied request can't be approved afterwards. That hash is the *pending id* below. Every value in it came from the authorize URL in the same browser, so it needs integrity, not secrecy.
+- Nothing is stored at authorize, so no number of strangers can fill a table or evict a pending Connect (#208 AC5). *Amended 2026-11-11 with #208's design: this replaced "the bounded, non-evictable ceremony table, capped per source", which a bounded table cannot deliver against many sources.* Nothing about the request rides in a cookie, and nothing survives a restart, because the key does not. A panic replaces the key (#208 design, D7), so nothing survives a panic either.
 - The consent page follows the existing owner UI's pattern: the shell page plus inline JS calling JSON endpoints. WebAuthn needs JS anyway.
 - The fresh assertion is a new ceremony kind, `consent`. Its WebAuthn challenge is `SHA-256(pending-id ‖ consent-nonce ‖ 32 random bytes)`, so the assertion commits to that one authorize request.
 - The consent POST returns `{"redirect": "<url>"}`, and the page navigates there. kharond never puts a code in a `Location` header that the browser follows on its own.
@@ -450,7 +450,7 @@ These extend SPEC §2. The actors are §2's, plus the operator as #208 adds them
 4. **Authorize, consent and code** (D6), on the owner hostname.
 5. **The token side.** Token and revoke endpoints, the state file, rotation and reuse detection (D3, D4). This includes the one-retry grace, which retires the whole superseded pair (I5).
 6. **Scope enforcement and the `no_browser` error** (D5, D7 phase 1), on #200's allow-list, with `tools/list` filtered by scope.
-7. **The Connections page,** Disconnect, the panic hook (clearing pending authorizations and codes), the audit events (D9), and the panic confirmation text and deployment-doc note that a panic means re-clicking Connect on every dashboard.
+7. **The Connections page,** Disconnect, the panic hook (clearing codes; pending authorizations end when the panic replaces #208's sealing key), the audit events (D9), and the panic confirmation text and deployment-doc note that a panic means re-clicking Connect on every dashboard.
 8. **An E2E.** A fake dashboard client (a CIMD served by the test) runs the full Connect, refresh, reuse-kill and Disconnect cycle against the compose stack.
 9. **Phase 2 design:** a dashboard runtime's connector authenticating with a Connect token (D7).
 10. **Optional:** a "customer-only approvals" mode for the owner socket (D9).

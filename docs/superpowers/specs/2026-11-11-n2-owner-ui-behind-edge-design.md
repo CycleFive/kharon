@@ -246,8 +246,8 @@ master-password guesses.
 
 AC3 wants owner auth failures audited with the source address. On a public
 hostname that hands a stranger a way to append to the hash-chained log, and a
-full disk makes every fill fail closed (`audit_failed`). D5 bounds each source
-to about eleven entries per ten minutes, but sources are cheap.
+full disk makes every fill fail closed (`audit_failed`). D5 doesn't bound this:
+it never counts a wrong `Origin`, and sources are cheap anyway.
 
 So in public mode at most **20 `owner_auth_fail` entries are itemized per
 minute**, across all sources. Twenty, not ten, so that one source running
@@ -259,11 +259,21 @@ daemon's existing 15-second flush tick, and at shutdown. This is the mechanism
 
 - It caps log writes. It never refuses a request, so it is not a global
   auth bucket.
-- **A failure on a request that carries a live session is always itemized**
-  and sits outside the ceiling. A stranger can't produce one, so they can't
-  grow the log with it, and it is the entry that matters most: a wrong
-  master password typed behind a stolen session cookie must not be hidden by
-  a flood started for that purpose. D5 still bounds these per source.
+- **A failure that got past the `Origin` check on a request with a live
+  session is always itemized** and sits outside the ceiling. A stranger
+  can't produce one, so they can't grow the log with it, and it is the
+  entry that matters most: a wrong master password typed behind a stolen
+  session cookie must not be hidden by a flood started for that purpose. D5
+  bounds these per source, because everything past the `Origin` check counts.
+- **A wrong `Origin` always goes through the ceiling, session or not**
+  (Nyx's review). `SameSite=Strict` is per site, not per origin. A page on
+  any sibling host under the same registrable domain is same-site, so the
+  owner's browser attaches the session cookie to its POSTs. They arrive with
+  the sibling's `Origin`, are refused, and D5 never counts them. Itemizing
+  them all would give one open tab an unbounded way to grow the log.
+- One source sending wrong-`Origin` requests can use the whole itemized
+  budget for a minute and crowd out other sources' detail. The ceiling
+  still holds and the count is kept.
 - The cost: during a flood, a session-less failure of the owner's own (a bad
   assertion, say) may be counted and not itemized. Nothing is lost but the
   detail.
@@ -319,11 +329,23 @@ Now it doesn't: the same token can be tried again until it expires in 120
 seconds. That is safe, because each try is a failure D5 counts and the
 challenge alone is worth nothing without the passkey.
 
+**A panic replaces the key** (Nyx's review). `REQ-OAU-005` and `REQ-REV-002`
+say a panic clears every pending authorization, and a sealed token can't be
+found and deleted. So a panic makes a new key and empties the used-set, which
+kills every outstanding token at once: sign-in and enrollment ceremonies in
+flight, and N3's pending authorizations. Both panic paths do it, the web
+route and the CLI's, and they do it whether or not the panic's own audit
+append succeeds, as a panic keeps grants revoked in that case. An owner who
+was mid-sign-in during a panic starts the ceremony again.
+
 **The register token is the proof that `register/options` was authorized.**
 `register/finish` checks no enrollment code and no session of its own: today
 the table row stands for that, and now the MAC and the `register` purpose do.
 So a token made for `login` must never open as `register`, and the purpose is
-inside the MAC. A failed `register/finish` leaves the token usable until it
+inside the MAC. The enrollment code is consumed at `register/options`
+(`registration_authorized` → `take_enroll`), so one code mints one register
+token. That check stays at `options`: moving it to `finish` would let one
+code be tried against many ceremonies. A failed `register/finish` leaves the token usable until it
 expires, so the owner can retry without a new code; a successful one burns
 it.
 
@@ -331,7 +353,8 @@ it.
 - Expiry is measured in milliseconds since the process started, on the
   monotonic clock. The key dies with the process, so nothing outside it ever
   needs to read the time, and a wall-clock step can't extend a token.
-- A restart invalidates in-flight ceremonies, as it does today.
+- A restart invalidates in-flight ceremonies, as it does today. So does a
+  panic, which is new.
 - Enrollment codes, sessions and unlock attempts keep their small tables.
   Filling them needs the owner socket, a completed sign-in, or a live
   session, which a stranger doesn't have.
@@ -449,7 +472,9 @@ own lines. The shape:
   and the CLI as the fallback.
 - `docs/deployment.md` gains the owner-hostname section: never set
   `httpHostHeader`; optional Access and the ntfy bypass; the throttle and how
-  to recover; re-enrolling after a change of RP ID.
+  to recover; re-enrolling after a change of RP ID. It also says to set
+  `[public_ingress] public_host` on any published deploy (Muse's review), so
+  the check isn't left off by omission where it matters most.
 - The compose E2E gains three fake-edge probes: the login page with the right
   `Host` is 200, a foreign `Host` is 421, a POST with no `Origin` is 403.
 
@@ -461,7 +486,11 @@ bounded non-evictable ceremony table (#208)". With D7 there is no such table.
 **Proposed amendment, in this PR:** a pending authorization is a sealed token
 made with D7's code, carried in the consent URL. It holds what the table row
 would have held (client, redirect URI, PKCE challenge, state, resource,
-scopes), lasts 10 minutes, and is recorded as used when consent succeeds.
+scopes), lasts 10 minutes, and is recorded as used when the owner approves
+**or denies** (Nyx's review). A deny is a decision: with the table it deleted
+the row, and without this a denied request would stay approvable for the rest
+of its ten minutes. Deny needs the owner's session, so a stranger can't use it
+to fill the used-set.
 Every value in it came from the authorize URL in the same browser, so it
 needs integrity, which the MAC gives, and not secrecy.
 
@@ -470,6 +499,10 @@ can block a Connect. It keeps N3's rule that nothing rides in a cookie and
 nothing survives a restart.
 
 What N3 takes from D7, and decides for itself:
+- **N3's panic path needs nothing of its own for pending authorizations.**
+  The key replacement in D7 already ends them, which keeps `REQ-OAU-005`'s
+  acceptance line true: a consent page opened before a panic can't be
+  approved after it. Unredeemed codes are N3's own state and N3 clears them.
 - The consent assertion is a third purpose, `consent`, sealed the same way.
 - The used-set is keyed by the token's hash and holds an entry until that
   token expires, so a 10-minute pending authorization holds its slot for up
@@ -478,10 +511,12 @@ What N3 takes from D7, and decides for itself:
 - The token rides in the consent URL and is about 1 KB. Field and path names
   are N3's.
 
-**Nyx and Muse: this edits reviewed N3 text.** Three places change, all in
-this PR: N3 design I1 (the pending-authorization bullet), N3 design I6 ("its
-ceremony table"), and `REQ-OAU-003` in SPEC.md. Please check those
-specifically.
+**Nyx and Muse: this edits reviewed N3 text.** These places change, all in
+this PR: N3 design I1 (the pending-authorization bullets), I6 ("its ceremony
+table"), D4's note on what lives in memory, D5's panic bullet and follow-up 7
+(the panic hook), and D6 step 7 (deny); and in SPEC.md, `REQ-OAU-003` and
+`REQ-OAU-005`. Please
+check those specifically.
 
 Everything else N3 asked of N2 is here as asked: the public origin, the
 `__Host-` cookie, the named exemption list (D3), and per-source throttling
@@ -498,7 +533,8 @@ crosses a module boundary or appears on the wire.
 1. **Passkey enrollment is unaudited.** Minting an enrollment code
    (`passkey_enroll`) and storing a passkey (`register/finish`) write no audit
    entry. On a managed deploy the operator can enroll a passkey of their own
-   with no trace. Proposed: two new events. Needs an issue and a §7 row.
+   with no trace. Proposed: two new events. Needs an issue and a §7 row. Duet
+   files it when this merges and links it from #208 (Nyx, Muse).
 2. **Host check in local mode.** It would close DNS rebinding against the
    loopback listener. The Origin rule and the RP ID already stop the damaging
    cases, and it is outside #208.

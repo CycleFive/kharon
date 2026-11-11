@@ -143,14 +143,16 @@ hostname there. Then:
    Header, no HTTP2 connection. See "Publishing the owner UI" in the
    [deployment guide](../../docs/deployment.md#publishing-the-owner-ui).
 2. Restart kharond so it reads the config: `docker compose restart kharon`.
-3. Enroll the first passkey. The command prints a one-time code:
+3. Enroll the first passkey. Open `https://kharon-owner.<domain>/enroll`
+   first. The code works once and for 120 seconds, so have the page
+   ready, then run:
 
    ```sh
    docker compose exec kharon kharon passkey-enroll
    ```
 
-   Open `https://kharon-owner.<domain>/enroll`, enter the code, and
-   follow the browser's passkey prompt. After that, sign in at
+   Enter the code it prints and follow the browser's passkey prompt (run
+   the command again if it expired). After that, sign in at
    `https://kharon-owner.<domain>/`.
 
 The CLI stays as the fallback, and it is the way in when the browser

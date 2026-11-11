@@ -316,4 +316,10 @@ fn compose_docs_no_longer_wait_for_208() {
     for needle in ["httpHostHeader", "/owner/approve/*", "public_host"] {
         assert!(guide.contains(needle), "deployment guide lacks {needle}");
     }
+    for stale in ["after #208", "until #208", "waits for #208"] {
+        assert!(
+            !guide.contains(stale),
+            "deployment guide still says {stale}"
+        );
+    }
 }

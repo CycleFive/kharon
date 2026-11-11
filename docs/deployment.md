@@ -622,21 +622,33 @@ the URL says. Set `public_origin` to publish.
    is not throttled. See "Watching it" below.
 
 5. **Restart and enroll.** Restart kharond (`docker compose restart
-   kharon`), then, on the box:
+   kharon`). Have the owner open
+   `https://kharon-owner.example.com/enroll` first. The code works once
+   and for 120 seconds, so it must not wait for a page to load. Then,
+   on the box:
 
    ```sh
    docker compose exec kharon kharon passkey-enroll
    ```
 
-   It prints a one-time code. Open `https://kharon-owner.example.com/enroll`,
-   paste the code and follow the browser's passkey prompt. Registering
-   does not sign you in; go to `https://kharon-owner.example.com/` and
-   sign in with the passkey.
+   Give the owner the code it prints. They paste it into the page and
+   follow the browser's passkey prompt. If it expires, run the command
+   again. Registering does not sign you in; the owner goes to
+   `https://kharon-owner.example.com/` and signs in with the passkey.
 
-6. **Check.** `curl -sI https://kharon-owner.example.com/` answers 200.
-   A 421 means the Host check refused the request: look for an
-   `httpHostHeader` on the route, or a hostname that differs from
-   `public_origin`.
+6. **Check.** `curl -s -o /dev/null -w '%{http_code}\n' https://kharon-owner.example.com/`
+   (a GET: the page answers GET only, so `curl -I` gets 405 even when
+   all is well). What the answer means:
+
+   - **200**: healthy.
+   - **421**: the Host check refused it. Look for an `httpHostHeader` on
+     the tunnel route, or a hostname that differs from `public_origin`.
+   - **403** with Access on: kharond refuses a request that carries no
+     valid Access token. Normally Cloudflare's Access application
+     redirects a browser to its login before the request reaches kharond,
+     so a plain `curl` gets that redirect (a 302) at the edge, and a 403
+     from kharond means the request reached it without a token. See
+     [Optional: Cloudflare Access in front](#optional-cloudflare-access-in-front).
 
 ### If the RP ID changes
 
@@ -670,10 +682,15 @@ sign-in: the passkey is still required.
    signing keys from `https://<team_domain>/cdn-cgi/access/certs`. It
    starts the first fetch in the background at startup, so a blocked
    network does not stop kharond from starting. Until one fetch has
-   succeeded, every route behind Access answers 403.
+   succeeded, every route behind Access answers 403. The same happens
+   for a moment when Cloudflare rotates its signing keys: requests that
+   arrive while a key fetch is in flight are refused. A 403 in the
+   first seconds after kharond starts, or right after a rotation, is
+   expected and clears on reload.
 
-5. **ntfy bypass.** ntfy's approve and deny buttons POST from ntfy's
-   servers or the owner's phone, with no Access login. If
+5. **ntfy bypass.** The approve and deny buttons in an ntfy message
+   are HTTP actions that the ntfy app on the owner's phone sends when
+   tapped (not ntfy's server), and that app has no Access session. If
    `[approval].ntfy` is on, add a second Access policy of action
    **Bypass** for the paths `/owner/approve/*` and `/owner/deny/*` on the
    same hostname. Those routes are protected by single-use tokens that
@@ -681,18 +698,39 @@ sign-in: the passkey is still required.
    every other path behind the login policy.
 
 When everyone gets 403, read the kharond log first
-(`docker compose logs kharon | grep 'owner UI Access'`):
+(`docker compose logs kharon | grep 'owner UI Access'`). There is one
+line per failed key fetch, with a fixed failure class
+(`kharond: owner UI Access keys fetch failed: <class>`), and one line
+the first time each kind of refusal is seen
+(`kharond: owner UI Access refused a request: <class> (logged once)`).
 
-- `kharond: owner UI Access keys fetch failed: <class>` for each failed
-  fetch. Classes: `connect_or_timeout`, `http_4xx`, `http_5xx`,
-  `http_other`, `too_large`, `unparseable`, `no_usable_keys`. A
-  connect or timeout means the box cannot reach the team domain.
-- `kharond: owner UI Access refused a request: <class> (logged once)`,
-  once per class. Classes: `missing_token`, `malformed_token`,
-  `unknown_key`, `bad_signature`, `issuer`, `audience`, `expired`,
-  `not_yet_valid`, `claims`. `audience` means the configured AUD tag
-  is not the application's (check it is not the Client ID);
-  `missing_token` means the request did not come through Access.
+| Class | Likely cause |
+|---|---|
+| fetch `connect_or_timeout` | The box has no outbound HTTPS to `<team>.cloudflareaccess.com`, or it timed out. |
+| fetch `http_4xx` | The certs endpoint refused the request. |
+| fetch `http_5xx`, `http_other` | Cloudflare side; retried automatically. |
+| fetch `too_large`, `unparseable`, `no_usable_keys` | The reply was not a usable key set; check `team_domain`. |
+| `missing_token` | The request did not come through an Access application covering this path, or the hostname bypasses Access. |
+| `malformed_token`, `bad_signature`, `claims` | Not a token from this team's Access. |
+| `audience` | `audience` is not this application's AUD tag. Often the Client ID was pasted. |
+| `issuer` | `team_domain` is not this team's. |
+| `unknown_key` | Right after a key rotation it clears within a minute; otherwise `team_domain` is wrong. |
+| `expired`, `not_yet_valid` | The token or the box's clock is off. |
+
+### Checks on the first live deploy
+
+With Access on, after the first real sign-in:
+
+- The log shows no fetch failure of class `http_4xx`. kharond's request
+  to the certs endpoint carries no `User-Agent`; if Cloudflare ever
+  refuses that, this is where it shows.
+- A signed-in owner is not refused with class `issuer`. The token's
+  `iss` must be `https://<team>.cloudflareaccess.com`, with no trailing
+  slash.
+- `kharon status` prints no `owner_ui_without_edge_address` line after
+  real traffic (the edge is sending `CF-Connecting-IP`).
+- A request with a wrong `Host` gets 421.
+- With ntfy on, the approve link works without an Access login.
 
 ### The throttle, and getting back in
 
@@ -768,7 +806,8 @@ broker has no WAN port forward.
 
 With a token-managed tunnel the Cloudflare dashboard route list is
 the edge allow-list. Point routes only at `http://127.0.0.1:8790`
-(and `http://127.0.0.1:8788` after #208). `[public_ingress]`'s
+and the owner UI route, `http://127.0.0.1:8788` (see
+[Publishing the owner UI](#publishing-the-owner-ui)). `[public_ingress]`'s
 allow-list holds for those routes alone. When cloudflared runs beside
 kharond it shares kharond's loopback, so a route to any other port
 bypasses it and reaches, with none of the public-side limits:

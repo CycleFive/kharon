@@ -702,6 +702,10 @@ docker compose start kharon
 docker compose exec kharon kharon passkey-enroll    # then /enroll, as in step 5
 ```
 
+That `docker run` runs as root on a volume kharond owns. That is fine
+for `rm`. Any command that creates files that way would leave them
+with the wrong uid.
+
 The file is `<data_dir>/owner/passkeys.json` (`/data` under compose).
 Without it kharond starts with no passkeys and accepts a fresh
 enrollment. The restart locks the vault, and none of this is audited
@@ -869,7 +873,8 @@ trip it for them; this is the cost of per-address limits.
 
 The audit log keeps the first 20 `owner_auth_fail` entries a minute from
 requests with no session (and every refused `Origin`), plus 5 `throttled` entries; the rest are
-counted, not written, so the worst case is 26 entries a minute.
+counted, not written, so the worst case is 26 entries a minute
+(20 + 5 + one count entry).
 
 ### Watching it
 

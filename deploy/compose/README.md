@@ -153,8 +153,8 @@ hostname there. Then:
    ```
 
    Send the owner the code it prints (43 characters) as a message they
-   can paste from; it works once, for 120 seconds. They enter it and follow the browser's passkey prompt (run
-   the command again if it expired). After that, sign in at
+   can paste from. They enter it and follow the browser's passkey
+   prompt (run the command again if it expired). After that, sign in at
    `https://kharon-owner.<domain>/`.
 
 The CLI stays as the fallback for whoever has a shell on the box. On a

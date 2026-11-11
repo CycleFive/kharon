@@ -614,7 +614,7 @@ fn canonical_public_origin(
     if !valid_rp_id(host) || rp_id.as_deref().is_some_and(|id| id != host) {
         return Err(bad);
     }
-    let port = url.port_or_known_default().ok_or(bad)?;
+    let port = url.port_or_known_default().filter(|p| *p != 0).ok_or(bad)?;
     Ok((host.to_owned(), serialize_origin("https", host, port)))
 }
 

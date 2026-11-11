@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use kharond::audit::{Entry, Event};
 use kharond::config::Config;
 use kharond::daemon;
 use kharond::lock::StaticHardening;
@@ -104,11 +105,11 @@ impl Running {
     }
 
     /// Every `owner_auth_fail` entry so far, oldest first.
-    fn auth_fails(&self) -> Vec<Json> {
+    fn auth_fails(&self) -> Vec<Entry> {
         self.audit()
             .lines()
-            .map(|l| serde_json::from_str::<Json>(l).unwrap())
-            .filter(|e| e["event"] == "owner_auth_fail")
+            .map(|l| serde_json::from_str::<Entry>(l).unwrap())
+            .filter(|e| e.event == Event::OwnerAuthFail)
             .collect()
     }
 }
@@ -199,7 +200,7 @@ async fn req_apr_009_public_posts_need_the_public_origin() {
         let fails = run.auth_fails();
         assert_eq!(fails.len(), before + 2, "{path}: one entry per refusal");
         for f in &fails[before..] {
-            assert_eq!(f["detail_code"], "origin", "{f}");
+            assert_eq!(f.detail_code.as_deref(), Some("origin"), "{f:?}");
         }
         let ok = http(
             run.ui,
@@ -211,7 +212,7 @@ async fn req_apr_009_public_posts_need_the_public_origin() {
         let origin_entries = run
             .auth_fails()
             .iter()
-            .filter(|f| f["detail_code"] == "origin")
+            .filter(|f| f.detail_code.as_deref() == Some("origin"))
             .count();
         assert_eq!(
             origin_entries,
@@ -264,12 +265,12 @@ async fn garbage_finish(run: &Running, host: &str, headers: &[(&str, &str)]) {
 #[tokio::test(flavor = "multi_thread")]
 async fn req_apr_009_auth_failures_carry_the_source_address() {
     let run = start_public().await;
-    let ip = |run: &Running| run.auth_fails().last().map(|f| f["client_ip"].clone());
+    let ip = |run: &Running| run.auth_fails().last().map(|f| f.client_ip.clone());
 
     garbage_finish(&run, PUBLIC_HOST, &[("CF-Connecting-IP", "203.0.113.7")]).await;
-    assert_eq!(ip(&run), Some(json!("203.0.113.7")));
+    assert_eq!(ip(&run), Some(Some("203.0.113.7".to_owned())));
     garbage_finish(&run, PUBLIC_HOST, &[]).await;
-    assert_eq!(ip(&run), Some(json!("127.0.0.1")));
+    assert_eq!(ip(&run), Some(Some("127.0.0.1".to_owned())));
     garbage_finish(
         &run,
         PUBLIC_HOST,
@@ -279,7 +280,7 @@ async fn req_apr_009_auth_failures_carry_the_source_address() {
         ],
     )
     .await;
-    assert_eq!(ip(&run), Some(json!("127.0.0.1")));
+    assert_eq!(ip(&run), Some(Some("127.0.0.1".to_owned())));
     assert_eq!(run.auth_fails().len(), 3);
     run.shutdown().await;
 
@@ -287,7 +288,7 @@ async fn req_apr_009_auth_failures_carry_the_source_address() {
     garbage_finish(&local, "localhost", &[("CF-Connecting-IP", "203.0.113.7")]).await;
     let fails = local.auth_fails();
     assert_eq!(fails.len(), 1, "{fails:?}");
-    assert!(fails[0].get("client_ip").is_none(), "{}", fails[0]);
+    assert!(fails[0].client_ip.is_none(), "{:?}", fails[0]);
     local.shutdown().await;
 }
 
@@ -372,6 +373,12 @@ async fn req_apr_009_public_session_cookie_is_host_prefixed() {
         200
     );
     assert_eq!(get(format!("kharon_owner={token}")).await.status, 401);
+    // A sibling subdomain can plant a part with no `=`; it must not
+    // hide the session.
+    assert_eq!(
+        get(format!("x; __Host-kharon_owner={token}")).await.status,
+        200
+    );
     assert_eq!(
         get(format!("kharon_owner=junk; __Host-kharon_owner={token}"))
             .await

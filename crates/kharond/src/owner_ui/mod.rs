@@ -458,7 +458,10 @@ async fn handle(
     }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    if path.starts_with(OWNER_APPROVE_PREFIX) || path.starts_with(OWNER_DENY_PREFIX) {
+    // The ntfy redeem routes: on `EDGE_EXEMPT`, so they take no `Origin`.
+    // Later checks that must skip them (the Access check) consult the
+    // same list.
+    if edge_exempt(&path) {
         let redeem = Arc::clone(&state.redeem);
         return dispatch_owner_approval(redeem, method, path).await;
     }
@@ -1407,7 +1410,9 @@ fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
     let header = header?;
     for part in header.split(';') {
         let part = part.trim();
-        let (k, v) = part.split_once('=')?;
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         if k.trim() == name {
             return Some(v.trim().to_owned());
         }
@@ -1973,6 +1978,19 @@ mod tests {
         assert!(enroll.contains(r#"type="text""#));
         assert!(!enroll.contains(r#"type="password""#));
         assert_eq!(SESSION_TTL, Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn a_nameless_cookie_part_does_not_hide_the_rest() {
+        assert_eq!(
+            cookie_value(Some("x; name=v"), "name").as_deref(),
+            Some("v")
+        );
+        assert_eq!(
+            cookie_value(Some("name=v; x"), "name").as_deref(),
+            Some("v")
+        );
+        assert_eq!(cookie_value(Some("x; y"), "name"), None);
     }
 
     #[test]

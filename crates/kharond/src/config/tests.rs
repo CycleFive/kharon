@@ -420,6 +420,7 @@ fn owner_ui_public_origin_must_be_https_and_bare() {
         "https://o.example.com/x",
         "https://u@o.example.com",
         "https://o.example.com?x=1",
+        "https://o.example.com:0",
     ] {
         let err = owner_ui_err(&format!(
             "listen = \"127.0.0.1:8788\"\npublic_origin = \"{origin}\""

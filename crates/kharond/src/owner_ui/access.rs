@@ -1240,4 +1240,39 @@ mod tests {
         let c = cfg(crate::config::JwksSource::TestStatic("not json".to_owned()));
         assert!(AccessVerifier::new(&c).is_err());
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_unknown_kids_share_one_fetch() {
+        let (a, _) = keys();
+        let (v, fake) = fetching_verifier(vec![Some(jwks(&[("k1", a)]))]);
+        let token = headers(&[&sign_with(a, "RS256", "k1", &good_claims())]);
+        let t0 = Instant::now();
+        let tasks: Vec<_> = (0..64)
+            .map(|_| {
+                let (v, token) = (Arc::clone(&v), token.clone());
+                tokio::spawn(async move { v.verify_at(&token, now(), t0).await })
+            })
+            .collect();
+        for t in tasks {
+            // The one that fetched passes; the rest are refused or pass,
+            // but none starts a second fetch.
+            let _ = t.await.unwrap();
+        }
+        assert_eq!(calls(&fake), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_cache_is_refreshed_once_for_a_thousand_requests() {
+        let (a, _) = keys();
+        let (v, fake) = fetching_verifier(vec![Some(jwks(&[("k1", a)])), Some(jwks(&[("k1", a)]))]);
+        let token = headers(&[&sign_with(a, "RS256", "k1", &good_claims())]);
+        let t0 = Instant::now();
+        assert_eq!(v.verify_at(&token, now(), t0).await, Ok(()));
+        let late = t0 + Duration::from_secs(25 * 3600);
+        for _ in 0..1000 {
+            assert_eq!(v.verify_at(&token, now(), late).await, Ok(()));
+        }
+        settle(&fake, 2).await;
+        assert_eq!(calls(&fake), 2, "the first load plus one refresh");
+    }
 }

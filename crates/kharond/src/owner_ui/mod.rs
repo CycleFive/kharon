@@ -3866,4 +3866,70 @@ mod tests {
         let got = rec.itemized.lock().unwrap().clone();
         assert!(got.iter().any(|(d, _)| *d == "throttled"), "{got:?}");
     }
+
+    /// Never reached by the Access tests: the redeem routes are not used.
+    struct NoRedeem;
+
+    impl ApprovalRedeemer for NoRedeem {
+        fn prompt(
+            &self,
+            _token: &str,
+        ) -> Result<
+            (
+                crate::api::grant::ApprovalPrompt,
+                crate::api::approval::ApprovalAction,
+            ),
+            crate::api::approval::TokenGone,
+        > {
+            Err(crate::api::approval::TokenGone::Unknown)
+        }
+
+        fn redeem(
+            &self,
+            _token: &str,
+        ) -> Result<crate::api::approval::ApprovalAction, crate::api::approval::TokenGone> {
+            Err(crate::api::approval::TokenGone::Unknown)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_access_gate_is_off_outside_public_mode() {
+        // One RSA entry; the verifier only decodes it, no token is checked.
+        let doc = r#"{"keys":[{"kid":"k1","kty":"RSA","n":"AQAB","e":"AQAB"}]}"#;
+        let verifier = access::AccessVerifier::new(&crate::config::AccessConfig {
+            team_domain: "test.cloudflareaccess.com".into(),
+            audience: "aud123".into(),
+            jwks: crate::config::JwksSource::TestStatic(doc.into()),
+        })
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ui = OwnerUi::open_with(
+            dir.path(),
+            OwnerUiOptions {
+                rp_id: "localhost".into(),
+                origin: ORIGIN.into(),
+                public: false,
+                access: Some(verifier),
+            },
+            Arc::new(StaticShell(ShellView {
+                locked: false,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        let state = Arc::new(OwnerServer {
+            ui,
+            redeem: Arc::new(NoRedeem),
+        });
+        let req = Request::builder()
+            .uri("/owner/session")
+            .body(Body::empty())
+            .unwrap();
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let resp = handle(State(state), ConnectInfo(peer), req).await;
+        // Local mode's own answer (no session), not the gate's 403.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

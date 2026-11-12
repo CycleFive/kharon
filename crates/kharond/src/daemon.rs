@@ -1313,10 +1313,9 @@ async fn bind_owner_ui(
             .as_ref()
             .and_then(|p| p.public_host.as_deref()),
     ) {
-        (Some(_), Some(host)) => Some(Arc::new(crate::api::oauth::Discovery::new(
-            origin.clone(),
-            host,
-        ))),
+        (Some(_), Some(host)) => Some(crate::owner_ui::OauthAs {
+            discovery: Arc::new(crate::api::oauth::Discovery::new(origin.clone(), host)),
+        }),
         _ => None,
     };
     // REQ-OAU-002 (#229): with `[oauth]` set, the authorize endpoint
@@ -1333,11 +1332,11 @@ async fn bind_owner_ui(
     });
     // REQ-OAU-004 (#231): the token endpoints serve the store the
     // broker carries (loaded at startup, before this listener).
-    // The code redeemer is not wired on this tree: the authorize
-    // side that issues codes is #230, and its `CodeStore` adapter
-    // is the one seam left for the two to compose (see
-    // `owner_ui::oauth_token::CodeRedeemer`). Until then the code
-    // grant fails closed and refresh/revoke work in full.
+    // The side is built `unwired`: `OwnerUi::open_with` binds the
+    // real code redeemer over the authorize side's own `CodeStore`
+    // (#230) as it builds the UI — the store does not exist before
+    // that moment (see `owner_ui::oauth_token::CodeRedeemer`).
+    // Refresh and revoke never depended on the redeemer.
     let oauth_tokens = broker
         .oauth_store()
         .map(|store| crate::owner_ui::oauth_token::TokenSide::unwired(Arc::clone(store)));

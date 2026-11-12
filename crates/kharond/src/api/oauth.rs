@@ -80,8 +80,8 @@ impl Discovery {
     }
 
     /// The protected resource: this deploy's public `/mcp` URL.
-    /// The token endpoint requires `resource` to equal it
-    /// (REQ-OAU-004).
+    /// Authorize (REQ-OAU-003) and the token endpoint
+    /// (REQ-OAU-004) both require `resource` to equal it.
     pub fn resource(&self) -> &str {
         &self.resource
     }

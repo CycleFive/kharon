@@ -224,6 +224,7 @@ impl<'de> Deserialize<'de> for Event {
             "oauth_connect" => Event::OauthConnect,
             "oauth_disconnect" => Event::OauthDisconnect,
             "oauth_refresh_reuse" => Event::OauthRefreshReuse,
+            "oauth_client_refused" => Event::OauthClientRefused,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"

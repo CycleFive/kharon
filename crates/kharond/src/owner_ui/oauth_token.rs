@@ -63,21 +63,70 @@ impl CodeRedeemer for UnwiredCodes {
     }
 }
 
+/// The production [`CodeRedeemer`]: #230's in-memory code store,
+/// adapted across the seam. `CodeStore` is born with the
+/// [`OwnerUi`] that serves the authorize routes, so the daemon
+/// cannot hold it when it builds the [`TokenSide`];
+/// [`OwnerUi::open_with`] binds this adapter over the UI's own
+/// store when the side asks it to (see [`TokenSide::unwired`]).
+pub struct CodeStoreRedeemer {
+    codes: Arc<super::oauth::CodeStore>,
+}
+
+impl CodeStoreRedeemer {
+    pub(super) fn new(codes: Arc<super::oauth::CodeStore>) -> Self {
+        Self { codes }
+    }
+}
+
+impl CodeRedeemer for CodeStoreRedeemer {
+    fn redeem(&self, plaintext: &str) -> Option<RedeemedCode> {
+        self.codes
+            .redeem(plaintext, Instant::now())
+            .map(|body| RedeemedCode {
+                client_id: body.client_id,
+                client_name: body.client_name,
+                redirect_uri: body.redirect_uri,
+                code_challenge: body.code_challenge,
+                scopes: body.scopes.iter().map(|s| s.as_str().to_owned()).collect(),
+                consented_at: body.consented_at,
+            })
+    }
+}
+
 /// What the token endpoints need: the shared OAuth token store and
 /// the code redeemer. Built by the daemon when `[oauth]` is set.
 #[derive(Clone)]
 pub struct TokenSide {
     pub store: Arc<OauthStore>,
     pub codes: Arc<dyn CodeRedeemer>,
+    /// True when `codes` is still the fail-closed placeholder and
+    /// [`OwnerUi::open_with`] must bind the real redeemer over the
+    /// authorize side's code store (the store does not exist until
+    /// the UI is built). A side built with an explicit redeemer
+    /// keeps it.
+    pub bind_at_open: bool,
 }
 
 impl TokenSide {
     /// The token side with the code grant not yet wired (see
-    /// [`UnwiredCodes`]).
+    /// [`UnwiredCodes`]): the placeholder redeemer fails closed
+    /// until `open_with` binds the real one.
     pub fn unwired(store: Arc<OauthStore>) -> Self {
         Self {
             store,
             codes: Arc::new(UnwiredCodes),
+            bind_at_open: true,
+        }
+    }
+
+    /// The token side with an explicit code redeemer (tests fake
+    /// the authorize side this way). `open_with` leaves it alone.
+    pub fn with_codes(store: Arc<OauthStore>, codes: Arc<dyn CodeRedeemer>) -> Self {
+        Self {
+            store,
+            codes,
+            bind_at_open: false,
         }
     }
 }
@@ -163,10 +212,10 @@ impl OwnerUi {
         // resource; `/connector` included in the refusal. Checked
         // before the code is touched, so a wrong-resource request
         // does not spend it.
-        let Some(discovery) = &self.oauth else {
+        let Some(oauth) = &self.oauth else {
             return oauth_error(StatusCode::NOT_FOUND, "not_found");
         };
-        if resource != discovery.resource() {
+        if resource != oauth.discovery.resource() {
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_target");
         }
         let code_hash = sha256(code.as_bytes());

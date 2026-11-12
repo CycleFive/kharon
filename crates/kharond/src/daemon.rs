@@ -1286,6 +1286,18 @@ async fn bind_owner_ui(
         }),
         _ => None,
     };
+    // REQ-OAU-002 (#229): with `[oauth]` set, the authorize endpoint
+    // admits clients through this — the allow-list gate, the CIMD
+    // fetch and the per-process cache. Its refusals audit through
+    // the broker (DaemonCimdAudit).
+    let admission = cfg.oauth.as_ref().map(|oauth| {
+        Arc::new(crate::api::cimd::ClientAdmission::new(
+            &oauth.clients,
+            Arc::new(DaemonCimdAudit {
+                broker: Arc::clone(broker),
+            }),
+        ))
+    });
     let ui = crate::owner_ui::OwnerUi::open_with(
         &cfg.data_dir,
         crate::owner_ui::OwnerUiOptions {
@@ -1294,6 +1306,7 @@ async fn bind_owner_ui(
             public: ui_cfg.public,
             access,
             oauth,
+            admission,
         },
         Arc::new(DaemonShell {
             broker: Arc::clone(broker),
@@ -1433,6 +1446,23 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
         let entry = crate::owner_ui::oauth_client_refused_entry(&refusal);
         if self.broker.append_audit(entry).is_err() {
             eprintln!("kharond: oauth_client_refused audit append failed");
+        }
+    }
+}
+
+/// Where CIMD admission's `oauth_client_refused` entries go
+/// (REQ-OAU-002, #229): through the broker's log, like the owner
+/// UI's. Best effort, as [`crate::api::cimd::RefusalAudit`]
+/// contracts: a failed append never turns a refusal into an
+/// admission.
+struct DaemonCimdAudit {
+    broker: Arc<DaemonBroker>,
+}
+
+impl crate::api::cimd::RefusalAudit for DaemonCimdAudit {
+    fn client_refused(&self, entry: Entry) {
+        if self.broker.append_audit(entry).is_err() {
+            eprintln!("kharond: oauth client refusal audit append failed");
         }
     }
 }

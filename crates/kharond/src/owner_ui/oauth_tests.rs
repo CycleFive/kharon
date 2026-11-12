@@ -81,6 +81,7 @@ fn open_ui(
                 discovery: Arc::new(discovery()),
                 clients,
             }),
+            admission: None,
         },
         Arc::new(StaticShell(ShellView {
             locked: false,

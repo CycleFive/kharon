@@ -13,10 +13,10 @@
 //!    outbound HTTPS stack (reqwest on rustls, native roots): no
 //!    redirects, a 5 s timeout, a 16 KiB body cap. The host is
 //!    resolved once, every resolved address is checked against the
-//!    refused classes (loopback, private, link-local, the deploy's
-//!    own), and the connection is pinned to those addresses with SNI
-//!    and `Host` from the URL, so DNS rebinding has no second answer
-//!    to swap in.
+//!    refused classes (loopback, private, link-local, NAT64, the
+//!    deploy's own), and the connection is pinned to those addresses
+//!    with SNI and `Host` from the URL, so DNS rebinding has no
+//!    second answer to swap in.
 //! 3. **Validation.** The document's `client_id` must equal the URL
 //!    exactly; `client_name` must be present; `redirect_uris` must
 //!    be non-empty, all `https`, with no localhost; and
@@ -304,8 +304,8 @@ enum FetchFault {
     Status(u16),
     /// The body exceeded [`MAX_DOCUMENT_BYTES`].
     TooLarge,
-    /// A resolved address is loopback, private, link-local or the
-    /// deploy's own.
+    /// A resolved address is loopback, private, link-local, NAT64
+    /// or the deploy's own.
     RefusedAddress,
 }
 
@@ -328,6 +328,12 @@ enum Source {
     Remote,
     #[cfg(test)]
     Fake(Arc<FakeFetch>),
+    /// A scripted DNS answer. The address check, the pin and the
+    /// single `oauth_client_refused` audit are the production ones;
+    /// only `lookup_host` is replaced, so a hostname that resolves
+    /// to NAT64 is testable without a resolver.
+    #[cfg(test)]
+    Resolved(Arc<[IpAddr]>),
 }
 
 impl Source {
@@ -336,6 +342,8 @@ impl Source {
             Self::Remote => fetch_remote(url).await,
             #[cfg(test)]
             Self::Fake(fake) => fake.fetch(),
+            #[cfg(test)]
+            Self::Resolved(ips) => fetch_resolved(url, ips).await,
         }
     }
 }
@@ -411,15 +419,55 @@ async fn fetch_remote(url_str: &str) -> Result<FetchedDocument, FetchFault> {
 
 async fn fetch_remote_inner(url_str: &str) -> Result<FetchedDocument, FetchFault> {
     let url = Url::parse(url_str).map_err(|_| FetchFault::Connect)?;
-    let host = url.host_str().ok_or(FetchFault::Connect)?;
     let port = url.port_or_known_default().ok_or(FetchFault::Connect)?;
+    // `host_str` wraps an IPv6 literal in brackets. `lookup_host`
+    // treats `[64:ff9b::1]` as a DNS name and fails, so the literal
+    // never reached the address check. An IP is the address; only a
+    // domain is resolved. The pin key is that same host, without
+    // brackets, which is what the HTTP stack looks up.
+    let kind = match url.host().ok_or(FetchFault::Connect)? {
+        url::Host::Domain(name) => HostKind::Name(name.to_owned()),
+        url::Host::Ipv4(ip) => HostKind::Addr(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => HostKind::Addr(IpAddr::V6(ip)),
+    };
+    let (host, addrs) = match kind {
+        HostKind::Name(name) => {
+            let addrs = lookup_host_port(&name, port).await?;
+            (name, addrs)
+        }
+        HostKind::Addr(ip) => (ip.to_string(), vec![SocketAddr::new(ip, port)]),
+    };
+    fetch_pinned(url, &host, &addrs).await
+}
+
+/// A URL host, copied off the `Url` so a DNS lookup can await
+/// without borrowing it.
+enum HostKind {
+    Name(String),
+    Addr(IpAddr),
+}
+
+async fn lookup_host_port(host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchFault> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_| FetchFault::Connect)?
         .collect();
     if addrs.is_empty() {
-        return Err(FetchFault::Connect);
+        Err(FetchFault::Connect)
+    } else {
+        Ok(addrs)
     }
+}
+
+/// The address check and pinned connect, shared by the production
+/// resolver and the scripted-resolution tests. A refusal here is a
+/// fetch fault only: [`ClientAdmission::admit`] writes the one
+/// `oauth_client_refused` entry.
+async fn fetch_pinned(
+    url: Url,
+    host: &str,
+    addrs: &[SocketAddr],
+) -> Result<FetchedDocument, FetchFault> {
     // All-or-nothing: any refused address in the answer refuses the
     // fetch, so a mixed answer can't steer the pinned connection.
     if addrs.iter().any(|a| address_refused(a.ip())) {
@@ -433,12 +481,34 @@ async fn fetch_remote_inner(url_str: &str) -> Result<FetchedDocument, FetchFault
         .use_preconfigured_tls(tls)
         // Pin the checked answer: reqwest connects to these
         // addresses while SNI and `Host` come from the URL.
-        .resolve_to_addrs(host, &addrs)
+        .resolve_to_addrs(host, addrs)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(FETCH_TIMEOUT)
         .build()
         .map_err(|_| FetchFault::Connect)?;
     get_document(&client, &url).await
+}
+
+/// Production fetch with a scripted DNS answer in place of
+/// [`lookup_host_port`].
+#[cfg(test)]
+async fn fetch_resolved(url_str: &str, ips: &[IpAddr]) -> Result<FetchedDocument, FetchFault> {
+    let url = Url::parse(url_str).map_err(|_| FetchFault::Connect)?;
+    let host = match url.host().ok_or(FetchFault::Connect)? {
+        url::Host::Domain(name) => name.to_owned(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    };
+    let port = url.port_or_known_default().ok_or(FetchFault::Connect)?;
+    if ips.is_empty() {
+        return Err(FetchFault::Connect);
+    }
+    let addrs: Vec<SocketAddr> = ips
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    fetch_pinned(url, &host, &addrs).await
 }
 
 /// One GET through an already-built client: 200 only, body streamed
@@ -481,7 +551,7 @@ async fn get_document(client: &reqwest::Client, url: &Url) -> Result<FetchedDocu
 }
 
 /// Whether a resolved address may be connected to for a CIMD fetch:
-/// not loopback, private, link-local or the deploy's own
+/// not loopback, private, link-local, NAT64 or the deploy's own
 /// (REQ-OAU-002).
 fn address_refused(ip: IpAddr) -> bool {
     class_refused(ip) || is_own_address(ip)
@@ -527,7 +597,28 @@ fn v6_class_refused(a: Ipv6Addr) -> bool {
     let s0 = a.segments()[0];
     // fe80::/10 link-local; fc00::/7 unique local (the v6 private);
     // ff00::/8 multicast.
-    (s0 & 0xffc0) == 0xfe80 || (s0 & 0xfe00) == 0xfc00 || (s0 & 0xff00) == 0xff00
+    (s0 & 0xffc0) == 0xfe80 || (s0 & 0xfe00) == 0xfc00 || (s0 & 0xff00) == 0xff00 || is_nat64(a)
+}
+
+/// A NAT64-mapped address. Connecting to one does not reach the
+/// address in the URL: a translator turns it into the embedded
+/// IPv4, which can be a class already refused here (loopback,
+/// private, the tailnet) without that IPv4 ever appearing in the
+/// DNS answer.
+///
+/// Two prefixes, and they do not overlap. `64:ff9b::/96` (RFC 6052)
+/// is the well-known prefix DNS64 synthesizes into; its last 32 bits
+/// are the embedded IPv4, and the whole prefix is refused, public
+/// embeddings included. `64:ff9b:1::/48` (RFC 8215) is the local-use
+/// prefix, organizational space in the same sense as `fc00::/7`.
+/// The well-known /96 requires bits 48–95 to be zero, so the
+/// local-use prefix (hextet 3 = 1) sits beside it, not inside it.
+fn is_nat64(a: Ipv6Addr) -> bool {
+    let s = a.segments();
+    let well_known =
+        s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0;
+    let local_use = s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1;
+    well_known || local_use
 }
 
 /// Whether `ip` is one of this host's own addresses: an address
@@ -938,6 +1029,24 @@ mod tests {
             // IPv4-mapped: judged as the IPv4 they name.
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052),
+            // including a public embedded IPv4: the prefix itself
+            // is the refusal, not the class of the embedding.
+            "64:ff9b::",
+            "64:ff9b::1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",
+            "64:ff9b::6440:1",
+            "64:ff9b::808:808",
+            "64:ff9b::ffff:ffff",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::8.8.8.8",
+            // Local-use NAT64 64:ff9b:1::/48 (RFC 8215). Beside the
+            // /96, not inside it.
+            "64:ff9b:1::",
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1::192.168.0.1",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
         ];
         for ip in refused {
             assert!(class_refused(ip.parse().unwrap()), "{ip} must be refused");
@@ -951,6 +1060,11 @@ mod tests {
             "172.32.0.1",
             "2606:4700:4700::1111",
             "::ffff:8.8.8.8",
+            // One bit outside 64:ff9b::/96, and the next hextet
+            // after the local-use /48. Neither is NAT64.
+            "64:ff9b:0:0:0:1::",
+            "64:ff9b:2::1",
+            "64:ff9a::1",
         ];
         for ip in allowed {
             assert!(
@@ -1001,6 +1115,79 @@ mod tests {
             audit.entries()[0].detail_code.as_deref(),
             Some("cimd_unavailable")
         );
+    }
+
+    /// One `admit`: `cimd_unavailable`, and exactly one
+    /// `oauth_client_refused` written by `ClientAdmission`.
+    async fn assert_refused_once(
+        admission: &ClientAdmission,
+        audit: &Recorded,
+        url: &str,
+        origin: &str,
+    ) {
+        let err = admission.admit(url).await.unwrap_err();
+        assert_eq!(err.code(), RefusalCode::CimdUnavailable, "{url}");
+        let entries = audit.entries();
+        assert_eq!(entries.len(), 1, "each refusal is audited once");
+        assert_eq!(entries[0].event.as_str(), "oauth_client_refused");
+        assert_eq!(entries[0].detail_code.as_deref(), Some("cimd_unavailable"));
+        assert_eq!(entries[0].origin.as_deref(), Some(origin));
+        assert_eq!(entries[0].agent_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_literal_nat64_cimd_url_is_refused_once() {
+        // Production path: the URL host is an IPv6 literal, so it is
+        // judged as that address and refused before any connect.
+        // Both prefixes, and a public embedding (8.8.8.8) that the
+        // v4 checks would have allowed.
+        let urls = [
+            "https://[64:ff9b::7f00:1]/cimd.json",
+            "https://[64:ff9b::808:808]/cimd.json",
+            "https://[64:ff9b:1::a00:1]/cimd.json",
+        ];
+        for url in urls {
+            let audit = Recorded::new();
+            let admission = ClientAdmission::new(&[url.to_owned()], audit.clone());
+            let err = fetch_remote(url).await.unwrap_err();
+            assert_eq!(err, FetchFault::RefusedAddress, "{url}");
+            let origin = url::Url::parse(url).unwrap().host_str().unwrap().to_owned();
+            assert_refused_once(&admission, &audit, url, &origin).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hostname_resolving_to_nat64_is_refused_once() {
+        // The DNS answer is scripted; the check and the audit are
+        // the production ones. A mixed answer is refused too: one
+        // NAT64 address is enough.
+        let url = "https://dashboard.example/cimd.json";
+        let cases: &[(&str, &[&str])] = &[
+            ("well-known prefix", &["64:ff9b::a00:1"]),
+            ("well-known, public embedding", &["64:ff9b::8.8.8.8"]),
+            ("local-use prefix", &["64:ff9b:1::192.168.0.1"]),
+            (
+                "mixed public and nat64",
+                &["2606:4700:4700::1111", "64:ff9b::808:808"],
+            ),
+        ];
+        for (name, ips) in cases {
+            let audit = Recorded::new();
+            let resolved: Arc<[IpAddr]> = ips
+                .iter()
+                .map(|s| s.parse().expect(s))
+                .collect::<Vec<_>>()
+                .into();
+            let err = fetch_resolved(url, &resolved).await.unwrap_err();
+            assert_eq!(err, FetchFault::RefusedAddress, "{name}");
+            assert_eq!(err.class(), "refused_address", "{name}");
+            let admission = ClientAdmission::with_source(
+                &[url.to_owned()],
+                audit.clone(),
+                Source::Resolved(resolved),
+            );
+            assert_refused_once(&admission, &audit, url, "dashboard.example").await;
+        }
     }
 
     // ---- get_document against a local HTTP server ----

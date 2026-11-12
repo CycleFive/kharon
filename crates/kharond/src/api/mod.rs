@@ -24,8 +24,12 @@
 //! - [`oauth`]: OAuth discovery for N3 Connect (REQ-OAU-001; #228):
 //!   the RFC 9728 / RFC 8414 metadata documents and the `/mcp` 401
 //!   challenge, all derived from `[oauth]` config.
+//! - [`cimd`]: OAuth client admission for N3 Connect (REQ-OAU-002;
+//!   #229): the `[oauth] clients` allow-list gate, the SSRF-hardened
+//!   CIMD fetch, document validation and the per-process cache.
 
 pub mod approval;
+pub mod cimd;
 pub mod core;
 pub mod error;
 pub mod fill;

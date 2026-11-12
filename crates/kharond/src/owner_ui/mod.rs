@@ -105,6 +105,7 @@ use zeroize::Zeroizing;
 use self::sealed::{Burn, Sealed};
 use self::store::PasskeyStore;
 use self::webauthn::{RegisteredCredential, b64url_decode, b64url_encode, ct_eq};
+use crate::api::cimd::ClientAdmission;
 use crate::api::http::{
     ApprovalRedeemer, OWNER_APPROVE_PREFIX, OWNER_DENY_PREFIX, dispatch_owner_approval,
 };
@@ -402,6 +403,10 @@ pub struct OwnerUi {
     /// serves its RFC 8414 metadata. `None` → the well-known path
     /// 404s like any other unknown one.
     oauth: Option<Arc<Discovery>>,
+    /// OAuth client admission (REQ-OAU-002; #229): the allow-list,
+    /// CIMD fetch and cache the authorize endpoint (#230) admits
+    /// through. `None` → no `[oauth]`, so no client is admissible.
+    admission: Option<Arc<ClientAdmission>>,
 }
 
 /// A ceremony as `options` hands it out: the sealed token (the
@@ -460,6 +465,9 @@ pub struct OwnerUiOptions {
     /// OAuth discovery, when `[oauth]` is set (REQ-OAU-001): this
     /// hostname then serves the RFC 8414 metadata document.
     pub oauth: Option<Arc<Discovery>>,
+    /// OAuth client admission, when `[oauth]` is set (REQ-OAU-002):
+    /// the authorize endpoint (#230) admits clients through it.
+    pub admission: Option<Arc<ClientAdmission>>,
 }
 
 impl OwnerUi {
@@ -484,6 +492,7 @@ impl OwnerUi {
                 public: false,
                 access: None,
                 oauth: None,
+                admission: None,
             },
             shell,
             audit,
@@ -505,6 +514,7 @@ impl OwnerUi {
             public,
             access,
             oauth,
+            admission,
         } = opts;
         // The Access gate exists only behind the edge. Config already
         // refuses `access` without `public_origin`; this is a second guard.
@@ -539,7 +549,14 @@ impl OwnerUi {
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
             oauth,
+            admission,
         }))
+    }
+
+    /// The OAuth client admission the authorize endpoint (#230)
+    /// admits through, when `[oauth]` is set (REQ-OAU-002).
+    pub fn client_admission(&self) -> Option<&Arc<ClientAdmission>> {
+        self.admission.as_ref()
     }
 
     /// Attach the web unlock backend. The daemon calls this once,
@@ -2755,6 +2772,7 @@ mod tests {
                     public: true,
                     access: None,
                     oauth,
+                    admission: None,
                 },
                 shell.clone(),
                 Arc::new(NoAudit),
@@ -3106,6 +3124,7 @@ mod tests {
                     public,
                     access: None,
                     oauth: None,
+                    admission: None,
                 },
                 Arc::new(StaticShell(ShellView {
                     locked: false,
@@ -4244,6 +4263,7 @@ mod tests {
                 public: true,
                 access: None,
                 oauth: None,
+                admission: None,
             },
             Arc::new(StaticShell(ShellView {
                 locked: false,
@@ -4455,6 +4475,7 @@ mod tests {
                 public: false,
                 access: Some(verifier),
                 oauth: None,
+                admission: None,
             },
             Arc::new(StaticShell(ShellView {
                 locked: false,
@@ -4502,6 +4523,7 @@ mod tests {
                     public: true,
                     access: Some(verifier),
                     oauth,
+                    admission: None,
                 },
                 Arc::new(StaticShell(ShellView {
                     locked: true,

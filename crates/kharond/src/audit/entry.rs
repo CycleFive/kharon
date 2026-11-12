@@ -106,6 +106,16 @@ pub enum Event {
     /// changes; a failed append removes nothing (REQ-APR-005,
     /// REQ-AUD-003).
     PasskeyRemoved,
+    /// REQ-OAU-002 (#229): an authorize request's client was refused
+    /// at admission — not on the `[oauth] clients` allow-list, its
+    /// CIMD could not be fetched, the document was invalid, or the
+    /// requested `redirect_uri` is not one of the document's. No
+    /// `agent_id`; `origin` is the client's CIMD hostname and
+    /// `detail_code` is one of `not_allowlisted`, `cimd_unavailable`,
+    /// `cimd_invalid` or `redirect_mismatch` (SPEC §7, #226 I7).
+    /// Best effort, like [`Event::ConnectorAuthFail`]: a failed
+    /// append never turns the refusal into an admission.
+    OauthClientRefused,
 }
 
 impl Event {
@@ -145,6 +155,7 @@ impl Event {
             Event::PasskeyEnrolled => "passkey_enrolled",
             Event::PasskeyListed => "passkey_listed",
             Event::PasskeyRemoved => "passkey_removed",
+            Event::OauthClientRefused => "oauth_client_refused",
         }
     }
 }

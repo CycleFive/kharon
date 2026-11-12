@@ -818,6 +818,36 @@ sign-in: the passkey is still required.
    `https://kharon-owner.example.com/` in a private window still goes to
    the Access login.
 
+6. **OAuth bypass (with `[oauth]`).** A dashboard's MCP client fetches
+   the RFC 8414 metadata, and its backend calls the token and revoke
+   endpoints, without an Access login. Bypass exactly these three
+   paths, on the same **separate** bypass application as step 5 (or a
+   second one like it, with action **Bypass**, Include **Everyone**),
+   never on the owner application:
+
+   - `kharon-owner.example.com/.well-known/oauth-authorization-server`
+   - `kharon-owner.example.com/oauth/token`
+   - `kharon-owner.example.com/oauth/revoke`
+
+   Do this even with ntfy off. kharond's own Access check already skips
+   these three paths and the step 5 routes (`EDGE_EXEMPT` in
+   `owner_ui/mod.rs`), but it never sees a request the edge stopped
+   first. Without the bypass, discovery fails before the consent page,
+   and a Connect that did complete can never refresh. Leave
+   `/oauth/authorize` and `/oauth/consent/*` behind Access: the owner's
+   browser signs in to Access, then gives the passkey. The token and
+   revoke endpoints take no session and are protected by PKCE, the
+   single-use code and the refresh token (REQ-OAU-004, REQ-OAU-008).
+   Check it:
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' https://kharon-owner.example.com/.well-known/oauth-authorization-server   # 200, no Access login
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST https://kharon-owner.example.com/oauth/token                       # 400 from kharond, not an Access redirect
+   ```
+
+   The second line is a deliberate bad request (`invalid_request`). It
+   counts as one failure in the owner UI's per-source throttle.
+
 When everyone gets 403, read the kharond log first
 (`docker compose logs kharon | grep 'owner UI Access'`). There is one
 line per failed key fetch, with a fixed failure class
@@ -1052,44 +1082,108 @@ covers it when it shares an address with `[api]`. Otherwise add one
 line for it, with the interface cloudflared arrives on (for example
 `tailscale0`).
 
-### OAuth discovery (N3, #228)
+### OAuth discovery and Connect endpoints (N3)
 
 With `[oauth]` set, kharond is also an OAuth authorization server
-(N3 Connect, REQ-OAU-001) and serves discovery on both hostnames.
-The tunnel needs two new paths (the owner applies Cloudflare-side
-changes, as everywhere in this guide):
+(N3 Connect, REQ-OAU-001). A dashboard's MCP client discovers it from
+the `/mcp` 401, sends the owner's browser to the owner hostname to
+consent with the passkey, and then redeems a code for tokens there.
+The owner applies the Cloudflare-side changes, as everywhere in this
+guide.
 
-| Hostname | New tunnel path | Reaches |
-|---|---|---|
-| `kharon.twkr.io` | `^/.well-known/oauth-protected-resource$` and `^/.well-known/oauth-protected-resource/mcp$` | RFC 9728 protected-resource metadata on `[public_ingress]`, unauthenticated |
-| `kharon-owner.twkr.io` | `^/.well-known/oauth-authorization-server$` | RFC 8414 authorization-server metadata on the owner UI listener |
+| Hostname | Path | Served by | Who calls it |
+|---|---|---|---|
+| `kharon.twkr.io` | `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource/mcp` | `[public_ingress]` (RFC 9728 protected-resource metadata, unauthenticated) | the MCP client |
+| `kharon-owner.twkr.io` | `GET /.well-known/oauth-authorization-server` | owner UI listener (RFC 8414 metadata, unauthenticated) | the MCP client |
+| `kharon-owner.twkr.io` | `GET /oauth/authorize`, `GET /oauth/consent/<token>`, `POST /oauth/consent/*` | owner UI listener; consent needs a fresh passkey assertion | the owner's browser |
+| `kharon-owner.twkr.io` | `POST /oauth/token`, `POST /oauth/revoke` | owner UI listener; no session, no `Origin` | the dashboard's backend |
 
-If the owner hostname sits behind a Cloudflare Access application
-(the `[owner_ui.access]` shape), that application also needs a
-**Bypass** policy for the exact path
-`/.well-known/oauth-authorization-server`. MCP clients fetch the
-RFC 8414 document before any sign-in and hold no Access token, so
-without the bypass discovery is refused at the edge — kharond
-itself exempts the path from its own Access check, but it never
-sees the request if the edge stops it first.
+**Tunnel routes.** The gateway hostname needs two more routes beside
+`^/mcp$` and `^/connector$`, both to `http://127.0.0.1:8790`:
+`^/\.well-known/oauth-protected-resource$` and
+`^/\.well-known/oauth-protected-resource/mcp$` (see the table in
+[Creating the tunnel](#creating-the-tunnel-owner)). The owner hostname
+needs nothing new: its route from
+[Publishing the owner UI](#publishing-the-owner-ui) step 3 has an
+empty path, so it already covers every path above. Without `[oauth]`,
+all of these paths answer the listener's usual 404.
+
+**Cloudflare Access.** If the owner hostname sits behind an Access
+application (the `[owner_ui.access]` shape), the metadata, token and
+revoke paths need the Access bypass in
+[step 6 of that section](#optional-cloudflare-access-in-front): the
+MCP client and the dashboard's backend are not browsers and hold no
+Access login. `/oauth/authorize` and the consent routes stay behind
+Access; the owner's browser signs in to Access first, then gives the
+passkey.
+
+**Config.**
 
 ```toml
 [oauth]
-# client_id URLs (CIMD) this deploy accepts for Connect; see
-# REQ-OAU-002. Discovery is served whether or not any are listed.
+# client_id URLs (CIMD) this deploy accepts for Connect (REQ-OAU-002).
+# Only listed URLs are ever fetched. Discovery is served whether or not
+# any are listed.
 clients = ["https://dashboard.example.com/.well-known/kharon-client.json"]
 ```
 
-`[oauth]` requires `[public_ingress]` with `public_host` set and
-an https `[owner_ui]` origin; kharond refuses to start otherwise
+`[oauth]` requires `[public_ingress]` with `public_host` set and an
+https `[owner_ui]` origin; kharond refuses to start otherwise
 (`oauth_needs_public_ingress`, `oauth_needs_public_host`,
-`oauth_needs_owner_ui`, `oauth_owner_origin_not_https`). The
-issuer is the owner origin. The metadata names the `/oauth/*`
-endpoints on the owner hostname; they arrive with the rest of N3
-(#230, #231). With `[oauth]` set, a `401` from `/mcp` also carries
-the discovery challenge (`resource_metadata`, `scope`). Without
-`[oauth]`, both well-known paths answer the usual 404 on both
-listeners and the `401` keeps its bare challenge.
+`oauth_needs_owner_ui`, `oauth_owner_origin_not_https`). Each
+`clients` entry must be an https URL (`oauth_client_not_https`). The
+issuer is the owner origin, and the RFC 8414 metadata names
+`<owner origin>/oauth/authorize`, `/oauth/token` and `/oauth/revoke`,
+the scopes `kharon:read`, `kharon:fill` and `kharon:request`, PKCE
+`S256` only, public clients only (`token_endpoint_auth_methods_supported:
+["none"]`) and `client_id_metadata_document_supported: true`. There
+is no dynamic client registration. With `[oauth]` set, a `401` from
+`/mcp` carries the discovery challenge:
+
+```text
+WWW-Authenticate: Bearer realm="kharon", resource_metadata="https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp", scope="kharon:read kharon:fill kharon:request"
+```
+
+Without `[oauth]` the `401` keeps its bare challenge.
+
+**The client's metadata document (CIMD).** Each dashboard that may
+Connect publishes one JSON document at the HTTPS URL that is its
+`client_id`, and that URL goes in `clients`. The dashboard's operator
+hosts it, not kharon. For example, at
+`https://dashboard.example.com/.well-known/kharon-client.json`:
+
+```json
+{
+  "client_id": "https://dashboard.example.com/.well-known/kharon-client.json",
+  "client_name": "Example dashboard",
+  "redirect_uris": ["https://dashboard.example.com/oauth/callback"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+kharond checks it as follows (REQ-OAU-002, `api/cimd.rs`); anything
+else is refused and audited as `oauth_client_refused`:
+
+- `client_id` equals the URL it was fetched from, exactly.
+- `client_name` is a non-empty string. The consent screen shows it
+  with the document's hostname and the redirect's hostname. Keep it
+  to 128 characters with no control characters, or the authorize
+  page refuses to render the request.
+- `redirect_uris` is a non-empty array. Every entry is an `https` URL
+  with no fragment whose host is not `localhost`, a `.localhost`
+  name or a loopback address. A Connect's `redirect_uri` must equal
+  one entry exactly, and must also carry no userinfo, whitespace or
+  backslash.
+- `token_endpoint_auth_method` is absent or `"none"`. Other keys are
+  ignored.
+- The URL answers `200` directly (no redirect is followed) within
+  5 seconds, with a body of at most 16 KiB. Its host must not resolve
+  to a loopback, private, link-local, CGNAT/tailnet (`100.64.0.0/10`)
+  or NAT64 address, or to one of the broker's own addresses.
+- kharond caches the document in memory for its `Cache-Control`
+  max-age, clamped to 1–24 hours. A failed fetch with no cached copy
+  refuses the Connect (`cimd_unavailable`); a changed `client_name`
+  shows once the cached copy expires.
 
 ### Connections, Disconnect and panic (N3, #233)
 
@@ -1139,7 +1233,16 @@ dashboard-managed tunnel. Add public-hostname routes for
 |---|---|
 | `^/mcp$` | `http://127.0.0.1:8790` |
 | `^/connector$` | `http://127.0.0.1:8790` |
+| `^/\.well-known/oauth-protected-resource$` (with `[oauth]`) | `http://127.0.0.1:8790` |
+| `^/\.well-known/oauth-protected-resource/mcp$` (with `[oauth]`) | `http://127.0.0.1:8790` |
 | (catch-all) | `HTTP Status: 404` |
+
+The two `.well-known` routes are needed only when the deploy has
+`[oauth]` for dashboard Connect (see
+[OAuth discovery and Connect endpoints](#oauth-discovery-and-connect-endpoints-n3)).
+Without them a dashboard cannot discover the authorization server.
+The owner hostname has its own route; see
+[Publishing the owner UI](#publishing-the-owner-ui).
 
 The dashboard creates the proxied DNS record. Copy the tunnel token
 into the secret file without echoing it or putting it in argv, as in
@@ -1232,10 +1335,10 @@ on the host.
 
 The owner UI gets its own hostname, `kharon-owner.twkr.io`, not a path
 on the gateway hostname. See
-[Publishing the owner UI](#publishing-the-owner-ui). The MCP
-authorization work (N3) serves its discovery from both hostnames —
-see [OAuth discovery](#oauth-discovery-n3-228) — and adds the
-`/oauth/*` endpoints here as it lands.
+[Publishing the owner UI](#publishing-the-owner-ui). With
+`[oauth]`, the owner hostname also serves the authorization-server
+metadata and the `/oauth/*` endpoints; see
+[OAuth discovery and Connect endpoints](#oauth-discovery-and-connect-endpoints-n3).
 
 ### Alternative: a locally managed tunnel
 

@@ -93,3 +93,14 @@ public_origin = "https://kharon-owner.example.com"
 # [owner_ui.access]
 # team_domain = "myteam.cloudflareaccess.com"
 # audience = "paste-the-AUD-tag-here"
+
+# Dashboard Connect (N3, REQ-OAU-001/-002): kharond as the OAuth
+# authorization server for MCP clients. Needs `public_host` set under
+# [public_ingress] above and the https `public_origin` under
+# [owner_ui]; kharond refuses to start otherwise. Each entry is the
+# https URL of a dashboard's client metadata document (CIMD); only
+# listed URLs are ever fetched. The tunnel also needs the two
+# `.well-known/oauth-protected-resource` routes on the gateway host.
+# See docs/deployment.md, "OAuth discovery and Connect endpoints".
+# [oauth]
+# clients = ["https://dashboard.example.com/.well-known/kharon-client.json"]

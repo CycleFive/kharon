@@ -119,7 +119,7 @@ fn request_bytes_matches_what_http_sends() {
 **Interfaces:**
 - Consumes: Task 1's `edge_pki`, `https_raw`, `request_bytes`, `mcp_call_bytes`; `owner_ui_support::{Http, VirtAuth, b64url}`; `compose_support::{env, manifest, write_public, fixture_scope, data_volume_of, redact}`; `docker_support::{docker, docker_raw, wait_for_log}`.
 - Produces, in the test file, for Task 3:
-  - `struct Run` (behind the same `run()` / `static RUN` pattern as `req_arch_002_compose_ws_e2e.rs:359–363`, plus a `static RT: LazyLock<Runtime>` with `block_on`, because the dashboard listener must outlive `setup()`) holding at least: `edge_ca: String`, `cookie: String` (the `__Host-kharon_owner=…` pair), `auth: Mutex<VirtAuth>`, `dashboard: Dashboard`, `client_id: String`, `redirect_uri: String`, `discovery: Discovered`.
+  - `struct Run` (behind the same `run()` / `static RUN` pattern as `req_arch_002_compose_ws_e2e.rs:359–363`, plus a `static RT: LazyLock<Runtime>` with `block_on`, because the dashboard listener must outlive `setup()`) holding at least: `edge_ca: String`, `cookie: String` (the `__Host-kharon_owner=…` pair), `dashboard: Dashboard`, `client_id: String`, `redirect_uri: String`, `discovery: Discovered`.
   - `struct Dashboard { port: u16, fetches: Arc<AtomicUsize> }`.
   - `struct Discovered { resource: String, issuer: String, authorization_endpoint: String, token_endpoint: String, revocation_endpoint: String }`.
   - `async fn owner(run_edge_ca: &str, req: Http<'_>) -> Result<RawResponse, String>`: `https_raw("203.0.113.1:8444", "kharon-owner.e2e.test", ca, &request_bytes(OWNER_ORIGIN, &req.host(OWNER_HOST).header("CF-Connecting-IP", "198.51.100.10")))`.
@@ -286,7 +286,7 @@ async fn dashboard_serves_its_metadata_document_and_counts_fetches() {
 - `req_apr_009_compose_each_edge_refuses_the_other_hostname`: step 8b.
 - `req_oau_007_compose_a_connect_has_no_browser`: steps 2 and 3.
 - `req_oau_compose_audit_chain_records_both_connects_and_verifies`: three `oauth_connect` entries (A, C, B; `result == "connected"`, `origin` containing `dashboard.e2e.test`), in order before their endings; the `audit verify` output says the log is OK. Audit lines are read into a typed struct with `event`, `agent_id`, `result`, `detail_code`, `channel`, `origin`, all optional but `event`.
-- `req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state`: after the positive controls in Review Focus 4, none of `at0 at1 at2 atB rt0 rt1 rt2 rtB`, the two codes, the enrolment code and the session cookie's value appears in kharond's log, `state.json` or `audit.jsonl`. `state.json` holds no string that starts with `kh_at_` or `kh_rt_` at all (tokens are stored as hashes).
+- `req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state`: after the positive controls in Review Focus 4, none of the tokens of the three Connects (`at0 at1 at2 rt0 rt1 rt2`, C's two pairs, `atB rtB`), the three codes, the enrolment code and the session cookie's value appears in kharond's log, `state.json` or `audit.jsonl`. None of the three texts holds any string that starts with `kh_at_` or `kh_rt_` (tokens are stored as hashes).
 
 - [x] **Step 1: Write the twelve ignored tests first**, against a `Scenario` struct with the fields they need. They compile and are skipped locally.
 - [x] **Step 2: Write `scenario()`** and call it from `setup()`.

@@ -538,23 +538,14 @@ impl OwnerOps for DaemonOwner {
 
     async fn panic_lock(&self) -> Result<(), OwnerFailure> {
         let broker = Arc::clone(&self.broker);
-        // Invalidate before the spawn, and again inside the blocking
-        // task right after the broker's panic returns: that task runs
-        // to the end even if the owner-socket client disconnects and
-        // this future is dropped. Rotating twice is harmless.
-        let ui = self.owner_ui.clone();
-        if let Some(ui) = &ui {
-            ui.invalidate_sealed();
-        }
-        tokio::task::spawn_blocking(move || {
-            let outcome = broker.panic_lock().map_err(map_grant_error);
-            if let Some(ui) = &ui {
-                ui.invalidate_sealed();
-            }
-            outcome
-        })
-        .await
-        .unwrap_or(Err(OwnerFailure::AuditFailed))
+        // No sealed-token invalidation here (#252): the broker's
+        // panic hook does it (registered in `bind_owner_ui`). The
+        // hook still runs if this future is dropped mid-await —
+        // dropping the join handle detaches the blocking task, so
+        // the panic (and its hooks) runs to the end regardless.
+        tokio::task::spawn_blocking(move || broker.panic_lock().map_err(map_grant_error))
+            .await
+            .unwrap_or(Err(OwnerFailure::AuditFailed))
     }
 }
 
@@ -1367,6 +1358,19 @@ async fn bind_owner_ui(
     .map_err(|e| StartupError::OwnerUiStore {
         kind: e.kind().to_string(),
     })?;
+    // #252: a panic ends every sealed owner-UI token in flight —
+    // registered once, on the broker's panic hook, so every panic
+    // path (web route, owner socket, any future one) gets it and no
+    // caller does it separately. `Weak`: the UI already holds the
+    // broker (its approvals backend); a strong arc back would cycle.
+    {
+        let weak = Arc::downgrade(&ui);
+        broker.add_panic_hook(Arc::new(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.invalidate_sealed();
+            }
+        }));
+    }
     Ok((Some((listener, ui)), Some(addr), Some(origin)))
 }
 

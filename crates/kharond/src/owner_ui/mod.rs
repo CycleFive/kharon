@@ -1604,10 +1604,12 @@ impl OwnerUi {
         if !body.confirm {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         }
+        // No sealed-token invalidation here (#252): the broker's
+        // panic hook does it, on every panic path and whatever the
+        // outcome (the panic keeps grants revoked even when its own
+        // audit append fails, so its hooks run either way). The
+        // daemon registers the hook when it builds this UI.
         let outcome = self.approvals.panic();
-        // Whether or not the panic's own audit append succeeded: it
-        // keeps grants revoked either way, so it ends ceremonies too.
-        self.invalidate_sealed();
         match outcome {
             Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
             Err(e) => decide_error(e),
@@ -1986,7 +1988,9 @@ impl OwnerUi {
     /// pending authorization stop opening, because both are sealed
     /// under this key, and every unredeemed authorization code is
     /// dropped (REQ-OAU-005, REQ-REV-002). An ordinary lock does not
-    /// call this.
+    /// call this. Called only from the broker's panic hook (#252 —
+    /// the daemon registers it in `bind_owner_ui`); no panic caller
+    /// calls it directly.
     pub fn invalidate_sealed(&self) {
         self.sealed.invalidate();
         self.codes.clear();
@@ -3818,7 +3822,7 @@ mod tests {
     /// built `unwired` is bound at open to the UI's own code
     /// store, so a code the authorize side issued redeems at the
     /// token endpoint for real. A panic drops unredeemed codes
-    /// (REQ-OAU-005): both panic surfaces call
+    /// (REQ-OAU-005): the broker's panic hook calls
     /// `OwnerUi::invalidate_sealed`, which clears the store.
     #[test]
     fn oauth_token_redeems_through_the_real_code_store() {
@@ -5789,6 +5793,91 @@ mod tests {
         };
         let refused = ui.burn_ceremony(&req, &opened).expect("refused");
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            ui.open_ceremony(&ceremony.id, CeremonyKind::Login)
+                .is_none()
+        );
+    }
+
+    /// #252: the sealed invalidation is a hook on the broker's
+    /// panic, not a step in any caller. A panic invoked directly on
+    /// the broker — no web route, no owner socket — kills an
+    /// outstanding ceremony token, and every panic runs the hook.
+    #[test]
+    fn a_direct_broker_panic_kills_an_outstanding_ceremony() {
+        use crate::api::token::TokenStore;
+        use crate::api::{AuditSink, Broker};
+        use crate::export::ExportSession;
+        use crate::lock::{AuditError, LockController, LockPolicy, StaticHardening, SystemClock};
+        use crate::origin::OriginConfig;
+
+        struct NullSink;
+        impl AuditSink for NullSink {
+            fn append(&mut self, _entry: crate::audit::Entry) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+
+        let (_token, hash) = crate::api::token::generate("alpha");
+        let tokens = TokenStore::new([("alpha", hash.as_str())]).unwrap();
+        let lock = LockController::<ExportSession, SystemClock>::new(
+            LockPolicy {
+                require_mlock: false,
+                ..LockPolicy::default()
+            },
+            SystemClock,
+            Box::new(StaticHardening::all_ok()),
+        );
+        let broker = Arc::new(Broker::new(
+            tokens,
+            lock,
+            Box::new(NullSink),
+            OriginConfig { allow_http: false },
+        ));
+        broker.wire_lock_audit();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ui = OwnerUi::open(
+            dir.path(),
+            "localhost",
+            ORIGIN,
+            Arc::new(StaticShell(ShellView {
+                locked: true,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            broker.clone() as Arc<dyn OwnerApprovals>,
+        )
+        .unwrap();
+        // The daemon's registration (`bind_owner_ui`), in miniature.
+        let weak = Arc::downgrade(&ui);
+        broker.add_panic_hook(Arc::new(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.invalidate_sealed();
+            }
+        }));
+
+        let ceremony = ui.begin(CeremonyKind::Login);
+        assert!(
+            ui.open_ceremony(&ceremony.id, CeremonyKind::Login)
+                .is_some(),
+            "the token opens before the panic"
+        );
+        broker.panic_lock().unwrap();
+        assert!(
+            ui.open_ceremony(&ceremony.id, CeremonyKind::Login)
+                .is_none(),
+            "a direct broker panic killed the outstanding token"
+        );
+        // A token sealed after the panic works, and a second panic
+        // (already locked) kills that one too: the hook runs on
+        // every panic, not just the one that transitions.
+        let ceremony = ui.begin(CeremonyKind::Login);
+        assert!(
+            ui.open_ceremony(&ceremony.id, CeremonyKind::Login)
+                .is_some()
+        );
+        broker.panic_lock().unwrap();
         assert!(
             ui.open_ceremony(&ceremony.id, CeremonyKind::Login)
                 .is_none()

@@ -4,7 +4,8 @@ Status: design, 2026-11-12, for #235. Follow-up 9 of the N3 design
 ([`2026-11-10-n3-mcp-oauth-connect-design.md`](2026-11-10-n3-mcp-oauth-connect-design.md),
 #213, #226), section D7. Builder: Nyx. Reviewers: Muse and Duet.
 Q3 (the malicious-edge residual) was accepted by Lothrop on
-2026-11-12, relayed by Muse on #284. Q1 and Q2 stay open.
+2026-11-12, and confirmed the same day in the sharpened form below.
+Q1 and Q2 stay open.
 
 This note is the phase 2 design D7 deferred. Where it and the D7 sketch
 disagree, this note is the one to implement. It confirms assumption A7
@@ -53,7 +54,9 @@ written as open questions at the end rather than as assumptions: the
 operational acceptance of provisioning the pin, and the consent-screen
 words. The residual that a malicious TLS-terminating edge can use a
 connector credential it sees on the token endpoint was accepted by
-Lothrop on 2026-11-12 (Q3, below). No further mitigation is added.
+Lothrop on 2026-11-12 (Q3, below). Phase 2 adds no further mitigation.
+The known later closure, an identity key beside the pin, is recorded
+and is not part of this design.
 
 ## Goals
 
@@ -587,17 +590,38 @@ runtime already has. D1 spends that anchor on the pin. A second
 provisioned key, plus a hello proof, would be a wire change for a
 threat the pin does not cover, and this note does not half-specify it.
 
-**Ruling (Lothrop, 2026-11-12, relayed by Muse on #284).** Accepted as
-a documented trust assumption. No additional mitigation. In every
-deployment shape the edge is already held by someone in the trust
-chain: the customer, when they self-host, or the service operator and
-Cloudflare, when they use the managed service. A malicious edge outside
-that chain is not a further threat on the refresh-token side. The
-passive-edge property stands: a terminating edge that does not use the
-token still sees no CDP. N3's sentence that the edge never sees page
-contents or filled credentials is the passive case. It is not a claim
-about an edge operator who chooses to use a connector credential the
-token endpoint already shows them.
+**Ruling (Lothrop, 2026-11-12, relayed by Muse on #284, and confirmed
+the same day after pushback).** Accepted for phase 2. No additional
+mitigation in this design.
+
+What is accepted is the sharpened form. Compromise of an edge account
+can silently substitute the browser. In the hosted shape that account
+is the operator's Cloudflare account. In the self-hosted shape it is
+the customer's own edge account, which in practice is often also a
+third-party tunnel or load balancer. Owner approval authenticates the
+agent and the origin. It does not authenticate which browser sits at
+the end of the connector session. The substitution shows up afterward
+as `connector_replaced`. One approved fill inside the attacker's
+window is enough for the filled values to land there, and that window
+is part of what is accepted.
+
+The passive-edge property stands for an edge that only terminates TLS
+and does not use the token: it still sees no CDP. N3's sentence that
+the edge never sees page contents or filled credentials is that
+passive case.
+
+**Known future closure, not a phase-2 requirement.** Provision a
+connector identity key alongside `broker_pin`, through the same
+out-of-band channel Q1 decides, and require proof of possession when
+the connector family is refreshed and in the `/connector` hello. A
+copied refresh token is then inert, and reuse detection applies to a
+presenter who does not hold the key. Registering that key over the
+terminated HTTP token endpoint stays rejected: the edge can substitute
+its own key in that request, which is why D1 spends the trust anchor
+on the pin instead. This note does not specify the proof, the hello
+change, or whether wire v1 still holds once the proof exists. Q1
+remains the decision about the channel. The closure cannot be built
+until that channel exists, and it is not built here.
 
 **Expiry mid-session.** The server drops the session at the token's
 stored `expires_at`. The runtime's five-minute lead is what makes a
@@ -867,7 +891,9 @@ alternative he might want — a dashboard that can attach with nothing
 provisioned except the Connect — needs a trust anchor in the dashboard
 build and a design this note does not contain. Kharond can publish the
 pin either way. Please confirm that storing the pin in the dashboard's
-per-deploy config is acceptable.
+per-deploy config is acceptable. The later closure recorded under Q3,
+a connector identity key beside the pin, uses this same channel once
+it exists. That does not decide this question.
 
 **Q2. Consent-screen words.** The recommendation is to change nothing
 the customer reads. `kharon:fill` already says the dashboard may ask to
@@ -879,16 +905,24 @@ in its own sentence, that sentence is his. This note does not draft it.
 ## Q3, ruled
 
 **A malicious edge that steals the connector refresh token.** Lothrop,
-2026-11-12, relayed by Muse on #284: accepted as a documented trust
-assumption. No additional mitigation. His reason is who holds the edge.
-A self-hosted deploy's edge belongs to the customer. A managed deploy's
-edge belongs to the operator, and so to Cloudflare. Trust in that party
-is the trust the customer already gave by running the deploy, not a new
-threat the connector family has to close. The analysis above stays in
-the note so the residual is written down. The bounds already in D3 and
-D5 (no exchange from an `/mcp` token, session drop at `expires_at`,
-replace and revocation) are unchanged. Sender-constraining is still not
-part of this design.
+2026-11-12, relayed by Muse on #284, and confirmed the same day after
+pushback. Accepted for phase 2, in this form: compromise of the edge
+account (the operator's Cloudflare account when hosted; the customer's
+own edge account when self-hosted) can silently substitute the browser.
+Approval checks the agent and the origin, not the endpoint. The
+substitution is visible afterward as `connector_replaced`. One approved
+fill inside that window is accepted.
+
+No further mitigation ships with phase 2. The bounds already in D3 and
+D5 stay: no exchange from an `/mcp` token, session drop at
+`expires_at`, replace, and revocation. Sender-constraining by
+registering a key over the token endpoint stays out, for the
+substitution reason in the threat model.
+
+The known later closure, not required here, is a connector identity key
+provisioned beside the pin on the channel Q1 decides, with proof of
+possession at refresh and at the hello. A copied refresh token is then
+inert. This note does not design that proof.
 
 ## Assumptions
 

@@ -22,6 +22,9 @@ pub(crate) const FAILURE_WINDOW: Duration = Duration::from_secs(600);
 /// Most sources the table holds.
 pub(crate) const MAX_SOURCES: usize = 1024;
 /// The routes a throttled source is refused on, and whose failures count.
+/// Sign-in, enrollment and unlock only (REQ-APR-009, #208 D5). A signed-in
+/// owner can still approve or deny a Connect: the consent routes are not
+/// on this list, and their failures do not count toward it.
 pub const THROTTLED_ROUTES: &[&str] = &[
     "/owner/login/options",
     "/owner/login/finish",
@@ -29,10 +32,6 @@ pub const THROTTLED_ROUTES: &[&str] = &[
     "/owner/register/finish",
     "/owner/unlock/begin",
     "/owner/unlock",
-    "/oauth/consent/view",
-    "/oauth/consent/options",
-    "/oauth/consent/approve",
-    "/oauth/consent/deny",
 ];
 
 /// Per-source failure counts.
@@ -205,5 +204,27 @@ mod tests {
             "a live entry went first"
         );
         assert!(t.len() < MAX_SOURCES);
+    }
+
+    #[test]
+    fn consent_is_not_on_the_sign_in_throttle() {
+        // REQ-APR-009: a throttled source's live session still approves.
+        // Consent approve and deny are owner decisions, so they are not
+        // refused here and their failures do not count.
+        for path in [
+            "/oauth/consent/view",
+            "/oauth/consent/options",
+            "/oauth/consent/approve",
+            "/oauth/consent/deny",
+            "/owner/approvals/approve",
+            "/owner/approvals/deny",
+            "/owner/panic",
+            "/owner/logout",
+        ] {
+            assert!(
+                !THROTTLED_ROUTES.contains(&path),
+                "{path} must stay off the sign-in throttle"
+            );
+        }
     }
 }

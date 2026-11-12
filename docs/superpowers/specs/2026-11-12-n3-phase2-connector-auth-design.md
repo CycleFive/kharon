@@ -3,6 +3,8 @@
 Status: design, 2026-11-12, for #235. Follow-up 9 of the N3 design
 ([`2026-11-10-n3-mcp-oauth-connect-design.md`](2026-11-10-n3-mcp-oauth-connect-design.md),
 #213, #226), section D7. Builder: Nyx. Reviewers: Muse and Duet.
+Q3 (the malicious-edge residual) was accepted by Lothrop on
+2026-11-12, relayed by Muse on #284. Q1 and Q2 stay open.
 
 This note is the phase 2 design D7 deferred. Where it and the D7 sketch
 disagree, this note is the one to implement. It confirms assumption A7
@@ -46,11 +48,12 @@ a token. That is the target user from #213.
 | 2 | Whether wire v1 suffices | **Wire v1 suffices.** No `WIRE_VERSION` bump, no new hello field, no new server-hello status, no subprotocol change. |
 | 3 | Who owns refresh | **Two refresh families, one Connect.** The dashboard backend owns the MCP family and performs one spawn. The runtime owns the connector family and is the only component that rotates it. `kharon-agent-connector` does not become an OAuth client. |
 
-Three things are not decided here. They need Lothrop, and they are
+Two things are not decided here. They need Lothrop, and they are
 written as open questions at the end rather than as assumptions: the
-operational acceptance of provisioning the pin, the consent-screen
-words, and the residual that a malicious TLS-terminating edge can use a
-connector credential it sees on the token endpoint.
+operational acceptance of provisioning the pin, and the consent-screen
+words. The residual that a malicious TLS-terminating edge can use a
+connector credential it sees on the token endpoint was accepted by
+Lothrop on 2026-11-12 (Q3, below). No further mitigation is added.
 
 ## Goals
 
@@ -538,10 +541,10 @@ runtime is using its provisioned pin (D1). A rewritten metadata
 document that does not match the pin is a refusal to dial, which is a
 denial of service the edge can already cause by dropping the socket.
 
-**The edge, malicious, on the token endpoint.** Open question Q3. N3
-accepts that the edge sees access and refresh tokens, and says CDP
-stays inside the inner TLS so the edge never sees page contents or
-filled credentials.
+**The edge, malicious, on the token endpoint.** Lothrop accepted this
+residual on 2026-11-12 (Q3). N3 accepts that the edge sees access and
+refresh tokens, and says CDP stays inside the inner TLS so the edge
+never sees page contents or filled credentials.
 Phase 2 puts a connector refresh token on that same token response,
 hourly. An edge that rewrites HTTP can do more than read it:
 
@@ -583,6 +586,18 @@ substituted key. Detecting the substitution needs a trust anchor the
 runtime already has. D1 spends that anchor on the pin. A second
 provisioned key, plus a hello proof, would be a wire change for a
 threat the pin does not cover, and this note does not half-specify it.
+
+**Ruling (Lothrop, 2026-11-12, relayed by Muse on #284).** Accepted as
+a documented trust assumption. No additional mitigation. In every
+deployment shape the edge is already held by someone in the trust
+chain: the customer, when they self-host, or the service operator and
+Cloudflare, when they use the managed service. A malicious edge outside
+that chain is not a further threat on the refresh-token side. The
+passive-edge property stands: a terminating edge that does not use the
+token still sees no CDP. N3's sentence that the edge never sees page
+contents or filled credentials is the passive case. It is not a claim
+about an edge operator who chooses to use a connector credential the
+token endpoint already shows them.
 
 **Expiry mid-session.** The server drops the session at the token's
 stored `expires_at`. The runtime's five-minute lead is what makes a
@@ -841,9 +856,9 @@ recording assertion is the one above.
 
 ## Open questions for Lothrop
 
-These are not decided. Reviewers should not treat a recommendation as
-his answer. None of them changes the token endpoint, which keeps
-refusing `/connector` until an implementation he has accepted.
+Q1 and Q2 are not decided. Reviewers should not treat a recommendation
+as his answer. Neither changes the token endpoint, which keeps refusing
+`/connector` until the implementation.
 
 **Q1. Provisioning the pin.** D1's recommendation is that the dashboard
 runtime is given `broker_pin` out of band, operator to operator, when
@@ -861,21 +876,24 @@ is not a checkbox and not a fourth bundle. Unticking fill is what
 refuses the browser. If the screen should name the dashboard's browser
 in its own sentence, that sentence is his. This note does not draft it.
 
-**Q3. A malicious edge that steals the connector refresh token.** The
-recommendation is to accept the residual in the threat model: a passive
-edge still sees no CDP, and a malicious edge that rewrites the token
-endpoint can become the browser, with every fill still owner-approved.
-Rejecting the residual means phase 2 does not ship on the public token
-endpoint. There is no other token path in the managed model. Please
-confirm the residual is accepted. Until he does, this question stays
-open, and the implementation should not treat N3's sentence "the edge
-never sees page contents or filled credentials" as still literally true
-of a malicious edge.
+## Q3, ruled
+
+**A malicious edge that steals the connector refresh token.** Lothrop,
+2026-11-12, relayed by Muse on #284: accepted as a documented trust
+assumption. No additional mitigation. His reason is who holds the edge.
+A self-hosted deploy's edge belongs to the customer. A managed deploy's
+edge belongs to the operator, and so to Cloudflare. Trust in that party
+is the trust the customer already gave by running the deploy, not a new
+threat the connector family has to close. The analysis above stays in
+the note so the residual is written down. The bounds already in D3 and
+D5 (no exchange from an `/mcp` token, session drop at `expires_at`,
+replace and revocation) are unchanged. Sender-constraining is still not
+part of this design.
 
 ## Assumptions
 
 The design's call, for Muse and Duet to overturn. They are not
-substitutes for Q1–Q3.
+substitutes for Q1 and Q2.
 
 - **A1.** The extension grant type is `urn:kharon:oauth:grant-type:connector`. Advertising it does not remove `authorization_code` or `refresh_token` from AS metadata.
 - **A2.** Spawn's lost-response grace is 30 s and one retry, the same window as I5. A further spawn is `invalid_grant` and does not end the Connect.

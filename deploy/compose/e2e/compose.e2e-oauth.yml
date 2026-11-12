@@ -1,0 +1,100 @@
+# CI overlay for the OAuth Connect compose E2E (issue #234, N3): kharond
+# runs in public mode behind two fake TLS-terminating edges, one for the
+# agent hostname and one for the owner hostname, and a dashboard's
+# Client ID Metadata Document is served from the docker host. No VPN, no
+# agent host, no connector, no kharond [api]; the broker stays locked.
+#
+#   docker compose -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/e2e/compose.e2e-oauth.yml -p kharon-e2e-oauth \
+#     --profile vaultwarden ...
+#
+# Topology:
+#   edge  203.0.113.0/24 (TEST-NET-3)  gateway 203.0.113.254 (the docker
+#         host, where the test serves the dashboard's metadata). holder
+#         203.0.113.1. kharond refuses to fetch a CIMD from a private,
+#         loopback, CGNAT or link-local address, so the dashboard needs
+#         a public-looking one.
+# - fake-edge joins the holder's network namespace (as cloudflared does)
+#   and terminates TLS on 203.0.113.1:8443 for kharon.e2e.test,
+#   forwarding to kharond's public ingress on 127.0.0.1:8790;
+# - fake-edge-owner does the same on 203.0.113.1:8444 for
+#   kharon-owner.e2e.test, forwarding to the owner UI on 127.0.0.1:8788.
+#   The hostnames carry no port: the test dials the addresses itself and
+#   sets SNI and Host, because kharond's issuer and resource cannot name
+#   a port;
+# - kharond joins the holder's namespace, so its /etc/hosts is the
+#   holder's: that is how it resolves dashboard.e2e.test;
+# - the test writes everything under e2e/run-oauth/ (gitignored).
+#
+# Relative paths resolve against deploy/compose (the first file).
+services:
+  holder:
+    container_name: kharon-e2e-oauth-holder
+    restart: "no"
+    networks:
+      edge:
+        ipv4_address: 203.0.113.1
+    extra_hosts:
+      - "dashboard.e2e.test:203.0.113.254"
+
+  fake-edge:
+    image: kharon-e2e-agent-host:local
+    container_name: kharon-e2e-oauth-fake-edge
+    restart: "no"
+    network_mode: "service:holder"
+    init: true
+    entrypoint:
+      - socat
+      - "OPENSSL-LISTEN:8443,bind=203.0.113.1,fork,reuseaddr,verify=0,cert=/edge/cert.pem,key=/edge/key.pem"
+      - "TCP:127.0.0.1:8790"
+    volumes:
+      - "./e2e/run-oauth/edge:/edge:ro"
+
+  fake-edge-owner:
+    image: kharon-e2e-agent-host:local
+    container_name: kharon-e2e-oauth-fake-edge-owner
+    restart: "no"
+    network_mode: "service:holder"
+    init: true
+    entrypoint:
+      - socat
+      - "OPENSSL-LISTEN:8444,bind=203.0.113.1,fork,reuseaddr,verify=0,cert=/edge/cert.pem,key=/edge/key.pem"
+      - "TCP:127.0.0.1:8788"
+    volumes:
+      - "./e2e/run-oauth/edge:/edge:ro"
+
+  vaultwarden:
+    extends:
+      file: ../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/docker-compose.yml
+      service: vaultwarden
+    container_name: kharon-e2e-oauth-vaultwarden
+    restart: "no"
+    volumes: !override
+      - "vaultwarden-fixture-data:/data"
+      - "../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls:/ssl:ro"
+
+  kharon:
+    image: kharon:e2e
+    container_name: kharon-e2e-oauth-kharond
+    restart: "no"
+    environment:
+      # kharond's CIMD fetch trusts the native roots, and
+      # rustls-native-certs reads this variable; there is no config key.
+      SSL_CERT_FILE: /etc/kharon/e2e-roots.pem
+    volumes: !override
+      - "kharon-data:/data"
+      - "./e2e/run-oauth/kharon.toml:/etc/kharon.toml:ro"
+      - "../../crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem:/etc/kharon/vault-ca.pem:ro"
+      - "./e2e/run-oauth/dashboard-ca.pem:/etc/kharon/e2e-roots.pem:ro"
+
+secrets:
+  kharon_bw_api_key:
+    file: ./e2e/run-oauth/api-key.json
+
+volumes:
+  vaultwarden-fixture-data:
+    name: kharon-e2e-oauth-vaultwarden-data
+
+networks:
+  edge:
+    ipam: { config: [{ subnet: 203.0.113.0/24, gateway: 203.0.113.254 }] }

@@ -7,7 +7,9 @@ name: image
 #   headless Chromium (REQ-DEP-002, REQ-DEP-006, REQ-ARCH-004,
 #   REQ-GOAL-002);
 # - compose-e2e-ws: path B over WebSocket with no VPN (issue #220,
-#   REQ-ARCH-002): the agent connector through a fake TLS edge.
+#   REQ-ARCH-002): the agent connector through a fake TLS edge;
+# - compose-e2e-oauth: the OAuth Connect flow (issue #234): kharond in
+#   public mode behind two fake TLS edges (agent and owner hostnames).
 on:
   workflow_dispatch:
   push: { branches: [master] }
@@ -24,6 +26,8 @@ on:
       - "crates/kharond/tests/req_dep_001_image.rs"
       - "crates/kharond/tests/req_dep_002_compose_e2e.rs"
       - "crates/kharond/tests/req_arch_002_compose_ws_e2e.rs"
+      - "crates/kharond/tests/req_oau_234_compose_connect_e2e.rs"
+      - "crates/kharond/tests/owner_ui_support/**"
       - "crates/kharond/tests/api_support/**"
       - "crates/kharon-agent-connector/**"
       - "crates/kharon-connector/**"
@@ -132,6 +136,50 @@ jobs:
           KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
           KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
         run: cargo test -p kharond --test req_arch_002_compose_ws_e2e -- --ignored
+      - name: Container logs
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: $COMPOSE down -v --remove-orphans
+
+  compose-e2e-oauth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # No --env-file: this stack has no connector, so nothing reads the
+      # host uid.
+      COMPOSE: >-
+        docker compose -f deploy/compose/docker-compose.yml
+        -f deploy/compose/e2e/compose.e2e-oauth.yml -p kharon-e2e-oauth
+        --profile vaultwarden
+      FIXTURE: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install "cryptography==43.0.3"
+      - name: Build the kharond and agent-host images
+        # The fake edges run socat from the agent-host image; no service
+        # of this overlay builds it.
+        run: |
+          docker build -t "$KHARON_IMAGE" .
+          docker build -t kharon-e2e-agent-host:local deploy/compose/e2e/agent-host
+      - name: Start and seed the Vaultwarden fixture
+        run: |
+          sh "$FIXTURE/gen-tls.sh"
+          $COMPOSE up -d --no-build vaultwarden
+          python3 "$FIXTURE/seed.py" --live --base-url https://127.0.0.1:8222 \
+            --ca-cert "$PWD/$FIXTURE/tls/ca.pem" \
+            --out "${{ runner.temp }}/sync.live.json" \
+            --api-key-out "${{ runner.temp }}/api-key.json"
+      - name: Compose E2E, OAuth Connect flow (REQ-OAU, issue #234)
+        env:
+          KHARON_FIXTURE_BASE_URL: https://127.0.0.1:8222
+          KHARON_FIXTURE_CA_CERT: ${{ github.workspace }}/crates/kharon-bwcrypto/tests/fixtures/vaultwarden/tls/ca.pem
+          KHARON_FIXTURE_API_KEY_JSON: ${{ runner.temp }}/api-key.json
+        run: cargo test -p kharond --test req_oau_234_compose_connect_e2e -- --ignored
       - name: Container logs
         if: failure()
         run: $COMPOSE logs --no-color --tail 200

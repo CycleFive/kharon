@@ -6,6 +6,10 @@ Status: design, 2026-11-12, for #235. Follow-up 9 of the N3 design
 Q1 (pin provisioning) and Q3 (the malicious-edge residual) were
 accepted by Lothrop on 2026-11-12. Q2, the consent-screen words, stays
 open. The recommendation is to change nothing the customer reads.
+After Duet's review at `311a2eb`: spawn is open only to a client whose
+metadata document declares the extension grant (D3, "Who may spawn"),
+and a retired MCP refresh token presented at spawn is specified (D3
+rule 2).
 
 This note is the phase 2 design D7 deferred. Where it and the D7 sketch
 disagree, this note is the one to implement. It confirms assumption A7
@@ -48,6 +52,7 @@ a token. That is the target user from #213.
 | 1 | How the runtime learns the inner key pin | The pin is **provisioned** with the runtime, the same `broker_pin` a tailnet connector has today. The `/connector` protected-resource metadata **publishes** the pin so the runtime can detect substitution or rotation. The runtime never adopts a pin it learned from HTTP. A token-response field is the wrong document for it. |
 | 2 | Whether wire v1 suffices | **Wire v1 suffices.** No `WIRE_VERSION` bump, no new hello field, no new server-hello status, no subprotocol change. |
 | 3 | Who owns refresh | **Two refresh families, one Connect.** The dashboard backend owns the MCP family and performs one spawn. The runtime owns the connector family and is the only component that rotates it. `kharon-agent-connector` does not become an OAuth client. |
+| 3a | Who may spawn (from review) | **Only a client that declares the extension grant** in its metadata document's `grant_types`, recorded on the identity at consent. Any other Connect gets `unauthorized_client`. |
 
 One thing is not decided here. It needs Lothrop, and it is written as
 an open question at the end rather than as an assumption: the
@@ -73,7 +78,8 @@ the pin, is recorded and is not part of this design.
    and the wire-v1 mux are unchanged.
 5. Revocation, panic, and refresh reuse drop a live connector session
    for that identity. The session does not outlive the access token
-   that authenticated it.
+   that authenticated it: it is live only while that token's record is
+   live (not revoked, not expired).
 
 ## Non-goals
 
@@ -349,17 +355,31 @@ is `invalid_grant` and is not reuse, as `refresh` already does):
 2. The presented token is a live MCP-family refresh token for that
    client. A connector-family refresh token, an access token, an
    expired or revoked token, or an unknown token is `invalid_grant`.
-   Nothing is retired.
-3. The identity's granted scopes include `kharon:fill`. A read-only
+   Nothing is retired. A **retired** MCP-family refresh token is
+   handled exactly as `grant_type=refresh_token` handles it, so spawn
+   is not a place where a stolen, already-rotated refresh token can be
+   tried without tripping reuse detection:
+   - outside its 30 s grace, it is reuse: the whole Connect ends (both
+     families, the live session), `oauth_refresh_reuse` is written, and
+     the answer is `invalid_grant`;
+   - inside its 30 s grace, it is `invalid_grant` and nothing changes:
+     the grace is not spent, the successor stays live, and nothing is
+     issued. A backend that rotates and spawns at the same moment is not
+     killed; it retries the spawn with the successor.
+3. The client declared the extension grant ("Who may spawn", below).
+   Otherwise `unauthorized_client`. Nothing is retired. This comes after
+   rule 2 so that a retired token is caught as reuse whichever client
+   presents it.
+4. The identity's granted scopes include `kharon:fill`. A read-only
    Connect gets `invalid_grant` and no family. There is nothing for a
    browser to do.
-4. No connector family exists yet. The presented MCP refresh token
+5. No connector family exists yet. The presented MCP refresh token
    stays live. The response is a normal token response,
    `Cache-Control: no-store`: `kh_at_…` audience `/connector`, scope
    exactly `kharon:connector`, `expires_in` 3600, and a new `kh_rt_…`
    that is the connector family's refresh token. Audit
    `oauth_connector_grant` before the persist (below).
-5. A connector family already exists. Within 30 s of that spawn, one
+6. A connector family already exists. Within 30 s of that spawn, one
    retry is a lost-response grace: it revokes the access token and
    retires the refresh token of the pair just issued, and issues a new
    pair, the same shape as I5's one retry. That retry is a rotation,
@@ -369,6 +389,44 @@ is `invalid_grant` and is not reuse, as `refresh` already does):
    connector family stays as it is. Two lost spawn responses are
    recovered by Disconnect and a new Connect, not by killing a healthy
    MCP client.
+
+#### Who may spawn
+
+Spawn takes the MCP *refresh* token and does not rotate it. That makes
+it the one use of a refresh token that reuse detection never sees, and
+while no connector family exists, a live MCP refresh token is enough to
+get the tunnel credential. "No connector family exists" is the
+permanent state of every client that never spawns: a stock MCP client,
+and every Connect that already exists on the day a deploy upgrades. If
+spawn were open to every Connect holding `kharon:fill`, anyone who
+obtained such a token (for example from a dashboard backend's token
+store) could spawn once and attach a browser without rotating anything
+or calling a tool; the real client's approved fills would then land in
+that browser when it sits on the granted origin.
+
+So spawn is open only to clients that declare it. The client's metadata
+document (CIMD) lists `urn:kharon:oauth:grant-type:connector` in
+`grant_types`. Consent records that declaration on the identity, beside
+its scopes. Spawn checks the recorded flag (rule 3), not a fresh fetch
+of the document. Any other client gets `unauthorized_client`. A
+document that adds the grant later takes effect only on a new Connect.
+`cimd.rs` reads `client_name`, `redirect_uris` and
+`token_endpoint_auth_method` today and ignores `grant_types`, so this is
+new implementation work. A client already on `[oauth] clients` is
+operator-approved; the declaration is what separates a dashboard that
+runs a browser from a stock MCP client on the same allow-list. An
+operator flag per `[oauth] clients` entry was the alternative; it was
+not chosen because `clients` is a list of URLs today, and the
+declaration travels with the client's own metadata, where the client
+says what it does.
+
+What still bounds a stolen MCP refresh token from a declaring client:
+one family per Connect (the real backend's later spawn gets
+`invalid_grant`, which is loud, and Disconnect removes the thief's
+family), the `oauth_connector_grant` audit entry, and the Connections
+page showing a live session. A stolen token from a client that does not
+declare the grant is worth what it is worth today: tool calls without
+fills, until the real client next rotates.
 
 The backend is the mailman for that one response. It forwards the
 connector refresh token, the connector access token, and the `c-…` id
@@ -435,8 +493,11 @@ grow a status for it (D2).
 ### D4. What the broker checks, and what a token is
 
 An access-token record gains an audience: `mcp` or `connector`. A
-refresh-token record gains the family it belongs to, the same two
-values. A missing audience on a state file written by phase 1 means
+refresh-token record gains an audience too, the same two values, naming
+which of the Connect's two refresh lines it belongs to. (`TokenRecord.family`
+already exists and holds the Connect id, the per-Connect lineage; the
+new field is called the audience in both places so the two do not
+collide.) A missing audience on a state file written by phase 1 means
 `mcp`, so `oauth/state.json` from a deploy that has not seen phase 2
 loads, and every existing access token stays an `/mcp` token. Tokens
 remain SHA-256 hashes at rest. No plaintext, no new store.
@@ -501,6 +562,13 @@ first and shuts it down. In-flight CDP on the old session dies. A fill
 that was between `fill_dispatch` and its outcome takes the existing
 abort path (`fill_aborted`). Phase 2 does not change grant consumption
 or REQ-APR-008.
+
+The session is bound to the access-token record that authenticated it,
+not just to a copy of its expiry: the session is live only while that
+record is live. A record that is revoked or expired means the session
+is absent. That covers the grace retry too, which revokes the
+superseded access token: a session attached with it stops filling at
+once instead of running to its old `expires_at`.
 
 The hub remembers `expires_at` from the token record, the server's
 timestamp, not anything in the hello. The token is opaque and carries
@@ -569,9 +637,11 @@ ones that hold:
 
 - An `/mcp` access token cannot be exchanged for a connector token
   (D3, option B rejected). The edge sees `/mcp` tokens on every tool
-  call. Those must not be tunnel credentials. Stealing the tunnel
-  requires the connector family, which appears only on the spawn
-  response and on connector-family refreshes.
+  call. Those must not be tunnel credentials. An `/mcp` *access* token
+  never opens the tunnel. The tunnel credential appears on the spawn
+  response and on connector-family refreshes, and spawn itself takes the
+  MCP *refresh* token. That case, and why spawn is limited to declaring
+  clients, is below ("A stolen MCP refresh token").
 - The access token dies at `expires_at`, and the session dies with it
   (D5). A stolen access token, without the refresh token, cannot hold
   the tunnel past its hour, including when the legitimate runtime is
@@ -605,7 +675,9 @@ the customer's own edge account, which in practice is often also a
 third-party tunnel or load balancer. Owner approval authenticates the
 agent and the origin. It does not authenticate which browser sits at
 the end of the connector session. The substitution shows up afterward
-as `connector_replaced`. One approved fill inside the attacker's
+as `connector_replaced`, but that entry does not tell a substitution
+from the scheduled hourly re-attach, which writes the same entry (A8,
+Audit). One approved fill inside the attacker's
 window is enough for the filled values to land there, and that window
 is part of what is accepted.
 
@@ -685,7 +757,28 @@ owner approval deposits a fill into that browser, on the live origin,
 under the existing origin check (REQ-ORG-002). Phase 1 could request
 the fill and could not receive it. Disconnect remains one click
 (REQ-OAU-005). A stolen MCP access token, without the connector family,
-still cannot attach.
+still cannot attach. A stolen MCP refresh token can, once, through
+spawn, if the client declares the grant and has not spawned yet (next
+paragraph).
+
+**A stolen MCP refresh token.** Leaving the edge aside (Q3 is ruled),
+take anyone else who obtains a live MCP refresh token, for example from
+the dashboard backend's token store.
+
+- Today it is worth tool calls without fills, until the real client
+  next rotates.
+- In phase 2, from a client that does **not** declare the extension
+  grant, it is worth the same: spawn answers `unauthorized_client`.
+- From a declaring client that has not spawned yet, it is worth one
+  spawn and an attached browser. The thief rotates nothing and calls no
+  tool. The real client's own approved fills then land in the thief's
+  browser if it sits on the granted origin. Bounds: one family per
+  Connect (the real backend's own spawn then fails with
+  `invalid_grant`, which a dashboard should treat as an alarm), the
+  `oauth_connector_grant` entry, the Connections page showing a live
+  session, and Disconnect, which removes the thief's family.
+- A *retired* MCP refresh token presented at spawn outside its grace is
+  reuse and ends the Connect (D3 rule 2), the same as on refresh.
 
 **Clock.** Expiry is the server's stored unix time. The runtime's lead
 uses `expires_in` from the token response. The server does not extend
@@ -727,7 +820,10 @@ Scheduled rotation and a stolen-token eviction look the same on the
 wire (the new token is also live, D4). The Connections page is the
 "browser attached" signal; this event is the "something replaced the
 session" signal. Token issue and refresh stay unaudited, one by one
-(A12).
+(A12). The entry does not tell a scheduled re-attach from a substitution.
+A cheap partial improvement the implementation may add: a detail on the
+entry when the replacing session's access token was not issued after the
+one it replaces, which a scheduled re-attach never is.
 
 **`oauth_connector_grant`** is new, written once per successful spawn
 and on the persist-failure compensation (D4). `agent_id` is the `c-…`
@@ -754,10 +850,24 @@ This note changes none of it. The list is the map for the follow-up.
 | `authenticate_on_mcp` | Connector audience is 401, before scopes. |
 | `[public_ingress]` | `GET /.well-known/oauth-protected-resource/connector` when `[oauth]` and a connector certificate are both set. The tunnel path allow-list in `docs/deployment.md` gains that path. |
 | AS metadata | `grant_types_supported` gains the extension grant and keeps the two it has. |
+| CIMD (`cimd.rs`) and consent | Read `grant_types`; record on the identity whether it lists the extension grant. Spawn checks the record; otherwise `unauthorized_client`. |
 | Connections page | Live session, and since when. |
 | Owner surfaces | No change. #279's refusal covers the new tokens because they are still `kh_at_` / `kh_rt_`. |
 | `kharon-agent-connector` | No OAuth. A reload of `token_file` is allowed and not required. |
 | SPEC | The rows below, in the implementation PR, not in this one. |
+
+Deployment notes for the implementation:
+
+- **Edge rate limit.** The live `/connector` rule on the managed deploy
+  is 5 requests per 10 s per IP, path-only on a Free zone (#223, #285).
+  One re-dial an hour per Connect is far under it. A hosted runtime that
+  restarts and re-dials many Connects from one egress address is not,
+  and path-only means it counts across every tenant hostname in the
+  zone. Re-dials after a restart should be spread out.
+- **Durable connector refresh token.** Losing the connector refresh
+  token costs the customer a new Connect (D3, lost responses). A runtime
+  whose disk is replaced is the commoner case, so dashboards should keep
+  that token in durable storage, not only on the runtime's disk.
 
 SPEC rows the implementation adds or amends:
 
@@ -811,7 +921,15 @@ access token no longer authenticates a hello. A third is
 `invalid_grant`, and the second pair still works. A Connect without
 `kharon:fill` gets `invalid_grant` and no family. A spawn that presents
 the connector refresh token is `invalid_grant`, and that token is not
-retired.
+retired. A retired MCP refresh token at spawn, outside its grace, writes
+`oauth_refresh_reuse`, ends the Connect (the successor MCP refresh token
+is refused afterward) and issues nothing; inside its grace it is
+`invalid_grant`, the successor still rotates, a spawn with the successor
+then succeeds, and the grace is still unused. A client whose metadata
+document does not list the extension grant gets `unauthorized_client`
+on spawn with a live MCP refresh token, and that token still rotates; a
+client that adds the grant to its document after consent still gets
+`unauthorized_client` on that Connect.
 
 **Family isolation.** Refreshing the connector family does not retire
 the MCP refresh token, and the reverse. Each wrong-resource cell of
@@ -896,6 +1014,12 @@ refuses the browser. If the screen should name the dashboard's browser
 in its own sentence, that sentence is his to supply. This note does
 not draft it.
 
+Linked, not answered: because spawn is limited to clients that declare
+the extension grant (D3), consent knows whether this Connect can attach
+a browser. With nothing changed on the screen, the owner cannot tell a
+Connect that can attach a browser from one that cannot. If the screen
+should say so, the declaration is where it would come from.
+
 ## Q1, ruled
 
 **Provisioning the pin.** Lothrop, 2026-11-12, relayed by Muse on #284.
@@ -914,7 +1038,8 @@ pushback. Accepted for phase 2, in this form: compromise of the edge
 account (the operator's Cloudflare account when hosted; the customer's
 own edge account when self-hosted) can silently substitute the browser.
 Approval checks the agent and the origin, not the endpoint. The
-substitution is visible afterward as `connector_replaced`. One approved
+substitution is visible afterward as `connector_replaced`, though that
+entry alone does not tell it from the hourly re-attach. One approved
 fill inside that window is accepted.
 
 No further mitigation ships with phase 2. The bounds already in D3 and
@@ -943,3 +1068,4 @@ substitute for Q2.
 - **A8.** `connector_replaced` is written for the hourly re-attach. The Connections page, not a new event, is what shows "browser attached".
 - **A9.** An ordinary lock does not drop the connector session. Panic does.
 - **A10.** Metadata fetch failure is not a pin mismatch. The runtime dials with the configured pin. A fetched pin that differs is a refusal to dial.
+- **A11.** Spawn is open only to a client whose metadata document declares `urn:kharon:oauth:grant-type:connector` in `grant_types`, recorded at consent. Reason: otherwise a live MCP refresh token from any `kharon:fill` Connect, including every stock MCP client and every pre-upgrade Connect, is a tunnel credential that reuse detection never sees.

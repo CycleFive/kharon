@@ -472,6 +472,7 @@ async fn req_apr_258_remove_kills_that_passkey_and_its_sessions() {
 /// existed still loads. A later assertion fills in last-used only.
 #[tokio::test(flavor = "multi_thread")]
 async fn req_apr_258_old_passkey_store_still_loads() {
+    use std::os::unix::fs::PermissionsExt;
     let run = start().await;
     let origin = run.origin.clone();
     let mut auth = VirtAuth::new();
@@ -486,6 +487,8 @@ async fn req_apr_258_old_passkey_store_still_loads() {
         cred.as_object_mut().unwrap().remove("last_used_at");
     }
     std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+    // `write` follows the umask. Load refuses a group-writable file.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let run = start_in(data).await;
     let origin = run.origin.clone();

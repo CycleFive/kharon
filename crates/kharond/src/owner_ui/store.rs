@@ -282,6 +282,7 @@ mod tests {
     /// without inventing an enrolled-at.
     #[test]
     fn old_store_file_loads_and_gains_last_used() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let id = webauthn::b64url_encode(&[0xab; 16]);
         let pk = webauthn::b64url_encode(&point());
@@ -298,7 +299,6 @@ mod tests {
         .unwrap();
         // `write` follows the umask. A 0660 file (umask 007) is refused
         // as group-writable, so pin the mode the store requires.
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut store = PasskeyStore::load(dir.path()).unwrap();
         assert_eq!(store.credentials().len(), 1);

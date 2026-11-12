@@ -1022,6 +1022,36 @@ covers it when it shares an address with `[api]`. Otherwise add one
 line for it, with the interface cloudflared arrives on (for example
 `tailscale0`).
 
+### OAuth discovery (N3, #228)
+
+With `[oauth]` set, kharond is also an OAuth authorization server
+(N3 Connect, REQ-OAU-001) and serves discovery on both hostnames.
+The tunnel needs two new paths (the owner applies Cloudflare-side
+changes, as everywhere in this guide):
+
+| Hostname | New tunnel path | Reaches |
+|---|---|---|
+| `kharon.twkr.io` | `^/.well-known/oauth-protected-resource$` and `^/.well-known/oauth-protected-resource/mcp$` | RFC 9728 protected-resource metadata on `[public_ingress]`, unauthenticated |
+| `kharon-owner.twkr.io` | `^/.well-known/oauth-authorization-server$` | RFC 8414 authorization-server metadata on the owner UI listener |
+
+```toml
+[oauth]
+# client_id URLs (CIMD) this deploy accepts for Connect; see
+# REQ-OAU-002. Discovery is served whether or not any are listed.
+clients = ["https://dashboard.example.com/.well-known/kharon-client.json"]
+```
+
+`[oauth]` requires `[public_ingress]` with `public_host` set and
+an https `[owner_ui]` origin; kharond refuses to start otherwise
+(`oauth_needs_public_ingress`, `oauth_needs_public_host`,
+`oauth_needs_owner_ui`, `oauth_owner_origin_not_https`). The
+issuer is the owner origin. The metadata names the `/oauth/*`
+endpoints on the owner hostname; they arrive with the rest of N3
+(#230, #231). With `[oauth]` set, a `401` from `/mcp` also carries
+the discovery challenge (`resource_metadata`, `scope`). Without
+`[oauth]`, both well-known paths answer the usual 404 on both
+listeners and the `401` keeps its bare challenge.
+
 ### Where cloudflared runs
 
 1. **Compose `edge` profile (default).** cloudflared joins the
@@ -1147,8 +1177,9 @@ on the host.
 The owner UI gets its own hostname, `kharon-owner.twkr.io`, not a path
 on the gateway hostname. See
 [Publishing the owner UI](#publishing-the-owner-ui). The MCP
-authorization work (N3) adds routes later, such as
-`/.well-known/oauth-protected-resource` and the token endpoint.
+authorization work (N3) serves its discovery from both hostnames —
+see [OAuth discovery](#oauth-discovery-n3-228) — and adds the
+`/oauth/*` endpoints here as it lands.
 
 ### Alternative: a locally managed tunnel
 

@@ -997,6 +997,12 @@ pub async fn start(
         // deadline. Startup does not need the browser. Path B attaches
         // the connector hub below, once the listener exists.
         .with_fill_backend(Box::new(cdp_backend));
+    // REQ-OAU-001 (#228): with `[oauth]` set, the broker carries the
+    // discovery `[public_ingress]` serves and the `/mcp` 401 names.
+    let broker = match crate::api::oauth::Discovery::from_config(cfg) {
+        Some(discovery) => broker.with_oauth(discovery),
+        None => broker,
+    };
     // REQ-APR-004 send half (#128): publish approval prompts to the
     // configured ntfy topic, with action URLs on the owner listener.
     // Needs both halves: no `[approval].ntfy` → no channel; no
@@ -1218,6 +1224,22 @@ async fn bind_owner_ui(
     if let Some(verifier) = access.as_ref().filter(|_| ui_cfg.public) {
         verifier.warm();
     }
+    // REQ-OAU-001 (#228): with `[oauth]` set, this hostname is the
+    // authorization server and serves its metadata. The issuer is
+    // the origin the UI actually serves (after the bound-port
+    // substitution above), so the metadata can never name another.
+    let oauth = match (
+        cfg.oauth.as_ref(),
+        cfg.public_ingress
+            .as_ref()
+            .and_then(|p| p.public_host.as_deref()),
+    ) {
+        (Some(_), Some(host)) => Some(Arc::new(crate::api::oauth::Discovery::new(
+            origin.clone(),
+            host,
+        ))),
+        _ => None,
+    };
     let ui = crate::owner_ui::OwnerUi::open_with(
         &cfg.data_dir,
         crate::owner_ui::OwnerUiOptions {
@@ -1225,6 +1247,7 @@ async fn bind_owner_ui(
             origin: origin.clone(),
             public: ui_cfg.public,
             access,
+            oauth,
         },
         Arc::new(DaemonShell {
             broker: Arc::clone(broker),

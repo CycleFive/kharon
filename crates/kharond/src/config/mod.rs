@@ -472,6 +472,29 @@ pub enum ConfigError {
         "[public_ingress].listen must differ from [api].listen, [connector].listen and [owner_ui].listen"
     )]
     PublicIngressListenConflict,
+    /// `[oauth]` without `[public_ingress]` (REQ-OAU-001): the
+    /// protected-resource metadata and the `/mcp` challenge live there.
+    #[error("[oauth] requires [public_ingress]")]
+    OauthNeedsPublicIngress,
+    /// `[oauth]` whose `[public_ingress]` names no `public_host`: the
+    /// RFC 9728 `resource` must be the deploy's public `/mcp` URL.
+    #[error(
+        "[oauth] requires public_ingress.public_host (the deploy's public /mcp URL is built from it)"
+    )]
+    OauthNeedsPublicHost,
+    /// `[oauth]` without `[owner_ui]`: the issuer is the owner origin.
+    #[error("[oauth] requires [owner_ui] (the issuer is derived from its origin)")]
+    OauthNeedsOwnerUi,
+    /// `[oauth]` with a non-https owner origin: an issuer is https.
+    #[error("[oauth] requires an https owner origin (the issuer is derived from it)")]
+    OauthOwnerOriginNotHttps,
+    /// An `[oauth] clients` entry is not an https URL: a `client_id`
+    /// is the HTTPS URL of a Client ID Metadata Document (REQ-OAU-002).
+    #[error("[oauth] clients entry `{client}` must be an https URL")]
+    OauthClientNotHttps {
+        /// The offending entry.
+        client: String,
+    },
 }
 
 impl ConfigError {
@@ -558,6 +581,11 @@ impl ConfigError {
             Self::PublicIngressListenNotUnicast => "public_ingress_listen_not_unicast",
             Self::PublicIngressPlainHttpNonLoopback => "public_ingress_plain_http_non_loopback",
             Self::PublicIngressListenConflict => "public_ingress_listen_conflict",
+            Self::OauthNeedsPublicIngress => "oauth_needs_public_ingress",
+            Self::OauthNeedsPublicHost => "oauth_needs_public_host",
+            Self::OauthNeedsOwnerUi => "oauth_needs_owner_ui",
+            Self::OauthOwnerOriginNotHttps => "oauth_owner_origin_not_https",
+            Self::OauthClientNotHttps { .. } => "oauth_client_not_https",
         }
     }
 }
@@ -907,6 +935,22 @@ pub struct Config {
     /// #198) forwards to. Serves `POST /mcp` only (and `/connector`
     /// once #199 mounts it); `None` = not configured.
     pub public_ingress: Option<PublicIngressConfig>,
+    /// `[oauth]`: the N3 Connect authorization server (REQ-OAU-001).
+    /// `None` = not configured; discovery is then served nowhere and
+    /// the `/mcp` 401 keeps its bare challenge.
+    pub oauth: Option<OAuthConfig>,
+}
+
+/// `[oauth]` (N3, REQ-OAU-001/-002): the operator allow-list of MCP
+/// clients for Connect. The issuer is not configured here: it is the
+/// `[owner_ui]` origin. Validation (in `raw`) requires
+/// `[public_ingress]` with a `public_host` and an https owner origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthConfig {
+    /// `client_id`s accepted at the authorize endpoint: each the
+    /// HTTPS URL of a Client ID Metadata Document (REQ-OAU-002).
+    /// Admission and fetching are #229; this step validates the shape.
+    pub clients: Vec<String>,
 }
 
 /// `[owner_ui]` (REQ-APR-005). The listener is always loopback. `origin`

@@ -9,6 +9,7 @@
 //! |---|---|
 //! | `POST /mcp` | the MCP transport ([`super::mcp`]), exactly as on `[api]`: same bearer auth, rate limits, audit |
 //! | `GET /connector` | the agent-connector WebSocket upgrade (#199) when `[connector] websocket = true`; 404 otherwise |
+//! | `GET /.well-known/oauth-protected-resource[/mcp]` | RFC 9728 protected-resource metadata (REQ-OAU-001) when `[oauth]` is set; 404 otherwise |
 //! | anything else | 404 `not_found` / `no_such_route` |
 //!
 //! "Anything else" includes `/v1/*` and `/v1/openapi.json` (the tailnet
@@ -39,8 +40,9 @@ use tokio::net::TcpListener;
 
 use super::core::{Broker, VaultView};
 use super::error::{ApiError, Detail, ErrorCode};
-use super::http::{AppState, TlsListener, error};
+use super::http::{AppState, TlsListener, error, json_response};
 use super::mcp::MCP_PATH;
+use super::oauth::{PROTECTED_RESOURCE_MCP_PATH, PROTECTED_RESOURCE_PATH};
 use super::transport::ClientIp;
 use crate::connector::WsEntry;
 use crate::lock::Clock;
@@ -215,12 +217,20 @@ enum Admit {
     Mcp,
     /// `GET /connector`: the connector WebSocket (#199).
     Connector,
+    /// `GET /.well-known/oauth-protected-resource[/mcp]`: RFC 9728
+    /// discovery (REQ-OAU-001). Admitted by shape; the handler
+    /// answers 404 when `[oauth]` is not configured, so the route's
+    /// existence never leaks the config.
+    ProtectedResource,
 }
 
 fn admit(method: &Method, path: &str) -> Option<Admit> {
     match (method, path) {
         (&Method::POST, MCP_PATH) => Some(Admit::Mcp),
         (&Method::GET, CONNECTOR_PATH) => Some(Admit::Connector),
+        (&Method::GET, PROTECTED_RESOURCE_PATH | PROTECTED_RESOURCE_MCP_PATH) => {
+            Some(Admit::ProtectedResource)
+        }
         _ => None,
     }
 }
@@ -257,6 +267,18 @@ where
         // indistinguishable from an unknown one.
         Some(Admit::Connector) => match ws {
             Some(ws) => ws.upgrade(req, peer),
+            None => not_found(),
+        },
+        // RFC 9728 discovery (REQ-OAU-001): a pure function of the
+        // config, served unauthenticated — discovery is how an
+        // unauthenticated client finds out how to authenticate.
+        // Without `[oauth]` the route is indistinguishable from an
+        // unknown one.
+        Some(Admit::ProtectedResource) => match state.broker.oauth_discovery() {
+            Some(discovery) => json_response(
+                axum::http::StatusCode::OK,
+                discovery.protected_resource_metadata().to_string(),
+            ),
             None => not_found(),
         },
         None => not_found(),
@@ -321,9 +343,20 @@ mod tests {
     }
 
     #[test]
-    fn only_post_mcp_and_get_connector_are_admitted() {
+    fn only_post_mcp_get_connector_and_get_discovery_are_admitted() {
         assert_eq!(admit(&Method::POST, "/mcp"), Some(Admit::Mcp));
         assert_eq!(admit(&Method::GET, "/connector"), Some(Admit::Connector));
+        // RFC 9728 discovery (REQ-OAU-001): both shapes clients try.
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            assert_eq!(
+                admit(&Method::GET, path),
+                Some(Admit::ProtectedResource),
+                "GET {path}"
+            );
+        }
         for (method, path) in [
             (Method::GET, "/mcp"),
             (Method::DELETE, "/mcp"),
@@ -343,6 +376,14 @@ mod tests {
             (Method::POST, "/v1/grants"),
             (Method::GET, "/owner/session"),
             (Method::GET, "/owner/approve/x"),
+            // Discovery is GET-only, exact-path, and the AS document
+            // lives on the owner hostname, not here.
+            (Method::POST, "/.well-known/oauth-protected-resource"),
+            (Method::POST, "/.well-known/oauth-protected-resource/mcp"),
+            (Method::GET, "/.well-known/oauth-protected-resource/"),
+            (Method::GET, "/.well-known/oauth-protected-resource/mcp/"),
+            (Method::GET, "/.well-known/oauth-authorization-server"),
+            (Method::GET, "/.well-known/openid-configuration"),
         ] {
             assert_eq!(admit(&method, path), None, "{method} {path}");
         }

@@ -520,3 +520,112 @@ fn public_ingress_public_host_is_optional_and_validated() {
         assert_eq!(err.code(), "public_ingress_public_host");
     }
 }
+
+/// `[oauth]` on the spec example, with the `[public_ingress]` and
+/// `[owner_ui]` tables it depends on spelled by the caller.
+fn oauth_config(public_ingress: &str, owner_ui: &str, oauth: &str) -> String {
+    format!(
+        "{}\n[public_ingress]\n{public_ingress}\n[owner_ui]\n{owner_ui}\n[oauth]\n{oauth}\n",
+        spec_example()
+    )
+}
+
+const OAUTH_PUBLIC_INGRESS: &str =
+    "listen = \"127.0.0.1:8790\"\npublic_host = \"kharon.example.com\"";
+const OAUTH_OWNER_UI: &str =
+    "listen = \"127.0.0.1:8788\"\npublic_origin = \"https://kharon-owner.example.com\"";
+
+#[test]
+fn oauth_loads_with_its_public_shape() {
+    let cfg = Config::from_toml_str(&oauth_config(
+        OAUTH_PUBLIC_INGRESS,
+        OAUTH_OWNER_UI,
+        "clients = [\"https://dashboard.example.com/.well-known/kharon-client.json\"]",
+    ))
+    .unwrap();
+    let oauth = cfg.oauth.unwrap();
+    assert_eq!(
+        oauth.clients,
+        ["https://dashboard.example.com/.well-known/kharon-client.json"]
+    );
+    // An absent `clients` is an empty allow-list, not an error:
+    // discovery is served and no client can be admitted (#229).
+    let cfg =
+        Config::from_toml_str(&oauth_config(OAUTH_PUBLIC_INGRESS, OAUTH_OWNER_UI, "")).unwrap();
+    assert_eq!(cfg.oauth.unwrap().clients, Vec::<String>::new());
+}
+
+#[test]
+fn oauth_requires_public_ingress() {
+    let text = format!(
+        "{}\n[owner_ui]\n{OAUTH_OWNER_UI}\n[oauth]\n",
+        spec_example()
+    );
+    let err = Config::from_toml_str(&text).unwrap_err();
+    assert_eq!(err, ConfigError::OauthNeedsPublicIngress);
+    assert_eq!(err.code(), "oauth_needs_public_ingress");
+}
+
+#[test]
+fn oauth_requires_a_public_host() {
+    // Without `public_host` the RFC 9728 `resource` cannot be named.
+    let err = Config::from_toml_str(&oauth_config(
+        "listen = \"127.0.0.1:8790\"",
+        OAUTH_OWNER_UI,
+        "",
+    ))
+    .unwrap_err();
+    assert_eq!(err, ConfigError::OauthNeedsPublicHost);
+    assert_eq!(err.code(), "oauth_needs_public_host");
+}
+
+#[test]
+fn oauth_requires_the_owner_ui() {
+    // The issuer is derived from the owner origin; no `[owner_ui]`,
+    // no issuer.
+    let text = format!(
+        "{}\n[public_ingress]\n{OAUTH_PUBLIC_INGRESS}\n[oauth]\n",
+        spec_example()
+    );
+    let err = Config::from_toml_str(&text).unwrap_err();
+    assert_eq!(err, ConfigError::OauthNeedsOwnerUi);
+    assert_eq!(err.code(), "oauth_needs_owner_ui");
+}
+
+#[test]
+fn oauth_requires_an_https_owner_origin() {
+    // Local mode with an http origin: fine for the UI alone, refused
+    // with `[oauth]` — an issuer is https.
+    let err = Config::from_toml_str(&oauth_config(
+        OAUTH_PUBLIC_INGRESS,
+        "listen = \"127.0.0.1:8788\"\norigin = \"http://localhost:8788\"",
+        "",
+    ))
+    .unwrap_err();
+    assert_eq!(err, ConfigError::OauthOwnerOriginNotHttps);
+    assert_eq!(err.code(), "oauth_owner_origin_not_https");
+}
+
+#[test]
+fn oauth_clients_must_be_https_urls() {
+    for bad in [
+        "http://dashboard.example.com/client.json",
+        "dashboard.example.com/client.json",
+        "",
+    ] {
+        let err = Config::from_toml_str(&oauth_config(
+            OAUTH_PUBLIC_INGRESS,
+            OAUTH_OWNER_UI,
+            &format!("clients = [\"{bad}\"]"),
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::OauthClientNotHttps {
+                client: bad.to_owned()
+            },
+            "{bad}"
+        );
+        assert_eq!(err.code(), "oauth_client_not_https");
+    }
+}

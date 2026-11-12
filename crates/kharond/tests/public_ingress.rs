@@ -499,3 +499,55 @@ fn cloudflared_example_routes_only_mcp_and_connector() {
         assert!(!cloudflared_problems(&bad).is_empty(), "{why}");
     }
 }
+
+#[tokio::test]
+async fn oauth_discovery_is_served_when_oauth_is_configured() {
+    // REQ-OAU-001: RFC 9728 metadata at both well-known shapes,
+    // unauthenticated, and the /mcp 401 challenge that names it.
+    let discovery = kharond::api::oauth::Discovery::new(
+        "https://kharon-owner.twkr.io".to_owned(),
+        "kharon.twkr.io",
+    );
+    let h = Harness::with(false, |b| b.with_oauth(discovery.clone()));
+    let addr = serve_public(h.broker.clone()).await;
+    for target in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ] {
+        let r = raw_request(addr, request("GET", target, None).as_bytes()).await;
+        assert_eq!(r.status, 200, "{target}: {}", r.body);
+        assert_eq!(
+            r.json(),
+            discovery.protected_resource_metadata(),
+            "{target}"
+        );
+    }
+    let r = mcp_request(addr, None, "tools/list", "{}").await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert_eq!(
+        r.header("www-authenticate"),
+        Some(discovery.challenge().as_str())
+    );
+    // A valid token is unaffected by the discovery configuration.
+    let r = mcp_request(addr, Some(&h.alpha), "tools/list", "{}").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+#[tokio::test]
+async fn without_oauth_discovery_is_the_uniform_404_and_the_challenge_is_bare() {
+    let h = Harness::new(false);
+    let addr = serve_public(h.broker.clone()).await;
+    for target in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ] {
+        let r = raw_request(addr, request("GET", target, None).as_bytes()).await;
+        assert_not_found(r.status, &r.body, target);
+    }
+    let r = mcp_request(addr, None, "tools/list", "{}").await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert_eq!(
+        r.header("www-authenticate"),
+        Some("Bearer realm=\"kharon\"")
+    );
+}

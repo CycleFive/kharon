@@ -49,8 +49,8 @@ pub mod token;
 pub mod transport;
 
 pub use self::core::{
-    AgentId, AuditSink, Broker, ContextResult, FillSync, Outcome, Request, StatusBody, SyncFetch,
-    VaultView,
+    AgentId, AuditSink, Broker, ContextResult, FillSync, Outcome, PanicHook, Request, StatusBody,
+    SyncFetch, VaultView,
 };
 pub use approval::{
     ApprovalAction, ApprovalTokenStore, TOKEN_TTL as APPROVAL_TOKEN_TTL, TokenGone,

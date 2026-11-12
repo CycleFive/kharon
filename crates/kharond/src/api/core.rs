@@ -478,11 +478,21 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// against it on `/mcp` (never on `/v1/*`), and a panic ends
     /// every Connect it holds.
     oauth_store: Option<Arc<super::oauth_store::OauthStore>>,
+    /// Panic hooks (#252): run on every [`Self::panic_lock`],
+    /// whatever its outcome. Registered after construction (the
+    /// owner UI is built from the broker, so it cannot be a builder
+    /// argument): the daemon registers the owner UI's sealed-token
+    /// invalidation here, so no panic caller has to remember it.
+    panic_hooks: Mutex<Vec<PanicHook>>,
 }
 
 /// Called with every resolved [`FillPlan`] after its values were
 /// zeroized (tests prove the wipe; REQ-API-009).
 pub type PlanWipedHook = Arc<dyn Fn(&FillPlan) + Send + Sync>;
+
+/// Runs on every broker panic, whatever the panic's outcome
+/// (#252). `Fn()`, not a result: a hook cannot fail a panic.
+pub type PanicHook = Arc<dyn Fn() + Send + Sync>;
 
 /// A fresh broker-side request id: 128 random bits, hex. Ties a
 /// `fill_dispatch` to its outcome entry (REQ-AUD-003†).
@@ -670,6 +680,36 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             rollback: Mutex::new(RollbackGuard::new()),
             oauth: None,
             oauth_store: None,
+            panic_hooks: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register a hook that runs on every [`Self::panic_lock`]
+    /// (#252), whatever the panic's outcome — including when the
+    /// panic unwinds, and, for the owner socket's blocking call,
+    /// when the awaiting future is dropped (that task is detached,
+    /// so the panic still runs to its end). The daemon registers
+    /// `OwnerUi::invalidate_sealed` here when the owner UI is
+    /// configured, replacing the per-caller calls the web route and
+    /// the owner socket used to make. Hooks run in registration
+    /// order, after the panic itself, with no broker lock held.
+    pub fn add_panic_hook(&self, hook: PanicHook) {
+        self.panic_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(hook);
+    }
+
+    /// Run the registered panic hooks. The hook list is cloned out
+    /// first, so a hook may call back into the broker.
+    fn run_panic_hooks(&self) {
+        let hooks = self
+            .panic_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for hook in hooks {
+            hook();
         }
     }
 
@@ -2223,7 +2263,30 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// channel is notified best-effort when one is configured
     /// (#128); the audited `panic` checkpoint also reaches the
     /// off-host sink on its own cadence (REQ-AUD-002).
+    ///
+    /// Every registered panic hook runs before this returns,
+    /// whatever the outcome (#252 — see [`Self::add_panic_hook`]):
+    /// the guard runs them on the normal path and on an unwind, so
+    /// no caller — web route, owner socket, a future ntfy action, a
+    /// direct call — does any panic cleanup of its own.
     pub fn panic_lock(&self) -> Result<(), GrantError> {
+        /// Runs the broker's panic hooks when dropped, so they fire
+        /// on every exit from `panic_lock`, success, error or unwind.
+        struct PanicHooks<'a, S: VaultView, C: Clock> {
+            broker: &'a Broker<S, C>,
+        }
+        impl<S: VaultView, C: Clock> Drop for PanicHooks<'_, S, C> {
+            fn drop(&mut self) {
+                self.broker.run_panic_hooks();
+            }
+        }
+        let _hooks = PanicHooks { broker: self };
+        self.panic_lock_inner()
+    }
+
+    /// The panic itself, without the hook run (that is
+    /// [`Self::panic_lock`]'s guard).
+    fn panic_lock_inner(&self) -> Result<(), GrantError> {
         let removed = self
             .grants
             .lock()

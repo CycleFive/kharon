@@ -50,7 +50,8 @@
 //!   `{"ok":true,"enroll_token":"<base64url>"}`. The code is not a
 //!   password and cannot sign in; it only authorizes registering a
 //!   passkey. It is zeroized with the reply buffer. Without an
-//!   owner UI configured the op is `unknown_op`.
+//!   owner UI configured the op is `unknown_op`. A failed audit
+//!   append is `audit_failed` and no code is minted (#249).
 //!
 //!   The CLI/ntfy presentation of the grant ops is #16; this socket
 //!   is the broker-side seam they drive. The web UI never accepts

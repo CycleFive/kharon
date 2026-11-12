@@ -15,7 +15,8 @@
 //! (same-uid) mints a single-use enrollment code via `passkey_enroll`;
 //! `POST /owner/register/*` accepts that code, or an existing owner
 //! session, and does not set a session cookie. Signing in still
-//! requires an assertion.
+//! requires an assertion. Minting a code and storing a passkey each
+//! append an audit entry first; a failed append does neither (#249).
 //!
 //! Fixed routes (no token in the path):
 //!
@@ -203,15 +204,40 @@ impl OwnerShell for StaticShell {
     }
 }
 
-/// Where `owner_auth_fail` entries go. Best effort: a failed append
-/// does not turn a refusal into a success.
+/// Where owner-UI audit entries go.
+///
+/// `auth_failed` and `suppressed_only` are best effort: a failed
+/// append does not turn a refusal into a success. Enrollment is
+/// fail-closed (#249, the fill rule): `Err` means the entry was not
+/// appended, and the caller must not mint a code or leave a
+/// credential stored.
 pub trait OwnerAudit: Send + Sync + 'static {
     /// Record a failed owner-UI authentication attempt.
     fn auth_failed(&self, failure: AuthFailure);
     /// Record the count of failures the audit ceiling (D6) did not
     /// itemize, as a `suppressed_only` entry.
     fn suppressed_only(&self, count: u64);
+    /// `passkey_enroll_code` on channel `cli`, before a code is
+    /// minted. `Err` mints nothing.
+    fn passkey_enroll_code(&self) -> Result<(), OwnerAuditError>;
+    /// `passkey_enrolled` on channel `web_ui`, before the passkey is
+    /// stored. Called while the passkey store lock is held, so the
+    /// sink must not call back into the UI. `Err` stores nothing.
+    fn passkey_enrolled(&self, enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError>;
 }
+
+/// A passkey that is about to be stored (#249). No credential id.
+pub struct PasskeyEnrolled {
+    /// Truncated SHA-256 of the raw credential id, 32 lowercase hex chars.
+    pub credential_fingerprint: String,
+    /// Enrolled passkeys once this one is stored.
+    pub passkey_count: u64,
+}
+
+/// The enrollment entry was not appended.
+#[derive(Debug, thiserror::Error)]
+#[error("audit append failed")]
+pub struct OwnerAuditError;
 
 /// One failed owner-UI authentication attempt, as the audit sink sees it.
 pub struct AuthFailure {
@@ -230,6 +256,12 @@ pub struct NoAudit;
 impl OwnerAudit for NoAudit {
     fn auth_failed(&self, _failure: AuthFailure) {}
     fn suppressed_only(&self, _count: u64) {}
+    fn passkey_enroll_code(&self) -> Result<(), OwnerAuditError> {
+        Ok(())
+    }
+    fn passkey_enrolled(&self, _enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
+        Ok(())
+    }
 }
 
 /// The owner UI's state: passkeys, sealed ceremony tokens (nothing
@@ -421,7 +453,11 @@ impl OwnerUi {
     /// The returned buffer is the only copy the caller should print;
     /// the server stores SHA-256 of it. The owner socket is the
     /// intended caller: it is already authenticated by peer uid.
-    pub fn mint_enroll_token(&self) -> Zeroizing<String> {
+    ///
+    /// Appends `passkey_enroll_code` first (#249, the fill rule). A
+    /// failed append returns [`OwnerAuditError`] and mints nothing.
+    pub fn mint_enroll_token(&self) -> Result<Zeroizing<String>, OwnerAuditError> {
+        self.audit.passkey_enroll_code()?;
         let raw = random_bytes::<32>();
         let token = Zeroizing::new(b64url_encode(&raw));
         let hash = sha256(token.as_bytes());
@@ -435,7 +471,16 @@ impl OwnerUi {
             hash,
             expires: now + CEREMONY_TTL,
         });
-        token
+        Ok(token)
+    }
+
+    /// Live enrollment codes. Unit tests use this to see that a
+    /// failed append minted nothing.
+    #[cfg(test)]
+    pub(crate) fn outstanding_enroll_codes(&self) -> usize {
+        let guard = self.enroll.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        guard.iter().filter(|e| e.expires > now).count()
     }
 
     /// Force every session to look expired. Session TTL is also
@@ -1305,9 +1350,15 @@ impl OwnerUi {
         if let Some(refused) = self.burn_ceremony(req, &opened) {
             return refused;
         }
-        if self.store_credential(registered).is_err() {
-            self.fail(req, "bad_assertion");
-            return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
+        match self.store_enrolled(registered) {
+            Ok(()) => {}
+            Err(EnrollStore::Audit) => {
+                return respond(StatusCode::INTERNAL_SERVER_ERROR, "audit_failed", None);
+            }
+            Err(EnrollStore::Store) => {
+                self.fail(req, "bad_assertion");
+                return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
+            }
         }
         // Registration is not a login. No session cookie.
         json_body(
@@ -1473,16 +1524,45 @@ impl OwnerUi {
         guard.retain(|s| !ct_eq(&s.hash, &hash));
     }
 
-    fn store_credential(&self, cred: RegisteredCredential) -> std::io::Result<()> {
-        self.passkeys
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    /// Store `cred` only after `passkey_enrolled` is durable (#249).
+    /// The count on the entry is the number of passkeys this store
+    /// will hold. The passkey lock is held across the append so that
+    /// count cannot race another enrollment.
+    fn store_enrolled(&self, cred: RegisteredCredential) -> Result<(), EnrollStore> {
+        let mut guard = self.passkeys.lock().unwrap_or_else(|p| p.into_inner());
+        if guard
+            .credentials()
+            .iter()
+            .any(|c| c.id == cred.credential_id)
+        {
+            return Err(EnrollStore::Store);
+        }
+        let passkey_count = guard.credentials().len() as u64 + 1;
+        let credential_fingerprint =
+            crate::api::revocation::truncated_sha256_hex(&cred.credential_id);
+        self.audit
+            .passkey_enrolled(PasskeyEnrolled {
+                credential_fingerprint,
+                passkey_count,
+            })
+            .map_err(|_| EnrollStore::Audit)?;
+        guard
             .insert(store::Credential {
                 id: cred.credential_id,
                 public_key: cred.public_key,
                 sign_count: cred.sign_count,
             })
+            .map_err(|_| EnrollStore::Store)
     }
+}
+
+/// Why a verified registration was not stored.
+#[derive(Debug)]
+enum EnrollStore {
+    /// The `passkey_enrolled` entry was not appended. Nothing was stored.
+    Audit,
+    /// The passkey file could not be written, or the id was already stored.
+    Store,
 }
 
 #[derive(Clone, Copy)]
@@ -2543,6 +2623,14 @@ mod tests {
         }
 
         fn suppressed_only(&self, _count: u64) {}
+
+        fn passkey_enroll_code(&self) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
+
+        fn passkey_enrolled(&self, _enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
     }
 
     const ORIGIN: &str = "http://localhost:9";
@@ -3585,7 +3673,7 @@ mod tests {
         let key =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
         let cred_id = vec![9u8; 16];
-        ui.store_credential(RegisteredCredential {
+        ui.store_enrolled(RegisteredCredential {
             credential_id: cred_id.clone(),
             public_key: key.public_key().as_ref().try_into().unwrap(),
             sign_count: 0,
@@ -3686,6 +3774,14 @@ mod tests {
 
         fn suppressed_only(&self, count: u64) {
             self.summaries.lock().unwrap().push(count);
+        }
+
+        fn passkey_enroll_code(&self) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
+
+        fn passkey_enrolled(&self, _enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
+            Ok(())
         }
     }
 

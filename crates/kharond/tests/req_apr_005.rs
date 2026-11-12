@@ -988,7 +988,7 @@ impl ApprovalsRig {
             broker.clone() as Arc<dyn OwnerApprovals>,
         )
         .unwrap();
-        let token = ui.mint_enroll_token();
+        let token = ui.mint_enroll_token().unwrap();
         let redeem: Arc<dyn ApprovalRedeemer> = broker.clone();
         tokio::spawn(kharond::owner_ui::serve(listener, ui.clone(), redeem));
         let cookie = register_and_sign_in(ui_addr, &origin, &token).await;
@@ -1393,7 +1393,7 @@ async fn req_apr_005_chromium_approve_click() {
     };
     let rig = ApprovalsRig::new().await;
     let approve = rig.pending_request().await;
-    let token = rig.owner.mint_enroll_token();
+    let token = rig.owner.mint_enroll_token().unwrap();
 
     let chromium = launch_chromium(&bin);
     let mut cdp = Cdp::connect(&chromium.ws).await;
@@ -1648,7 +1648,7 @@ async fn req_apr_005_chromium_revoke_click() {
     };
     let rig = ApprovalsRig::new().await;
     let grant = rig.per_origin_grant().await;
-    let token = rig.owner.mint_enroll_token();
+    let token = rig.owner.mint_enroll_token().unwrap();
 
     let chromium = launch_chromium(&bin);
     let mut cdp = Cdp::connect(&chromium.ws).await;
@@ -1869,7 +1869,7 @@ async fn req_apr_005_chromium_panic_click() {
     };
     let rig = ApprovalsRig::new().await;
     let _grant = rig.per_origin_grant().await;
-    let token = rig.owner.mint_enroll_token();
+    let token = rig.owner.mint_enroll_token().unwrap();
 
     let chromium = launch_chromium(&bin);
     let mut cdp = Cdp::connect(&chromium.ws).await;

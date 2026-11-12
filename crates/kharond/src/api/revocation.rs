@@ -38,19 +38,22 @@ use super::token::TokenStore;
 /// Hex chars of the SHA-256 kept in a token fingerprint (16 bytes).
 pub const TOKEN_FINGERPRINT_HEX: usize = 32;
 
+/// First [`TOKEN_FINGERPRINT_HEX`] lowercase hex chars of SHA-256
+/// over `bytes`. Shared by [`token_fingerprint`] and the passkey
+/// credential-id fingerprint (#249): same 32-hex shape, different
+/// input.
+pub fn truncated_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(bytes)[..TOKEN_FINGERPRINT_HEX / 2])
+}
+
 /// Fingerprint of a `token_hash` PHC string: SHA-256 of the string,
 /// lowercase hex, truncated to [`TOKEN_FINGERPRINT_HEX`] chars. The
 /// PHC string carries a random salt and already sits in the config
 /// file (operator-readable), so the fingerprint exposes nothing
 /// usable; equality is all the rebuild needs.
 pub fn token_fingerprint(token_hash_phc: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(token_hash_phc.as_bytes());
-    let mut hex = String::with_capacity(TOKEN_FINGERPRINT_HEX);
-    for byte in &digest[..TOKEN_FINGERPRINT_HEX / 2] {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    hex
+    truncated_sha256_hex(token_hash_phc.as_bytes())
 }
 
 /// Revoke / suspend state folded from the audit log.
@@ -171,8 +174,10 @@ mod tests {
 
     #[test]
     fn req_rev_132_fingerprint_is_stable_short_and_hash_sensitive() {
-        let fp = token_fingerprint("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA");
+        let phc = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA";
+        let fp = token_fingerprint(phc);
         assert_eq!(fp.len(), TOKEN_FINGERPRINT_HEX);
+        assert_eq!(fp, truncated_sha256_hex(phc.as_bytes()));
         assert_eq!(
             fp,
             token_fingerprint("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA")

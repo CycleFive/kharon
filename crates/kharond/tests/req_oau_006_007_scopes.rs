@@ -8,7 +8,10 @@
 //! endpoint in phase 1 — gets `forbidden` / `no_browser` for
 //! context and fills, before any fill backend is consulted
 //! (REQ-OAU-007). The `[policy]` limits are keyed by agent id, so
-//! they bind a `c-…` id exactly like a config agent's.
+//! they bind a `c-…` id exactly like a config agent's. No scope
+//! approves: a `kh_at_` or `kh_rt_` presented to an owner-UI
+//! route, an ntfy redeem route, or the owner socket is refused
+//! (REQ-OAU-006).
 
 mod api_support;
 
@@ -17,12 +20,14 @@ use std::sync::Arc;
 use api_support::*;
 use base64ct::{Base64UrlUnpadded, Encoding};
 use kharond::api::grant::{Channel, GrantAction, GrantRequestArgs};
+use kharond::api::http::ApprovalRedeemer;
 use kharond::api::oauth::Discovery;
 use kharond::api::oauth_store::{CodeGrant, ConnectLifecycle, OauthStore};
 use kharond::api::rate::RatePolicy;
 use kharond::api::revocation::DurableState;
 use kharond::api::token::{TokenStore, generate_with};
 use kharond::api::{ApiError, Broker, Detail, ErrorCode, FillOperation, FillRequest, Request};
+use kharond::api::{ApprovalAction, ApprovalPrompt, TokenGone};
 use kharond::audit::{AuditConfig, AuditLog, Entry, Event, NullCheckpointSink};
 use kharond::cdp::fill::FieldKind;
 use kharond::lock::{LockController, LockPolicy, ManualClock, StaticHardening};
@@ -390,6 +395,36 @@ fn connect_list_calls_draw_on_the_list_budget() {
 }
 
 #[test]
+fn connect_search_draws_on_the_same_list_budget() {
+    let (store, access, _) = live_connect(&ALL_SCOPES);
+    let policy = RatePolicy {
+        list_per_minute: 2,
+        ..RatePolicy::default()
+    };
+    let h = Harness::with(false, |b| {
+        b.with_oauth_store(store).with_rate_policy(policy)
+    });
+    let agent = h.broker.authenticate_on_mcp(&access).unwrap();
+
+    // REQ-OAU-007: list and search share `list_per_minute`. One of
+    // each spends a budget of 2; the next search is refused.
+    assert!(
+        h.broker
+            .dispatch(&agent, Request::List { origin: None })
+            .is_ok()
+    );
+    let search = Request::Search {
+        q: "example".to_owned(),
+        origin: None,
+    };
+    assert!(h.broker.dispatch(&agent, search.clone()).is_ok());
+    assert_eq!(
+        h.broker.dispatch(&agent, search),
+        Err(ApiError::RATE_LIMITED)
+    );
+}
+
+#[test]
 fn a_suspended_connect_is_refused_until_the_owner_resets_it() {
     let (store, access, agent_id) = live_connect(&ALL_SCOPES);
 
@@ -451,4 +486,193 @@ fn a_suspended_connect_is_refused_until_the_owner_resets_it() {
             .dispatch(&agent, Request::List { origin: None })
             .is_ok()
     );
+}
+
+const ACCESS_TOKEN: &str = "kh_at_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const REFRESH_TOKEN: &str =
+    "kh_rt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// A redeemer that never holds an approval link. The route test
+/// does not exercise redeem; the bearer gate returns before it.
+struct ClosedRedeem;
+
+impl ApprovalRedeemer for ClosedRedeem {
+    fn prompt(&self, _token: &str) -> Result<(ApprovalPrompt, ApprovalAction), TokenGone> {
+        Err(TokenGone::Unknown)
+    }
+
+    fn redeem(&self, _token: &str) -> Result<ApprovalAction, TokenGone> {
+        Err(TokenGone::Unknown)
+    }
+}
+
+async fn owner_http(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> RawResponse {
+    let auth = bearer
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    raw_request(addr, head.as_bytes()).await
+}
+
+fn assert_oauth_bearer_refused(r: &RawResponse, token: &str) {
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("\"error\":\"forbidden\""), "{}", r.body);
+    assert!(
+        !r.body.contains(token),
+        "the refusal echoes the token: {}",
+        r.body
+    );
+}
+
+#[tokio::test]
+async fn oauth_bearer_is_refused_on_every_owner_ui_route() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://localhost:{}", addr.port());
+    let ui = kharond::owner_ui::OwnerUi::open(
+        data.path(),
+        "localhost",
+        origin,
+        Arc::new(kharond::owner_ui::StaticShell(
+            kharond::owner_ui::ShellView {
+                locked: false,
+                pending: 0,
+            },
+        )),
+        Arc::new(kharond::owner_ui::NoAudit),
+        Arc::new(kharond::owner_ui::NoApprovals),
+    )
+    .unwrap();
+    let enroll = ui.mint_enroll_token().unwrap();
+    tokio::spawn(kharond::owner_ui::serve(
+        listener,
+        Arc::clone(&ui),
+        Arc::new(ClosedRedeem),
+    ));
+
+    // REQ-OAU-006: every owner-UI route, connections and panic
+    // included, refuses an OAuth bearer before the route runs.
+    for (method, path) in kharond::owner_ui::ROUTES {
+        let r = owner_http(addr, method, path, Some(ACCESS_TOKEN)).await;
+        assert_oauth_bearer_refused(&r, ACCESS_TOKEN);
+    }
+    // A refresh token is the same refusal, and the scheme's case
+    // does not matter.
+    let head = format!(
+        "GET /owner/session HTTP/1.1\r\nHost: localhost\r\nauthorization: bearer {REFRESH_TOKEN}\r\nConnection: close\r\n\r\n"
+    );
+    let r = raw_request(addr, head.as_bytes()).await;
+    assert_oauth_bearer_refused(&r, REFRESH_TOKEN);
+
+    // A bearer that is not an OAuth token is not this gate: the
+    // session route answers unauthenticated, and the enrollment
+    // code still starts registration (it was not consumed by the
+    // access-token attempt above).
+    let r = owner_http(addr, "GET", "/owner/session", Some("enroll-code")).await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    assert!(r.body.contains("unauthenticated"), "{}", r.body);
+
+    let r = owner_http(addr, "POST", "/owner/register/options", Some(ACCESS_TOKEN)).await;
+    assert_oauth_bearer_refused(&r, ACCESS_TOKEN);
+    let r = owner_http(
+        addr,
+        "POST",
+        "/owner/register/options",
+        Some(enroll.as_str()),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("ceremony_id"), "{}", r.body);
+
+    // The home page still renders when no OAuth token is sent.
+    let r = owner_http(addr, "GET", "/", None).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("kharon"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn oauth_token_does_not_redeem_an_ntfy_approval() {
+    let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://example.com/");
+    let h = Harness::with(false, |b| b.with_fill_backend(Box::new(fake)));
+    let alpha = h.broker.authenticate(&h.alpha).unwrap();
+    let outcome = h
+        .broker
+        .fill_from(
+            &alpha,
+            fill_req(FillOperation::Fill),
+            tokio::time::Instant::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    let kharond::api::Outcome::Fill(result) = outcome else {
+        panic!("expected a fill outcome");
+    };
+    assert_eq!(result.status, "pending_approval", "{result:?}");
+    let request_id = result.grant_request_id.expect("pending request id");
+    let (approve_path, _deny_path) = h.broker.approval_token_paths(&request_id).unwrap();
+
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ui_addr = listener.local_addr().unwrap();
+    let origin = format!("http://localhost:{}", ui_addr.port());
+    let ui = kharond::owner_ui::OwnerUi::open(
+        data.path(),
+        "localhost",
+        origin,
+        Arc::new(kharond::owner_ui::StaticShell(
+            kharond::owner_ui::ShellView {
+                locked: false,
+                pending: 1,
+            },
+        )),
+        Arc::new(kharond::owner_ui::NoAudit),
+        h.broker.clone(),
+    )
+    .unwrap();
+    tokio::spawn(kharond::owner_ui::serve(
+        listener,
+        ui,
+        h.broker.clone() as Arc<dyn ApprovalRedeemer>,
+    ));
+    let owner_addr = serve_owner(Arc::clone(&h.broker)).await;
+
+    // Authorization: Bearer kh_at_ on the live link does not
+    // consume it, on either listener.
+    for addr in [ui_addr, owner_addr] {
+        let r = owner_http(addr, "POST", &approve_path, Some(ACCESS_TOKEN)).await;
+        assert_oauth_bearer_refused(&r, ACCESS_TOKEN);
+        assert!(
+            h.broker
+                .approval_token_prompt(approve_path.rsplit('/').next().unwrap())
+                .is_ok(),
+            "the approval link was consumed"
+        );
+    }
+
+    // The access token as the path is an unknown link (410), and
+    // the real link is still live.
+    let forged = format!("/owner/approve/{ACCESS_TOKEN}");
+    let r = owner_http(ui_addr, "POST", &forged, None).await;
+    assert_eq!(r.status, 410, "{}", r.body);
+    assert!(!r.body.contains("approved"), "{}", r.body);
+    let forged_refresh = format!("/owner/deny/{REFRESH_TOKEN}");
+    let r = owner_http(owner_addr, "GET", &forged_refresh, None).await;
+    assert_eq!(r.status, 410, "{}", r.body);
+    let token = approve_path.rsplit('/').next().unwrap();
+    assert!(h.broker.approval_token_prompt(token).is_ok());
+
+    // The real link then approves, once.
+    let r = owner_http(owner_addr, "POST", &approve_path, None).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("approved"), "{}", r.body);
+    assert!(h.broker.approval_token_prompt(token).is_err());
 }

@@ -1215,6 +1215,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://kharon.twkr.io/mcp \
 refused for want of a token. A tool call with a real agent token
 then behaves as it does on `[api]`.
 
+[`deploy/checks/edge-checks.sh`](../deploy/checks/edge-checks.sh) runs
+these checks and the owner-hostname and `/connector` ones in one pass,
+with no credentials. Its header lists the side effects. The full
+acceptance procedure for a new deploy, including the canary checks, is
+in [`acceptance-checks.md`](acceptance-checks.md).
+
 Then the origin on its own, bypassing the edge. This is the second
 layer: kharond's own 404. From the compose holder's namespace, run
 from `deploy/compose`:

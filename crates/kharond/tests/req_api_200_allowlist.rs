@@ -5,8 +5,9 @@
 //! and an agent's allow-list binds that identity to a tool set:
 //! `tools/list` is filtered, calls outside the list are refused 403
 //! `tool_not_allowed` on both transports, and the owner's revoke
-//! refuses the very next request — no cache window anywhere (auth
-//! and the allow-list are read fresh per request).
+//! refuses the very next request on `/v1` and `/mcp` — no cache
+//! window anywhere (auth and the allow-list are read fresh per
+//! request).
 
 mod api_support;
 
@@ -149,6 +150,11 @@ async fn revoke_refuses_the_next_request_immediately() {
         "the same token, one call later, no longer authenticates"
     );
     let r = get(addr, "/v1/status", Some(&h.alpha)).await;
+    assert_eq!(r.status, 401, "{}", r.body);
+    // REQ-API-011: revocation is read fresh per request in the
+    // broker, so both transports are bound. One `/mcp` call with
+    // the same token is 401 as well (#239 N6).
+    let r = mcp_call(addr, Some(&h.alpha), "kharon_status", "{}").await;
     assert_eq!(r.status, 401, "{}", r.body);
     // Beta is untouched by alpha's revocation.
     let r = get(addr, "/v1/status", Some(&h.beta)).await;

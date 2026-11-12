@@ -13,8 +13,9 @@
 //!
 //! The token semantics — identities, rotation, reuse, persistence —
 //! live in [`crate::api::oauth_store`]. This module is the HTTP
-//! skin: form parsing, the `resource` pin, the second-redemption
-//! check against the store's redeemed set, and error mapping.
+//! skin: form parsing, the `resource` pin, the single-use code take
+//! (a pending redeemed-use marker recorded atomically with it), and
+//! error mapping.
 //!
 //! Codes are the authorize side's (#230): redemption goes through
 //! [`CodeRedeemer`], a seam over its in-memory code store.
@@ -26,7 +27,7 @@ use axum::http::{Method, StatusCode};
 use serde_json::json;
 
 use super::{Incoming, OwnerUi, Response, json_body, method_not_allowed, sha256};
-use crate::api::oauth_store::{CodeGrant, DisconnectDetail, OauthStore, TokenError};
+use crate::api::oauth_store::{CodeClaim, CodeGrant, DisconnectDetail, OauthStore, TokenError};
 
 /// A redeemed authorization code, carried from the authorize side
 /// to the token store: #230's `CodeBody` across the seam.
@@ -50,6 +51,12 @@ pub trait CodeRedeemer: Send + Sync {
     /// Remove and return the code's body. `None` when the code is
     /// unknown, expired or already redeemed.
     fn redeem(&self, plaintext: &str) -> Option<RedeemedCode>;
+
+    /// Called after this redemption has taken the code and recorded
+    /// its pending use, and before the Connect is committed. The
+    /// store lock is not held. The default does nothing; tests block
+    /// here so a second presentation can land in that window.
+    fn after_take(&self) {}
 }
 
 /// No authorize side wired: every code is unknown. On a tree
@@ -219,21 +226,44 @@ impl OwnerUi {
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_target");
         }
         let code_hash = sha256(code.as_bytes());
-        // A second redemption revokes everything the first issued
-        // (D4). The redeemed set is checked before the code store:
-        // the store has already forgotten the code.
-        if let Some(identity_id) = side.store.redeemed_identity(&code_hash, now) {
-            let _ = side
-                .store
-                .disconnect(&identity_id, DisconnectDetail::CodeReuse, "web_ui", now);
-            return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
-        }
-        let Some(body) = side.codes.redeem(code) else {
-            return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
+        // Take the code and record the pending redeemed-use marker
+        // under the store lock (D4, RFC 6749 §4.1.2). A second
+        // presentation, at any point after this returns, sees the
+        // marker: a committed Connect is revoked, and one that has
+        // not committed yet is marked so `connect` refuses it.
+        let codes = Arc::clone(&side.codes);
+        let code_owned = code.to_owned();
+        let claim = side.store.begin_redemption(code_hash, now, move || {
+            codes.redeem(&code_owned).map(|body| {
+                let consented_at = body.consented_at;
+                (body, consented_at)
+            })
+        });
+        let body = match claim {
+            CodeClaim::Unknown => {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
+            }
+            CodeClaim::Reuse { identity_id } => {
+                if let Some(identity_id) = identity_id {
+                    let _ = side.store.disconnect(
+                        &identity_id,
+                        DisconnectDetail::CodeReuse,
+                        "web_ui",
+                        now,
+                    );
+                }
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
+            }
+            CodeClaim::Taken(body) => body,
         };
+        // The marker is recorded and the lock is released. A second
+        // redemption can land here; `connect` observes it under the
+        // store lock and does not leave a live Connect.
+        side.codes.after_take();
         // The redemption must name the client and redirect the code
         // was bound to (RFC 6749 §4.1.3). The code is spent either
-        // way: the authorize side has already taken it out.
+        // way: the authorize side has already taken it out, and the
+        // pending marker keeps a later presentation refused.
         if body.client_id != client_id || body.redirect_uri != redirect_uri {
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
         }

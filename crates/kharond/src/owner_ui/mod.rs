@@ -2962,15 +2962,30 @@ mod tests {
     struct RecLifecycle {
         entries: StdMutex<Vec<crate::audit::Entry>>,
         ended: StdMutex<Vec<String>>,
+        fail_append: StdMutex<bool>,
     }
 
     impl ConnectLifecycle for RecLifecycle {
         fn append(&self, entry: crate::audit::Entry) -> bool {
+            if *self.fail_append.lock().unwrap() {
+                return false;
+            }
             self.entries.lock().unwrap().push(entry);
             true
         }
         fn connect_ended(&self, agent_id: &str) {
             self.ended.lock().unwrap().push(agent_id.to_owned());
+        }
+    }
+
+    impl RecLifecycle {
+        fn events(&self) -> Vec<(String, Option<String>)> {
+            self.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| (e.event.as_str().to_owned(), e.detail_code.clone()))
+                .collect()
         }
     }
 
@@ -2991,18 +3006,17 @@ mod tests {
         lifecycle: Arc<RecLifecycle>,
     }
 
-    fn token_fixture(dir: &Path, with_side: bool) -> TokenFixture {
-        let store = Arc::new(OauthStore::load(dir).unwrap());
-        let lifecycle = Arc::new(RecLifecycle::default());
-        store.set_lifecycle(lifecycle.clone());
-        let codes = Arc::new(FakeCodes::default());
-        let oauth_tokens =
-            with_side.then(|| oauth_token::TokenSide::with_codes(store.clone(), codes.clone()));
+    fn open_token_ui(
+        dir: &Path,
+        store: Arc<OauthStore>,
+        codes: Option<Arc<dyn oauth_token::CodeRedeemer>>,
+    ) -> Arc<OwnerUi> {
+        let oauth_tokens = codes.map(|codes| oauth_token::TokenSide::with_codes(store, codes));
         let discovery = Discovery::new(
             "https://kharon-owner.example.com".to_owned(),
             "kharon.example.com",
         );
-        let ui = OwnerUi::open_with(
+        OwnerUi::open_with(
             dir,
             OwnerUiOptions {
                 rp_id: "kharon-owner.example.com".into(),
@@ -3020,7 +3034,19 @@ mod tests {
             Arc::new(NoAudit),
             Arc::new(NoApprovals),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn token_fixture(dir: &Path, with_side: bool) -> TokenFixture {
+        let store = Arc::new(OauthStore::load(dir).unwrap());
+        let lifecycle = Arc::new(RecLifecycle::default());
+        store.set_lifecycle(lifecycle.clone());
+        let codes = Arc::new(FakeCodes::default());
+        let ui = open_token_ui(
+            dir,
+            store.clone(),
+            with_side.then(|| codes.clone() as Arc<dyn oauth_token::CodeRedeemer>),
+        );
         TokenFixture {
             ui,
             store,
@@ -3036,22 +3062,54 @@ mod tests {
             .as_secs()
     }
 
+    /// A code bound to `verifier`'s PKCE challenge, the dashboard
+    /// client and redirect the token tests present.
+    fn redeemed_code(verifier: &str) -> oauth_token::RedeemedCode {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        let challenge = Base64UrlUnpadded::encode_string(&sha256(verifier.as_bytes()));
+        oauth_token::RedeemedCode {
+            client_id: "https://dashboard.example/.well-known/kharon-client.json".to_owned(),
+            client_name: "Dashboard".to_owned(),
+            redirect_uri: "https://dashboard.example/cb".to_owned(),
+            code_challenge: challenge,
+            scopes: vec!["kharon:read".to_owned()],
+            consented_at: unix_now(),
+        }
+    }
+
     /// Insert a code on the fake authorize side, bound to
     /// `verifier`'s PKCE challenge.
     fn plant_code(fx: &TokenFixture, code: &str, verifier: &str) {
-        use base64ct::{Base64UrlUnpadded, Encoding};
-        let challenge = Base64UrlUnpadded::encode_string(&sha256(verifier.as_bytes()));
-        fx.codes.0.lock().unwrap().insert(
-            code.to_owned(),
-            oauth_token::RedeemedCode {
-                client_id: "https://dashboard.example/.well-known/kharon-client.json".to_owned(),
-                client_name: "Dashboard".to_owned(),
-                redirect_uri: "https://dashboard.example/cb".to_owned(),
-                code_challenge: challenge,
-                scopes: vec!["kharon:read".to_owned()],
-                consented_at: unix_now(),
-            },
-        );
+        fx.codes
+            .0
+            .lock()
+            .unwrap()
+            .insert(code.to_owned(), redeemed_code(verifier));
+    }
+
+    fn assert_no_live_connect(dir: &Path) {
+        let path = dir.join("oauth").join("state.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let state: Value = serde_json::from_str(&text).unwrap();
+        let live = state["identities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["revoked"].as_bool() == Some(false));
+        assert!(!live, "{text}");
+    }
+
+    fn oauth_err(response: Response) -> String {
+        let status = response.status();
+        let body = futures_body(response);
+        serde_json::from_str::<Value>(&body).unwrap_or_else(|_| {
+            panic!("status {status}, body {body}");
+        })["error"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn form(pairs: &[(&str, &str)]) -> Vec<u8> {
@@ -3503,6 +3561,241 @@ mod tests {
                 ("oauth_disconnect".to_owned(), Some("code_reuse".to_owned())),
             ]
         );
+    }
+
+    /// Parks the first redemption after the code is taken and the
+    /// pending marker is recorded, and before the Connect commits.
+    struct ParkingCodes {
+        codes: StdMutex<HashMap<String, oauth_token::RedeemedCode>>,
+        parked: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl oauth_token::CodeRedeemer for ParkingCodes {
+        fn redeem(&self, plaintext: &str) -> Option<oauth_token::RedeemedCode> {
+            self.codes.lock().unwrap().remove(plaintext)
+        }
+
+        fn after_take(&self) {
+            let tx = self.parked.lock().unwrap().take();
+            let Some(tx) = tx else {
+                return;
+            };
+            let _ = tx.send(());
+            let rx = self.release.lock().unwrap().take();
+            let Some(rx) = rx else {
+                return;
+            };
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the racing redemption did not release the first");
+        }
+    }
+
+    #[test]
+    fn oauth_token_racing_second_redemption_leaves_no_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(OauthStore::load(dir.path()).unwrap());
+        let lifecycle = Arc::new(RecLifecycle::default());
+        store.set_lifecycle(lifecycle.clone());
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let codes = Arc::new(ParkingCodes {
+            codes: StdMutex::new(HashMap::new()),
+            parked: StdMutex::new(Some(parked_tx)),
+            release: StdMutex::new(Some(release_rx)),
+        });
+        codes
+            .codes
+            .lock()
+            .unwrap()
+            .insert("code-race".to_owned(), redeemed_code("verifier-race"));
+        let ui = open_token_ui(
+            dir.path(),
+            store.clone(),
+            Some(codes as Arc<dyn oauth_token::CodeRedeemer>),
+        );
+        let ui_first = Arc::clone(&ui);
+        let first = std::thread::spawn(move || {
+            post_token(
+                &ui_first,
+                oauth_token::TOKEN_PATH,
+                code_form(
+                    "code-race",
+                    "verifier-race",
+                    "https://kharon.example.com/mcp",
+                ),
+                None,
+                None,
+            )
+        });
+        parked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first redemption did not park between take and commit");
+        // The second presentation runs while the first is past the
+        // take and not yet committed.
+        let second = post_token(
+            &ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-race",
+                "verifier-race",
+                "https://kharon.example.com/mcp",
+            ),
+            None,
+            None,
+        );
+        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(second), "invalid_grant");
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(first), "invalid_grant");
+        // The first had already been audited (I5) by the time it
+        // observed the marker, so it compensates with `code_reuse`
+        // and persists nothing.
+        assert_eq!(
+            lifecycle.events(),
+            [
+                ("oauth_connect".to_owned(), None),
+                ("oauth_disconnect".to_owned(), Some("code_reuse".to_owned())),
+            ]
+        );
+        assert!(lifecycle.ended.lock().unwrap().is_empty());
+        assert_no_live_connect(dir.path());
+        // The code stays spent.
+        let third = post_token(
+            &ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-race",
+                "verifier-race",
+                "https://kharon.example.com/mcp",
+            ),
+            None,
+            None,
+        );
+        assert_eq!(third.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(third), "invalid_grant");
+        assert_eq!(lifecycle.events().len(), 2);
+    }
+
+    #[test]
+    fn oauth_token_failed_redemption_stays_spent() {
+        let resource = "https://kharon.example.com/mcp";
+        let present =
+            |ui: &OwnerUi, body: Vec<u8>| post_token(ui, oauth_token::TOKEN_PATH, body, None, None);
+        let again = |ui: &OwnerUi, code: &str, verifier: &str| {
+            let response = present(ui, code_form(code, verifier, resource));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(oauth_err(response), "invalid_grant");
+        };
+
+        // Bad PKCE. The code is spent; nothing is created.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let fx = token_fixture(dir.path(), true);
+            plant_code(&fx, "code-pkce", "right-verifier");
+            let response = present(&fx.ui, code_form("code-pkce", "wrong-verifier", resource));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(oauth_err(response), "invalid_grant");
+            again(&fx.ui, "code-pkce", "right-verifier");
+            assert!(fx.lifecycle.events().is_empty());
+            assert!(fx.lifecycle.ended.lock().unwrap().is_empty());
+            assert_no_live_connect(dir.path());
+        }
+
+        // Client mismatch.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let fx = token_fixture(dir.path(), true);
+            plant_code(&fx, "code-client", "verifier-client");
+            let response = present(
+                &fx.ui,
+                form(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", "code-client"),
+                    (
+                        "client_id",
+                        "https://other.example/.well-known/kharon-client.json",
+                    ),
+                    ("redirect_uri", "https://dashboard.example/cb"),
+                    ("code_verifier", "verifier-client"),
+                    ("resource", resource),
+                ]),
+            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(oauth_err(response), "invalid_grant");
+            again(&fx.ui, "code-client", "verifier-client");
+            assert!(fx.lifecycle.events().is_empty());
+            assert_no_live_connect(dir.path());
+        }
+
+        // Redirect mismatch.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let fx = token_fixture(dir.path(), true);
+            plant_code(&fx, "code-redir", "verifier-redir");
+            let response = present(
+                &fx.ui,
+                form(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", "code-redir"),
+                    (
+                        "client_id",
+                        "https://dashboard.example/.well-known/kharon-client.json",
+                    ),
+                    ("redirect_uri", "https://dashboard.example/other"),
+                    ("code_verifier", "verifier-redir"),
+                    ("resource", resource),
+                ]),
+            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(oauth_err(response), "invalid_grant");
+            again(&fx.ui, "code-redir", "verifier-redir");
+            assert!(fx.lifecycle.events().is_empty());
+            assert_no_live_connect(dir.path());
+        }
+
+        // Audit failure: nothing is created, and the code stays spent.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let fx = token_fixture(dir.path(), true);
+            plant_code(&fx, "code-audit", "verifier-audit");
+            *fx.lifecycle.fail_append.lock().unwrap() = true;
+            let response = present(&fx.ui, code_form("code-audit", "verifier-audit", resource));
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(oauth_err(response), "server_error");
+            *fx.lifecycle.fail_append.lock().unwrap() = false;
+            again(&fx.ui, "code-audit", "verifier-audit");
+            assert!(fx.lifecycle.events().is_empty());
+            assert_no_live_connect(dir.path());
+        }
+
+        // Persist failure: compensating disconnect, no live Connect,
+        // and a later presentation is still refused.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let fx = token_fixture(dir.path(), true);
+            plant_code(&fx, "code-disk", "verifier-disk");
+            std::fs::write(dir.path().join("oauth"), b"not a directory").unwrap();
+            let response = present(&fx.ui, code_form("code-disk", "verifier-disk", resource));
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(oauth_err(response), "server_error");
+            assert_eq!(
+                fx.lifecycle.events(),
+                [
+                    ("oauth_connect".to_owned(), None),
+                    (
+                        "oauth_disconnect".to_owned(),
+                        Some("persist_failed".to_owned())
+                    ),
+                ]
+            );
+            again(&fx.ui, "code-disk", "verifier-disk");
+            assert_eq!(fx.lifecycle.events().len(), 2);
+            assert!(fx.lifecycle.ended.lock().unwrap().is_empty());
+            assert_no_live_connect(dir.path());
+        }
     }
 
     #[test]

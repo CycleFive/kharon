@@ -1115,6 +1115,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "tower-service",
+ "tracing",
  "url",
  "zeroize",
 ]

@@ -107,3 +107,8 @@ tempfile = "3"
 rcgen = { version = "0.13", features = ["crypto", "ring"] }
 # Paused clock for the REQ-API-009 deadline tests.
 tokio = { version = "1", features = ["test-util"] }
+# Redaction probe (#239 N4): a capture subscriber over the public
+# surface. Already in the tree via hyper-util and h2. No default
+# features: `attributes` would pull tracing-attributes, which nothing
+# else in the graph enables.
+tracing = { version = "0.1", default-features = false, features = ["std"] }

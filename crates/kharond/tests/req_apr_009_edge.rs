@@ -1060,6 +1060,159 @@ async fn req_apr_009_a_flood_of_failures_is_itemized_twenty_a_minute() {
     assert!(last.client_ip.is_none(), "{last:?}");
 }
 
+/// #255: a public owner UI, a keep-alive connection already accepted,
+/// shutdown, then a failing request on that connection. It is either
+/// refused, or its count is in the final `suppressed_only` entry.
+/// An idle keep-alive must not hold shutdown past [`daemon::OWNER_UI_DRAIN`].
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_kept_alive_failure_during_shutdown_is_refused_or_counted() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut run = start_public().await;
+    // Fill the itemized allowance so the next failure is counted, not
+    // written as its own entry. A different source each time, so the
+    // per-source throttle stays out of it.
+    for i in 0..20 {
+        let ip = format!("198.51.100.{}", i + 1);
+        let r = garbage_from(&run, &ip).await;
+        assert_eq!(r.status, 401, "{i}: {}", r.body);
+    }
+    assert!(
+        run.auth_fails()
+            .iter()
+            .all(|e| e.result.as_deref() == Some("denied")),
+        "budget not full: {:?}",
+        run.auth_fails()
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(run.ui).await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let get = format!("GET / HTTP/1.1\r\nHost: {PUBLIC_HOST}\r\nConnection: keep-alive\r\n\r\n");
+    stream.write_all(get.as_bytes()).await.unwrap();
+    let (status, raw) = read_http(&mut stream)
+        .await
+        .expect("keep-alive GET produced no response");
+    assert_eq!(status, 200, "{raw}");
+
+    // The connection is accepted and idle. Signal shutdown, then give
+    // the daemon time to leave the accept loop before the failure is
+    // sent on this same connection: the window cloudflared's open
+    // origin connection sits in.
+    let started = Instant::now();
+    run.stop.take().unwrap().send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let body = "{}";
+    let fail = format!(
+        "POST /owner/login/finish HTTP/1.1\r\n\
+         Host: {PUBLIC_HOST}\r\n\
+         Origin: {PUBLIC_ORIGIN}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         CF-Connecting-IP: 198.51.100.21\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        len = body.len(),
+    );
+    let wrote =
+        tokio::time::timeout(Duration::from_secs(1), stream.write_all(fail.as_bytes())).await;
+    let served = if wrote.is_ok_and(|r| r.is_ok()) {
+        tokio::time::timeout(Duration::from_secs(1), read_http(&mut stream))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    // Hold the socket until the daemon returns. Shutdown must not be
+    // waiting on this keep-alive.
+    let budget = daemon::OWNER_UI_DRAIN + Duration::from_secs(5);
+    tokio::time::timeout(budget, &mut run.server)
+        .await
+        .expect("owner UI keep-alive held shutdown open")
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < budget,
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    drop(stream);
+
+    let fails = run.auth_fails();
+    let denied = fails
+        .iter()
+        .filter(|e| e.result.as_deref() == Some("denied"))
+        .count();
+    assert_eq!(denied, 20, "late failure was itemized: {fails:?}");
+    let counted = fails.iter().rev().find_map(|e| {
+        (e.result.as_deref() == Some("suppressed_only")).then_some(e.suppressed.unwrap_or(0))
+    });
+    if let Some((status, raw)) = served {
+        assert_eq!(status, 401, "{raw}");
+        assert_eq!(
+            counted,
+            Some(1),
+            "dispatched failure missing from the final suppressed_only: {fails:?}"
+        );
+    } else {
+        // Refused, or dispatched and then dropped before the status
+        // line came back. A lost count is the failure this test exists
+        // for, and that one still has a status line.
+        assert!(
+            matches!(counted, None | Some(1)),
+            "unexpected suppressed count: {fails:?}"
+        );
+    }
+}
+
+/// One HTTP/1 response off a keep-alive socket. `None` when the peer
+/// closed without a status line.
+async fn read_http(stream: &mut tokio::net::TcpStream) -> Option<(u16, String)> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    loop {
+        match stream.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+        let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if buf.len() > 65_536 {
+                break;
+            }
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buf[..split]);
+        let status = http_status(&headers)?;
+        let Some(len) = http_content_length(&headers) else {
+            return Some((status, String::from_utf8_lossy(&buf).into_owned()));
+        };
+        if buf.len() - (split + 4) >= len {
+            buf.truncate(split + 4 + len);
+            return Some((status, String::from_utf8_lossy(&buf).into_owned()));
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let status = http_status(&text)?;
+    text.starts_with("HTTP/")
+        .then(|| (status, text.into_owned()))
+}
+
+fn http_status(headers: &str) -> Option<u16> {
+    headers.split([' ', '\r']).nth(1)?.parse().ok()
+}
+
+fn http_content_length(headers: &str) -> Option<usize> {
+    headers.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn req_apr_009_local_mode_itemizes_every_failure() {
     let run = start_local().await;

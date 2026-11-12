@@ -1114,6 +1114,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "toml",
+ "tower-service",
  "url",
  "zeroize",
 ]

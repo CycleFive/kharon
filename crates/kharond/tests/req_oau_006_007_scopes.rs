@@ -17,6 +17,7 @@ use std::sync::Arc;
 use api_support::*;
 use base64ct::{Base64UrlUnpadded, Encoding};
 use kharond::api::grant::{GrantAction, GrantRequestArgs};
+use kharond::api::oauth::Discovery;
 use kharond::api::oauth_store::{CodeGrant, ConnectLifecycle, OauthStore};
 use kharond::api::rate::RatePolicy;
 use kharond::api::revocation::DurableState;
@@ -206,16 +207,55 @@ async fn tools_list_returns_only_the_tokens_scope_tools() {
 }
 
 #[tokio::test]
+async fn tools_list_for_an_empty_scope_set_is_empty() {
+    // Fail closed: a Connect whose token carries no scopes at all
+    // lists nothing (and could call nothing).
+    let (store, access, _) = live_connect(&[]);
+    let h = Harness::with(false, |b| b.with_oauth_store(store));
+    let addr = serve_http(h.broker.clone()).await;
+    let r = mcp_request(addr, Some(&access), "tools/list", "{}").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(tool_names(&r.json()).is_empty(), "{}", r.body);
+}
+
+#[tokio::test]
 async fn out_of_scope_calls_get_insufficient_scope() {
     let (store, access, _) = live_connect(&["kharon:read"]);
-    let h = Harness::with(false, |b| b.with_oauth_store(store));
+    let discovery = Discovery::new("https://kharon-owner.example".to_owned(), "kharon.example");
+    let h = Harness::with(false, |b| {
+        b.with_oauth_store(store).with_oauth(discovery.clone())
+    });
     let addr = serve_http(h.broker.clone()).await;
 
     // On the wire (REQ-OAU-001's acceptance): a read-only token
-    // calling a fill-bundle tool gets 403 `insufficient_scope` —
-    // the scope refusal, not `no_browser`: the scope gate is
-    // checked first.
+    // calling a fill-bundle tool gets the RFC 6750 step-up — HTTP
+    // 403 and the challenge naming the error and every scope the
+    // retry needs (the granted `kharon:read` plus the missing
+    // `kharon:fill`), so the client can re-authorize and call
+    // again. The refusal is the scope one, not `no_browser`: the
+    // scope gate is checked first. The body stays the tool-error
+    // result.
     let r = mcp_call(addr, Some(&access), "kharon_context", "{}").await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    let challenge = r.header("www-authenticate").expect("step-up challenge");
+    assert_eq!(
+        challenge,
+        discovery.step_up_challenge(&["kharon:read".to_owned()], "kharon:fill")
+    );
+    assert!(
+        challenge.contains("error=\"insufficient_scope\""),
+        "{challenge}"
+    );
+    assert!(
+        challenge.contains("scope=\"kharon:read kharon:fill\""),
+        "{challenge}"
+    );
+    assert!(
+        challenge.contains(
+            "resource_metadata=\"https://kharon.example/.well-known/oauth-protected-resource/mcp\""
+        ),
+        "{challenge}"
+    );
     let err = tool_error(&r.json());
     assert_eq!(err["error"], "insufficient_scope", "{err}");
     assert_eq!(
@@ -223,8 +263,9 @@ async fn out_of_scope_calls_get_insufficient_scope() {
         "token does not have the scope this tool needs"
     );
 
-    // Its own bundle still works.
+    // Its own bundle still works, in the plain 200 shape.
     let r = mcp_call(addr, Some(&access), "kharon_status", "{}").await;
+    assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.json()["result"]["isError"], false, "{}", r.body);
 
     // At the broker, the same refusal for the other bundles, as
@@ -267,7 +308,12 @@ async fn connect_context_and_fills_answer_no_browser_without_a_backend() {
     let fake = FakeFill::new(FakeAnswer::Filled);
     let probe = fake.clone();
     let h = Harness::with(false, |b| {
-        b.with_oauth_store(store).with_fill_backend(Box::new(fake))
+        b.with_oauth_store(store)
+            .with_fill_backend(Box::new(fake))
+            .with_oauth(Discovery::new(
+                "https://kharon-owner.example".to_owned(),
+                "kharon.example",
+            ))
     });
     let agent = h.broker.authenticate_on_mcp(&access).unwrap();
 
@@ -293,6 +339,19 @@ async fn connect_context_and_fills_answer_no_browser_without_a_backend() {
 
     // Never falls back: the fill backend saw nothing at all.
     assert!(probe.seen().is_empty());
+    assert!(probe.context_calls.lock().unwrap().is_empty());
+
+    // On the wire the refusal keeps the plain tool-result shape —
+    // HTTP 200, `forbidden` / `no_browser`, no step-up challenge:
+    // the step-up answers scope refusals only, and this token
+    // holds every scope.
+    let addr = serve_http(h.broker.clone()).await;
+    let r = mcp_call(addr, Some(&access), "kharon_context", "{}").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.header("www-authenticate"), None);
+    let err = tool_error(&r.json());
+    assert_eq!(err["error"], "forbidden", "{err}");
+    assert_eq!(err["detail"], "this connection has no browser attached yet");
     assert!(probe.context_calls.lock().unwrap().is_empty());
 
     // A config agent is unaffected: its context call reaches the

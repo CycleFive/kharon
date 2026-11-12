@@ -165,6 +165,27 @@ impl Discovery {
             SCOPES_SUPPORTED.join(" ")
         )
     }
+
+    /// The `WWW-Authenticate` value of a `/mcp` 403 refusing a call
+    /// the token's scopes do not cover (REQ-OAU-001, D1): the RFC
+    /// 6750 §3.1 step-up challenge — the 401 challenge's shape plus
+    /// `error="insufficient_scope"` and a `scope` naming what the
+    /// retry needs: the token's granted scopes plus the one the
+    /// call needs, so re-authorizing does not drop a scope the
+    /// token already holds. Only fixed scope names go in: nothing
+    /// from the request is interpolated (REQ-API-006).
+    pub fn step_up_challenge(&self, granted: &[String], needed: &str) -> String {
+        let mut scopes: Vec<&str> = granted.iter().map(String::as_str).collect();
+        if !scopes.contains(&needed) {
+            scopes.push(needed);
+        }
+        format!(
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"{}\", resource_metadata=\"{}\"",
+            scopes.join(" "),
+            self.resource_metadata
+        )
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +274,31 @@ mod tests {
             "Bearer realm=\"kharon\", \
              resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\", \
              scope=\"kharon:read kharon:fill kharon:request\""
+        );
+    }
+
+    #[test]
+    fn step_up_challenge_names_the_error_and_the_full_retry_scope_set() {
+        // Granted scopes keep their order; the missing one is
+        // appended, and an already-held scope is not repeated.
+        let granted = vec!["kharon:read".to_owned()];
+        assert_eq!(
+            discovery().step_up_challenge(&granted, "kharon:fill"),
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"kharon:read kharon:fill\", \
+             resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\""
+        );
+        assert_eq!(
+            discovery().step_up_challenge(&granted, "kharon:read"),
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"kharon:read\", \
+             resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\""
+        );
+        assert_eq!(
+            discovery().step_up_challenge(&[], "kharon:request"),
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"kharon:request\", \
+             resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\""
         );
     }
 }

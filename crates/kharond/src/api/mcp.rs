@@ -875,7 +875,21 @@ where
     let (parts, body) = req.into_parts();
     let agent = match authenticate(&state, token).await {
         Ok(a) => a,
-        Err(e) => return error(e),
+        Err(e) => {
+            let mut resp = error(e);
+            // REQ-OAU-001: with `[oauth]` set, the 401 challenge
+            // names the discovery document and the scope set. Only
+            // `/mcp` changes; `/v1/*` keeps the bare challenge, and
+            // without `[oauth]` nothing here changes either.
+            if e.code == super::error::ErrorCode::Unauthorized
+                && let Some(discovery) = state.broker.oauth_discovery()
+                && let Ok(challenge) = HeaderValue::from_str(&discovery.challenge())
+            {
+                resp.headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, challenge);
+            }
+            return resp;
+        }
     };
     if !state.broker.transport_agent_admit(&agent, received) {
         return error(ApiError::RATE_LIMITED);

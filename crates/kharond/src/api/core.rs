@@ -421,6 +421,11 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     transport: TransportLimits,
     /// Sync rollback high-water marks since unlock (REQ-REV-004).
     rollback: Mutex<RollbackGuard>,
+    /// OAuth discovery (REQ-OAU-001; #228), when `[oauth]` is
+    /// configured: the `/mcp` transports read the 401 challenge from
+    /// it and `[public_ingress]` serves its protected-resource
+    /// document. `None` keeps every pre-N3 response shape.
+    oauth: Option<super::oauth::Discovery>,
 }
 
 /// Called with every resolved [`FillPlan`] after its values were
@@ -611,7 +616,23 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
             transport: TransportLimits::new(),
             rollback: Mutex::new(RollbackGuard::new()),
+            oauth: None,
         }
+    }
+
+    /// Serve OAuth discovery (REQ-OAU-001; #228): `[public_ingress]`
+    /// answers the RFC 9728 document and the `/mcp` 401 carries the
+    /// discovery challenge. The daemon builds the [`super::oauth::Discovery`]
+    /// from the validated config at startup.
+    pub fn with_oauth(mut self, discovery: super::oauth::Discovery) -> Self {
+        self.oauth = Some(discovery);
+        self
+    }
+
+    /// The OAuth discovery this broker serves, when `[oauth]` is
+    /// configured.
+    pub fn oauth_discovery(&self) -> Option<&super::oauth::Discovery> {
+        self.oauth.as_ref()
     }
 
     /// Use `clock` for grant TTLs and the request timeout instead of

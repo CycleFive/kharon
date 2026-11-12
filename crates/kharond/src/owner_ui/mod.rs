@@ -24,6 +24,7 @@
 //! |---|---|---|
 //! | GET | `/` | Login page, or the signed-in shell |
 //! | GET | `/enroll` | Enrollment page (one-time code, not a password) |
+//! | GET | `/.well-known/oauth-authorization-server` | RFC 8414 metadata, only with `[oauth]` set (REQ-OAU-001); no session |
 //! | POST | `/owner/login/options` | Begin an assertion ceremony |
 //! | POST | `/owner/login/finish` | Finish it; sets the session cookie |
 //! | POST | `/owner/register/options` | Begin registration |
@@ -105,6 +106,7 @@ use self::webauthn::{RegisteredCredential, b64url_decode, b64url_encode, ct_eq};
 use crate::api::http::{
     ApprovalRedeemer, OWNER_APPROVE_PREFIX, OWNER_DENY_PREFIX, dispatch_owner_approval,
 };
+use crate::api::oauth::{AUTHORIZATION_SERVER_PATH, Discovery};
 
 /// SPEC §5: an owner web session is at most 15 minutes.
 pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -132,10 +134,16 @@ pub enum EdgeExempt {
 }
 
 /// The one list of routes that take no `Origin` and no Access login:
-/// the ntfy redeem routes, whose clients are not browsers.
+/// the ntfy redeem routes, whose clients are not browsers, and the
+/// RFC 8414 metadata route, whose clients are not browsers behind
+/// Access either — discovery is how an unauthenticated client finds
+/// the authorize endpoint (REQ-OAU-001). The two kinds route
+/// differently: the redeem prefixes are answered by the approval
+/// redeemer, the metadata path by the UI's own dispatch.
 pub const EDGE_EXEMPT: &[EdgeExempt] = &[
     EdgeExempt::Prefix(OWNER_APPROVE_PREFIX),
     EdgeExempt::Prefix(OWNER_DENY_PREFIX),
+    EdgeExempt::Exact(AUTHORIZATION_SERVER_PATH),
 ];
 
 /// True when `path` is on [`EDGE_EXEMPT`].
@@ -146,13 +154,27 @@ pub fn edge_exempt(path: &str) -> bool {
     })
 }
 
+/// True when `path` is an ntfy redeem route: the [`EDGE_EXEMPT`]
+/// prefixes, which the approval redeemer answers rather than the
+/// UI's own dispatch. The list's one `Exact` entry (the RFC 8414
+/// metadata path) is the UI's own route and is not one.
+pub fn redeem_exempt(path: &str) -> bool {
+    EDGE_EXEMPT.iter().any(|e| match e {
+        EdgeExempt::Prefix(p) => path.starts_with(p),
+        EdgeExempt::Exact(_) => false,
+    })
+}
+
 /// Fixed routes this UI serves (no token in the path). Tests assert
 /// none of them is a password login. ntfy redeem is the
 /// `/owner/approve/<token>` and `/owner/deny/<token>` prefixes on
-/// this same listener.
+/// this same listener. The well-known route is served only when
+/// `[oauth]` is configured (REQ-OAU-001); without it the path 404s
+/// like any other unknown one.
 pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/"),
     ("GET", "/enroll"),
+    ("GET", AUTHORIZATION_SERVER_PATH),
     ("POST", "/owner/login/options"),
     ("POST", "/owner/login/finish"),
     ("POST", "/owner/register/options"),
@@ -301,6 +323,11 @@ pub struct OwnerUi {
     /// `unknown_op`.
     unlocker: OnceLock<Arc<dyn OwnerUnlock>>,
     unlock_attempts: Mutex<Vec<unlock::Attempt>>,
+    /// OAuth discovery (REQ-OAU-001; #228): when `[oauth]` is
+    /// configured, this hostname is the authorization server and
+    /// serves its RFC 8414 metadata. `None` → the well-known path
+    /// 404s like any other unknown one.
+    oauth: Option<Arc<Discovery>>,
 }
 
 /// A ceremony as `options` hands it out: the sealed token (the
@@ -352,6 +379,9 @@ pub struct OwnerUiOptions {
     pub public: bool,
     /// The Access check, when `[owner_ui.access]` is set (public mode).
     pub access: Option<Arc<access::AccessVerifier>>,
+    /// OAuth discovery, when `[oauth]` is set (REQ-OAU-001): this
+    /// hostname then serves the RFC 8414 metadata document.
+    pub oauth: Option<Arc<Discovery>>,
 }
 
 impl OwnerUi {
@@ -375,6 +405,7 @@ impl OwnerUi {
                 origin: origin.into(),
                 public: false,
                 access: None,
+                oauth: None,
             },
             shell,
             audit,
@@ -395,6 +426,7 @@ impl OwnerUi {
             origin,
             public,
             access,
+            oauth,
         } = opts;
         // The Access gate exists only behind the edge. Config already
         // refuses `access` without `public_origin`; this is a second guard.
@@ -428,6 +460,7 @@ impl OwnerUi {
             enroll: Mutex::new(Vec::new()),
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
+            oauth,
         }))
     }
 
@@ -558,8 +591,11 @@ async fn handle(
     let path = req.uri().path().to_owned();
     let exempt = edge_exempt(&path);
     // The ntfy redeem routes: on `EDGE_EXEMPT`, so they take no `Origin`
-    // and no Access token.
-    if exempt {
+    // and no Access token, and the approval redeemer answers them.
+    // The RFC 8414 metadata path is on the same list but is the UI's
+    // own route: it falls through to `dispatch` below, skipping only
+    // the Access gate.
+    if redeem_exempt(&path) {
         let redeem = Arc::clone(&state.redeem);
         return dispatch_owner_approval(redeem, method, path).await;
     }
@@ -579,9 +615,12 @@ async fn handle(
         })
     });
     // Access (D9): after the Host check, before the body is read or
-    // anything routes. Exempt routes returned above: their clients are
-    // not browsers behind Access.
-    if let Some(verifier) = ui.access.as_ref()
+    // anything routes. Exempt routes skip it: the redeem routes
+    // returned above, and the metadata path, which `dispatch` serves
+    // (with `[oauth]`) or 404s (without) — a discovering client holds
+    // no Access token.
+    if !exempt
+        && let Some(verifier) = ui.access.as_ref()
         && verifier
             .verify(&headers, std::time::SystemTime::now())
             .await
@@ -821,6 +860,22 @@ impl OwnerUi {
             && let Some(left) = self.throttle.blocked(ip, Instant::now())
         {
             return rate_limited(left);
+        }
+        // RFC 8414 discovery (REQ-OAU-001): public metadata, no
+        // session — it is how an unauthenticated client finds the
+        // authorize endpoint. Only with `[oauth]` set; without it
+        // the path falls through to the unknown-route 404 below.
+        if req.path == AUTHORIZATION_SERVER_PATH
+            && let Some(oauth) = &self.oauth
+        {
+            if req.method != Method::GET {
+                return method_not_allowed("GET");
+            }
+            return json_body(
+                StatusCode::OK,
+                oauth.authorization_server_metadata().to_string(),
+                None,
+            );
         }
         let allowed = match req.path.as_str() {
             "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants"
@@ -2356,18 +2411,84 @@ mod tests {
     }
 
     #[test]
-    fn edge_exempt_lists_only_the_ntfy_redeem_routes() {
+    fn edge_exempt_lists_the_redeem_routes_and_the_metadata_path() {
         for path in ["/owner/approve/abc", "/owner/deny/abc"] {
             assert!(edge_exempt(path), "{path}");
+            assert!(redeem_exempt(path), "{path}");
         }
+        // The RFC 8414 metadata path is exempt from Access and
+        // `Origin`, but it is the UI's own route, not a redeem route:
+        // the routing has to tell the two apart.
+        assert!(edge_exempt(AUTHORIZATION_SERVER_PATH));
+        assert!(!redeem_exempt(AUTHORIZATION_SERVER_PATH));
         for path in [
             "/owner/approvals/approve",
             "/owner/login/finish",
             "/",
             "/oauth/token",
+            "/.well-known/openid-configuration",
+            "/.well-known/oauth-authorization-server/",
         ] {
             assert!(!edge_exempt(path), "{path}");
         }
+    }
+
+    #[test]
+    fn oauth_metadata_route_serves_the_golden_document() {
+        // REQ-OAU-001: the owner hostname is the authorization
+        // server. Its RFC 8414 metadata is public (no session) and
+        // exists only with `[oauth]` set.
+        let dir = tempfile::tempdir().unwrap();
+        let shell = Arc::new(StaticShell(ShellView {
+            locked: true,
+            pending: 0,
+        }));
+        let mk = |oauth: Option<Arc<Discovery>>| {
+            OwnerUi::open_with(
+                dir.path(),
+                OwnerUiOptions {
+                    rp_id: "kharon-owner.example.com".into(),
+                    origin: "https://kharon-owner.example.com".into(),
+                    public: true,
+                    access: None,
+                    oauth,
+                },
+                shell.clone(),
+                Arc::new(NoAudit),
+                Arc::new(NoApprovals),
+            )
+            .unwrap()
+        };
+        let call = |ui: &OwnerUi, method: Method, origin: Option<&str>| {
+            ui.dispatch(Incoming {
+                method,
+                path: AUTHORIZATION_SERVER_PATH.into(),
+                cookie: None,
+                origin: origin.map(str::to_owned),
+                authorization: None,
+                content_type: None,
+                body: Vec::new(),
+                client_ip: None,
+                throttle_key: None,
+            })
+        };
+        // Without `[oauth]`: an unknown route, like any other.
+        let ui = mk(None);
+        assert_eq!(call(&ui, Method::GET, None).status(), StatusCode::NOT_FOUND);
+        // With it: the golden document, and GET only.
+        let discovery = Discovery::new(
+            "https://kharon-owner.example.com".to_owned(),
+            "kharon.example.com",
+        );
+        let ui = mk(Some(Arc::new(discovery.clone())));
+        let response = call(&ui, Method::GET, None);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&futures_body(response)).unwrap();
+        assert_eq!(body, discovery.authorization_server_metadata());
+        assert_eq!(
+            call(&ui, Method::POST, Some("https://kharon-owner.example.com")).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
     }
 
     #[test]
@@ -2673,6 +2794,7 @@ mod tests {
                     origin: origin.into(),
                     public,
                     access: None,
+                    oauth: None,
                 },
                 Arc::new(StaticShell(ShellView {
                     locked: false,
@@ -3796,6 +3918,7 @@ mod tests {
                 origin: PUBLIC.into(),
                 public: true,
                 access: None,
+                oauth: None,
             },
             Arc::new(StaticShell(ShellView {
                 locked: false,
@@ -4006,6 +4129,7 @@ mod tests {
                 origin: ORIGIN.into(),
                 public: false,
                 access: Some(verifier),
+                oauth: None,
             },
             Arc::new(StaticShell(ShellView {
                 locked: false,
@@ -4027,5 +4151,83 @@ mod tests {
         let resp = handle(State(state), ConnectInfo(peer), req).await;
         // Local mode's own answer (no session), not the gate's 403.
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_metadata_path_answers_behind_the_access_gate() {
+        // REQ-OAU-001 + #208 D9: with `[owner_ui.access]` set, the
+        // RFC 8414 document still answers with no Access token — a
+        // discovering client is not a browser behind Access — while
+        // the rest of the UI stays gated. Without `[oauth]` the path
+        // keeps the uniform 404, gate or no gate.
+        let doc = r#"{"keys":[{"kid":"k1","kty":"RSA","n":"AQAB","e":"AQAB"}]}"#;
+        let mk = |oauth: Option<Arc<Discovery>>| {
+            let verifier = access::AccessVerifier::new(&crate::config::AccessConfig {
+                team_domain: "test.cloudflareaccess.com".into(),
+                audience: "aud123".into(),
+                jwks: crate::config::JwksSource::TestStatic(doc.into()),
+            })
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let ui = OwnerUi::open_with(
+                dir.path(),
+                OwnerUiOptions {
+                    rp_id: "owner.example.com".into(),
+                    origin: PUBLIC.into(),
+                    public: true,
+                    access: Some(verifier),
+                    oauth,
+                },
+                Arc::new(StaticShell(ShellView {
+                    locked: true,
+                    pending: 0,
+                })),
+                Arc::new(NoAudit),
+                Arc::new(NoApprovals),
+            )
+            .unwrap();
+            (
+                Arc::new(OwnerServer {
+                    ui,
+                    redeem: Arc::new(NoRedeem),
+                }),
+                dir,
+            )
+        };
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let get = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .header(header::HOST, "owner.example.com")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let discovery = Discovery::new(PUBLIC.to_owned(), "kharon.example.com");
+        let (state, _dir) = mk(Some(Arc::new(discovery.clone())));
+        // No Access token: the metadata answers anyway...
+        let resp = handle(
+            State(Arc::clone(&state)),
+            ConnectInfo(peer),
+            get(AUTHORIZATION_SERVER_PATH),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), MAX_BODY)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, discovery.authorization_server_metadata());
+        // ...while the UI itself stays behind the gate.
+        let resp = handle(State(Arc::clone(&state)), ConnectInfo(peer), get("/")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Without `[oauth]`: the uniform 404, not the gate's 403.
+        let (state, _dir) = mk(None);
+        let resp = handle(
+            State(state),
+            ConnectInfo(peer),
+            get(AUTHORIZATION_SERVER_PATH),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

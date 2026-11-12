@@ -21,6 +21,9 @@
 //!   in [`http`], mounted by the owner UI).
 //! - [`notify`]: publishing approval prompts to the owner's ntfy
 //!   topic (REQ-APR-004 send half; #128).
+//! - [`oauth`]: OAuth discovery for N3 Connect (REQ-OAU-001; #228):
+//!   the RFC 9728 / RFC 8414 metadata documents and the `/mcp` 401
+//!   challenge, all derived from `[oauth]` config.
 
 pub mod approval;
 pub mod core;
@@ -31,6 +34,7 @@ pub mod http;
 pub mod mcp;
 pub mod meta;
 pub mod notify;
+pub mod oauth;
 pub mod public;
 pub mod rate;
 pub mod revocation;

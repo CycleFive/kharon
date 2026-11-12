@@ -11,8 +11,8 @@ use url::Url;
 use super::{
     AccessConfig, AgentConfig, ApiConfig, ApprovalConfig, AuditConfig, BitwardenConfig, Config,
     ConfigError, ConnectorConfig, DEFAULT_DATA_DIR, ExportConfig, FORBIDDEN_SECRET_KEYS, GrantKind,
-    JwksSource, MemoryConfig, NtfyConfig, OwnerUiConfig, PolicyConfig, PublicIngressConfig,
-    Redacted, Source, TlsMaterial, parse_duration, tunnel_from_config,
+    JwksSource, MemoryConfig, NtfyConfig, OAuthConfig, OwnerUiConfig, PolicyConfig,
+    PublicIngressConfig, Redacted, Source, TlsMaterial, parse_duration, tunnel_from_config,
 };
 use crate::api::token::{HashProblem, ParamFloor, check_token_hash};
 use crate::cdp::{CdpEndpoint, CertSha256};
@@ -58,6 +58,14 @@ struct RawConfig {
     data_dir: Option<PathBuf>,
     owner_ui: Option<RawOwnerUi>,
     public_ingress: Option<RawPublicIngress>,
+    oauth: Option<RawOAuth>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOAuth {
+    #[serde(default)]
+    clients: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -402,6 +410,12 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             return Err(ConfigError::PublicIngressListenConflict);
         }
     }
+    // REQ-OAU-001: `[oauth]` hangs off the two listeners it serves
+    // discovery on, so its rules are checked against both.
+    let oauth = raw
+        .oauth
+        .map(|o| validate_oauth(o, &owner_ui, &public_ingress))
+        .transpose()?;
     let data_dir = raw
         .data_dir
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
@@ -423,6 +437,40 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         data_dir,
         owner_ui,
         public_ingress,
+        oauth,
+    })
+}
+
+/// REQ-OAU-001: the N3 authorization server exists only as part of
+/// the public shape. Discovery is served on `[public_ingress]` and
+/// the owner hostname, the issuer is the owner origin, and the RFC
+/// 9728 `resource` is the public `/mcp` URL — so `[oauth]` requires
+/// all three inputs, each with its own typed error.
+fn validate_oauth(
+    raw: RawOAuth,
+    owner_ui: &Option<OwnerUiConfig>,
+    public_ingress: &Option<PublicIngressConfig>,
+) -> Result<OAuthConfig, ConfigError> {
+    let public = public_ingress
+        .as_ref()
+        .ok_or(ConfigError::OauthNeedsPublicIngress)?;
+    if public.public_host.is_none() {
+        return Err(ConfigError::OauthNeedsPublicHost);
+    }
+    let owner = owner_ui.as_ref().ok_or(ConfigError::OauthNeedsOwnerUi)?;
+    if !owner.origin.starts_with("https://") {
+        return Err(ConfigError::OauthOwnerOriginNotHttps);
+    }
+    for client in &raw.clients {
+        let ok = Url::parse(client).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some());
+        if !ok {
+            return Err(ConfigError::OauthClientNotHttps {
+                client: client.clone(),
+            });
+        }
+    }
+    Ok(OAuthConfig {
+        clients: raw.clients,
     })
 }
 

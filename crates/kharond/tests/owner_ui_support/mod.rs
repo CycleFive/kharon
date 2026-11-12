@@ -86,7 +86,8 @@ impl<'a> Http<'a> {
     }
 }
 
-pub async fn http(addr: std::net::SocketAddr, origin: &str, req: Http<'_>) -> RawResponse {
+/// The exact bytes [`http`] sends for `req`.
+pub fn request_bytes(origin: &str, req: &Http<'_>) -> Vec<u8> {
     let method = req.method;
     let path = req.path;
     let body = req.body;
@@ -116,6 +117,11 @@ pub async fn http(addr: std::net::SocketAddr, origin: &str, req: Http<'_>) -> Ra
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{origin}{extra}{cookie}{bearer}{ctype}Connection: close\r\n\r\n{body}"
     );
+    head.into_bytes()
+}
+
+pub async fn http(addr: std::net::SocketAddr, origin: &str, req: Http<'_>) -> RawResponse {
+    let head = request_bytes(origin, &req);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match TcpStream::connect(addr).await {
@@ -126,7 +132,7 @@ pub async fn http(addr: std::net::SocketAddr, origin: &str, req: Http<'_>) -> Ra
             }
         }
     }
-    raw_request(addr, head.as_bytes()).await
+    raw_request(addr, &head).await
 }
 
 pub fn session_cookie(resp: &RawResponse) -> Option<String> {

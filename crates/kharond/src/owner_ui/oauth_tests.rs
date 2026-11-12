@@ -14,17 +14,15 @@ use sha2::{Digest, Sha256};
 use super::super::store::Credential;
 use super::super::webauthn::{P256_POINT_LEN, b64url_encode};
 use super::super::{
-    Incoming, NoApprovals, NoAudit, OwnerAudit, OwnerAuditError, OwnerUi, OwnerUiOptions,
-    PasskeyEnrolled, PasskeyListed, PasskeyRemoved, ShellView, StaticShell,
+    Incoming, NoApprovals, NoAudit, OwnerAudit, OwnerUi, OwnerUiOptions, ShellView, StaticShell,
 };
 use super::{
-    AuthorizeBudget, CODE_TTL, CONNECT_NOTICE, CodeStore, OauthAs, OauthClientRefusal,
-    PENDING_PURPOSE, PENDING_TTL, Scope, consent_challenge, oauth_client_refused_entry,
-    parse_query,
+    AuthorizeBudget, CODE_TTL, CONNECT_NOTICE, CodeStore, OauthAs, PENDING_PURPOSE, PENDING_TTL,
+    Scope, consent_challenge, parse_query,
 };
+use crate::api::cimd::{ClientAdmission, RefusalAudit};
 use crate::api::oauth::Discovery;
-use crate::api::oauth_clients::{AllowlistAdmission, ClientAdmission, FixtureClients};
-use crate::audit::Event;
+use crate::audit::{Entry, Event};
 
 const ORIGIN: &str = "https://owner.example";
 const RP_ID: &str = "owner.example";
@@ -36,36 +34,66 @@ fn discovery() -> Discovery {
     Discovery::new(ORIGIN.to_owned(), "kharon.example")
 }
 
-fn fixture() -> FixtureClients {
-    FixtureClients::one(CLIENT_ID, "Muse", vec![REDIRECT.to_owned()])
+/// One valid CIMD for [`CLIENT_ID`] whose only redirect is [`REDIRECT`].
+fn cimd_document(name: &str, redirects: &[&str]) -> String {
+    let uris = redirects
+        .iter()
+        .map(|uri| format!("\"{uri}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"client_id":"{CLIENT_ID}","client_name":"{name}","redirect_uris":[{uris}],"token_endpoint_auth_method":"none"}}"#
+    )
 }
 
-struct Rec {
-    refused: Mutex<Vec<OauthClientRefusal>>,
+fn listed_document() -> Result<(String, Option<String>), ()> {
+    Ok((
+        cimd_document("Muse", &[REDIRECT]),
+        Some("max-age=86400".into()),
+    ))
 }
 
-impl OwnerAudit for Rec {
-    fn auth_failed(&self, _: super::super::AuthFailure) {}
-    fn suppressed_only(&self, _: u64) {}
-    fn passkey_enroll_code(&self) -> Result<(), OwnerAuditError> {
-        Ok(())
+struct SilentAudit;
+
+impl RefusalAudit for SilentAudit {
+    fn client_refused(&self, _: Entry) {}
+}
+
+struct Recorded(Mutex<Vec<Entry>>);
+
+impl Recorded {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(Vec::new())))
     }
-    fn passkey_enrolled(&self, _: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
-        Ok(())
+
+    fn entries(&self) -> Vec<Entry> {
+        self.0.lock().unwrap().clone()
     }
-    fn passkey_listed(&self, _: PasskeyListed) -> Result<(), OwnerAuditError> {
-        Ok(())
+}
+
+impl RefusalAudit for Recorded {
+    fn client_refused(&self, entry: Entry) {
+        self.0.lock().unwrap().push(entry);
     }
-    fn passkey_removed(&self, _: PasskeyRemoved) -> Result<(), OwnerAuditError> {
-        Ok(())
-    }
-    fn oauth_client_refused(&self, refusal: OauthClientRefusal) {
-        self.refused.lock().unwrap().push(refusal);
-    }
+}
+
+fn admission(
+    outcomes: Vec<Result<(String, Option<String>), ()>>,
+    audit: Arc<dyn RefusalAudit>,
+) -> Arc<ClientAdmission> {
+    Arc::new(ClientAdmission::from_canned(
+        &[CLIENT_ID.to_owned()],
+        outcomes,
+        audit,
+    ))
+}
+
+fn fixture() -> Arc<ClientAdmission> {
+    admission(vec![listed_document()], Arc::new(SilentAudit))
 }
 
 fn open_ui(
-    clients: Arc<dyn ClientAdmission>,
+    clients: Arc<ClientAdmission>,
     audit: Arc<dyn OwnerAudit>,
     public: bool,
 ) -> (Arc<OwnerUi>, tempfile::TempDir) {
@@ -79,9 +107,8 @@ fn open_ui(
             access: None,
             oauth: Some(OauthAs {
                 discovery: Arc::new(discovery()),
-                clients,
             }),
-            admission: None,
+            admission: Some(clients),
         },
         Arc::new(StaticShell(ShellView {
             locked: false,
@@ -95,7 +122,17 @@ fn open_ui(
 }
 
 fn ui() -> (Arc<OwnerUi>, tempfile::TempDir) {
-    open_ui(Arc::new(fixture()), Arc::new(NoAudit), false)
+    open_ui(fixture(), Arc::new(NoAudit), false)
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    thread_local! {
+        static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+    }
+    RT.with(|rt| rt.block_on(fut))
 }
 
 fn body_of(response: Response) -> (StatusCode, String, Option<String>) {
@@ -106,12 +143,7 @@ fn body_of(response: Response) -> (StatusCode, String, Option<String>) {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     assert_oauth_frame(&response);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let bytes = rt
-        .block_on(axum::body::to_bytes(response.into_body(), 64 * 1024))
-        .unwrap();
+    let bytes = block_on(axum::body::to_bytes(response.into_body(), 64 * 1024)).unwrap();
     (status, String::from_utf8(bytes.to_vec()).unwrap(), location)
 }
 
@@ -196,23 +228,19 @@ fn plain_body(response: Response) -> (StatusCode, String, Option<String>) {
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let bytes = rt
-        .block_on(axum::body::to_bytes(response.into_body(), 64 * 1024))
-        .unwrap();
+    let bytes = block_on(axum::body::to_bytes(response.into_body(), 64 * 1024)).unwrap();
     (status, String::from_utf8(bytes.to_vec()).unwrap(), location)
 }
 
 fn authorize(ui: &OwnerUi, query: &str) -> (StatusCode, String, Option<String>) {
-    body_of(ui.dispatch(incoming(
-        Method::GET,
-        "/oauth/authorize",
-        Some(query),
-        None,
-        "",
-    )))
+    authorize_req(
+        ui,
+        incoming(Method::GET, "/oauth/authorize", Some(query), None, ""),
+    )
+}
+
+fn authorize_req(ui: &OwnerUi, req: Incoming) -> (StatusCode, String, Option<String>) {
+    body_of(block_on(ui.authorize_response(&req)))
 }
 
 fn param(url: &str, key: &str) -> Option<String> {
@@ -232,31 +260,42 @@ fn consent_token(location: &str) -> &str {
 }
 
 #[test]
-fn steps_1_to_3_never_redirect_and_are_audited() {
-    let rec = Arc::new(Rec {
-        refused: Mutex::new(Vec::new()),
-    });
-    let (ui, _dir) = open_ui(Arc::new(fixture()), rec.clone(), false);
-    // A bad client wins over a bad response_type: no redirect, and the
-    // attacker-supplied id is not echoed.
-    let (status, page, location) = authorize(
-        &ui,
-        &form(&[
-            ("client_id", "https://evil.example/<script>"),
-            ("response_type", "token"),
-            ("redirect_uri", "https://evil.example/phish"),
-        ]),
+fn steps_1_to_3_never_redirect_and_each_refusal_is_one_audit_entry() {
+    let not_listed = "This dashboard is not on this kharon's allow-list.";
+    let unavailable = "We couldn't check this dashboard. Try again in a minute.";
+    let mismatch = "The address this dashboard sent does not match its client metadata.";
+    let invalid = "This dashboard's client metadata is not valid.";
+
+    // A bad client wins over a bad response_type: no redirect, the
+    // attacker-supplied id is not echoed, and admit writes one entry.
+    let audit = Recorded::new();
+    let (ui, _dir) = open_ui(
+        admission(vec![listed_document()], audit.clone()),
+        Arc::new(NoAudit),
+        false,
     );
+    let evil = form(&[
+        ("client_id", "https://evil.example/<script>"),
+        ("response_type", "token"),
+        ("redirect_uri", "https://evil.example/phish"),
+    ]);
+    let (status, page, location) = authorize(&ui, &evil);
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(location.is_none(), "{location:?}");
-    assert!(page.contains("isn't one kharon connects to"));
+    assert!(page.contains(not_listed));
     assert!(!page.contains("evil.example"));
     assert!(!page.contains("<script>"));
+    assert_one_refusal(&audit.entries(), "not_allowlisted", Some("evil.example"));
+    // The same refusal again is one more entry, not a second write of the first.
+    let (_status, _page, location) = authorize(&ui, &evil);
+    assert!(location.is_none());
+    assert_eq!(audit.entries().len(), 2);
 
-    // Listed, but the stand-in has no CIMD: unavailable, still no redirect,
-    // and a wrong redirect does not get consulted first.
+    // Listed, but the fetch fails closed: unavailable, still no redirect,
+    // and the wrong redirect is not consulted first.
+    let unavailable_audit = Recorded::new();
     let (ui, _dir) = open_ui(
-        Arc::new(AllowlistAdmission::new([CLIENT_ID])),
+        admission(vec![Err(())], unavailable_audit.clone()),
         Arc::new(NoAudit),
         false,
     );
@@ -270,65 +309,160 @@ fn steps_1_to_3_never_redirect_and_are_audited() {
     );
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(location.is_none(), "{location:?}");
-    assert!(page.contains("couldn't check this dashboard"));
+    assert!(page.contains(unavailable));
     assert!(!page.contains("evil.example"));
+    assert_one_refusal(
+        &unavailable_audit.entries(),
+        "cimd_unavailable",
+        Some("dashboard.example"),
+    );
 
-    // Exact redirect mismatch, after a document we do have.
-    let (listed, _listed_dir) = open_ui(Arc::new(fixture()), Arc::new(NoAudit), false);
+    // The document does not validate: one cimd_invalid, no redirect.
+    let invalid_audit = Recorded::new();
+    let (ui, _dir) = open_ui(
+        admission(vec![Ok(("not json".into(), None))], invalid_audit.clone()),
+        Arc::new(NoAudit),
+        false,
+    );
     let (status, page, location) = authorize(
-        &listed,
+        &ui,
         &form(&[
-            ("response_type", "code"),
             ("client_id", CLIENT_ID),
-            ("redirect_uri", "https://dashboard.example/other"),
-            ("code_challenge", &challenge()),
-            ("code_challenge_method", "S256"),
-            ("state", "xyz"),
-            ("resource", RESOURCE),
+            ("redirect_uri", REDIRECT),
+            ("response_type", "code"),
         ]),
     );
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(location.is_none(), "{location:?}");
-    assert!(page.contains("hasn't registered"));
-    assert!(!page.contains("other"));
+    assert!(page.contains(invalid));
+    assert_one_refusal(
+        &invalid_audit.entries(),
+        "cimd_invalid",
+        Some("dashboard.example"),
+    );
 
-    let got = rec.refused.lock().unwrap().clone();
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].detail, "not_allowlisted");
-    assert!(got[0].origin.is_none());
-    let entry = oauth_client_refused_entry(&got[0]);
-    let value = serde_json::to_value(&entry).unwrap();
-    assert_eq!(value["event"], "oauth_client_refused");
-    assert_eq!(value["detail_code"], "not_allowlisted");
-    assert_eq!(value["result"], "refused");
-    assert!(value.get("agent_id").is_none(), "{value}");
-    assert!(value.get("channel").is_none(), "{value}");
-    assert_eq!(entry.event, Event::OauthClientRefused);
-}
-
-#[test]
-fn redirect_mismatch_is_audited_with_the_cimd_host() {
-    let rec = Arc::new(Rec {
-        refused: Mutex::new(Vec::new()),
-    });
-    let (ui, _dir) = open_ui(Arc::new(fixture()), rec.clone(), false);
-    let query = form(&[
+    // Exact redirect mismatch, after a document we do have. A repeat
+    // is a cache hit and still exactly one new entry.
+    let mismatch_audit = Recorded::new();
+    let (listed, _listed_dir) = open_ui(
+        admission(vec![listed_document()], mismatch_audit.clone()),
+        Arc::new(NoAudit),
+        false,
+    );
+    let mismatch_query = form(&[
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
         ("redirect_uri", "https://dashboard.example/other"),
         ("code_challenge", &challenge()),
         ("code_challenge_method", "S256"),
+        ("state", "xyz"),
         ("resource", RESOURCE),
     ]);
-    let (_status, _page, location) = authorize(&ui, &query);
+    let (status, page, location) = authorize(&listed, &mismatch_query);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(location.is_none(), "{location:?}");
+    assert!(page.contains(mismatch));
+    assert!(!page.contains("other"));
+    assert_one_refusal(
+        &mismatch_audit.entries(),
+        "redirect_mismatch",
+        Some("dashboard.example"),
+    );
+    let (_status, _page, location) = authorize(&listed, &mismatch_query);
     assert!(location.is_none());
-    let got = rec.refused.lock().unwrap().clone();
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].detail, "redirect_mismatch");
-    assert_eq!(got[0].origin.as_deref(), Some("dashboard.example"));
-    let entry = oauth_client_refused_entry(&got[0]);
-    assert_eq!(entry.origin.as_deref(), Some("dashboard.example"));
+    assert_eq!(mismatch_audit.entries().len(), 2);
+    assert_eq!(
+        mismatch_audit.entries()[1].detail_code.as_deref(),
+        Some("redirect_mismatch")
+    );
+
+    // A request that reaches consent writes no refusal.
+    let quiet = Recorded::new();
+    let (ui, _dir) = open_ui(
+        admission(vec![listed_document()], quiet.clone()),
+        Arc::new(NoAudit),
+        false,
+    );
+    let (status, _page, location) = authorize(&ui, &valid_query("kharon:fill", "xyz"));
+    assert_eq!(status, StatusCode::FOUND);
+    assert!(location.unwrap().starts_with("/oauth/consent/"));
+    assert!(quiet.entries().is_empty());
+}
+
+/// One `oauth_client_refused` entry, the shape admission writes.
+fn assert_one_refusal(entries: &[Entry], detail: &str, origin: Option<&str>) {
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry.event, Event::OauthClientRefused);
+    assert_eq!(entry.detail_code.as_deref(), Some(detail));
+    assert_eq!(entry.result.as_deref(), Some("refused"));
+    assert_eq!(entry.channel.as_deref(), Some("web_ui"));
+    assert_eq!(entry.origin.as_deref(), origin);
     assert!(entry.agent_id.is_none());
+    let value = serde_json::to_value(entry).unwrap();
+    assert_eq!(value["event"], "oauth_client_refused");
+    assert_eq!(value["detail_code"], detail);
+    let event: Event = serde_json::from_value(value["event"].clone()).unwrap();
+    assert_eq!(event, Event::OauthClientRefused);
+}
+
+/// The production handler, not the sync dispatch: one refusal, one entry.
+#[tokio::test]
+async fn the_http_handler_audits_one_refusal() {
+    let audit = Recorded::new();
+    let (ui, _dir) = open_ui(
+        admission(vec![listed_document()], audit.clone()),
+        Arc::new(NoAudit),
+        false,
+    );
+    let state = Arc::new(super::super::OwnerServer {
+        ui,
+        redeem: Arc::new(NoRedeem),
+    });
+    let req = axum::http::Request::builder()
+        .uri("/oauth/authorize?client_id=https%3A%2F%2Fevil.example%2Fcimd.json")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let response = super::super::handle(
+        axum::extract::State(state),
+        axum::extract::ConnectInfo(peer),
+        req,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.headers().get(header::LOCATION).is_none());
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let page = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(page.contains("not on this kharon's allow-list"));
+    assert!(!page.contains("evil.example"));
+    assert_one_refusal(&audit.entries(), "not_allowlisted", Some("evil.example"));
+}
+
+struct NoRedeem;
+
+impl crate::api::http::ApprovalRedeemer for NoRedeem {
+    fn prompt(
+        &self,
+        _token: &str,
+    ) -> Result<
+        (
+            crate::api::grant::ApprovalPrompt,
+            crate::api::approval::ApprovalAction,
+        ),
+        crate::api::approval::TokenGone,
+    > {
+        Err(crate::api::approval::TokenGone::Unknown)
+    }
+
+    fn redeem(
+        &self,
+        _token: &str,
+    ) -> Result<crate::api::approval::ApprovalAction, crate::api::approval::TokenGone> {
+        Err(crate::api::approval::TokenGone::Unknown)
+    }
 }
 
 #[test]
@@ -428,7 +562,7 @@ fn a_valid_request_seals_a_pending_authorization_and_stores_nothing() {
     );
     assert!(ui.open_pending(&early, now + PENDING_TTL).is_none());
     // A new process has a new key: the token does not survive a restart.
-    let (other, _dir2) = open_ui(Arc::new(fixture()), Arc::new(NoAudit), false);
+    let (other, _dir2) = open_ui(fixture(), Arc::new(NoAudit), false);
     assert!(
         other
             .open_pending(&token, std::time::Instant::now())
@@ -730,7 +864,7 @@ fn panic_clears_pending_authorizations_and_codes() {
 
 #[test]
 fn authorize_is_throttled_per_source_and_not_globally() {
-    let (ui, _dir) = open_ui(Arc::new(fixture()), Arc::new(NoAudit), true);
+    let (ui, _dir) = open_ui(fixture(), Arc::new(NoAudit), true);
     let query = valid_query("kharon:fill", "xyz");
     let one: std::net::IpAddr = "203.0.113.7".parse().unwrap();
     let other: std::net::IpAddr = "203.0.113.8".parse().unwrap();
@@ -738,17 +872,17 @@ fn authorize_is_throttled_per_source_and_not_globally() {
         let mut req = incoming(Method::GET, "/oauth/authorize", Some(&query), None, "");
         req.throttle_key = Some(one);
         req.client_ip = Some(one);
-        let (status, _, location) = body_of(ui.dispatch(req));
+        let (status, _, location) = authorize_req(&ui, req);
         assert_eq!(status, StatusCode::FOUND, "{location:?}");
     }
     let mut blocked = incoming(Method::GET, "/oauth/authorize", Some(&query), None, "");
     blocked.throttle_key = Some(one);
-    let (status, body, location) = body_of(ui.dispatch(blocked));
+    let (status, body, location) = authorize_req(&ui, blocked);
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert!(location.is_none());
     let mut ok = incoming(Method::GET, "/oauth/authorize", Some(&query), None, "");
     ok.throttle_key = Some(other);
-    let (status, _, location) = body_of(ui.dispatch(ok));
+    let (status, _, location) = authorize_req(&ui, ok);
     assert_eq!(status, StatusCode::FOUND, "{location:?}");
     // No edge address: not throttled, and it does not share a bucket.
     for _ in 0..40 {

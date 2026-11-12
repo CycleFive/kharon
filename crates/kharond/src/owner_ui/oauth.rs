@@ -21,10 +21,10 @@
 //! only. The consent POST returns `{"redirect": ...}`; the code is
 //! never placed in a `Location` header.
 //!
-//! Client admission (steps 1–3) is [`crate::api::oauth_clients`]. The
-//! daemon's value fails closed until #229's CIMD fetch replaces it.
-//! This module writes `oauth_client_refused`; the admission impl must
-//! not.
+//! Client admission (steps 1–3) is [`crate::api::cimd::ClientAdmission`].
+//! A refusal is audited there, once, as `oauth_client_refused`. This
+//! module renders the plain page or the redirect and does not append
+//! that event.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -39,10 +39,9 @@ use sha2::{Digest, Sha256};
 use super::sealed::{Burn, Opened};
 use super::webauthn::{b64url_decode, b64url_encode, ct_eq};
 use super::{CEREMONY_TTL, CeremonyKind, Incoming, OwnerUi, credential_response};
+use crate::api::cimd::{ClientAdmission, ClientMetadata, Refusal};
 use crate::api::oauth::Discovery;
-use crate::api::oauth_clients::{ClientAdmission, ClientRefusal, RefusalKind, display_host};
 use crate::api::transport::ip_key;
-use crate::audit::{Entry, Event};
 
 /// How long a pending authorization can be approved or denied.
 pub(super) const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -64,12 +63,12 @@ const MAX_REDIRECT: usize = 1024;
 const MAX_CLIENT_ID: usize = 2048;
 const MAX_NAME: usize = 128;
 
-/// The authorization server on this owner UI: discovery plus the
-/// client-admission seam. `None` on [`super::OwnerUi`] means `[oauth]`
-/// is off and `/oauth/authorize` 404s.
+/// The authorization server on this owner UI. `None` on
+/// [`super::OwnerUi`] means `[oauth]` is off and `/oauth/authorize`
+/// 404s. Client admission is [`super::OwnerUi`]'s
+/// [`super::OwnerUi::client_admission`], the CIMD fetch from #229.
 pub struct OauthAs {
     pub discovery: Arc<Discovery>,
-    pub clients: Arc<dyn ClientAdmission>,
 }
 
 const PENDING_PURPOSE: &str = "pending";
@@ -300,30 +299,6 @@ struct ConsentCeremony {
     nonce: String,
 }
 
-/// `oauth_client_refused`, as the audit sink sees it. No agent id:
-/// the client was refused before a Connect existed (I7).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OauthClientRefusal {
-    /// `not_allowlisted`, `cimd_unavailable`, `cimd_invalid` or
-    /// `redirect_mismatch`.
-    pub detail: &'static str,
-    /// CIMD hostname when the client was on the allow-list.
-    pub origin: Option<String>,
-}
-
-/// The entry authorize writes for a step 1–3 refusal. No `agent_id`,
-/// no `channel`: the refusal is the client's request, not an owner
-/// action (I7).
-pub fn oauth_client_refused_entry(refusal: &OauthClientRefusal) -> Entry {
-    let mut entry = Entry::new(Event::OauthClientRefused)
-        .result("refused")
-        .detail_code(refusal.detail);
-    if let Some(origin) = &refusal.origin {
-        entry = entry.origin(origin.clone());
-    }
-    entry
-}
-
 /// `SHA-256(pending-id ‖ nonce ‖ 32 random bytes)`.
 fn consent_challenge(pending_id: &[u8; 32], nonce: &[u8], random: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -366,10 +341,11 @@ fn consent_route(path: &str) -> Option<ConsentRoute> {
 }
 
 impl OwnerUi {
+    /// Consent routes. `/oauth/authorize` is [`Self::authorize_response`]:
+    /// admission fetches, so it runs on the async runtime rather than
+    /// this synchronous dispatch.
     pub(super) fn oauth_dispatch(&self, req: &Incoming) -> Response {
-        let response = if req.path == "/oauth/authorize" {
-            self.authorize(req)
-        } else if let Some(route) = consent_route(&req.path) {
+        let response = if let Some(route) = consent_route(&req.path) {
             self.consent(req, route)
         } else {
             super::respond(StatusCode::NOT_FOUND, "no_such_route", None)
@@ -377,12 +353,21 @@ impl OwnerUi {
         frame_deny(response)
     }
 
-    fn authorize(&self, req: &Incoming) -> Response {
+    /// `GET /oauth/authorize`. Admission and its audit happen inside
+    /// [`ClientAdmission`]; this only renders.
+    pub(super) async fn authorize_response(&self, req: &Incoming) -> Response {
+        frame_deny(self.authorize(req).await)
+    }
+
+    async fn authorize(&self, req: &Incoming) -> Response {
         if req.method != Method::GET {
             return super::method_not_allowed("GET");
         }
         let Some(oauth) = &self.oauth else {
             return super::respond(StatusCode::NOT_FOUND, "no_such_route", None);
+        };
+        let Some(clients) = self.client_admission() else {
+            return error_page(crate::api::cimd::RefusalCode::NotAllowlisted.plain_message());
         };
         if let Some(ip) = req.throttle_key
             && let Err(left) = self.authorize_budget.admit(ip, Instant::now())
@@ -392,18 +377,12 @@ impl OwnerUi {
         let decided = decide_authorize(
             req.query.as_deref().unwrap_or(""),
             oauth.discovery.resource(),
-            oauth.clients.as_ref(),
-        );
+            clients.as_ref(),
+        )
+        .await;
         match decided {
             Authorize::Unusable => error_page(UNUSABLE),
-            Authorize::Refused(refusal) => {
-                let host = refusal.client_host.clone();
-                self.audit.oauth_client_refused(OauthClientRefusal {
-                    detail: refusal.kind.detail_code(),
-                    origin: host.filter(|h| safe_origin(h)),
-                });
-                error_page(refusal.kind.message())
-            }
+            Authorize::Refused(refusal) => error_page(refusal.plain_message()),
             Authorize::Redirect {
                 error,
                 redirect_uri,
@@ -816,7 +795,7 @@ fn grant_scopes(effective: &[Scope], chosen: &[String]) -> Option<Vec<Scope>> {
 
 enum Authorize {
     Unusable,
-    Refused(ClientRefusal),
+    Refused(Refusal),
     Redirect {
         error: &'static str,
         redirect_uri: String,
@@ -845,60 +824,50 @@ impl Pairs {
     }
 }
 
-fn decide_authorize(
-    query: &str,
-    resource: &str,
-    clients: &dyn crate::api::oauth_clients::ClientAdmission,
-) -> Authorize {
+async fn decide_authorize(query: &str, resource: &str, clients: &ClientAdmission) -> Authorize {
     if query.len() > MAX_QUERY {
         return Authorize::Unusable;
     }
     let Some(pairs) = parse_query(query) else {
         return Authorize::Unusable;
     };
+    // A missing, repeated, or over-long `client_id` is not a listed
+    // URL. Admit `""` so the refusal is the one entry `admit` writes,
+    // and so nothing is fetched.
     let client_id = match pairs.one("client_id") {
-        Ok(Some(id)) if id.len() <= MAX_CLIENT_ID => Some(id),
-        Ok(Some(_)) | Err(()) => return Authorize::Refused(ClientRefusal::not_allowlisted()),
-        Ok(None) => None,
+        Ok(Some(id)) if id.len() <= MAX_CLIENT_ID => id,
+        Ok(Some(_)) | Err(()) | Ok(None) => return refusal_of(clients.admit("").await),
     };
     let redirect_raw = match pairs.one("redirect_uri") {
         Ok(v) => v,
         Err(()) => {
-            // Two redirect URIs: step 1 still runs, and we never pick
-            // one to redirect to.
-            return match clients.admit(client_id, None) {
-                Err(refusal) if refusal.kind == RefusalKind::NotAllowlisted => {
-                    Authorize::Refused(refusal)
-                }
-                Ok(client) => Authorize::Refused(ClientRefusal {
-                    kind: RefusalKind::RedirectMismatch,
-                    client_host: Some(client.client_host),
-                }),
-                Err(refusal) => Authorize::Refused(refusal),
-            };
+            // Two redirect URIs: still admit the client, and never
+            // pick one to redirect to.
+            return no_single_redirect(clients, client_id).await;
         }
     };
-    let admitted = match clients.admit(client_id, redirect_raw) {
-        Ok(client) => client,
+    let admitted = match clients.admit(client_id).await {
+        Ok(metadata) => metadata,
         Err(refusal) => return Authorize::Refused(refusal),
     };
     let Some(redirect_uri) = redirect_raw else {
-        return Authorize::Refused(ClientRefusal {
-            kind: RefusalKind::RedirectMismatch,
-            client_host: Some(admitted.client_host),
-        });
+        return redirect_refused(clients, &admitted);
     };
-    if !safe_redirect(redirect_uri) || !plain_name(&admitted.client_name) {
-        return Authorize::Refused(ClientRefusal {
-            kind: RefusalKind::CimdInvalid,
-            client_host: Some(admitted.client_host),
-        });
+    if let Err(refusal) = clients.check_redirect(&admitted, redirect_uri) {
+        return Authorize::Refused(refusal);
     }
+    // The document matched. These checks only keep a value we would
+    // not put on the page or in a Location header from becoming a
+    // pending authorization. They are not a second admission refusal:
+    // `admit` already accepted the document, so nothing is audited here.
+    if !safe_redirect(redirect_uri) || !plain_name(admitted.client_name()) {
+        return Authorize::Unusable;
+    }
+    let Some(client_host) = display_host(admitted.client_id()) else {
+        return Authorize::Unusable;
+    };
     let Some(redirect_host) = display_host(redirect_uri) else {
-        return Authorize::Refused(ClientRefusal {
-            kind: RefusalKind::CimdInvalid,
-            client_host: Some(admitted.client_host),
-        });
+        return Authorize::Unusable;
     };
     // Steps 4–7 may redirect. `redirect_to` echoes `state` only when
     // the request carried exactly one and it fits.
@@ -942,9 +911,9 @@ fn decide_authorize(
         Err(()) => return redirect_to(ERR_INVALID_SCOPE),
     };
     Authorize::Pending(Pending {
-        client_id: admitted.client_id,
-        client_name: admitted.client_name,
-        client_host: admitted.client_host,
+        client_id: admitted.client_id().to_owned(),
+        client_name: admitted.client_name().to_owned(),
+        client_host,
         redirect_uri: redirect_uri.to_owned(),
         redirect_host,
         code_challenge: challenge,
@@ -952,6 +921,35 @@ fn decide_authorize(
         resource: resource.to_owned(),
         scopes,
     })
+}
+
+/// `admit` already audited. An `Ok` here would be an allow-list entry
+/// of `""`, which config does not accept.
+fn refusal_of(result: Result<ClientMetadata, Refusal>) -> Authorize {
+    match result {
+        Err(refusal) => Authorize::Refused(refusal),
+        Ok(_) => Authorize::Unusable,
+    }
+}
+
+/// No single `redirect_uri` to compare. Admit first, so a client that
+/// is not listed is `not_allowlisted` and is not fetched; a listed
+/// client is then one `redirect_mismatch`.
+async fn no_single_redirect(clients: &ClientAdmission, client_id: &str) -> Authorize {
+    let admitted = match clients.admit(client_id).await {
+        Ok(metadata) => metadata,
+        Err(refusal) => return Authorize::Refused(refusal),
+    };
+    redirect_refused(clients, &admitted)
+}
+
+/// An empty redirect matches no registered URI, so this is the one
+/// `redirect_mismatch` entry.
+fn redirect_refused(clients: &ClientAdmission, admitted: &ClientMetadata) -> Authorize {
+    match clients.check_redirect(admitted, "") {
+        Err(refusal) => Authorize::Refused(refusal),
+        Ok(()) => Authorize::Unusable,
+    }
 }
 
 /// Absent `scope` asks for all three. A present value is those tokens
@@ -1142,12 +1140,21 @@ fn plain_name(name: &str) -> bool {
     !name.is_empty() && name.chars().count() <= MAX_NAME && name.chars().all(|c| !c.is_control())
 }
 
-fn safe_origin(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 253
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+/// Hostname to show on the consent screen. `None` when `url` is not
+/// an https URL with a host we are willing to render.
+fn display_host(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host.is_empty() || host.len() > 253 || host.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    match url.port() {
+        Some(port) => Some(format!("{host}:{port}")),
+        None => Some(host.to_owned()),
+    }
 }
 
 fn valid_challenge(s: &str) -> bool {

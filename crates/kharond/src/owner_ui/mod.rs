@@ -89,7 +89,7 @@ mod webauthn;
 pub use self::approvals::{
     AUDIT_TAIL_LEN, AuditRow, DecideError, NoApprovals, OwnerApprovals, PendingRow, WebGrantKind,
 };
-pub use self::oauth::{OauthAs, OauthClientRefusal, oauth_client_refused_entry};
+pub use self::oauth::OauthAs;
 pub use self::unlock::OwnerUnlock;
 
 use std::future::Future;
@@ -272,12 +272,6 @@ pub trait OwnerAudit: Send + Sync + 'static {
     /// while the passkey store lock is held, so the sink must not
     /// call back into the UI. `Err` removes nothing.
     fn passkey_removed(&self, removed: PasskeyRemoved) -> Result<(), OwnerAuditError>;
-    /// `oauth_client_refused` when authorize refuses a client before
-    /// it will redirect (REQ-OAU-003). Best effort, like
-    /// [`Self::auth_failed`]: the page is shown either way. The
-    /// default discards, so test sinks that don't model OAuth stay
-    /// as they are. The daemon's sink records it.
-    fn oauth_client_refused(&self, _refusal: OauthClientRefusal) {}
 }
 
 /// A passkey that is about to be stored (#249). No credential id.
@@ -769,21 +763,25 @@ async fn handle(
         Ok(b) => b.to_vec(),
         Err(_) => return respond(StatusCode::PAYLOAD_TOO_LARGE, "bad_request", None),
     };
-    let joined = tokio::task::spawn_blocking(move || {
-        ui.dispatch(Incoming {
-            method,
-            path,
-            cookie,
-            origin,
-            authorization,
-            content_type,
-            body: bytes,
-            client_ip,
-            throttle_key: edge_ip,
-            query,
-        })
-    })
-    .await;
+    let incoming = Incoming {
+        method,
+        path: path.clone(),
+        cookie,
+        origin,
+        authorization,
+        content_type,
+        body: bytes,
+        client_ip,
+        throttle_key: edge_ip,
+        query,
+    };
+    // CIMD admission fetches. That stays on this runtime. The rest of
+    // the UI runs on the blocking pool, with the passkey store and the
+    // vault lock.
+    if path == "/oauth/authorize" {
+        return ui.authorize_response(&incoming).await;
+    }
+    let joined = tokio::task::spawn_blocking(move || ui.dispatch(incoming)).await;
     match joined {
         Ok(response) => response,
         Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR, "error", None),
@@ -1010,9 +1008,7 @@ impl OwnerUi {
                 None,
             );
         }
-        if self.oauth.is_some()
-            && (req.path == "/oauth/authorize" || req.path.starts_with("/oauth/consent"))
-        {
+        if self.oauth.is_some() && req.path.starts_with("/oauth/consent") {
             return self.oauth_dispatch(&req);
         }
         let allowed = match req.path.as_str() {
@@ -2763,15 +2759,11 @@ mod tests {
     use super::*;
     use crate::api::oauth::Discovery;
 
-    /// Discovery with the fail-closed admission. These tests only
-    /// serve the metadata document.
+    /// Discovery only. These tests serve the metadata document and
+    /// do not admit a client.
     fn metadata_oauth(discovery: Discovery) -> OauthAs {
         OauthAs {
             discovery: Arc::new(discovery),
-            clients: Arc::new(crate::api::oauth_clients::AllowlistAdmission::new(Vec::<
-                String,
-            >::new(
-            ))),
         }
     }
 

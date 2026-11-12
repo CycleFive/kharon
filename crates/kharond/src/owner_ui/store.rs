@@ -114,7 +114,14 @@ impl PasskeyStore {
             ));
         }
         self.credentials.push(cred);
-        self.persist()
+        if let Err(e) = self.persist() {
+            // The audit entry, when there is one, was written against
+            // a store that does not hold this id. Drop the in-memory
+            // copy so a failed write cannot sign in.
+            self.credentials.pop();
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Record a signature counter after a verified assertion.

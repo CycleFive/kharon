@@ -472,10 +472,17 @@ impl OwnerOps for DaemonOwner {
     }
 
     async fn passkey_enroll(&self) -> Result<Zeroizing<String>, OwnerFailure> {
-        match &self.owner_ui {
-            Some(ui) => Ok(ui.mint_enroll_token()),
-            None => Err(OwnerFailure::Unsupported),
-        }
+        // The append is file I/O, and it happens before the code
+        // exists (#249): a failed append returns `audit_failed` and
+        // mints nothing. A panicked blocking task is the same refusal
+        // — the code must not be reported if the entry's fate is unknown.
+        let Some(ui) = self.owner_ui.clone() else {
+            return Err(OwnerFailure::Unsupported);
+        };
+        tokio::task::spawn_blocking(move || ui.mint_enroll_token())
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+            .map_err(|_| OwnerFailure::AuditFailed)
     }
 
     async fn revoke_grant(&self, grant_id: String) -> Result<bool, OwnerFailure> {
@@ -1306,6 +1313,29 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
             eprintln!("kharond: owner_ui audit append failed");
         }
     }
+
+    fn passkey_enroll_code(&self) -> Result<(), crate::owner_ui::OwnerAuditError> {
+        let entry = Entry::new(Event::PasskeyEnrollCode)
+            .channel(Channel::Cli.as_str())
+            .result("minted");
+        self.broker
+            .append_audit(entry)
+            .map_err(|_| crate::owner_ui::OwnerAuditError)
+    }
+
+    fn passkey_enrolled(
+        &self,
+        enrolled: crate::owner_ui::PasskeyEnrolled,
+    ) -> Result<(), crate::owner_ui::OwnerAuditError> {
+        let entry = Entry::new(Event::PasskeyEnrolled)
+            .channel(Channel::WebUi.as_str())
+            .result("enrolled")
+            .credential_fingerprint(enrolled.credential_fingerprint)
+            .passkey_count(enrolled.passkey_count);
+        self.broker
+            .append_audit(entry)
+            .map_err(|_| crate::owner_ui::OwnerAuditError)
+    }
 }
 
 /// Web unlock backend (#131 slice 5b): the owner socket's own
@@ -1975,10 +2005,11 @@ mod tests {
 
     /// An audit sink that records event names and can be told to
     /// refuse `export_loaded` appends (PR #81 review, item 6's
-    /// failing-sink test).
+    /// failing-sink test), or any one named event.
     struct TestSink {
         events: Arc<Mutex<Vec<String>>>,
         fail_export_loaded: bool,
+        fail_name: Option<&'static str>,
     }
 
     impl AuditSink for TestSink {
@@ -1989,6 +2020,9 @@ mod tests {
                 .unwrap()
                 .to_owned();
             if self.fail_export_loaded && name == "export_loaded" {
+                return Err(AuditError);
+            }
+            if self.fail_name == Some(name.as_str()) {
                 return Err(AuditError);
             }
             self.events.lock().unwrap().push(name);
@@ -2008,6 +2042,7 @@ mod tests {
         let sink = TestSink {
             events: Arc::clone(&events),
             fail_export_loaded,
+            fail_name: None,
         };
         // One real agent, so tests can drive the broker's agent
         // surface (nit 6's explicit 423 assertion).
@@ -2108,5 +2143,80 @@ mod tests {
         let loaded = events.iter().position(|e| e == "export_loaded").unwrap();
         let unlock = events.iter().position(|e| e == "unlock").unwrap();
         assert!(loaded < unlock, "export_loaded precedes unlock: {events:?}");
+    }
+
+    /// #249: a failed `passkey_enroll_code` append is `audit_failed`
+    /// and leaves no enrollment code. The socket maps that error
+    /// through [`OwnerFailure::code`].
+    #[tokio::test]
+    async fn passkey_enroll_append_failure_mints_no_code() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink {
+            events: Arc::clone(&events),
+            fail_export_loaded: false,
+            fail_name: Some("passkey_enroll_code"),
+        };
+        let tokens = TokenStore::new([(
+            "alpha",
+            "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$CANARYhashCANARYhash",
+        )])
+        .unwrap();
+        let lock = LockController::new(
+            LockPolicy {
+                require_mlock: false,
+                ..LockPolicy::default()
+            },
+            SystemClock,
+            Box::new(StaticHardening::all_ok()),
+        );
+        let broker = Arc::new(Broker::new(
+            tokens,
+            lock,
+            Box::new(sink),
+            crate::origin::OriginConfig { allow_http: false },
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let ui = crate::owner_ui::OwnerUi::open(
+            dir.path(),
+            "localhost",
+            "http://localhost:1",
+            Arc::new(crate::owner_ui::StaticShell(crate::owner_ui::ShellView {
+                locked: true,
+                pending: 0,
+            })),
+            Arc::new(DaemonUiAudit {
+                broker: Arc::clone(&broker),
+            }),
+            Arc::new(crate::owner_ui::NoApprovals),
+        )
+        .unwrap();
+        let owner = DaemonOwner {
+            broker,
+            source: UnlockSource::Export(Arc::new(
+                ExportFile::from_bytes(
+                    include_bytes!("../tests/fixtures/export/password_protected.json").as_slice(),
+                )
+                .unwrap(),
+            )),
+            sync_task: std::sync::Mutex::new(None),
+            owner_ui: Some(ui),
+        };
+        let err = owner.passkey_enroll().await.unwrap_err();
+        assert_eq!(err, OwnerFailure::AuditFailed);
+        assert_eq!(err.code(), "audit_failed");
+        assert_eq!(
+            owner.owner_ui.as_ref().unwrap().outstanding_enroll_codes(),
+            0,
+            "a refused append must not leave a code"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e == "passkey_enroll_code"),
+            "the refused entry is not in the log: {:?}",
+            events.lock().unwrap()
+        );
     }
 }

@@ -82,6 +82,17 @@ pub enum Event {
     /// `agent_id`, the new session's `transport`, `old_session_secs` and
     /// `suppressed`; at most one per agent per 60 s. Best effort.
     ConnectorReplaced,
+    /// #249: the owner socket minted an enrollment code. Channel
+    /// `cli`, result `minted`. Carries no code. Appended before the
+    /// code exists; a failed append mints nothing (REQ-APR-005,
+    /// REQ-AUD-003).
+    PasskeyEnrollCode,
+    /// #249: a passkey is about to be stored. Channel `web_ui`,
+    /// result `enrolled`. Carries `credential_fingerprint` and
+    /// `passkey_count`, never the credential id. Appended before the
+    /// store; a failed append stores nothing (REQ-APR-005,
+    /// REQ-AUD-003).
+    PasskeyEnrolled,
 }
 
 impl Event {
@@ -117,6 +128,8 @@ impl Event {
             Event::LogTruncated => "log_truncated",
             Event::ConnectorAuthFail => "connector_auth_fail",
             Event::ConnectorReplaced => "connector_replaced",
+            Event::PasskeyEnrollCode => "passkey_enroll_code",
+            Event::PasskeyEnrolled => "passkey_enrolled",
         }
     }
 }
@@ -160,6 +173,8 @@ impl<'de> Deserialize<'de> for Event {
             "log_truncated" => Event::LogTruncated,
             "connector_auth_fail" => Event::ConnectorAuthFail,
             "connector_replaced" => Event::ConnectorReplaced,
+            "passkey_enroll_code" => Event::PasskeyEnrollCode,
+            "passkey_enrolled" => Event::PasskeyEnrolled,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"
@@ -279,6 +294,16 @@ pub struct Entry {
     /// so the fingerprint exposes nothing usable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_fingerprint: Option<String>,
+    /// Fingerprint of a stored passkey's credential id (only on
+    /// `passkey_enrolled`, #249): SHA-256 of the raw id, lowercase
+    /// hex, truncated to 32 chars — the same shape as
+    /// `token_fingerprint`. The id itself is never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint: Option<String>,
+    /// Enrolled passkeys once this one is stored (only on
+    /// `passkey_enrolled`, #249).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passkey_count: Option<u64>,
 }
 
 impl Entry {
@@ -308,6 +333,8 @@ impl Entry {
             suppressed: None,
             old_session_secs: None,
             token_fingerprint: None,
+            credential_fingerprint: None,
+            passkey_count: None,
         }
     }
 
@@ -410,6 +437,19 @@ impl Entry {
         self
     }
 
+    /// Fingerprint of the stored passkey's credential id (only on
+    /// `passkey_enrolled`, #249).
+    pub fn credential_fingerprint(mut self, v: impl Into<String>) -> Self {
+        self.credential_fingerprint = Some(v.into());
+        self
+    }
+
+    /// Enrolled passkeys after this store (`passkey_enrolled`, #249).
+    pub fn passkey_count(mut self, v: u64) -> Self {
+        self.passkey_count = Some(v);
+        self
+    }
+
     /// Machine-readable detail code. Never interpolate values here
     /// (REQ-API-006 applies to everything the daemon emits).
     pub fn detail_code(mut self, v: impl Into<String>) -> Self {
@@ -437,5 +477,30 @@ mod tests {
             back.live_origin.as_deref(),
             Some("https://login.example.com")
         );
+    }
+
+    /// #249: the passkey fields stay off every other event, and a
+    /// `passkey_enrolled` entry round-trips its fingerprint and count.
+    #[test]
+    fn passkey_enrollment_fields_are_omitted_when_unset() {
+        let e = Entry::new(Event::PasskeyEnrollCode)
+            .channel("cli")
+            .result("minted");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["event"], "passkey_enroll_code");
+        assert!(v.get("credential_fingerprint").is_none());
+        assert!(v.get("passkey_count").is_none());
+        let fp = "ab".repeat(16);
+        let e = Entry::new(Event::PasskeyEnrolled)
+            .channel("web_ui")
+            .result("enrolled")
+            .credential_fingerprint(fp.clone())
+            .passkey_count(2);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["credential_fingerprint"], fp);
+        assert_eq!(v["passkey_count"], 2);
+        let back: Entry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.credential_fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(back.passkey_count, Some(2));
     }
 }

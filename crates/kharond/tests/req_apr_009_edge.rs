@@ -1033,6 +1033,241 @@ async fn req_apr_009_local_mode_is_never_throttled() {
     run.shutdown().await;
 }
 
+// ---- The per-session failure cap (#254) ----
+
+const PASSWORD_BODY: &str = r#"{"password":"guess"}"#;
+const SRC_C: &str = "203.0.113.50";
+
+async fn owner_session(run: &Running, cookie: &str) -> api_support::RawResponse {
+    http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        Http::get("/owner/session").host(PUBLIC_HOST).cookie(cookie),
+    )
+    .await
+}
+
+async fn authed_post(
+    run: &Running,
+    cookie: &str,
+    path: &str,
+    body: &str,
+    ip: &str,
+) -> api_support::RawResponse {
+    http(
+        run.ui,
+        PUBLIC_ORIGIN,
+        pub_post(path, body)
+            .cookie(cookie)
+            .header("CF-Connecting-IP", ip),
+    )
+    .await
+}
+
+fn detail_count(run: &Running, detail: &str) -> usize {
+    run.auth_fails()
+        .iter()
+        .filter(|e| e.detail_code.as_deref() == Some(detail))
+        .count()
+}
+
+/// N failures behind one session end it. The failure that crosses the
+/// cap still gets its own status; the next request with that cookie is
+/// 401. Exactly one audit entry records that the session was ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_n_failures_behind_one_session_end_it() {
+    let run = start_public().await;
+    let mut auth = enroll_public_from(&run, SRC_A).await;
+    let cookie = sign_in_from(&run, &mut auth, SRC_A).await;
+    let cap = kharond::owner_ui::SESSION_FAILURE_CAP;
+
+    for i in 1..cap {
+        let r = authed_post(
+            &run,
+            &cookie,
+            "/owner/approvals/approve",
+            PASSWORD_BODY,
+            SRC_A,
+        )
+        .await;
+        assert_eq!(r.status, 400, "{i}: {}", r.body);
+        assert!(r.body.contains("password_rejected"), "{i}: {}", r.body);
+    }
+    let still = owner_session(&run, &cookie).await;
+    assert_eq!(still.status, 200, "N-1 leaves the session: {}", still.body);
+    assert_eq!(detail_count(&run, "session_ended"), 0);
+
+    let nth = authed_post(
+        &run,
+        &cookie,
+        "/owner/approvals/approve",
+        PASSWORD_BODY,
+        SRC_A,
+    )
+    .await;
+    assert_eq!(
+        nth.status, 400,
+        "the Nth failure is still its own refusal: {}",
+        nth.body
+    );
+    assert!(nth.body.contains("password_rejected"), "{}", nth.body);
+
+    let gone = owner_session(&run, &cookie).await;
+    assert_eq!(gone.status, 401, "{}", gone.body);
+    assert!(gone.body.contains("unauthenticated"), "{}", gone.body);
+
+    let fails = run.auth_fails();
+    let ended: Vec<_> = fails
+        .iter()
+        .filter(|e| e.detail_code.as_deref() == Some("session_ended"))
+        .collect();
+    assert_eq!(ended.len(), 1, "{fails:?}");
+    assert_eq!(ended[0].client_ip.as_deref(), Some(SRC_A), "{:?}", ended[0]);
+    assert_eq!(ended[0].result.as_deref(), Some("denied"), "{:?}", ended[0]);
+    assert_eq!(
+        detail_count(&run, "password_rejected"),
+        cap as usize,
+        "{fails:?}"
+    );
+
+    // A later failure with the dead cookie is a missing session, and
+    // does not write a second ending entry.
+    let again = authed_post(
+        &run,
+        &cookie,
+        "/owner/approvals/approve",
+        PASSWORD_BODY,
+        SRC_A,
+    )
+    .await;
+    assert_eq!(again.status, 401, "{}", again.body);
+    assert_eq!(detail_count(&run, "session_ended"), 1);
+    assert_eq!(detail_count(&run, "no_session"), 1);
+    run.shutdown().await;
+}
+
+/// The count is the session's. Failures from different addresses, on
+/// different routes, with different details, add up. Another session
+/// is a different count.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_session_failures_add_up_across_sources() {
+    let run = start_public().await;
+    let mut auth = enroll_public_from(&run, SRC_A).await;
+    let stolen = sign_in_from(&run, &mut auth, SRC_A).await;
+    let other = sign_in_from(&run, &mut auth, SRC_B).await;
+    let cap = kharond::owner_ui::SESSION_FAILURE_CAP as usize;
+
+    // Approve (`password_rejected`) from A, login/finish (`no_assertion`)
+    // from B, deny (`password_rejected`) from C: different routes,
+    // details and addresses, and no source is near the cap or the
+    // per-source throttle. The cookie is what adds up.
+    let rest = cap - 1;
+    let from_b = 3.min(rest.saturating_sub(2));
+    let from_c = 2.min(rest - from_b);
+    let from_a = rest - from_b - from_c;
+    assert!(from_a > 0 && from_b > 0 && from_c > 0);
+    assert!(from_a < cap && from_b < cap && from_c < cap);
+    let mut calls = Vec::new();
+    for _ in 0..from_a {
+        calls.push(("/owner/approvals/approve", PASSWORD_BODY, SRC_A));
+    }
+    for _ in 0..from_b {
+        calls.push(("/owner/login/finish", "{}", SRC_B));
+    }
+    for _ in 0..from_c {
+        calls.push(("/owner/approvals/deny", PASSWORD_BODY, SRC_C));
+    }
+    for (i, (path, body, ip)) in calls.iter().enumerate() {
+        let r = authed_post(&run, &stolen, path, body, ip).await;
+        assert_ne!(r.status, 200, "{i} {path}: {}", r.body);
+        assert_ne!(r.status, 429, "{i} {path} was throttled: {}", r.body);
+    }
+    let still = owner_session(&run, &stolen).await;
+    assert_eq!(still.status, 200, "{}", still.body);
+    let other_ok = owner_session(&run, &other).await;
+    assert_eq!(other_ok.status, 200, "{}", other_ok.body);
+
+    let last = authed_post(
+        &run,
+        &stolen,
+        "/owner/grants/revoke",
+        PASSWORD_BODY,
+        "198.51.100.77",
+    )
+    .await;
+    assert_eq!(last.status, 400, "{}", last.body);
+    assert!(last.body.contains("password_rejected"), "{}", last.body);
+
+    let gone = owner_session(&run, &stolen).await;
+    assert_eq!(gone.status, 401, "{}", gone.body);
+    let other_still = owner_session(&run, &other).await;
+    assert_eq!(
+        other_still.status, 200,
+        "a second session is its own count: {}",
+        other_still.body
+    );
+    let fails = run.auth_fails();
+    let ended: Vec<_> = fails
+        .iter()
+        .filter(|e| e.detail_code.as_deref() == Some("session_ended"))
+        .collect();
+    assert_eq!(ended.len(), 1, "{fails:?}");
+    assert_eq!(
+        ended[0].client_ip.as_deref(),
+        Some("198.51.100.77"),
+        "{:?}",
+        ended[0]
+    );
+    run.shutdown().await;
+}
+
+/// A refused `Origin` carries the cookie and must not count. More of
+/// them than the cap leaves the session up, and they do not consume
+/// the failures that would end it.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_apr_009_wrong_origin_does_not_count_toward_the_session_cap() {
+    let run = start_public().await;
+    let mut auth = enroll_public_from(&run, SRC_A).await;
+    let cookie = sign_in_from(&run, &mut auth, SRC_A).await;
+    let cap = kharond::owner_ui::SESSION_FAILURE_CAP;
+
+    for i in 0..(cap + 5) {
+        let r = http(
+            run.ui,
+            EVIL,
+            pub_post("/owner/approvals/approve", PASSWORD_BODY)
+                .cookie(&cookie)
+                .header("CF-Connecting-IP", SRC_A),
+        )
+        .await;
+        assert_eq!(r.status, 403, "{i}: {}", r.body);
+        assert!(r.body.contains(r#""error":"origin""#), "{i}: {}", r.body);
+    }
+    let still = owner_session(&run, &cookie).await;
+    assert_eq!(
+        still.status, 200,
+        "wrong Origin signed the owner out: {}",
+        still.body
+    );
+    assert_eq!(detail_count(&run, "session_ended"), 0);
+
+    for i in 1..cap {
+        let r = authed_post(&run, &cookie, "/owner/panic", PASSWORD_BODY, SRC_B).await;
+        assert_eq!(r.status, 400, "{i}: {}", r.body);
+        assert!(r.body.contains("password_rejected"), "{i}: {}", r.body);
+    }
+    let after = owner_session(&run, &cookie).await;
+    assert_eq!(after.status, 200, "origin failures counted: {}", after.body);
+    assert_eq!(detail_count(&run, "session_ended"), 0);
+
+    let nth = authed_post(&run, &cookie, "/owner/panic", PASSWORD_BODY, SRC_B).await;
+    assert_eq!(nth.status, 400, "{}", nth.body);
+    let gone = owner_session(&run, &cookie).await;
+    assert_eq!(gone.status, 401, "{}", gone.body);
+    assert_eq!(detail_count(&run, "session_ended"), 1);
+    run.shutdown().await;
+}
+
 // ---- The audit ceiling (D6) ----
 
 #[tokio::test(flavor = "multi_thread")]

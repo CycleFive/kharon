@@ -263,7 +263,8 @@ Two limits worth stating plainly:
 
 *Duet's call:* unlock failures count even though unlock needs a session,
 because AC4 lists them and a stolen session cookie shouldn't buy unlimited
-master-password guesses.
+master-password guesses. The per-source table does not hold that by itself:
+sources are cheap. The per-session cap in D6 does.
 
 ### D6. A ceiling on audit entries a stranger can cause
 
@@ -286,8 +287,18 @@ daemon's existing 15-second flush tick, and at shutdown. This is the mechanism
   session is always itemized** and sits outside the ceiling. A stranger
   can't produce one, so they can't grow the log with it, and it is the
   entry that matters most: a wrong master password typed behind a stolen
-  session cookie must not be hidden by a flood started for that purpose. D5
-  bounds these per source, because everything past the `Origin` check counts.
+  session cookie must not be hidden by a flood started for that purpose. What
+  bounds them is a per-session cap, not D5 (#254): 10 such failures — any
+  route, any detail except a refused `Origin` — end that session. The count
+  is per session, so failures from different addresses with the same cookie
+  add up, and the next request with that cookie is `401`. One
+  `owner_auth_fail` with detail `session_ended` records it. A completed
+  sign-in or unlock clears that session's count, as a success clears the
+  source's. A refused
+  `Origin` does not count, because a same-site sibling page can send the
+  cookie and must not be able to sign the owner out. D5 still bounds the six
+  throttled routes per source; off those routes, and wherever a thief rotates
+  addresses, this cap is the bound.
 - **A wrong `Origin` always goes through the ceiling, session or not**
   (Nyx's review). `SameSite=Strict` is per site, not per origin. A page on
   any sibling host under the same registrable domain is same-site, so the

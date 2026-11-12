@@ -9,7 +9,11 @@
 //! encrypted to a per-attempt daemon key. A session
 //! lasts at most [`SESSION_TTL`] (15 minutes, SPEC §5) and is an
 //! `HttpOnly; SameSite=Strict` cookie. Logout drops that session
-//! on the server; clearing the cookie alone does not end it.
+//! on the server; clearing the cookie alone does not end it. In
+//! public mode, [`SESSION_FAILURE_CAP`] auth failures attributed to
+//! one session (any route, any detail except a refused `Origin`)
+//! end it too: the next request with that cookie is 401, and one
+//! `owner_auth_fail` (`session_ended`) records why (#254).
 //!
 //! Registering the first passkey is not a login. The owner socket
 //! (same-uid) mints a single-use enrollment code via `passkey_enroll`;
@@ -130,6 +134,16 @@ use crate::api::oauth::AUTHORIZATION_SERVER_PATH;
 
 /// SPEC §5: an owner web session is at most 15 minutes.
 pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Auth failures behind one live session that end it, in public mode
+/// (#254, REQ-APR-009). The same number as the per-source throttle:
+/// a stolen cookie gets about as many guesses as one source, on any
+/// route, and then the session is gone. A refused `Origin` does not
+/// count. The count is the session's, so the source address does not
+/// matter.
+pub const SESSION_FAILURE_CAP: u32 = 10;
+
+const _: () = assert!(SESSION_FAILURE_CAP == throttle::MAX_FAILURES);
 
 /// A challenge or enrollment code lives this long, matching the
 /// ntfy one-time token (SPEC §5).
@@ -489,6 +503,10 @@ struct Session {
     /// session a test issued without a passkey. Removing the passkey
     /// ends every session that carries its id.
     credential_id: Vec<u8>,
+    /// `owner_auth_fail` entries attributed to this session, other
+    /// than a refused `Origin` (#254). Reaching
+    /// [`SESSION_FAILURE_CAP`] drops the session.
+    auth_failures: u32,
 }
 
 struct Enroll {
@@ -1000,7 +1018,7 @@ async fn handle(
                     client_ip,
                     throttle_key: None,
                     throttled_route: false,
-                    has_session: false,
+                    session: None,
                 },
                 ACCESS_REFUSED,
             );
@@ -1063,8 +1081,14 @@ struct Incoming {
 }
 
 /// The detail code of a refused `Origin`: always capped by the audit
-/// ceiling (D6) and never counted by the throttle (D5).
+/// ceiling (D6), never counted by the throttle (D5), and never counted
+/// toward the per-session cap (#254). A same-site sibling page can
+/// send the cookie; counting it would let that page sign the owner out.
 const ORIGIN_REFUSED: &str = "origin";
+
+/// The one `owner_auth_fail` detail that records a session ended
+/// because it reached [`SESSION_FAILURE_CAP`] (#254).
+const SESSION_ENDED: &str = "session_ended";
 
 /// How an `owner_auth_fail` entry meets the public audit ceiling (D6).
 #[derive(Clone, Copy)]
@@ -1089,8 +1113,9 @@ struct FailureCtx {
     throttle_key: Option<IpAddr>,
     /// The request was on one of [`throttle::THROTTLED_ROUTES`].
     throttled_route: bool,
-    /// The request carried a live session.
-    has_session: bool,
+    /// The live session this failure is attributed to, when the
+    /// cookie names one (#254).
+    session: Option<[u8; 32]>,
 }
 
 impl OwnerUi {
@@ -1102,7 +1127,7 @@ impl OwnerUi {
                 client_ip: req.client_ip,
                 throttle_key: req.throttle_key,
                 throttled_route: throttle::THROTTLED_ROUTES.contains(&req.path.as_str()),
-                has_session: self.session_alive(req.cookie.as_deref()),
+                session: self.live_session(req.cookie.as_deref()),
             },
             detail,
         );
@@ -1114,11 +1139,12 @@ impl OwnerUi {
         // is always itemized: a stranger cannot make one (D6). A wrong
         // `Origin` is capped either way: a same-site sibling page can
         // send one with the owner's cookie.
+        let session_bearing = ctx.session.is_some() && detail != ORIGIN_REFUSED;
         self.write_failure(
             now,
             detail,
             ctx.client_ip,
-            if ctx.has_session && detail != ORIGIN_REFUSED {
+            if session_bearing {
                 Admit::Exempt
             } else {
                 Admit::Budget
@@ -1135,6 +1161,18 @@ impl OwnerUi {
         {
             // Session-less in the budget's eyes, like any other entry.
             self.write_failure(now, "throttled", ctx.client_ip, Admit::Trip);
+        }
+        // Per-session cap (#254). Public mode only, like the throttle.
+        // The count is the session's, so rotating source addresses
+        // adds up, and a refused `Origin` never counts. Reaching the
+        // cap drops the session; one entry records that, and it is
+        // not itself counted.
+        if self.public
+            && session_bearing
+            && let Some(hash) = ctx.session
+            && self.note_session_failure(hash)
+        {
+            self.write_failure(now, SESSION_ENDED, ctx.client_ip, Admit::Exempt);
         }
     }
 
@@ -1207,10 +1245,20 @@ impl OwnerUi {
         }
     }
 
-    /// A completed sign-in or unlock clears the source's failure count.
+    /// A completed sign-in or unlock clears the source's failure count
+    /// and this session's (#254). An owner who mistypes and then gets
+    /// in starts fresh; the typos before the success do not end the
+    /// session.
     fn forgive(&self, req: &Incoming) {
         if let Some(ip) = req.throttle_key {
             self.throttle.clear(ip);
+        }
+        let Some(hash) = session_hash(self.cookie_name, req.cookie.as_deref()) else {
+            return;
+        };
+        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(session) = guard.iter_mut().find(|s| ct_eq(&s.hash, &hash)) {
+            session.auth_failures = 0;
         }
     }
 
@@ -1961,6 +2009,7 @@ impl OwnerUi {
             hash,
             expires: now + SESSION_TTL,
             credential_id: credential_id.to_vec(),
+            auth_failures: 0,
         });
         session_cookie(self.cookie_name, &token, self.secure_cookie)
     }
@@ -1972,13 +2021,36 @@ impl OwnerUi {
     }
 
     fn session_alive(&self, cookie_header: Option<&str>) -> bool {
-        let Some(hash) = session_hash(self.cookie_name, cookie_header) else {
-            return false;
-        };
+        self.live_session(cookie_header).is_some()
+    }
+
+    /// The hash of the live session `cookie_header` names, if it
+    /// still has time left. Expired sessions are dropped.
+    fn live_session(&self, cookie_header: Option<&str>) -> Option<[u8; 32]> {
+        let hash = session_hash(self.cookie_name, cookie_header)?;
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         guard.retain(|s| s.expires > now);
-        guard.iter().any(|s| ct_eq(&s.hash, &hash))
+        guard.iter().any(|s| ct_eq(&s.hash, &hash)).then_some(hash)
+    }
+
+    /// Count one non-origin failure against this session.
+    ///
+    /// `true` when the count reaches [`SESSION_FAILURE_CAP`] and the
+    /// session was removed. A session that is already gone (logged
+    /// out, expired, or ended by an earlier failure) counts nothing
+    /// and writes no second ending entry.
+    fn note_session_failure(&self, hash: [u8; 32]) -> bool {
+        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(pos) = guard.iter().position(|s| ct_eq(&s.hash, &hash)) else {
+            return false;
+        };
+        guard[pos].auth_failures = guard[pos].auth_failures.saturating_add(1);
+        if guard[pos].auth_failures < SESSION_FAILURE_CAP {
+            return false;
+        }
+        guard.remove(pos);
+        true
     }
 
     /// Remove the session that matches this cookie, expired or not.
@@ -5660,7 +5732,7 @@ mod tests {
             client_ip: None,
             throttle_key: None,
             throttled_route: false,
-            has_session: false,
+            session: None,
         };
         let t = Instant::now();
         for _ in 0..25 {

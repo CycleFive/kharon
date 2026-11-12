@@ -116,6 +116,21 @@ pub enum Event {
     /// Best effort, like [`Event::ConnectorAuthFail`]: a failed
     /// append never turns the refusal into an admission.
     OauthClientRefused,
+    /// REQ-OAU-004 (#231): a Connect identity was created at code
+    /// redemption. `agent_id` is the new `c-…` id, `origin` the
+    /// client's CIMD hostname, channel `web_ui`. Appended before the
+    /// identity is persisted (I5): a failed append creates nothing.
+    OauthConnect,
+    /// REQ-OAU-005 (#231): a Connect ended. `detail_code` is one of
+    /// `owner`, `client`, `panic`, `code_reuse` or `persist_failed`
+    /// (SPEC §7). The `persist_failed` form is the compensating entry
+    /// for an [`Event::OauthConnect`] whose state write then failed.
+    OauthDisconnect,
+    /// REQ-OAU-004 (#231): a retired refresh token was presented
+    /// again outside the 30 s grace, and the whole Connect was
+    /// revoked for reuse. `agent_id` is the Connect's `c-…` id,
+    /// `origin` the client's CIMD hostname, channel `web_ui`.
+    OauthRefreshReuse,
 }
 
 impl Event {
@@ -156,6 +171,9 @@ impl Event {
             Event::PasskeyListed => "passkey_listed",
             Event::PasskeyRemoved => "passkey_removed",
             Event::OauthClientRefused => "oauth_client_refused",
+            Event::OauthConnect => "oauth_connect",
+            Event::OauthDisconnect => "oauth_disconnect",
+            Event::OauthRefreshReuse => "oauth_refresh_reuse",
         }
     }
 }
@@ -203,6 +221,9 @@ impl<'de> Deserialize<'de> for Event {
             "passkey_enrolled" => Event::PasskeyEnrolled,
             "passkey_listed" => Event::PasskeyListed,
             "passkey_removed" => Event::PasskeyRemoved,
+            "oauth_connect" => Event::OauthConnect,
+            "oauth_disconnect" => Event::OauthDisconnect,
+            "oauth_refresh_reuse" => Event::OauthRefreshReuse,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"

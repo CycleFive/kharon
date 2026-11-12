@@ -1,0 +1,1283 @@
+//! The OAuth token store (REQ-OAU-004/-005; N3 design #226, D3/D4,
+//! I5): Connect identities and their tokens, persisted in
+//! `data_dir/oauth/state.json`.
+//!
+//! A Connect identity (`c-<10 lowercase base32>`) is created when an
+//! authorization code is redeemed at `POST /oauth/token` — never at
+//! consent, so an unredeemed consent leaves nothing behind (A17).
+//! Tokens are opaque (`kh_at_<64 hex>`, `kh_rt_<64 hex>`); the file
+//! holds only their SHA-256 hashes, with the identities (D3). Codes
+//! are never written here: they live in the authorize side's memory
+//! (#230), and the redeemed-code set that makes a second redemption
+//! revoke is memory-only too, expiring with the code.
+//!
+//! Ordering follows I5 / REQ-AUD-003, and the two directions fail
+//! closed opposite ways, on purpose:
+//! - **Issuance** (connect, refresh): audit first where an entry is
+//!   owed (`oauth_connect`), then persist, then answer. Work happens
+//!   on a clone of the file state and is only swapped in once the
+//!   write lands, so a failed write answers 500 with no tokens and
+//!   leaves the previous state — in memory and on disk — untouched.
+//! - **Ending a Connect** (revoke, reuse, panic): revoke first, in
+//!   memory and in the state file, then audit (the #135 precedent).
+//!   A failed write is reported but cannot un-revoke what memory
+//!   already ended.
+//!
+//! The store is transport-free. Audit appends and grant cleanup go
+//! through [`ConnectLifecycle`], which the daemon implements over
+//! the broker (cf. [`super::cimd::RefusalAudit`]); the token and
+//! revoke endpoints live in `owner_ui::oauth_token`.
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use rand::RngCore;
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::audit::{Entry, Event};
+
+/// Access tokens live one hour (D4).
+pub const ACCESS_TTL_SECS: u64 = 3_600;
+/// A refresh token idles out 30 days after its last rotation (D4).
+pub const REFRESH_IDLE_SECS: u64 = 30 * 86_400;
+/// …and dies absolutely 90 days after consent (D4, A6).
+pub const REFRESH_ABSOLUTE_SECS: u64 = 90 * 86_400;
+/// The refresh-retry grace after a rotation (I5, A13).
+pub const GRACE_SECS: u64 = 30;
+/// Authorization codes live 60 s (D4); the redeemed set is kept
+/// exactly that long past consent.
+pub const CODE_TTL_SECS: u64 = 60;
+
+const STATE_VERSION: u32 = 1;
+
+/// Where a Connect's audit entries go, and who drops its live
+/// grants when it ends. Implemented by the daemon over the broker.
+pub trait ConnectLifecycle: Send + Sync {
+    /// Append one audit entry; `false` when the log refused it.
+    /// Only `oauth_connect` treats a refusal as fatal (I5: the
+    /// append precedes the persist, and a failed append creates
+    /// nothing); the ending entries are appended after the
+    /// revocation they describe and are best effort.
+    fn append(&self, entry: Entry) -> bool;
+    /// A Connect ended: drop the identity's live grants and pending
+    /// requests (REQ-REV-001). Best effort, like the audit append
+    /// that follows it.
+    fn connect_ended(&self, agent_id: &str);
+}
+
+/// Why a token operation failed. `InvalidGrant` is the OAuth
+/// `invalid_grant` error; `PersistFailed` and `AuditFailed` are
+/// server faults the endpoint answers 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenError {
+    /// The presented code or token is unknown, expired, spent or
+    /// otherwise not usable.
+    InvalidGrant,
+    /// The `oauth_connect` append failed: nothing was created.
+    AuditFailed,
+    /// The state write failed: no tokens are answered.
+    PersistFailed,
+}
+
+/// A freshly issued token pair, plaintext, for the one response
+/// that carries it. Never stored, never logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IssuedPair {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// The granted scopes, space-separated, as the token response's
+    /// `scope` (the granted set can differ from the requested one,
+    /// REQ-OAU-003).
+    pub scope: String,
+}
+
+impl std::fmt::Debug for IssuedPair {
+    /// The plaintext tokens never print, even in a test failure.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedPair")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// What an access token authenticates as on `/mcp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticated {
+    pub agent_id: String,
+    /// The Connect's granted scopes (their tool enforcement is
+    /// #232; the store carries them from here).
+    pub scopes: Vec<String>,
+}
+
+/// The checked contents of a redeemed authorization code (#230's
+/// `CodeBody`, carried across the seam): everything the identity
+/// will need (D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeGrant {
+    pub client_id: String,
+    pub client_name: String,
+    /// The S256 `code_challenge` the code was bound to.
+    pub code_challenge: String,
+    /// The granted scopes, canonical order.
+    pub scopes: Vec<String>,
+    /// Unix seconds of the consent; the refresh token's 90-day
+    /// absolute lifetime counts from here (D4).
+    pub consented_at: u64,
+}
+
+/// How a Connect ended, for the `oauth_disconnect` `detail_code`
+/// (SPEC §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectDetail {
+    /// Disconnect in the owner UI or `revoke agent` on the socket.
+    Owner,
+    /// The client's `POST /oauth/revoke` with its refresh token.
+    Client,
+    /// Panic (REQ-REV-002).
+    Panic,
+    /// The code was redeemed a second time.
+    CodeReuse,
+}
+
+impl DisconnectDetail {
+    pub fn detail_code(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Client => "client",
+            Self::Panic => "panic",
+            Self::CodeReuse => "code_reuse",
+        }
+    }
+}
+
+/// One Connect identity (D3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    /// `c-<10 lowercase base32>`.
+    pub id: String,
+    pub client_id: String,
+    /// The `client_name` as shown at consent.
+    pub client_name: String,
+    /// The granted scopes.
+    pub scopes: Vec<String>,
+    /// Unix seconds the identity was created (code redemption).
+    pub created_at: u64,
+    /// Unix seconds of the consent; the refresh absolute lifetime
+    /// counts from here.
+    pub consented_at: u64,
+    /// Always `"oauth"` in this design (D3); kept in the record so
+    /// the Connections page can say how a Connect arrived.
+    pub connected_via: String,
+    pub revoked: bool,
+}
+
+impl Identity {
+    /// The CIMD hostname an audit entry names as `origin` (I7),
+    /// when the `client_id` parses as a URL with a host.
+    pub fn audit_origin(&self) -> Option<String> {
+        cimd_host(&self.client_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TokenKind {
+    Access,
+    Refresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TokenStatus {
+    Live,
+    Retired,
+    Revoked,
+}
+
+/// One token, by hash only (D3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TokenRecord {
+    /// Lowercase hex SHA-256 of the plaintext token.
+    hash: String,
+    kind: TokenKind,
+    identity_id: String,
+    /// The refresh family: one per Connect, named by the identity.
+    family: String,
+    /// The hash of the token this one descends from: a refresh
+    /// token's parent is the refresh token it rotated from; an
+    /// access token's parent is the refresh token issued in its
+    /// pair. `None` for a Connect's first pair.
+    parent: Option<String>,
+    issued_at: u64,
+    /// Access: issue + 1 h. Refresh: the earlier of the 30-day idle
+    /// limit and the 90-day absolute limit.
+    expires_at: u64,
+    status: TokenStatus,
+    /// Refresh only: when a rotation retired this token.
+    retired_at: Option<u64>,
+    /// Refresh only: the hash of the refresh token that replaced
+    /// this one.
+    successor: Option<String>,
+    /// Refresh only: the 30 s grace retry has been spent (I5).
+    grace_used: bool,
+}
+
+/// The persisted form. Codes are never in it (D3); the redeemed
+/// set below is runtime-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FileState {
+    version: u32,
+    identities: Vec<Identity>,
+    tokens: Vec<TokenRecord>,
+}
+
+impl FileState {
+    fn new() -> Self {
+        Self {
+            version: STATE_VERSION,
+            identities: Vec::new(),
+            tokens: Vec::new(),
+        }
+    }
+
+    fn identity(&self, id: &str) -> Option<&Identity> {
+        self.identities.iter().find(|i| i.id == id)
+    }
+}
+
+/// A code redeemed once, remembered until the code would have
+/// expired: a second presentation in that window revokes what the
+/// first one issued (D4). Memory only, like the codes themselves.
+struct RedeemedUse {
+    code_hash: [u8; 32],
+    identity_id: String,
+    expires_at: u64,
+}
+
+struct Inner {
+    file: FileState,
+    redeemed: Vec<RedeemedUse>,
+}
+
+/// The store. One per daemon, shared by the token endpoints (via
+/// the owner UI), the broker's `/mcp` auth dispatch and the daemon.
+pub struct OauthStore {
+    path: PathBuf,
+    inner: Mutex<Inner>,
+    lifecycle: OnceLock<Arc<dyn ConnectLifecycle>>,
+}
+
+impl OauthStore {
+    /// Load `data_dir/oauth/state.json`. A missing file is an empty
+    /// store; an unparseable one is an error, and with `[oauth]`
+    /// set the daemon refuses to start on it (I2: fail closed).
+    /// Called before any listener opens.
+    pub fn load(data_dir: &Path) -> io::Result<Self> {
+        let path = data_dir.join("oauth").join("state.json");
+        let file = match std::fs::read(&path) {
+            Ok(bytes) => {
+                let parsed: FileState = serde_json::from_slice(&bytes).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("oauth state {}: {e}", path.display()),
+                    )
+                })?;
+                if parsed.version != STATE_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "oauth state {}: unsupported version {}",
+                            path.display(),
+                            parsed.version
+                        ),
+                    ));
+                }
+                parsed
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => FileState::new(),
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            path,
+            inner: Mutex::new(Inner {
+                file,
+                redeemed: Vec::new(),
+            }),
+            lifecycle: OnceLock::new(),
+        })
+    }
+
+    /// Wire the audit/grant lifecycle (the daemon, once the broker
+    /// exists). Until set, audit appends fail — so `connect` fails
+    /// closed — and grant cleanup is skipped.
+    pub fn set_lifecycle(&self, lifecycle: Arc<dyn ConnectLifecycle>) {
+        let _ = self.lifecycle.set(lifecycle);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn append(&self, entry: Entry) -> bool {
+        match self.lifecycle.get() {
+            Some(lifecycle) => lifecycle.append(entry),
+            None => false,
+        }
+    }
+
+    fn connect_ended(&self, agent_id: &str) {
+        if let Some(lifecycle) = self.lifecycle.get() {
+            lifecycle.connect_ended(agent_id);
+        }
+    }
+
+    /// Serialize and atomically replace the state file (0600,
+    /// write-then-rename, like `owner/passkeys.json`).
+    fn persist(&self, file: &FileState) -> io::Result<()> {
+        let text = serde_json::to_string(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        write_private(&self.path, text.as_bytes())
+    }
+
+    /// The identity a code's first redemption created, while the
+    /// code would still be live. The token endpoint checks this
+    /// before redeeming: a hit is a second redemption.
+    pub fn redeemed_identity(&self, code_hash: &[u8; 32], now: u64) -> Option<String> {
+        let mut inner = self.lock();
+        inner.redeemed.retain(|r| r.expires_at > now);
+        inner
+            .redeemed
+            .iter()
+            .find(|r| ct_eq(&r.code_hash, code_hash))
+            .map(|r| r.identity_id.clone())
+    }
+
+    /// Create a Connect identity from a redeemed code and issue its
+    /// first token pair (I5 ordering: append `oauth_connect`, then
+    /// persist, then answer; a failed persist writes a compensating
+    /// `oauth_disconnect`/`persist_failed` and creates nothing).
+    /// The caller has already taken the code from the authorize
+    /// side's store: the code is spent whatever happens here.
+    pub fn connect(
+        &self,
+        grant: &CodeGrant,
+        code_verifier: &str,
+        code_hash: [u8; 32],
+        now: u64,
+    ) -> Result<IssuedPair, TokenError> {
+        // PKCE S256: SHA-256(verifier), base64url without padding,
+        // must equal the challenge the code was bound to.
+        let digest = sha256(code_verifier.as_bytes());
+        if !ct_eq(
+            b64url_encode(&digest).as_bytes(),
+            grant.code_challenge.as_bytes(),
+        ) {
+            return Err(TokenError::InvalidGrant);
+        }
+        let id = new_identity_id();
+        let origin = cimd_host(&grant.client_id);
+        // 1. Audit. A failed append fails the request closed: no
+        // identity, no tokens (I5).
+        let entry = Entry::new(Event::OauthConnect)
+            .agent_id(id.clone())
+            .channel("web_ui")
+            .result("connected");
+        let entry = match &origin {
+            Some(host) => entry.origin(host.clone()),
+            None => entry,
+        };
+        if !self.append(entry) {
+            return Err(TokenError::AuditFailed);
+        }
+        // 2. Persist. Work on a clone; swap in only once the write
+        // lands, so a failure leaves the running state untouched.
+        let identity = Identity {
+            id: id.clone(),
+            client_id: grant.client_id.clone(),
+            client_name: grant.client_name.clone(),
+            scopes: grant.scopes.clone(),
+            created_at: now,
+            consented_at: grant.consented_at,
+            connected_via: "oauth".to_owned(),
+            revoked: false,
+        };
+        let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now);
+        let mut next = {
+            let inner = self.lock();
+            inner.file.clone()
+        };
+        next.identities.push(identity);
+        next.tokens.push(access_rec);
+        next.tokens.push(refresh_rec);
+        if self.persist(&next).is_err() {
+            // Best-effort compensation (I5): the chain reads connect,
+            // then disconnect, for an identity that never served.
+            let entry = Entry::new(Event::OauthDisconnect)
+                .agent_id(id)
+                .channel("web_ui")
+                .result("revoked")
+                .detail_code("persist_failed");
+            let entry = match &origin {
+                Some(host) => entry.origin(host.clone()),
+                None => entry,
+            };
+            self.append(entry);
+            return Err(TokenError::PersistFailed);
+        }
+        let mut inner = self.lock();
+        inner.file = next;
+        inner.redeemed.retain(|r| r.expires_at > now);
+        inner.redeemed.push(RedeemedUse {
+            code_hash,
+            identity_id: id,
+            expires_at: grant.consented_at.saturating_add(CODE_TTL_SECS),
+        });
+        // 3. Answer.
+        Ok(pair)
+    }
+
+    /// `grant_type=refresh_token`: rotate, applying the idle and
+    /// absolute limits, the 30 s grace and reuse detection (D4, I5).
+    pub fn refresh(&self, presented: &str, now: u64) -> Result<IssuedPair, TokenError> {
+        let hash = hex(&sha256(presented.as_bytes()));
+        enum Plan {
+            Invalid,
+            Rotate,
+            GraceRetry,
+            Reuse(String),
+        }
+        let plan = {
+            let inner = self.lock();
+            let file = &inner.file;
+            let Some(rec) = file.tokens.iter().find(|t| t.hash == hash) else {
+                return Err(TokenError::InvalidGrant);
+            };
+            if rec.kind != TokenKind::Refresh {
+                return Err(TokenError::InvalidGrant);
+            }
+            let Some(identity) = file.identity(&rec.identity_id) else {
+                return Err(TokenError::InvalidGrant);
+            };
+            if identity.revoked || rec.status == TokenStatus::Revoked {
+                return Err(TokenError::InvalidGrant);
+            }
+            match rec.status {
+                TokenStatus::Live => {
+                    if now >= rec.expires_at || refresh_deadline(identity, now) <= now {
+                        Plan::Invalid
+                    } else {
+                        Plan::Rotate
+                    }
+                }
+                TokenStatus::Retired => {
+                    let grace = !rec.grace_used
+                        && rec
+                            .retired_at
+                            .is_some_and(|t| now.saturating_sub(t) <= GRACE_SECS)
+                        && rec.successor.as_ref().is_some_and(|succ| {
+                            file.tokens.iter().any(|t| {
+                                t.hash == *succ
+                                    && t.status == TokenStatus::Live
+                                    && t.identity_id == rec.identity_id
+                            })
+                        });
+                    if grace {
+                        Plan::GraceRetry
+                    } else {
+                        Plan::Reuse(rec.identity_id.clone())
+                    }
+                }
+                TokenStatus::Revoked => Plan::Invalid,
+            }
+        };
+        match plan {
+            Plan::Invalid => Err(TokenError::InvalidGrant),
+            Plan::Reuse(identity_id) => {
+                // Reuse (I5): revoke first — memory and the state
+                // file — then audit `oauth_refresh_reuse`. The
+                // answer is `invalid_grant` whatever the write did.
+                let ended = self.end_connect(&identity_id);
+                if let Some(identity) = ended {
+                    let entry = Entry::new(Event::OauthRefreshReuse)
+                        .agent_id(identity.id.clone())
+                        .channel("web_ui")
+                        .result("revoked");
+                    let entry = match cimd_host(&identity.client_id) {
+                        Some(host) => entry.origin(host),
+                        None => entry,
+                    };
+                    self.append(entry);
+                }
+                Err(TokenError::InvalidGrant)
+            }
+            Plan::Rotate | Plan::GraceRetry => {
+                let grace = matches!(plan, Plan::GraceRetry);
+                let mut next = {
+                    let inner = self.lock();
+                    inner.file.clone()
+                };
+                // Re-check under the clone: a racing request may
+                // have moved the chain since the plan was made. The
+                // store mutex is not held across the plan, so this
+                // second look is what makes rotation atomic enough:
+                // the record must still be in the planned state.
+                let Some(pos) = next.tokens.iter().position(|t| t.hash == hash) else {
+                    return Err(TokenError::InvalidGrant);
+                };
+                let rec = next.tokens[pos].clone();
+                let Some(identity) = next.identity(&rec.identity_id).cloned() else {
+                    return Err(TokenError::InvalidGrant);
+                };
+                if identity.revoked {
+                    return Err(TokenError::InvalidGrant);
+                }
+                if grace {
+                    if rec.status != TokenStatus::Retired || rec.grace_used {
+                        return Err(TokenError::InvalidGrant);
+                    }
+                    let successor = rec.successor.clone();
+                    next.tokens[pos].grace_used = true;
+                    // The pair issued moments before dies, both
+                    // tokens (I5): the successor refresh, and the
+                    // access token issued alongside it.
+                    if let Some(succ) = &successor {
+                        for t in next.tokens.iter_mut() {
+                            if (t.hash == *succ || t.parent.as_deref() == Some(succ.as_str()))
+                                && t.status == TokenStatus::Live
+                            {
+                                t.status = TokenStatus::Revoked;
+                            }
+                        }
+                    }
+                } else {
+                    if rec.status != TokenStatus::Live || now >= rec.expires_at {
+                        return Err(TokenError::InvalidGrant);
+                    }
+                }
+                let (pair, access_rec, refresh_rec) = issue_pair(&identity, Some(hash), now);
+                if !grace {
+                    let old = &mut next.tokens[pos];
+                    old.status = TokenStatus::Retired;
+                    old.retired_at = Some(now);
+                    old.successor = Some(refresh_rec.hash.clone());
+                    old.grace_used = false;
+                }
+                next.tokens.push(access_rec);
+                next.tokens.push(refresh_rec);
+                // The store is written before the response (I5); a
+                // failed write fails the request with no tokens,
+                // and the clone is dropped, so the presented token
+                // stays live for a retry.
+                self.persist(&next).map_err(|_| TokenError::PersistFailed)?;
+                self.lock().file = next;
+                Ok(pair)
+            }
+        }
+    }
+
+    /// `POST /oauth/revoke` (RFC 7009): an access token ends only
+    /// itself; a refresh token ends the whole Connect (detail
+    /// `client`). An unknown or already-dead token is a success:
+    /// RFC 7009 answers 200 either way. A failed state write fails
+    /// the request — the revocation still stands in memory.
+    pub fn revoke(&self, presented: &str, now: u64) -> Result<(), TokenError> {
+        let hash = hex(&sha256(presented.as_bytes()));
+        let (kind, identity_id) = {
+            let inner = self.lock();
+            let Some(rec) = inner.file.tokens.iter().find(|t| t.hash == hash) else {
+                return Ok(());
+            };
+            if rec.status == TokenStatus::Revoked {
+                return Ok(());
+            }
+            (rec.kind, rec.identity_id.clone())
+        };
+        match kind {
+            TokenKind::Refresh => {
+                self.disconnect(&identity_id, DisconnectDetail::Client, "web_ui", now)?;
+                Ok(())
+            }
+            TokenKind::Access => {
+                let mut inner = self.lock();
+                if let Some(rec) = inner.file.tokens.iter_mut().find(|t| t.hash == hash) {
+                    rec.status = TokenStatus::Revoked;
+                }
+                let persisted = self.persist(&inner.file);
+                drop(inner);
+                persisted.map_err(|_| TokenError::PersistFailed)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// End a whole Connect: the identity and all its tokens, at
+    /// once (REQ-OAU-005). Revoke first — in memory and in the
+    /// state file — then the grants hook, then audit
+    /// `oauth_disconnect` (best effort). Returns whether a live
+    /// Connect ended; a failed write is `Err` after the revocation
+    /// has already taken effect in memory.
+    pub fn disconnect(
+        &self,
+        identity_id: &str,
+        detail: DisconnectDetail,
+        channel: &str,
+        _now: u64,
+    ) -> Result<bool, TokenError> {
+        let Some(identity) = self.end_connect(identity_id) else {
+            return Ok(false);
+        };
+        let entry = Entry::new(Event::OauthDisconnect)
+            .agent_id(identity.id.clone())
+            .channel(channel)
+            .result("revoked")
+            .detail_code(detail.detail_code());
+        let entry = match cimd_host(&identity.client_id) {
+            Some(host) => entry.origin(host),
+            None => entry,
+        };
+        self.append(entry);
+        Ok(true)
+    }
+
+    /// End every live Connect (panic, REQ-REV-002). One write for
+    /// the batch; a failed write is only logged, never allowed to
+    /// fail a panic. Returns the identities that ended, with their
+    /// audit origins, for the caller's `oauth_disconnect` entries.
+    pub fn revoke_all(&self) -> Vec<Identity> {
+        let ended = {
+            let mut inner = self.lock();
+            let ids: Vec<String> = inner
+                .file
+                .identities
+                .iter()
+                .filter(|i| !i.revoked)
+                .map(|i| i.id.clone())
+                .collect();
+            let mut ended = Vec::new();
+            for id in ids {
+                if let Some(identity) = end_in(&mut inner.file, &id) {
+                    ended.push(identity);
+                }
+            }
+            if !ended.is_empty() && self.persist(&inner.file).is_err() {
+                eprintln!("kharond: oauth state write failed during panic revoke-all");
+            }
+            ended
+        };
+        for identity in &ended {
+            self.connect_ended(&identity.id);
+        }
+        ended
+    }
+
+    /// Authenticate an access token on `/mcp`: a hash lookup, never
+    /// an Argon2id permit (REQ-OAU-008). `None` for unknown,
+    /// expired, revoked or wrong-kind tokens, and for tokens whose
+    /// Connect has ended.
+    pub fn authenticate_access(&self, presented: &str, now: u64) -> Option<Authenticated> {
+        let hash = hex(&sha256(presented.as_bytes()));
+        let inner = self.lock();
+        let rec = inner.file.tokens.iter().find(|t| t.hash == hash)?;
+        if rec.kind != TokenKind::Access || rec.status != TokenStatus::Live || now >= rec.expires_at
+        {
+            return None;
+        }
+        let identity = inner.file.identity(&rec.identity_id)?;
+        if identity.revoked {
+            return None;
+        }
+        Some(Authenticated {
+            agent_id: identity.id.clone(),
+            scopes: identity.scopes.clone(),
+        })
+    }
+
+    /// Whether the id is one of this store's Connect identities
+    /// (live or ended). The broker's grant cleanup for a `c-…` id
+    /// goes through [`Self::disconnect`]; this only names the set.
+    pub fn is_connect(&self, agent_id: &str) -> bool {
+        self.lock().file.identity(agent_id).is_some()
+    }
+
+    /// The shared tail of every Connect-ending path: mutate memory
+    /// first (fail closed in-process), then persist, then the
+    /// grants hook. Returns the identity as it stood, when a live
+    /// one ended. Audit is the caller's entry, after this returns.
+    fn end_connect(&self, identity_id: &str) -> Option<Identity> {
+        let identity = {
+            let mut inner = self.lock();
+            let identity = end_in(&mut inner.file, identity_id)?;
+            if self.persist(&inner.file).is_err() {
+                eprintln!(
+                    "kharond: oauth state write failed ending Connect {identity_id}; \
+                     the revocation stands in memory"
+                );
+            }
+            identity
+        };
+        self.connect_ended(identity_id);
+        Some(identity)
+    }
+}
+
+/// End one Connect inside `file`: the identity and every token it
+/// owns. Returns the identity as it stood before the revocation,
+/// when a live one ended.
+fn end_in(file: &mut FileState, identity_id: &str) -> Option<Identity> {
+    let identity = file.identity(identity_id)?.clone();
+    if identity.revoked {
+        return None;
+    }
+    for i in file.identities.iter_mut() {
+        if i.id == identity_id {
+            i.revoked = true;
+        }
+    }
+    for t in file.tokens.iter_mut() {
+        if t.identity_id == identity_id && t.status != TokenStatus::Revoked {
+            t.status = TokenStatus::Revoked;
+        }
+    }
+    Some(identity)
+}
+
+/// A refresh token's expiry from `issued_at`: the earlier of the
+/// 30-day idle limit and 90 days after consent (D4).
+fn refresh_deadline(identity: &Identity, issued_at: u64) -> u64 {
+    issued_at
+        .saturating_add(REFRESH_IDLE_SECS)
+        .min(identity.consented_at.saturating_add(REFRESH_ABSOLUTE_SECS))
+}
+
+/// Mint a token pair for `identity`. `parent` is the hash of the
+/// refresh token being rotated from (`None` for a Connect's first
+/// pair).
+fn issue_pair(
+    identity: &Identity,
+    parent: Option<String>,
+    now: u64,
+) -> (IssuedPair, TokenRecord, TokenRecord) {
+    let access_token = format!("kh_at_{}", hex(&random_bytes::<32>()));
+    let refresh_token = format!("kh_rt_{}", hex(&random_bytes::<32>()));
+    let refresh_hash = hex(&sha256(refresh_token.as_bytes()));
+    let access_rec = TokenRecord {
+        hash: hex(&sha256(access_token.as_bytes())),
+        kind: TokenKind::Access,
+        identity_id: identity.id.clone(),
+        family: identity.id.clone(),
+        parent: Some(refresh_hash.clone()),
+        issued_at: now,
+        expires_at: now.saturating_add(ACCESS_TTL_SECS),
+        status: TokenStatus::Live,
+        retired_at: None,
+        successor: None,
+        grace_used: false,
+    };
+    let refresh_rec = TokenRecord {
+        hash: refresh_hash,
+        kind: TokenKind::Refresh,
+        identity_id: identity.id.clone(),
+        family: identity.id.clone(),
+        parent,
+        issued_at: now,
+        expires_at: refresh_deadline(identity, now),
+        status: TokenStatus::Live,
+        retired_at: None,
+        successor: None,
+        grace_used: false,
+    };
+    let pair = IssuedPair {
+        access_token,
+        refresh_token,
+        scope: identity.scopes.join(" "),
+    };
+    (pair, access_rec, refresh_rec)
+}
+
+/// `c-<10 lowercase base32>` (D3): 50 bits of randomness, RFC 4648
+/// lowercase alphabet.
+fn new_identity_id() -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let raw = random_bytes::<8>();
+    let mut bits = u64::from_be_bytes(raw);
+    let mut id = String::with_capacity(12);
+    id.push_str("c-");
+    for _ in 0..10 {
+        id.push(ALPHABET[(bits >> 59) as usize] as char);
+        bits <<= 5;
+    }
+    id
+}
+
+/// The CIMD hostname an audit entry names as `origin` (I7), when
+/// the `client_id` parses as a URL with a host.
+fn cimd_host(client_id: &str) -> Option<String> {
+    url::Url::parse(client_id)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut b = [0u8; N];
+    OsRng.fill_bytes(&mut b);
+    b
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Base64url without padding (RFC 4648 §5): the S256 challenge form.
+fn b64url_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// Constant-time equality for equal-length inputs (token hashes,
+/// code hashes, PKCE digests); differing lengths are just unequal.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Write `bytes` to `path` as mode 0600, replacing any previous
+/// file (the `owner/passkeys.json` pattern): tmp file, sync,
+/// rename.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        b.mode(0o700);
+        b.create(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    const NOW: u64 = 1_700_000_000;
+    const CLIENT: &str = "https://dashboard.example/.well-known/kharon-client.json";
+
+    #[derive(Default)]
+    struct Recording {
+        entries: StdMutex<Vec<Entry>>,
+        ended: StdMutex<Vec<String>>,
+        fail_append: StdMutex<bool>,
+    }
+
+    impl ConnectLifecycle for Recording {
+        fn append(&self, entry: Entry) -> bool {
+            if *self.fail_append.lock().unwrap() {
+                return false;
+            }
+            self.entries.lock().unwrap().push(entry);
+            true
+        }
+        fn connect_ended(&self, agent_id: &str) {
+            self.ended.lock().unwrap().push(agent_id.to_owned());
+        }
+    }
+
+    impl Recording {
+        fn events(&self) -> Vec<(String, Option<String>)> {
+            self.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| (e.event.as_str().to_owned(), e.detail_code.clone()))
+                .collect()
+        }
+    }
+
+    fn store(dir: &Path) -> (Arc<OauthStore>, Arc<Recording>) {
+        let store = OauthStore::load(dir).unwrap();
+        let recording = Arc::new(Recording::default());
+        store.set_lifecycle(recording.clone() as Arc<dyn ConnectLifecycle>);
+        (Arc::new(store), recording)
+    }
+
+    fn grant(verifier: &str) -> (CodeGrant, String) {
+        let challenge = b64url_encode(&sha256(verifier.as_bytes()));
+        (
+            CodeGrant {
+                client_id: CLIENT.to_owned(),
+                client_name: "Dashboard".to_owned(),
+                code_challenge: challenge,
+                scopes: vec!["kharon:read".to_owned(), "kharon:fill".to_owned()],
+                consented_at: NOW,
+            },
+            verifier.to_owned(),
+        )
+    }
+
+    fn connect_one(store: &OauthStore) -> (IssuedPair, String) {
+        let (g, verifier) = grant("correct-verifier");
+        let pair = store
+            .connect(&g, &verifier, sha256(b"the-code"), NOW)
+            .unwrap();
+        let id = store
+            .authenticate_access(&pair.access_token, NOW)
+            .unwrap()
+            .agent_id;
+        (pair, id)
+    }
+
+    #[test]
+    fn connect_creates_identity_and_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        let (pair, id) = connect_one(&store);
+        assert!(id.starts_with("c-"), "{id}");
+        assert_eq!(id.len(), 12, "{id}");
+        assert!(pair.access_token.starts_with("kh_at_"));
+        assert!(pair.refresh_token.starts_with("kh_rt_"));
+        assert_eq!(pair.scope, "kharon:read kharon:fill");
+        let auth = store.authenticate_access(&pair.access_token, NOW).unwrap();
+        assert_eq!(auth.scopes, ["kharon:read", "kharon:fill"]);
+        assert_eq!(recording.events(), [("oauth_connect".to_owned(), None)],);
+        // The state file names no plaintext token (D3).
+        let text = std::fs::read_to_string(dir.path().join("oauth/state.json")).unwrap();
+        assert!(!text.contains(&pair.access_token));
+        assert!(!text.contains(&pair.refresh_token));
+        // Mode 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("oauth/state.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn connect_rejects_a_wrong_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (g, _v) = grant("right");
+        let err = store.connect(&g, "wrong", sha256(b"c"), NOW).err().unwrap();
+        assert_eq!(err, TokenError::InvalidGrant);
+        assert!(!std::fs::exists(dir.path().join("oauth/state.json")).unwrap());
+    }
+
+    #[test]
+    fn connect_audit_failure_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        *recording.fail_append.lock().unwrap() = true;
+        let (g, v) = grant("v");
+        let err = store.connect(&g, &v, sha256(b"c"), NOW).err().unwrap();
+        assert_eq!(err, TokenError::AuditFailed);
+        assert!(!std::fs::exists(dir.path().join("oauth/state.json")).unwrap());
+    }
+
+    #[test]
+    fn second_redemption_revokes_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        let (pair, id) = connect_one(&store);
+        let code_hash = sha256(b"the-code");
+        // The endpoint's redeemed-set check sees the first redemption.
+        assert_eq!(store.redeemed_identity(&code_hash, NOW), Some(id.clone()));
+        // …and ends the Connect for the second (detail `code_reuse`).
+        let ended = store
+            .disconnect(&id, DisconnectDetail::CodeReuse, "web_ui", NOW)
+            .unwrap();
+        assert!(ended);
+        assert!(store.authenticate_access(&pair.access_token, NOW).is_none());
+        assert_eq!(
+            store.refresh(&pair.refresh_token, NOW),
+            Err(TokenError::InvalidGrant)
+        );
+        assert_eq!(recording.ended.lock().unwrap().as_slice(), [id.as_str()]);
+        assert_eq!(
+            recording.events(),
+            [
+                ("oauth_connect".to_owned(), None),
+                ("oauth_disconnect".to_owned(), Some("code_reuse".to_owned())),
+            ]
+        );
+        // The redeemed set is gone once the code would have expired.
+        assert_eq!(
+            store.redeemed_identity(&code_hash, NOW + CODE_TTL_SECS + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_rotates_and_the_old_token_dies_after_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, _id) = connect_one(&store);
+        let pair2 = store.refresh(&pair.refresh_token, NOW + 60).unwrap();
+        assert_ne!(pair2.refresh_token, pair.refresh_token);
+        assert_ne!(pair2.access_token, pair.access_token);
+        // Rotation retires the old refresh; its access token lives
+        // out its own hour (only the grace path retires a pair).
+        assert!(
+            store
+                .authenticate_access(&pair.access_token, NOW + 60)
+                .is_some()
+        );
+        // After the grace, the retired token is reuse.
+        assert_eq!(
+            store.refresh(&pair.refresh_token, NOW + 60 + GRACE_SECS + 1),
+            Err(TokenError::InvalidGrant)
+        );
+    }
+
+    #[test]
+    fn grace_retry_rotates_again_and_retires_the_superseded_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, _id) = connect_one(&store);
+        let pair2 = store.refresh(&pair.refresh_token, NOW + 100).unwrap();
+        // The client lost pair2's response and retries with the
+        // just-retired token inside 30 s (I5).
+        let pair3 = store
+            .refresh(&pair.refresh_token, NOW + 100 + GRACE_SECS)
+            .unwrap();
+        // The superseded pair is retired, both tokens.
+        assert!(
+            store
+                .authenticate_access(&pair2.access_token, NOW + 100)
+                .is_none()
+        );
+        assert_eq!(
+            store.refresh(&pair2.refresh_token, NOW + 100),
+            Err(TokenError::InvalidGrant)
+        );
+        // pair3 works.
+        assert!(
+            store
+                .authenticate_access(&pair3.access_token, NOW + 100)
+                .is_some()
+        );
+        // A second presentation of the original token is reuse, and
+        // reuse ends the Connect.
+        assert_eq!(
+            store.refresh(&pair.refresh_token, NOW + 100 + GRACE_SECS),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(
+            store
+                .authenticate_access(&pair3.access_token, NOW + 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reuse_writes_oauth_refresh_reuse_and_ends_the_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        let (pair, id) = connect_one(&store);
+        let _pair2 = store.refresh(&pair.refresh_token, NOW).unwrap();
+        let err = store
+            .refresh(&pair.refresh_token, NOW + GRACE_SECS + 1)
+            .err()
+            .unwrap();
+        assert_eq!(err, TokenError::InvalidGrant);
+        assert_eq!(
+            recording.events(),
+            [
+                ("oauth_connect".to_owned(), None),
+                ("oauth_refresh_reuse".to_owned(), None),
+            ]
+        );
+        let entries = recording.entries.lock().unwrap();
+        assert_eq!(entries[1].agent_id.as_deref(), Some(id.as_str()));
+        assert_eq!(entries[1].origin.as_deref(), Some("dashboard.example"));
+    }
+
+    #[test]
+    fn refresh_idle_and_absolute_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, _id) = connect_one(&store);
+        // Idle: 30 days after the last rotation the token is dead.
+        assert_eq!(
+            store.refresh(&pair.refresh_token, NOW + REFRESH_IDLE_SECS),
+            Err(TokenError::InvalidGrant)
+        );
+        // Just inside the idle limit it rotates…
+        let mut current = store
+            .refresh(&pair.refresh_token, NOW + REFRESH_IDLE_SECS - 1)
+            .unwrap();
+        // …but nothing outlives 90 days from consent.
+        let mut t = NOW + REFRESH_IDLE_SECS - 1;
+        while t + REFRESH_IDLE_SECS - 1 < NOW + REFRESH_ABSOLUTE_SECS {
+            t += REFRESH_IDLE_SECS - 1;
+            current = store.refresh(&current.refresh_token, t).unwrap();
+        }
+        assert_eq!(
+            store.refresh(&current.refresh_token, NOW + REFRESH_ABSOLUTE_SECS),
+            Err(TokenError::InvalidGrant)
+        );
+    }
+
+    #[test]
+    fn revoke_access_ends_only_itself_revoke_refresh_ends_the_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        let (pair, _id) = connect_one(&store);
+        store.revoke(&pair.access_token, NOW).unwrap();
+        assert!(store.authenticate_access(&pair.access_token, NOW).is_none());
+        // The refresh token still works.
+        let pair2 = store.refresh(&pair.refresh_token, NOW + 1).unwrap();
+        // Revoking by the refresh token ends the whole Connect.
+        store.revoke(&pair2.refresh_token, NOW + 2).unwrap();
+        assert!(
+            store
+                .authenticate_access(&pair2.access_token, NOW + 2)
+                .is_none()
+        );
+        assert_eq!(
+            store.refresh(&pair2.refresh_token, NOW + 3),
+            Err(TokenError::InvalidGrant)
+        );
+        // Unknown tokens are a quiet success (RFC 7009).
+        store.revoke("kh_rt_unknown", NOW).unwrap();
+        assert_eq!(
+            recording.events().last().unwrap(),
+            &("oauth_disconnect".to_owned(), Some("client".to_owned()))
+        );
+    }
+
+    #[test]
+    fn state_survives_a_reload_and_corruption_is_a_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, id) = connect_one(&store);
+        drop(store);
+        let reloaded = OauthStore::load(dir.path()).unwrap();
+        let auth = reloaded
+            .authenticate_access(&pair.access_token, NOW)
+            .unwrap();
+        assert_eq!(auth.agent_id, id);
+        // Disconnect persists too.
+        reloaded
+            .disconnect(&id, DisconnectDetail::Owner, "cli", NOW)
+            .unwrap();
+        let again = OauthStore::load(dir.path()).unwrap();
+        assert!(again.authenticate_access(&pair.access_token, NOW).is_none());
+        // Corrupt the file: load refuses (the daemon then refuses
+        // to start, with `[oauth]` set).
+        std::fs::write(dir.path().join("oauth/state.json"), b"{not json").unwrap();
+        assert!(OauthStore::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn access_tokens_expire_and_wrong_kinds_do_not_authenticate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, _id) = connect_one(&store);
+        assert!(
+            store
+                .authenticate_access(&pair.access_token, NOW + ACCESS_TTL_SECS)
+                .is_none()
+        );
+        // A refresh token is not an access token.
+        assert!(
+            store
+                .authenticate_access(&pair.refresh_token, NOW)
+                .is_none()
+        );
+        // An access token is not a refresh token.
+        assert_eq!(
+            store.refresh(&pair.access_token, NOW),
+            Err(TokenError::InvalidGrant)
+        );
+    }
+
+    #[test]
+    fn failed_write_fails_the_request_with_no_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        // Sabotage persistence after the (empty) load: `oauth`
+        // exists as a regular file, so the state write can never
+        // land.
+        std::fs::write(dir.path().join("oauth"), b"not a directory").unwrap();
+        let (g, v) = grant("v");
+        let err = store.connect(&g, &v, sha256(b"c"), NOW).err().unwrap();
+        assert_eq!(err, TokenError::PersistFailed);
+        // The compensating disconnect follows the connect (I5).
+        assert_eq!(
+            recording.events(),
+            [
+                ("oauth_connect".to_owned(), None),
+                (
+                    "oauth_disconnect".to_owned(),
+                    Some("persist_failed".to_owned())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn revoke_all_ends_every_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, id) = connect_one(&store);
+        let (pair2, id2) = connect_one(&store);
+        let ended = store.revoke_all();
+        assert_eq!(ended.len(), 2);
+        assert!(store.authenticate_access(&pair.access_token, NOW).is_none());
+        assert!(
+            store
+                .authenticate_access(&pair2.access_token, NOW)
+                .is_none()
+        );
+        assert_ne!(id, id2);
+    }
+}

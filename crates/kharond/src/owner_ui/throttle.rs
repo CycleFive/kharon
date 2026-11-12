@@ -29,6 +29,13 @@ pub const THROTTLED_ROUTES: &[&str] = &[
     "/owner/register/finish",
     "/owner/unlock/begin",
     "/owner/unlock",
+    // The OAuth token endpoints (REQ-OAU-008): unauthenticated and
+    // on the internet, throttled per trusted source like the routes
+    // above — each source its own bucket, no global one. Their
+    // failures are recorded by their handlers, not by `fail()`: a
+    // refused token request is not an `owner_auth_fail`.
+    "/oauth/token",
+    "/oauth/revoke",
 ];
 
 /// Per-source failure counts.

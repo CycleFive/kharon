@@ -76,7 +76,7 @@ use super::core::{
 use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillArgs, FillOperation, FillTotpArgs, parse_fill};
 use super::grant::{GrantArgs, parse_grant};
-use super::http::{AppState, authenticate, bearer_token, error, json_response};
+use super::http::{AppState, authenticate_mcp, bearer_token, error, json_response};
 use super::transport::ClientIp;
 use crate::lock::Clock;
 use tokio::time::Instant;
@@ -873,7 +873,7 @@ where
     }
     let token = bearer_token(&req);
     let (parts, body) = req.into_parts();
-    let agent = match authenticate(&state, token).await {
+    let agent = match authenticate_mcp(&state, token).await {
         Ok(a) => a,
         Err(e) => {
             let mut resp = error(e);

@@ -679,6 +679,15 @@ pub enum StartupError {
         /// `std::io::ErrorKind` rendering. No key material.
         kind: String,
     },
+    /// The OAuth state file (`data_dir/oauth/state.json`) could not
+    /// be loaded. With `[oauth]` set an unparseable file refuses
+    /// startup (REQ-OAU-004, I2): a bad Connect state fails closed
+    /// rather than forgetting every Connect.
+    #[error("cannot load oauth state: {kind}")]
+    OauthState {
+        /// `std::io::ErrorKind` rendering. No file contents.
+        kind: String,
+    },
     /// A configured TLS certificate or key could not be loaded.
     #[error("tls material: {reason}")]
     TlsMaterial {
@@ -778,6 +787,7 @@ impl StartupError {
             Self::OwnerUiBind { .. } => "owner_ui_bind",
             Self::OwnerUiStore { .. } => "owner_ui_store",
             Self::OwnerUiAccess { .. } => "owner_ui_access",
+            Self::OauthState { .. } => "oauth_state",
             Self::TlsMaterial { .. } => "tls_material",
             Self::ConnectorBind { .. } => "connector_bind",
             Self::PublicIngressBind { .. } => "public_ingress_bind",
@@ -803,9 +813,10 @@ impl StartupError {
             | Self::OwnerUiBind { .. }
             | Self::ConnectorBind { .. }
             | Self::PublicIngressBind { .. } => EX_UNAVAILABLE,
-            Self::TlsMaterial { .. } | Self::OwnerUiAccess { .. } | Self::ScopeTooBroad { .. } => {
-                EX_CONFIG
-            }
+            Self::TlsMaterial { .. }
+            | Self::OwnerUiAccess { .. }
+            | Self::ScopeTooBroad { .. }
+            | Self::OauthState { .. } => EX_CONFIG,
         }
     }
 }
@@ -1047,6 +1058,22 @@ pub async fn start(
         Some(discovery) => broker.with_oauth(discovery),
         None => broker,
     };
+    // REQ-OAU-004 (#231): with `[oauth]` set, the broker also
+    // carries the OAuth token store. It is loaded here — before any
+    // listener opens — and an unparseable state file refuses
+    // startup (I2). The one store is shared with the owner UI's
+    // token endpoints (see `bind_owner_ui`).
+    let broker = match &cfg.oauth {
+        Some(_) => {
+            let store = crate::api::oauth_store::OauthStore::load(&cfg.data_dir).map_err(|e| {
+                StartupError::OauthState {
+                    kind: e.kind().to_string(),
+                }
+            })?;
+            broker.with_oauth_store(Arc::new(store))
+        }
+        None => broker,
+    };
     // REQ-APR-004 send half (#128): publish approval prompts to the
     // configured ntfy topic, with action URLs on the owner listener.
     // Needs both halves: no `[approval].ntfy` → no channel; no
@@ -1079,6 +1106,14 @@ pub async fn start(
     });
     // Lock/unlock transitions belong in the audit log (REQ-AUD-003).
     broker.wire_lock_audit();
+    // REQ-OAU-004/-005 (#231): the OAuth store's audit appends and
+    // grant cleanup run through this broker (its lifecycle shim
+    // sits with the CIMD one below).
+    if let Some(store) = broker.oauth_store() {
+        store.set_lifecycle(Arc::new(DaemonOauthLifecycle {
+            broker: Arc::clone(&broker),
+        }));
+    }
     // #199: the connector's two audit events go through the broker's
     // synchronous append (best effort; the hub logs a failure).
     if let Some(rt) = &connector {
@@ -1296,6 +1331,16 @@ async fn bind_owner_ui(
             }),
         ))
     });
+    // REQ-OAU-004 (#231): the token endpoints serve the store the
+    // broker carries (loaded at startup, before this listener).
+    // The code redeemer is not wired on this tree: the authorize
+    // side that issues codes is #230, and its `CodeStore` adapter
+    // is the one seam left for the two to compose (see
+    // `owner_ui::oauth_token::CodeRedeemer`). Until then the code
+    // grant fails closed and refresh/revoke work in full.
+    let oauth_tokens = broker
+        .oauth_store()
+        .map(|store| crate::owner_ui::oauth_token::TokenSide::unwired(Arc::clone(store)));
     let ui = crate::owner_ui::OwnerUi::open_with(
         &cfg.data_dir,
         crate::owner_ui::OwnerUiOptions {
@@ -1305,6 +1350,7 @@ async fn bind_owner_ui(
             access,
             oauth,
             admission,
+            oauth_tokens,
         },
         Arc::new(DaemonShell {
             broker: Arc::clone(broker),
@@ -1455,6 +1501,24 @@ impl crate::api::cimd::RefusalAudit for DaemonCimdAudit {
         if self.broker.append_audit(entry).is_err() {
             eprintln!("kharond: oauth client refusal audit append failed");
         }
+    }
+}
+
+/// The OAuth token store's lifecycle (REQ-OAU-004/-005, #231):
+/// audit appends go through the broker's log (an `oauth_connect`
+/// append error fails the redemption closed, per I5), and a
+/// Connect that ends drops its live grants on the broker.
+struct DaemonOauthLifecycle {
+    broker: Arc<DaemonBroker>,
+}
+
+impl crate::api::oauth_store::ConnectLifecycle for DaemonOauthLifecycle {
+    fn append(&self, entry: Entry) -> bool {
+        self.broker.append_audit(entry).is_ok()
+    }
+
+    fn connect_ended(&self, agent_id: &str) {
+        self.broker.revoke_connect_grants(agent_id);
     }
 }
 

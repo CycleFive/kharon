@@ -1536,8 +1536,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
         // #180 item 3, as in `pending_for_fill`: a claim that fails
         // the scheme rule creates no request and prompts no one.
+        // The audit records the same `insecure_context` detail the
+        // body returns, matching the fill path (#195, REQ-AUD-003).
         if self.claim_pre_refused(&args.expected_origin) {
-            self.append(base("origin_mismatch"))?;
+            self.append(base("origin_mismatch").detail_code("insecure_context"))?;
             return Ok(Outcome::GrantRequest(
                 GrantRequestBody::refused_with_detail("origin_mismatch", "insecure_context"),
             ));

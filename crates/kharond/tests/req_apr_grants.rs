@@ -16,7 +16,9 @@
 //!   observed; a claim that disagrees makes the fill
 //!   `origin_mismatch` and the request is refused before any prompt
 //!   exists. A claim that fails §6's scheme rule (#180 item 3) is
-//!   refused before a request is even created.
+//!   refused before a request is even created; both the fill and
+//!   the explicit grant request audit that pre-refusal as
+//!   `origin_mismatch` with detail `insecure_context` (#195).
 //! - **REQ-MEM-007**: a standing grant is inert while the broker is
 //!   locked (the fill returns `locked`, with no CDP write and no
 //!   grant use spent) and survives the lock — the same grant admits
@@ -468,8 +470,10 @@ async fn req_apr_007_http_claim_is_refused_before_a_request_exists() {
             .is_empty()
     );
     // Audit: the fill outcome only — no grant_request creation.
-    let events: Vec<String> = rig
-        .audit_entries()
+    // The outcome carries the scheme refusal's detail (#195), the
+    // same `insecure_context` the grants path records.
+    let entries = rig.audit_entries();
+    let events: Vec<String> = entries
         .iter()
         .map(|e| {
             serde_json::to_value(&e.event)
@@ -480,6 +484,8 @@ async fn req_apr_007_http_claim_is_refused_before_a_request_exists() {
         })
         .collect();
     assert_eq!(events, ["fill"], "{events:?}");
+    assert_eq!(entries[0].result.as_deref(), Some("origin_mismatch"));
+    assert_eq!(entries[0].detail_code.as_deref(), Some("insecure_context"));
 }
 
 #[tokio::test]
@@ -536,9 +542,10 @@ async fn req_apr_007_request_grant_http_claim_creates_no_request() {
             .pending_requests()
             .is_empty()
     );
-    // Audit (REQ-AUD-003): exactly one entry — the refusal itself.
-    // A request creation would be audited with the new request's id
-    // and a `pending` result; there is neither.
+    // Audit (REQ-AUD-003): exactly one entry — the refusal itself,
+    // with the same `insecure_context` detail the body carries
+    // (#195). A request creation would be audited with the new
+    // request's id and a `pending` result; there is neither.
     let entries = rig.audit_entries();
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(
@@ -549,6 +556,7 @@ async fn req_apr_007_request_grant_http_claim_creates_no_request() {
         "grant_request"
     );
     assert_eq!(entries[0].result.as_deref(), Some("origin_mismatch"));
+    assert_eq!(entries[0].detail_code.as_deref(), Some("insecure_context"));
     assert!(entries[0].request_id.is_none());
 }
 
@@ -585,6 +593,59 @@ async fn req_apr_007_request_grant_non_http_scheme_claim_creates_no_request() {
             .pending_requests()
             .is_empty()
     );
+}
+
+/// The audited shape shared by a scheme pre-refusal on either path:
+/// exactly one entry, result `origin_mismatch`, detail
+/// `insecure_context` (#195, REQ-AUD-003).
+fn assert_insecure_scheme_audit(entries: &[Entry], event: &str) {
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].event.as_str(), event);
+    assert_eq!(entries[0].result.as_deref(), Some("origin_mismatch"));
+    assert_eq!(entries[0].detail_code.as_deref(), Some("insecure_context"));
+}
+
+#[tokio::test]
+async fn req_apr_007_insecure_scheme_claim_audits_insecure_context_on_both_paths() {
+    // #195 (REQ-APR-007, REQ-AUD-003): an insecure-scheme claim is
+    // pre-refused before a request exists. Both the fill and the
+    // explicit grant request audit that refusal as `origin_mismatch`
+    // with `detail_code` `insecure_context`.
+    let origin = "http://practicetestautomation.com";
+
+    let fill = Rig::new("http://practicetestautomation.com/practice-test-login");
+    let r = fill.fill_claim(origin).await;
+    assert_eq!(r["status"], "origin_mismatch", "{r}");
+    assert_eq!(r["detail"], "insecure_context", "{r}");
+    assert!(r.get("grant_request_id").is_none(), "{r}");
+    assert_insecure_scheme_audit(&fill.audit_entries(), "fill");
+
+    let grants = Rig::new("http://practicetestautomation.com/practice-test-login");
+    let args = parse_grant(
+        json!({
+            "item_id": ITEM_A,
+            "target": {"cdp_target_id": "tab-1", "expected_origin": origin},
+            "action": "fill",
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let out = grants
+        .broker
+        .request_grant(&grants.agent(), args, Instant::now())
+        .await
+        .unwrap();
+    let Outcome::GrantRequest(body) = out else {
+        panic!("expected a grant request outcome, got {out:?}");
+    };
+    assert_eq!(body.state, "origin_mismatch");
+    assert_eq!(body.detail, Some("insecure_context"));
+    assert!(body.grant_request_id.is_none());
+    let grant_entries = grants.audit_entries();
+    assert_insecure_scheme_audit(&grant_entries, "grant_request");
+    // No grant request was created, so the entry has no request id.
+    assert!(grant_entries[0].request_id.is_none(), "{grant_entries:?}");
 }
 
 #[tokio::test]

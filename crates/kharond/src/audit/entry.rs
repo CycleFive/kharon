@@ -93,6 +93,19 @@ pub enum Event {
     /// store; a failed append stores nothing (REQ-APR-005,
     /// REQ-AUD-003).
     PasskeyEnrolled,
+    /// #258: passkeys are about to be listed. Channel `cli` or
+    /// `web_ui`, result `listed`. Carries `credential_fingerprints`
+    /// and `passkey_count`, never a credential id or public key.
+    /// Appended before the list is returned; a failed append returns
+    /// no list (REQ-APR-005, REQ-AUD-003).
+    PasskeyListed,
+    /// #258: a passkey is about to be removed. Channel `cli` or
+    /// `web_ui`, result `removed`. Carries `credential_fingerprint`
+    /// and `passkey_count` (the count after removal), never the
+    /// credential id or public key. Appended before the store
+    /// changes; a failed append removes nothing (REQ-APR-005,
+    /// REQ-AUD-003).
+    PasskeyRemoved,
 }
 
 impl Event {
@@ -130,6 +143,8 @@ impl Event {
             Event::ConnectorReplaced => "connector_replaced",
             Event::PasskeyEnrollCode => "passkey_enroll_code",
             Event::PasskeyEnrolled => "passkey_enrolled",
+            Event::PasskeyListed => "passkey_listed",
+            Event::PasskeyRemoved => "passkey_removed",
         }
     }
 }
@@ -175,6 +190,8 @@ impl<'de> Deserialize<'de> for Event {
             "connector_replaced" => Event::ConnectorReplaced,
             "passkey_enroll_code" => Event::PasskeyEnrollCode,
             "passkey_enrolled" => Event::PasskeyEnrolled,
+            "passkey_listed" => Event::PasskeyListed,
+            "passkey_removed" => Event::PasskeyRemoved,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"
@@ -294,14 +311,19 @@ pub struct Entry {
     /// so the fingerprint exposes nothing usable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_fingerprint: Option<String>,
-    /// Fingerprint of a stored passkey's credential id (only on
-    /// `passkey_enrolled`, #249): SHA-256 of the raw id, lowercase
-    /// hex, truncated to 32 chars — the same shape as
+    /// Fingerprint of a passkey's credential id (`passkey_enrolled`
+    /// and `passkey_removed`, #249, #258): SHA-256 of the raw id,
+    /// lowercase hex, truncated to 32 chars — the same shape as
     /// `token_fingerprint`. The id itself is never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_fingerprint: Option<String>,
-    /// Enrolled passkeys once this one is stored (only on
-    /// `passkey_enrolled`, #249).
+    /// Every fingerprint a `passkey_listed` entry names (#258), in
+    /// list order. Each element is a `credential_fingerprint`. Absent
+    /// when the store was empty. Never credential ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprints: Option<Vec<String>>,
+    /// Enrolled passkeys after the store this entry records
+    /// (`passkey_enrolled`, `passkey_listed`, `passkey_removed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passkey_count: Option<u64>,
 }
@@ -334,6 +356,7 @@ impl Entry {
             old_session_secs: None,
             token_fingerprint: None,
             credential_fingerprint: None,
+            credential_fingerprints: None,
             passkey_count: None,
         }
     }
@@ -437,14 +460,20 @@ impl Entry {
         self
     }
 
-    /// Fingerprint of the stored passkey's credential id (only on
-    /// `passkey_enrolled`, #249).
+    /// Fingerprint of one passkey's credential id (`passkey_enrolled`,
+    /// `passkey_removed`).
     pub fn credential_fingerprint(mut self, v: impl Into<String>) -> Self {
         self.credential_fingerprint = Some(v.into());
         self
     }
 
-    /// Enrolled passkeys after this store (`passkey_enrolled`, #249).
+    /// Fingerprints a `passkey_listed` entry names (#258).
+    pub fn credential_fingerprints(mut self, v: Vec<String>) -> Self {
+        self.credential_fingerprints = Some(v);
+        self
+    }
+
+    /// Enrolled passkeys after the step this entry records.
     pub fn passkey_count(mut self, v: u64) -> Self {
         self.passkey_count = Some(v);
         self
@@ -502,5 +531,39 @@ mod tests {
         let back: Entry = serde_json::from_value(v).unwrap();
         assert_eq!(back.credential_fingerprint.as_deref(), Some(fp.as_str()));
         assert_eq!(back.passkey_count, Some(2));
+    }
+
+    /// #258: a list entry carries every fingerprint and nothing else
+    /// about the passkey; a remove entry carries the one fingerprint.
+    #[test]
+    fn passkey_list_and_remove_fields_round_trip() {
+        let bare = Entry::new(Event::PasskeyListed)
+            .channel("cli")
+            .result("listed")
+            .passkey_count(0);
+        let v = serde_json::to_value(&bare).unwrap();
+        assert_eq!(v["event"], "passkey_listed");
+        assert!(v.get("credential_fingerprint").is_none());
+        assert!(v.get("credential_fingerprints").is_none());
+        assert_eq!(v["passkey_count"], 0);
+        let fps = vec!["ab".repeat(16), "cd".repeat(16)];
+        let listed = Entry::new(Event::PasskeyListed)
+            .channel("web_ui")
+            .result("listed")
+            .credential_fingerprints(fps.clone())
+            .passkey_count(2);
+        let v = serde_json::to_value(&listed).unwrap();
+        assert_eq!(v["credential_fingerprints"], serde_json::json!(fps));
+        let back: Entry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.credential_fingerprints, Some(fps));
+        let removed = Entry::new(Event::PasskeyRemoved)
+            .channel("cli")
+            .result("removed")
+            .credential_fingerprint("ef".repeat(16))
+            .passkey_count(1);
+        let v = serde_json::to_value(&removed).unwrap();
+        assert!(v.get("credential_fingerprints").is_none());
+        assert_eq!(v["credential_fingerprint"], "ef".repeat(16));
+        assert_eq!(v["result"], "removed");
     }
 }

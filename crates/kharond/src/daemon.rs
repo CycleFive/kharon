@@ -485,6 +485,28 @@ impl OwnerOps for DaemonOwner {
             .map_err(|_| OwnerFailure::AuditFailed)
     }
 
+    async fn passkey_list(&self) -> Result<Vec<crate::owner::PasskeyRow>, OwnerFailure> {
+        let Some(ui) = self.owner_ui.clone() else {
+            return Err(OwnerFailure::Unsupported);
+        };
+        tokio::task::spawn_blocking(move || ui.list_passkeys(crate::owner_ui::PasskeyChannel::Cli))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+            .map_err(map_passkey_error)
+    }
+
+    async fn passkey_remove(&self, id: String) -> Result<(), OwnerFailure> {
+        let Some(ui) = self.owner_ui.clone() else {
+            return Err(OwnerFailure::Unsupported);
+        };
+        tokio::task::spawn_blocking(move || {
+            ui.remove_passkey(crate::owner_ui::PasskeyChannel::Cli, &id)
+        })
+        .await
+        .map_err(|_| OwnerFailure::AuditFailed)?
+        .map_err(map_passkey_error)
+    }
+
     async fn revoke_grant(&self, grant_id: String) -> Result<bool, OwnerFailure> {
         let broker = Arc::clone(&self.broker);
         tokio::task::spawn_blocking(move || {
@@ -542,6 +564,21 @@ fn map_grant_error(e: GrantError) -> OwnerFailure {
         GrantError::StandingDisabled => OwnerFailure::StandingDisabled,
         GrantError::InvalidTerms(_) => OwnerFailure::InvalidTerms,
         GrantError::AuditFailed => OwnerFailure::AuditFailed,
+    }
+}
+
+/// Map a passkey list/remove refusal onto the owner socket's codes.
+fn map_passkey_error(e: crate::owner_ui::PasskeyOpError) -> OwnerFailure {
+    use crate::owner_ui::PasskeyOpError;
+    match e {
+        PasskeyOpError::Audit => OwnerFailure::AuditFailed,
+        PasskeyOpError::NotFound => OwnerFailure::NotFound,
+        PasskeyOpError::Ambiguous => OwnerFailure::Ambiguous,
+        PasskeyOpError::BadId => OwnerFailure::BadId,
+        PasskeyOpError::Store => OwnerFailure::StoreFailed,
+        // The socket allows removing the last passkey. This is the
+        // web UI's refusal, mapped so it can never be reported as success.
+        PasskeyOpError::LastPasskey => OwnerFailure::LastPasskey,
     }
 }
 
@@ -1355,6 +1392,36 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
             .result("enrolled")
             .credential_fingerprint(enrolled.credential_fingerprint)
             .passkey_count(enrolled.passkey_count);
+        self.broker
+            .append_audit(entry)
+            .map_err(|_| crate::owner_ui::OwnerAuditError)
+    }
+
+    fn passkey_listed(
+        &self,
+        listed: crate::owner_ui::PasskeyListed,
+    ) -> Result<(), crate::owner_ui::OwnerAuditError> {
+        let mut entry = Entry::new(Event::PasskeyListed)
+            .channel(listed.channel)
+            .result("listed")
+            .passkey_count(listed.passkey_count);
+        if !listed.credential_fingerprints.is_empty() {
+            entry = entry.credential_fingerprints(listed.credential_fingerprints);
+        }
+        self.broker
+            .append_audit(entry)
+            .map_err(|_| crate::owner_ui::OwnerAuditError)
+    }
+
+    fn passkey_removed(
+        &self,
+        removed: crate::owner_ui::PasskeyRemoved,
+    ) -> Result<(), crate::owner_ui::OwnerAuditError> {
+        let entry = Entry::new(Event::PasskeyRemoved)
+            .channel(removed.channel)
+            .result("removed")
+            .credential_fingerprint(removed.credential_fingerprint)
+            .passkey_count(removed.passkey_count);
         self.broker
             .append_audit(entry)
             .map_err(|_| crate::owner_ui::OwnerAuditError)

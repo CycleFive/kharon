@@ -698,30 +698,38 @@ A passkey is bound to the RP ID (by default, the hostname in
 another hostname, changes it, and the old passkey stops working. Run
 `kharon passkey-enroll` again and register a new passkey at `/enroll`.
 A new hostname also needs its own tunnel route and Access application.
-The old passkey's entry stays in the store (see the next section).
+Remove the old passkey with `kharon passkey remove` (see the next section).
 
 ### A lost passkey
 
-`kharon passkey-enroll` adds a passkey; nothing lists or removes one
-(a `passkey list` / `passkey remove` command is tracked as #258). A lost or stolen authenticator therefore stays valid until the
-passkey file is deleted. Deleting it removes **all** passkeys. Then
-enroll again. kharond reads the file at start, so stop it first:
+List the passkeys, then remove the one that was lost. The id is the
+short prefix of that passkey's credential fingerprint. Removing it
+ends every live owner session that was opened with it. The others
+keep working.
 
 ```sh
-docker compose stop kharon
-docker run --rm --volumes-from "$(docker compose ps -aq kharon)" alpine:3.22 rm /data/owner/passkeys.json
-docker compose start kharon
-docker compose exec kharon kharon passkey-enroll    # then /enroll, as in step 5
+docker compose exec kharon kharon passkey list
+docker compose exec kharon kharon passkey remove <id>
 ```
 
-That `docker run` runs as root on a volume kharond owns. That is fine
-for `rm`. Any command that creates files that way would leave them
-with the wrong uid.
+Removing the last passkey is allowed from this command. The owner
+can enroll again (`kharon passkey-enroll`, then `/enroll`, as in
+step 5). The signed-in owner page lists the same passkeys and can
+remove one, but it refuses to remove the last: that would end the
+session the page is using. Use the command above for that.
 
-The file is `<data_dir>/owner/passkeys.json` (`/data` under compose).
-Without it kharond starts with no passkeys and accepts a fresh
-enrollment. The restart locks the vault, and none of this is audited
-(#249).
+Both commands write an audit entry (`passkey_listed`,
+`passkey_removed`) on channel `cli`. The page writes the same
+events on channel `web_ui`. The entries carry the credential
+fingerprint, not the credential id or the public key. A failed
+audit append does not list or remove.
+
+The store is `<data_dir>/owner/passkeys.json` (`/data` under
+compose). kharond keeps it loaded; these commands change it
+without a restart, and without deleting the file. A store written
+before last-used was recorded still loads. Last-used stays blank
+until that passkey signs in again. Enrolled-at stays blank for a
+passkey stored before it was recorded.
 
 ### Unlocking from the browser
 

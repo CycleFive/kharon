@@ -366,9 +366,35 @@ impl FakeFetch {
     }
 }
 
+/// Run `fut` under the fetch budget: elapsed maps to
+/// [`FetchFault::Timeout`]. Split out so the bound itself is
+/// testable with a stalled future (a stalled resolver cannot be
+/// staged portably in a unit test).
+async fn within_budget<F>(budget: Duration, fut: F) -> Result<FetchedDocument, FetchFault>
+where
+    F: std::future::Future<Output = Result<FetchedDocument, FetchFault>>,
+{
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(FetchFault::Timeout),
+    }
+}
+
 /// The production fetch (I4): resolve once, refuse bad addresses,
 /// connect pinned to the answer, HTTPS with native roots.
+///
+/// The 5 s budget wraps the *whole* fetch — DNS lookup and the
+/// own-address bind probes included, not just the reqwest client
+/// (Nyx review 5867946549 on #267): `lookup_host` has no timeout
+/// of its own, so a slow or black-holed resolver would otherwise
+/// hold an authorize request open well past the budget the module
+/// doc and REQ-OAU-002/I4 promise. The client keeps its own
+/// timeout as belt and braces for the connect/TLS/body phase.
 async fn fetch_remote(url_str: &str) -> Result<FetchedDocument, FetchFault> {
+    within_budget(FETCH_TIMEOUT, fetch_remote_inner(url_str)).await
+}
+
+async fn fetch_remote_inner(url_str: &str) -> Result<FetchedDocument, FetchFault> {
     let url = Url::parse(url_str).map_err(|_| FetchFault::Connect)?;
     let host = url.host_str().ok_or(FetchFault::Connect)?;
     let port = url.port_or_known_default().ok_or(FetchFault::Connect)?;
@@ -465,6 +491,10 @@ fn v4_class_refused(a: Ipv4Addr) -> bool {
         || a.is_link_local()
         || a.is_unspecified()
         || a.is_broadcast()
+        || a.is_multicast()
+        // 198.18.0.0/15 (RFC 2544 benchmarking): never a host to
+        // connect to.
+        || (a.octets()[0] == 198 && (a.octets()[1] & 0xfe) == 18)
         // 0.0.0.0/8, "this host on this network": never a host to
         // connect to (`is_unspecified` covers only 0.0.0.0 itself).
         || a.octets()[0] == 0
@@ -480,8 +510,9 @@ fn v6_class_refused(a: Ipv6Addr) -> bool {
         return true;
     }
     let s0 = a.segments()[0];
-    // fe80::/10 link-local; fc00::/7 unique local (the v6 private).
-    (s0 & 0xffc0) == 0xfe80 || (s0 & 0xfe00) == 0xfc00
+    // fe80::/10 link-local; fc00::/7 unique local (the v6 private);
+    // ff00::/8 multicast.
+    (s0 & 0xffc0) == 0xfe80 || (s0 & 0xfe00) == 0xfc00 || (s0 & 0xff00) == 0xff00
 }
 
 /// Whether `ip` is one of this host's own addresses: an address
@@ -577,6 +608,10 @@ fn redirect_uri_ok(uri: &str) -> bool {
     if url.scheme() != "https" {
         return false;
     }
+    // RFC 6749 §3.1.2: a redirect URI MUST NOT include a fragment.
+    if url.fragment().is_some() {
+        return false;
+    }
     match url.host() {
         Some(url::Host::Domain(d)) => {
             let d = d.to_ascii_lowercase();
@@ -587,7 +622,12 @@ fn redirect_uri_ok(uri: &str) -> bool {
             d != "localhost" && !d.ends_with(".localhost")
         }
         Some(url::Host::Ipv4(a)) => !a.is_loopback(),
-        Some(url::Host::Ipv6(a)) => !a.is_loopback(),
+        // An IPv4-mapped IPv6 host is judged as the IPv4 it names:
+        // `Ipv6Addr::is_loopback` does not see a mapped loopback.
+        Some(url::Host::Ipv6(a)) => match a.to_ipv4_mapped() {
+            Some(v4) => !v4.is_loopback(),
+            None => !a.is_loopback(),
+        },
         None => false,
     }
 }
@@ -750,6 +790,14 @@ mod tests {
                 valid_doc().replace(REDIRECT, "https://127.0.0.1/callback"),
             ),
             (
+                "redirect_uri is an IPv4-mapped IPv6 loopback",
+                valid_doc().replace(REDIRECT, "https://[::ffff:127.0.0.1]/callback"),
+            ),
+            (
+                "redirect_uri carries a fragment",
+                valid_doc().replace(REDIRECT, "https://dashboard.example/oauth/callback#frag"),
+            ),
+            (
                 "token_endpoint_auth_method is not none",
                 valid_doc().replace("\"none\"", "\"private_key_jwt\""),
             ),
@@ -858,6 +906,10 @@ mod tests {
             "169.254.1.1",
             "100.64.0.1",
             "100.127.255.255",
+            "198.18.0.1",
+            "198.19.255.255",
+            "224.0.0.1",
+            "239.255.255.255",
             "0.0.0.0",
             "0.1.2.3",
             "255.255.255.255",
@@ -867,6 +919,7 @@ mod tests {
             "fe90::abcd",
             "fc00::1",
             "fd12:3456::1",
+            "ff02::1",
             // IPv4-mapped: judged as the IPv4 they name.
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
@@ -879,6 +932,7 @@ mod tests {
             "1.1.1.1",
             "100.63.255.255",
             "100.128.0.1",
+            "198.20.0.1",
             "172.32.0.1",
             "2606:4700:4700::1111",
             "::ffff:8.8.8.8",
@@ -897,6 +951,23 @@ mod tests {
         // TEST-NET-1 (192.0.2.0/24, RFC 5737): never assigned.
         assert!(!is_own_address("192.0.2.1".parse().unwrap()));
         assert!(address_refused("127.0.0.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_fetch_budget_bounds_a_stalled_fetch() {
+        // The outer wrap in `fetch_remote`: a future that never
+        // finishes inside the budget (a black-holed resolver is
+        // the production shape) maps to `Timeout`, not a hang.
+        let err = within_budget(Duration::from_millis(50), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(FetchedDocument {
+                body: Vec::new(),
+                cache_control: None,
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err, FetchFault::Timeout);
     }
 
     #[tokio::test]

@@ -1091,6 +1091,23 @@ the discovery challenge (`resource_metadata`, `scope`). Without
 `[oauth]`, both well-known paths answer the usual 404 on both
 listeners and the `401` keeps its bare challenge.
 
+### Connections, Disconnect and panic (N3, #233)
+
+Every completed Connect is an identity of its own, listed on the
+owner UI's **Connections** page with the client's name, its CIMD
+hostname, its scopes, the date it connected and its channel.
+**Disconnect** on that page ends the Connect at once — the
+identity, all its tokens and its live grants — and so does
+`kharon revoke agent <c-id>` on the owner socket, which means the
+same thing. A suspended Connect is reset from the same page (or
+with the socket's `unsuspend`).
+
+A panic ends every Connect as well as locking and revoking every
+grant: **a panic means re-clicking Connect on every dashboard.**
+Nothing about a Connect survives a panic — not its tokens, not a
+consent that was still open, not an unredeemed code. An ordinary
+lock, idle or manual, leaves Connects alone.
+
 ### Where cloudflared runs
 
 1. **Compose `edge` profile (default).** cloudflared joins the

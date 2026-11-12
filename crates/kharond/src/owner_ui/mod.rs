@@ -94,7 +94,8 @@ pub mod unlock;
 mod webauthn;
 
 pub use self::approvals::{
-    AUDIT_TAIL_LEN, AuditRow, DecideError, NoApprovals, OwnerApprovals, PendingRow, WebGrantKind,
+    AUDIT_TAIL_LEN, AuditRow, ConnectionRow, DecideError, GrantRow, NoApprovals, OwnerApprovals,
+    PendingRow, WebGrantKind,
 };
 pub use self::oauth::OauthAs;
 pub use self::unlock::OwnerUnlock;
@@ -239,6 +240,9 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/owner/audit"),
     ("GET", "/owner/passkeys"),
     ("POST", "/owner/passkeys/remove"),
+    ("GET", "/owner/connections"),
+    ("POST", "/owner/connections/disconnect"),
+    ("POST", "/owner/connections/unsuspend"),
     ("POST", "/owner/panic"),
     ("POST", "/owner/unlock/begin"),
     ("POST", "/owner/unlock"),
@@ -1331,7 +1335,7 @@ impl OwnerUi {
         }
         let allowed = match req.path.as_str() {
             "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants"
-            | "/owner/audit" | "/owner/passkeys" => Some(Method::GET),
+            | "/owner/audit" | "/owner/passkeys" | "/owner/connections" => Some(Method::GET),
             "/owner/login/options"
             | "/owner/login/finish"
             | "/owner/register/options"
@@ -1341,6 +1345,8 @@ impl OwnerUi {
             | "/owner/approvals/deny"
             | "/owner/grants/revoke"
             | "/owner/passkeys/remove"
+            | "/owner/connections/disconnect"
+            | "/owner/connections/unsuspend"
             | "/owner/panic"
             | "/owner/unlock/begin"
             | "/owner/unlock" => Some(Method::POST),
@@ -1373,6 +1379,11 @@ impl OwnerUi {
             "/owner/audit" => self.audit_tail(&req),
             "/owner/passkeys" => self.passkeys_list(&req),
             "/owner/passkeys/remove" => self.passkeys_remove(&req),
+            "/owner/connections" => self.connections_list(&req),
+            "/owner/connections/disconnect" => {
+                self.connections_act(&req, ConnectAction::Disconnect)
+            }
+            "/owner/connections/unsuspend" => self.connections_act(&req, ConnectAction::Unsuspend),
             "/owner/panic" => self.panic(&req),
             "/owner/unlock/begin" => self.unlock_begin(&req),
             "/owner/unlock" => self.unlock_finish(&req),
@@ -1413,6 +1424,7 @@ impl OwnerUi {
                 json!({
                     "request_id": r.request_id,
                     "agent_id": r.agent_id,
+                    "agent_name": r.agent_name,
                     "item_id": r.item_id,
                     "action": r.action,
                     "origin": r.origin,
@@ -1532,6 +1544,45 @@ impl OwnerUi {
             return respond(StatusCode::BAD_REQUEST, "bad_request", None);
         }
         match self.approvals.revoke(&body.grant_id) {
+            Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
+            Err(e) => decide_error(e),
+        }
+    }
+
+    /// The live Connect identities for the Connections page (#233,
+    /// D3). Read-only and unaudited, like the grants list: the page
+    /// refreshes it on the shell's timer.
+    fn connections_list(&self, req: &Incoming) -> Response {
+        if !self.session_alive(req.cookie.as_deref()) {
+            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+        }
+        let connections = self.approvals.connections();
+        json_body(
+            StatusCode::OK,
+            json!({"ok": true, "connections": connections}).to_string(),
+            None,
+        )
+    }
+
+    /// Disconnect or Unsuspend a Connect identity (#233), behind
+    /// [`Self::gate_owner_post`] and a well-formed agent id. Neither
+    /// route is on the sign-in throttle list: Disconnect is a
+    /// revoke-class action and Unsuspend its reset (REQ-APR-009).
+    fn connections_act(&self, req: &Incoming, action: ConnectAction) -> Response {
+        if let Some(err) = self.gate_owner_post(req) {
+            return err;
+        }
+        let Ok(body) = serde_json::from_slice::<AgentBody>(&req.body) else {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        };
+        if !valid_id(&body.agent_id) {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        }
+        let result = match action {
+            ConnectAction::Disconnect => self.approvals.disconnect(&body.agent_id),
+            ConnectAction::Unsuspend => self.approvals.unsuspend(&body.agent_id),
+        };
+        match result {
             Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
             Err(e) => decide_error(e),
         }
@@ -2244,6 +2295,20 @@ enum Decision {
     Deny,
 }
 
+/// Which Connections-page action a POST route runs (#233).
+#[derive(Clone, Copy)]
+enum ConnectAction {
+    Disconnect,
+    Unsuspend,
+}
+
+/// Body of a Connections-page action. Unknown keys are refused.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentBody {
+    agent_id: String,
+}
+
 /// Body of an approve or deny call. Unknown keys are refused.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2772,9 +2837,10 @@ fn render_shell(locked: &str, pending: usize, connect: &str) -> String {
 
 /// The signed-in shell: broker state, the approvals queue (#131
 /// slice 1), the live grants (slice 2), the panic button (slice 3,
-/// two clicks: arm, then confirm), the audit tail (slice 4) and the
-/// passkey list (#258). The list is fetched once, not on the 5 s
-/// refresh: each fetch writes an audit entry.
+/// two clicks: arm, then confirm), the audit tail (slice 4), the
+/// passkey list (#258) and the Connections page (#233). The passkey
+/// list is fetched once, not on the 5 s refresh: each fetch writes
+/// an audit entry.
 /// Rows are built with `textContent` only: origins come from agents
 /// (the page the tab was on, or the origin a grant was approved for),
 /// so nothing from a row is ever parsed as markup.
@@ -2826,6 +2892,12 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <thead><tr><th>Agent</th><th>Scope</th><th>Origin</th><th>Actions</th><th>Uses</th><th>Expires</th><th></th></tr></thead>
 <tbody id="grant-rows"></tbody>
 </table>
+<h2>Connections</h2>
+<p id="connections-empty">No dashboards connected.</p>
+<table id="connections" hidden>
+<thead><tr><th>Identity</th><th>Client</th><th>Host</th><th>Scopes</th><th>Connected</th><th>Channel</th><th></th></tr></thead>
+<tbody id="connection-rows"></tbody>
+</table>
 <h2>Audit</h2>
 <p id="audit-empty">No audit entries yet.</p>
 <table id="audit" hidden>
@@ -2840,7 +2912,7 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 </table>
 <p>Removing the last passkey is refused here. Use <code>kharon passkey remove</code> on the box for that.</p>
 <h2>Panic</h2>
-<p>Lock the broker and revoke every grant. Fills stop until the next unlock.</p>
+<p>Lock the broker and revoke every grant. Fills stop until the next unlock. A panic also ends every dashboard connection, so each dashboard has to click Connect again.</p>
 <button id="panic" type="button">Panic</button>
 <p id="err" class="err" role="alert"></p>
 <button id="signout" type="button">Sign out</button>
@@ -2889,7 +2961,7 @@ async function refreshGrants() {
     tr.dataset.grantId = g.id;
     const scope = g.item_id ? "item " + g.item_id : "collection " + g.collection_id;
     const uses = g.max_uses === undefined ? String(g.uses) : g.uses + " / " + g.max_uses;
-    tr.append(cell(g.agent_id), cell(scope), cell(g.origin, "origin"), cell(g.actions.join(", ")), cell(uses), cell(g.expires_at));
+    tr.append(cell(g.agent_name || g.agent_id), cell(scope), cell(g.origin, "origin"), cell(g.actions.join(", ")), cell(uses), cell(g.expires_at));
     const actions = document.createElement("td");
     actions.append(button("Revoke", () => decide("/owner/grants/revoke", { grant_id: g.id })));
     tr.append(actions);
@@ -2897,6 +2969,29 @@ async function refreshGrants() {
   }
   document.getElementById("grants").hidden = data.grants.length === 0;
   document.getElementById("grants-empty").hidden = data.grants.length !== 0;
+}
+async function refreshConnections() {
+  const r = await fetch("/owner/connections", { credentials: "same-origin" });
+  if (r.status === 401) { location.assign("/"); return; }
+  if (!r.ok) return;
+  const data = await r.json();
+  const rows = document.getElementById("connection-rows");
+  rows.replaceChildren();
+  for (const c of data.connections) {
+    const tr = document.createElement("tr");
+    tr.dataset.agentId = c.agent_id;
+    tr.append(cell(c.agent_id), cell(c.client_name), cell(c.host || "", "origin"),
+      cell(c.scopes.join(", ")), cell(c.connected_at), cell(c.channel));
+    const actions = document.createElement("td");
+    if (c.suspended) {
+      actions.append(button("Unsuspend", () => decide("/owner/connections/unsuspend", { agent_id: c.agent_id })), " ");
+    }
+    actions.append(button("Disconnect", () => decide("/owner/connections/disconnect", { agent_id: c.agent_id })));
+    tr.append(actions);
+    rows.append(tr);
+  }
+  document.getElementById("connections").hidden = data.connections.length === 0;
+  document.getElementById("connections-empty").hidden = data.connections.length !== 0;
 }
 async function refreshAudit() {
   const r = await fetch("/owner/audit", { credentials: "same-origin" });
@@ -2909,7 +3004,7 @@ async function refreshAudit() {
     const tr = document.createElement("tr");
     tr.dataset.seq = String(e.seq);
     const result = e.detail_code ? (e.result || "") + " (" + e.detail_code + ")" : (e.result || "");
-    tr.append(cell(String(e.seq)), cell(e.ts), cell(e.event), cell(e.agent_id || ""),
+    tr.append(cell(String(e.seq)), cell(e.ts), cell(e.event), cell(e.agent_name || e.agent_id || ""),
       cell(e.live_origin || e.origin || "", "origin"), cell(result), cell(e.channel || ""));
     rows.append(tr);
   }
@@ -2962,6 +3057,7 @@ async function refreshPasskeys() {
 }
 window.kharonRefresh = async function () {
   await refreshGrants();
+  await refreshConnections();
   await refreshAudit();
   const r = await fetch("/owner/approvals", { credentials: "same-origin" });
   if (r.status === 401) { location.assign("/"); return; }
@@ -2972,7 +3068,7 @@ window.kharonRefresh = async function () {
   for (const p of data.pending) {
     const tr = document.createElement("tr");
     tr.dataset.requestId = p.request_id;
-    tr.append(cell(p.agent_id), cell(p.action), cell(p.origin, "origin"), cell(p.item_id), cell(p.age_s + " s"));
+    tr.append(cell(p.agent_name || p.agent_id), cell(p.action), cell(p.origin, "origin"), cell(p.item_id), cell(p.age_s + " s"));
     const actions = document.createElement("td");
     actions.append(
       button("Approve once", () => decide("/owner/approvals/approve", { request_id: p.request_id, kind: "once" })),
@@ -2999,7 +3095,7 @@ function disarmPanic() {
 panicButton.addEventListener("click", async () => {
   if (!panicArmed) {
     panicArmed = true;
-    panicButton.textContent = "Confirm panic: lock and revoke all";
+    panicButton.textContent = "Confirm panic: lock, revoke all, disconnect every dashboard";
     panicTimer = setTimeout(disarmPanic, 10000);
     return;
   }
@@ -4320,6 +4416,7 @@ mod tests {
             vec![PendingRow {
                 request_id: "gr_1".into(),
                 agent_id: "alpha".into(),
+                agent_name: None,
                 item_id: "item-1".into(),
                 action: "fill",
                 origin: "https://login.example.com".into(),
@@ -4349,18 +4446,21 @@ mod tests {
             Ok(())
         }
 
-        fn grants(&self) -> Vec<crate::api::grant::GrantView> {
-            vec![crate::api::grant::GrantView {
-                id: "g_1".into(),
-                agent_id: "alpha".into(),
-                item_id: Some("item-1".into()),
-                collection_id: None,
-                origin: "login.example.com".into(),
-                actions: vec![crate::api::grant::GrantAction::Fill],
-                expires_at: "2026-11-08T02:00:00Z".into(),
-                max_uses: Some(1),
-                uses: 0,
-                created_by_channel: crate::api::grant::Channel::WebUi,
+        fn grants(&self) -> Vec<GrantRow> {
+            vec![GrantRow {
+                view: crate::api::grant::GrantView {
+                    id: "g_1".into(),
+                    agent_id: "alpha".into(),
+                    item_id: Some("item-1".into()),
+                    collection_id: None,
+                    origin: "login.example.com".into(),
+                    actions: vec![crate::api::grant::GrantAction::Fill],
+                    expires_at: "2026-11-08T02:00:00Z".into(),
+                    max_uses: Some(1),
+                    uses: 0,
+                    created_by_channel: crate::api::grant::Channel::WebUi,
+                },
+                agent_name: None,
             }]
         }
 
@@ -4376,6 +4476,39 @@ mod tests {
                 "g_audit" => Err(DecideError::AuditFailed),
                 _ => Ok(()),
             }
+        }
+
+        /// One suspended Connect (#233).
+        fn connections(&self) -> Vec<ConnectionRow> {
+            vec![ConnectionRow {
+                agent_id: "c-abcdefghij".into(),
+                client_name: "Example Dashboard".into(),
+                host: Some("dashboard.example".into()),
+                scopes: vec!["kharon:read".into(), "kharon:fill".into()],
+                connected_at: "2026-11-12T00:00:00Z".into(),
+                channel: "oauth".into(),
+                suspended: true,
+            }]
+        }
+
+        /// `c-gone` is not found; anything else disconnects.
+        fn disconnect(&self, agent_id: &str) -> Result<(), DecideError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("disconnect {agent_id}"));
+            if agent_id == "c-gone" {
+                return Err(DecideError::NotFound);
+            }
+            Ok(())
+        }
+
+        fn unsuspend(&self, agent_id: &str) -> Result<(), DecideError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unsuspend {agent_id}"));
+            Ok(())
         }
 
         /// One web revoke, newest first, built from a full [`Entry`]
@@ -4952,6 +5085,100 @@ mod tests {
         assert!(!body.contains(&"ab".repeat(32)), "{body}");
         assert!(rig.calls().is_empty(), "{:?}", rig.calls());
     }
+    // ---- #233: Connections page ----
+
+    #[test]
+    fn connections_routes_are_listed() {
+        for route in [
+            ("GET", "/owner/connections"),
+            ("POST", "/owner/connections/disconnect"),
+            ("POST", "/owner/connections/unsuspend"),
+        ] {
+            assert!(ROUTES.contains(&route), "{route:?} missing from ROUTES");
+        }
+        let shell = shell_page("unlocked", 0);
+        assert!(shell.contains("/owner/connections"), "no connections fetch");
+        assert!(
+            shell.contains("click Connect again"),
+            "the panic text must say a panic means re-clicking Connect"
+        );
+        // Disconnect is a revoke-class action and Unsuspend its
+        // reset: neither is on the sign-in throttle list
+        // (REQ-APR-009).
+        for path in [
+            "/owner/connections/disconnect",
+            "/owner/connections/unsuspend",
+        ] {
+            assert!(
+                !throttle::THROTTLED_ROUTES.contains(&path),
+                "{path} must not be throttled"
+            );
+        }
+    }
+
+    #[test]
+    fn connections_list_renders_the_rows() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/connections", true, None, None, "");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        let c = &v["connections"][0];
+        assert_eq!(c["agent_id"], "c-abcdefghij");
+        assert_eq!(c["client_name"], "Example Dashboard");
+        assert_eq!(c["host"], "dashboard.example");
+        assert_eq!(c["scopes"], json!(["kharon:read", "kharon:fill"]));
+        assert_eq!(c["connected_at"], "2026-11-12T00:00:00Z");
+        assert_eq!(c["channel"], "oauth");
+        assert_eq!(c["suspended"], true);
+        assert!(rig.calls().is_empty(), "listing is read-only");
+    }
+
+    #[test]
+    fn connections_list_needs_a_session() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(Method::GET, "/owner/connections", false, None, None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    #[test]
+    fn connections_actions_reach_the_backend() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.post(
+            "/owner/connections/disconnect",
+            r#"{"agent_id":"c-abcdefghij"}"#,
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = rig.post(
+            "/owner/connections/unsuspend",
+            r#"{"agent_id":"c-abcdefghij"}"#,
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            rig.calls(),
+            ["disconnect c-abcdefghij", "unsuspend c-abcdefghij"]
+        );
+        // An unknown Connect is the backend's not_found.
+        let (status, body) = rig.post("/owner/connections/disconnect", r#"{"agent_id":"c-gone"}"#);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("not_found"), "{body}");
+    }
+
+    #[test]
+    fn connections_posts_need_our_origin() {
+        let rig = ApprovalsRig::new();
+        let (status, body) = rig.send(
+            Method::POST,
+            "/owner/connections/disconnect",
+            true,
+            Some("https://evil.example"),
+            Some("application/json"),
+            r#"{"agent_id":"c-abcdefghij"}"#,
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(rig.calls().is_empty(), "the gate runs first");
+    }
+
     // ---- #131 slice 3: panic ----
 
     #[test]

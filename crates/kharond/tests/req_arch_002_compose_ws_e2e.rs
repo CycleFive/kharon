@@ -35,7 +35,6 @@ use compose_support::{
 };
 use docker_support::{docker, docker_on_tty, docker_raw, wait_for_log};
 use kharond::api::token::{generate, generate_tunnel};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -411,21 +410,6 @@ struct ComposeService {
 const DETACH: &str = "agent connector detached: agent=alpha transport=ws";
 const ATTACH: &str = "agent connector attached: agent=alpha transport=ws";
 
-/// A CA and a server leaf for `host` signed by it: (ca pem, leaf cert
-/// pem, leaf key pem).
-fn edge_pki(host: &str) -> (String, String, String) {
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = ca_params.self_signed(&ca_key).unwrap();
-    let leaf_key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec![host.to_owned()])
-        .unwrap()
-        .signed_by(&leaf_key, &ca, &ca_key)
-        .unwrap();
-    (ca.pem(), leaf.pem(), leaf_key.serialize_pem())
-}
-
 /// The agent's browser context (created by kharond through the
 /// connector), then `FILLS` fills of the canary item, each followed by
 /// the in-page submit. Runs inside `setup()`, so the page server's
@@ -593,7 +577,7 @@ async fn setup() -> Run {
     // which the connector pins by the SHA-256 of its DER.
     let (acceptor, spki) = page_tls();
     write_public(&run_dir.join("page").join("page-spki"), spki.as_bytes());
-    let (edge_ca, edge_cert, edge_key) = edge_pki("kharon.e2e.test");
+    let (edge_ca, edge_cert, edge_key) = compose_support::edge_pki(&["kharon.e2e.test"]);
     // Keys are throwaway, and the daemons that read them run as other
     // uids than the host user (socat as 10002, kharond as 10001), so
     // these two are mode 0644 (kharond only requires readability).

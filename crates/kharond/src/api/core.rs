@@ -2054,9 +2054,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// hash is configured. [`Self::unsuspend_agent`] does not clear
     /// it and there is no un-revoke op; recovery is rotating the
     /// token (mint a new one, replace `token_hash`, restart).
-    /// Audited as `token_revoke` + per-grant `grant_revoke` + a
-    /// `grant_request` denial (detail `agent_revoked`) per dropped
-    /// pending request (#196).
+    /// Audited as `token_revoke`, then a `grant_revoke` per grant,
+    /// then a `grant_request` denial (detail `agent_revoked`) per
+    /// dropped pending request (#196). `token_revoke` is first so
+    /// the durable record exists even when a later append fails.
     pub fn revoke_agent(&self, agent_id: &str) -> Result<usize, GrantError> {
         // A Connect identity ends through its own store instead
         // (REQ-OAU-005, #233): the socket's `revoke_agent` accepts
@@ -2097,6 +2098,27 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .revoke_agent(agent_id);
+        // `token_revoke` goes first (#242, from the #261 review): it
+        // is the entry the startup rebuild revokes the agent from,
+        // so it must be in the log before any entry below can fail
+        // and return. Written last, a failed `grant_revoke` or
+        // request denial left the agent revoked in memory only, and
+        // a restart let the token back in. If this append fails
+        // itself, nothing is put back: the agent stays refused and
+        // its grants stay gone until the owner retries.
+        let entry = Entry::new(Event::TokenRevoke)
+            .agent_id(agent_id.to_owned())
+            .result("revoked");
+        // #132: bind the revocation to the token this daemon has
+        // configured for the agent, so the startup rebuild can tell
+        // "same token, still revoked" from "rotated, let it in". An
+        // agent the store does not configure writes no fingerprint
+        // (agent-bound, as before fingerprints existed).
+        let entry = match self.tokens.token_fingerprint(agent_id) {
+            Some(fp) => entry.token_fingerprint(fp),
+            None => entry,
+        };
+        self.append(entry).map_err(|_| GrantError::AuditFailed)?;
         for grant in &removed.grants {
             let entry = Entry::new(Event::GrantRevoke)
                 .agent_id(grant.agent_id.clone())
@@ -2127,19 +2149,6 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             self.append(dropped_request_entry(req, "agent_revoked"))
                 .map_err(|_| GrantError::AuditFailed)?;
         }
-        let entry = Entry::new(Event::TokenRevoke)
-            .agent_id(agent_id.to_owned())
-            .result("revoked");
-        // #132: bind the revocation to the token this daemon has
-        // configured for the agent, so the startup rebuild can tell
-        // "same token, still revoked" from "rotated, let it in". An
-        // agent the store does not configure writes no fingerprint
-        // (agent-bound, as before fingerprints existed).
-        let entry = match self.tokens.token_fingerprint(agent_id) {
-            Some(fp) => entry.token_fingerprint(fp),
-            None => entry,
-        };
-        self.append(entry).map_err(|_| GrantError::AuditFailed)?;
         Ok(removed.grants.len())
     }
 

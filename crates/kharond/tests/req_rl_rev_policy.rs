@@ -1101,3 +1101,52 @@ async fn req_aud_003_agent_revoke_failed_denial_append_does_not_restore_the_requ
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].request_id, pending);
 }
+
+/// Whether the log holds the entry the startup rebuild revokes
+/// `alpha` from (#132).
+fn token_revoke_logged(rig: &Rig) -> bool {
+    rig.audit.entries.lock().unwrap().iter().any(|e| {
+        e.event == Event::TokenRevoke
+            && e.agent_id.as_deref() == Some("alpha")
+            && e.result.as_deref() == Some("revoked")
+    })
+}
+
+#[tokio::test]
+async fn req_rev_001_agent_revoke_is_durable_when_a_request_denial_append_fails() {
+    let rig = Rig::new("https://login.example.com/");
+    pending_request(&rig, api_support::HOST_CLONE, "https://login.example.com").await;
+    *rig.audit.fail_event.lock().unwrap() = Some("grant_request");
+
+    assert_eq!(
+        rig.broker.revoke_agent("alpha"),
+        Err(GrantError::AuditFailed)
+    );
+
+    // The agent is refused now, and the log says so, so a restart
+    // refuses it too (#242, from the #261 review).
+    assert!(rig.broker.authenticate(&rig.alpha).is_err());
+    assert!(
+        token_revoke_logged(&rig),
+        "token_revoke must be written before the entries that can fail after it"
+    );
+}
+
+#[tokio::test]
+async fn req_rev_001_agent_revoke_is_durable_when_a_grant_revoke_append_fails() {
+    let rig = Rig::new("https://login.example.com/");
+    let approved = pending_request(&rig, ITEM_A, "https://login.example.com").await;
+    approve(&rig, &approved, ITEM_A);
+    *rig.audit.fail_event.lock().unwrap() = Some("grant_revoke");
+
+    assert_eq!(
+        rig.broker.revoke_agent("alpha"),
+        Err(GrantError::AuditFailed)
+    );
+
+    assert!(rig.broker.authenticate(&rig.alpha).is_err());
+    assert!(
+        token_revoke_logged(&rig),
+        "token_revoke must be written before the entries that can fail after it"
+    );
+}

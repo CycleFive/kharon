@@ -39,8 +39,9 @@ pub struct PendingRow {
     /// The requesting agent.
     pub agent_id: String,
     /// The display name when the agent is a Connect: its
-    /// `client_name` (D9, #233). The page names the Connect by it
-    /// and falls back to the raw id. `None` for config agents.
+    /// `client_name` (D9, #233). The page renders it with the id —
+    /// `client_name (c-…)` — never instead of it, since the name is
+    /// a string the client chose. `None` for config agents.
     pub agent_name: Option<String>,
     /// The item the fill wants.
     pub item_id: String,
@@ -73,7 +74,7 @@ pub struct AuditRow {
     /// The `client_name` when `agent_id` is a Connect identity
     /// (D9, #233), filled by the broker's `audit_tail`, not by the
     /// projection: an entry alone does not know the name. The audit
-    /// view names the Connect by it.
+    /// view renders it with the id, as the other rows do.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,11 +252,12 @@ pub trait OwnerApprovals: Send + Sync + 'static {
         Err(DecideError::NotFound)
     }
 
-    /// Clear an agent's suspension from the Connections page
-    /// (REQ-RL-002 owner reset, #233): the broker's own
-    /// `unsuspend_agent`, the socket op's other face. Default:
-    /// refused, like [`Self::panic`], so a backend without the
-    /// slice cannot silently report a reset that never happened.
+    /// Clear a live Connect's suspension from the Connections
+    /// page (REQ-RL-002 owner reset, #233): the broker's own
+    /// `unsuspend_agent` on the `web_ui` channel. Live Connects
+    /// only — a config agent's reset stays with the owner socket.
+    /// Default: refused, like [`Self::panic`], so a backend without
+    /// the slice cannot silently report a reset that never happened.
     fn unsuspend(&self, agent_id: &str) -> Result<(), DecideError> {
         let _ = agent_id;
         Err(DecideError::AuditFailed)
@@ -386,7 +388,16 @@ where
     }
 
     fn unsuspend(&self, agent_id: &str) -> Result<(), DecideError> {
-        self.unsuspend_agent(agent_id).map_err(DecideError::from)
+        // The page route lives under `/owner/connections` and the
+        // page only offers the button there, so the web surface may
+        // reset a live Connect only (#233 review). A config agent's
+        // REQ-RL-002 suspension stays socket-only (`cli`), exactly
+        // as before this page existed.
+        if !self.connect_identities().iter().any(|i| i.id == agent_id) {
+            return Err(DecideError::NotFound);
+        }
+        self.unsuspend_agent(agent_id, Channel::WebUi)
+            .map_err(DecideError::from)
     }
 
     fn revoke(&self, grant_id: &str) -> Result<(), DecideError> {

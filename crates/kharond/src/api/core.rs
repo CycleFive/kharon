@@ -2145,7 +2145,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// Clear an agent's suspension (REQ-RL-002 owner reset). Does
     /// not restore a revoked token; a revocation lasts until the
     /// token is rotated (mint, new `token_hash`, restart; #132).
-    pub fn unsuspend_agent(&self, agent_id: &str) -> Result<(), GrantError> {
+    /// The entry carries the caller's `channel` (#233 review): the
+    /// owner page (`web_ui`) and the owner socket (`cli`) both reset
+    /// suspensions, and the log must say which surface did it.
+    pub fn unsuspend_agent(&self, agent_id: &str, channel: Channel) -> Result<(), GrantError> {
         self.rates
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2153,6 +2156,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         self.append(
             Entry::new(Event::RateLimit)
                 .agent_id(agent_id.to_owned())
+                .channel(channel.as_str())
                 .result("unsuspended")
                 .detail_code("owner_reset"),
         )

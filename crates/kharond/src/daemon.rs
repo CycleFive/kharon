@@ -528,7 +528,9 @@ impl OwnerOps for DaemonOwner {
     async fn unsuspend(&self, agent_id: String) -> Result<(), OwnerFailure> {
         let broker = Arc::clone(&self.broker);
         tokio::task::spawn_blocking(move || {
-            broker.unsuspend_agent(&agent_id).map_err(map_grant_error)
+            broker
+                .unsuspend_agent(&agent_id, crate::api::grant::Channel::Cli)
+                .map_err(map_grant_error)
         })
         .await
         .map_err(|_| OwnerFailure::AuditFailed)?

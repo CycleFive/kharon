@@ -2961,7 +2961,7 @@ async function refreshGrants() {
     tr.dataset.grantId = g.id;
     const scope = g.item_id ? "item " + g.item_id : "collection " + g.collection_id;
     const uses = g.max_uses === undefined ? String(g.uses) : g.uses + " / " + g.max_uses;
-    tr.append(cell(g.agent_name || g.agent_id), cell(scope), cell(g.origin, "origin"), cell(g.actions.join(", ")), cell(uses), cell(g.expires_at));
+    tr.append(cell(g.agent_name ? g.agent_name + " (" + g.agent_id + ")" : g.agent_id), cell(scope), cell(g.origin, "origin"), cell(g.actions.join(", ")), cell(uses), cell(g.expires_at));
     const actions = document.createElement("td");
     actions.append(button("Revoke", () => decide("/owner/grants/revoke", { grant_id: g.id })));
     tr.append(actions);
@@ -3004,7 +3004,7 @@ async function refreshAudit() {
     const tr = document.createElement("tr");
     tr.dataset.seq = String(e.seq);
     const result = e.detail_code ? (e.result || "") + " (" + e.detail_code + ")" : (e.result || "");
-    tr.append(cell(String(e.seq)), cell(e.ts), cell(e.event), cell(e.agent_name || e.agent_id || ""),
+    tr.append(cell(String(e.seq)), cell(e.ts), cell(e.event), cell(e.agent_name ? e.agent_name + " (" + (e.agent_id || "") + ")" : (e.agent_id || "")),
       cell(e.live_origin || e.origin || "", "origin"), cell(result), cell(e.channel || ""));
     rows.append(tr);
   }
@@ -3068,7 +3068,7 @@ window.kharonRefresh = async function () {
   for (const p of data.pending) {
     const tr = document.createElement("tr");
     tr.dataset.requestId = p.request_id;
-    tr.append(cell(p.agent_name || p.agent_id), cell(p.action), cell(p.origin, "origin"), cell(p.item_id), cell(p.age_s + " s"));
+    tr.append(cell(p.agent_name ? p.agent_name + " (" + p.agent_id + ")" : p.agent_id), cell(p.action), cell(p.origin, "origin"), cell(p.item_id), cell(p.age_s + " s"));
     const actions = document.createElement("td");
     actions.append(
       button("Approve once", () => decide("/owner/approvals/approve", { request_id: p.request_id, kind: "once" })),

@@ -383,7 +383,65 @@ async fn unsuspend_from_the_page_writes_the_owner_reset() {
         .expect("a rate_limit entry");
     assert_eq!(reset.result.as_deref(), Some("unsuspended"));
     assert_eq!(reset.detail_code.as_deref(), Some("owner_reset"));
+    // The page did it, and the entry says so (#233 review): a
+    // reset from the owner's passkey is `web_ui`, not channel-less.
+    assert_eq!(reset.channel.as_deref(), Some("web_ui"));
     assert!(!rig.broker.agent_suspended(&id));
+
+    // The web route refuses a config agent: clearing a config
+    // agent's suspension stays socket-only.
+    let (status, body) = rig
+        .post(
+            "/owner/connections/unsuspend",
+            &json!({"agent_id": "alpha"}),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"], "not_found");
+    assert!(
+        !rig.entries_for("alpha")
+            .iter()
+            .any(|e| e.event.as_str() == "rate_limit"),
+        "no reset was written for the config agent"
+    );
+}
+
+#[tokio::test]
+async fn unsuspend_from_the_socket_writes_the_cli_channel() {
+    let rig = Rig::new().await;
+    let (_, id) = rig.connect(DASHBOARD, "Muse");
+    // The exact broker call the owner socket's `unsuspend` op
+    // makes (owner::OwnerOps through DaemonOwner).
+    rig.broker.unsuspend_agent(&id, Channel::Cli).unwrap();
+    let entries = rig.entries_for(&id);
+    let reset = entries
+        .iter()
+        .find(|e| e.event.as_str() == "rate_limit")
+        .expect("a rate_limit entry");
+    assert_eq!(reset.result.as_deref(), Some("unsuspended"));
+    assert_eq!(reset.detail_code.as_deref(), Some("owner_reset"));
+    assert_eq!(reset.channel.as_deref(), Some("cli"));
+}
+
+#[tokio::test]
+async fn owner_rows_render_a_connect_name_with_its_id() {
+    // `client_name` is a string the client chose, so no row may
+    // show it instead of the `c-…` id (#233 review): the pending,
+    // grants and audit renderers all build `name (id)`.
+    let rig = Rig::new().await;
+    let r = http(rig.ui, &rig.origin, Http::get("/").cookie(&rig.cookie)).await;
+    assert_eq!(r.status, 200);
+    for expr in [
+        "p.agent_name ? p.agent_name + \" (\" + p.agent_id + \")\" : p.agent_id",
+        "g.agent_name ? g.agent_name + \" (\" + g.agent_id + \")\" : g.agent_id",
+        "e.agent_name ? e.agent_name + \" (\" + (e.agent_id || \"\") + \")\" : (e.agent_id || \"\")",
+    ] {
+        assert!(r.body.contains(expr), "row renderer missing: {expr}");
+    }
+    assert!(
+        !r.body.contains("agent_name ||"),
+        "no row falls back to name-instead-of-id"
+    );
 }
 
 #[tokio::test]

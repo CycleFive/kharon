@@ -564,8 +564,7 @@ pub async fn mcp_call(
     tool: &str,
     arguments: &str,
 ) -> RawResponse {
-    let params = format!(r#"{{"name":"{tool}","arguments":{arguments}}}"#);
-    mcp_request(addr, token, "tools/call", &params).await
+    raw_request(addr, &mcp_call_bytes("localhost", token, tool, arguments)).await
 }
 
 /// The bytes of one `tools/call` POST to `/mcp` with `Host: host`.

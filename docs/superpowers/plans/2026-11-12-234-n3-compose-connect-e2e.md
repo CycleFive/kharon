@@ -26,12 +26,12 @@
 - **Addresses:** one network, `edge`, subnet `203.0.113.0/24` (TEST-NET-3), gateway `203.0.113.254` (the docker host). Holder `203.0.113.1`. The fake edges listen on `203.0.113.1:8443` (agent, to `127.0.0.1:8790`) and `203.0.113.1:8444` (owner, to `127.0.0.1:8788`). The dashboard listener binds `203.0.113.254` on a port the OS picks.
   - Why TEST-NET: kharond refuses to fetch a CIMD from a loopback, RFC 1918, CGNAT or link-local address, or from an address of its own netns (`cimd.rs` `address_refused`). `203.0.113.254` is none of those.
 - **Host and Origin headers.** Every request to the agent edge carries `Host: kharon.e2e.test`; every request to the owner edge carries `Host: kharon-owner.e2e.test`; every owner POST that the UI gates carries `Origin: https://kharon-owner.e2e.test`. The test dials the socket address and sets SNI and `Host` itself, so the edge ports never appear in a header.
-- **`CF-Connecting-IP`.** The test adds it, as the real edge would: `198.51.100.10` on the owner-browser requests, `198.51.100.20` on the dashboard-backend requests (`/oauth/token`, `/mcp`). The token endpoint counts 4xx answers per source and throttles at 10 in 600 s (`owner_ui/throttle.rs`); the scenario makes at most 3 on purpose. Do not add more.
+- **`CF-Connecting-IP`.** The test adds it, as the real edge would: `198.51.100.10` on the owner-browser requests, `198.51.100.20` on the dashboard-backend requests (`/oauth/token`, `/mcp`). The token endpoint counts 4xx answers per source and throttles at 10 in 600 s (`owner_ui/throttle.rs`); the scenario makes exactly four on purpose (rt0's third presentation, rt2 after the kill, rtC0 after the 30 s window, rtB after Disconnect), counted from the answers. Do not add more.
 - **The dashboard backend sends no `Authorization` header to `/oauth/token` or `/oauth/revoke`.** A public client does not, and PR #279 makes kharond refuse one there.
 - **Secrets.** Tokens, codes, the enrolment code, the session cookie and TLS keys are generated fresh each run, never passed on a command line, and never printed: every assert message and error string that could hold one goes through `compose_support::redact`.
 - **No host `sudo`.** Files kharond reads are written with `compose_support::write_public` (0644), as the ws E2E does. State files are read from the data volume by a one-off container running as `10001:10001` (the pattern in `compose_support::owner_approve`).
 - **Typed serde for new code:** structs deriving `Serialize`/`Deserialize` for every JSON body the test builds or reads (metadata documents, the CIMD, consent bodies, the token answer, audit lines). No `serde_json::json!`, no `serde_json::Value`, except where an existing helper's signature already takes one (`VirtAuth` returns `Json`).
-- **Every cargo command** uses `CARGO_TARGET_DIR=/home/lothrop/projects/kharon-234/target`.
+- **Every cargo command** uses a target directory of the worktree's own (`CARGO_TARGET_DIR=<worktree>/target`).
 - **The compose stack cannot run on the dev box** (its firewall rejects container-to-host TCP, and this test needs kharond to reach the host). Locally you run the non-ignored tests, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `docker compose … config`. The `#[ignore]`d tests run only in CI; the controller pushes and reads the job.
 - **Commit trailer.** Every commit ends with exactly these two lines, and no other `Co-Authored-By`:
   ```
@@ -45,7 +45,7 @@
 2. **Short lifetimes.** The enrolment code and each WebAuthn ceremony live 120 s, an authorization code 60 s, and the refresh retry window is 30 s of wall-clock time. No step sleeps between obtaining one of these and using it. The scenario records `Instant`s around the rotation, the retry and the reuse, and fails with "runner too slow, not a product failure" if the retry was sent more than 20 s after the rotation.
 3. **The CIMD fetch has three ways to fail that look alike** (name resolution through the holder's `/etc/hosts`, trust through `SSL_CERT_FILE`, the address class). All three answer `/oauth/authorize` with a 400 HTML page. When authorize does not answer 302, the error carries: the status, the redacted body, the dashboard listener's request count, and the last 50 lines of kharond's log.
 4. **Vacuous secret scans.** A scan of an empty log or a missing file passes. Each scanned text has a positive control first: kharond's log contains its public-ingress listening line, `state.json` contains both Connect ids, the audit log contains `oauth_connect`.
-5. **The throttle.** The three intended 4xx answers on `/oauth/token` come from `198.51.100.20`. A fourth unintended one is a bug in the test; a `429` anywhere fails the run with the source address in the message.
+5. **The throttle.** The four intended 4xx answers on `/oauth/token` come from `198.51.100.20`. A fifth unintended one is a bug in the test; a `429` anywhere fails the run with the source address in the message.
 
 ---
 
@@ -61,13 +61,13 @@
 **Interfaces:**
 - Produces, in `compose_support`:
   - `pub fn edge_pki(hosts: &[&str]) -> (String, String, String)` returning `(ca_pem, leaf_pem, leaf_key_pem)`: one fresh CA and one leaf whose SANs are `hosts`. This is `edge_pki` from `req_arch_002_compose_ws_e2e.rs:416`, moved and given a slice; the ws test calls `edge_pki(&["kharon.e2e.test"])`.
-  - `pub async fn https_raw(addr: SocketAddr, sni: &str, ca_pem: &str, request: &[u8]) -> Result<RawResponse, String>`: one TLS connection trusting only `ca_pem`, write `request`, read to EOF, parse with the parser `api_support::raw_request` uses. 30 s overall timeout. `RawResponse` is `api_support`'s.
+  - `pub async fn https_raw(addr: SocketAddr, sni: &str, ca_pem: &str, request: &[u8]) -> Result<RawResponse, String>`: one TLS connection trusting only `ca_pem`, write `request`, read to EOF, parse with `api_support::parse_response` (extracted from `raw_request`). 30 s overall timeout. `RawResponse` is `api_support`'s.
 - Produces, in `owner_ui_support`:
   - `pub fn request_bytes(origin: &str, req: &Http<'_>) -> Vec<u8>`: exactly the bytes `http()` sends today (it adds `Origin` to POSTs unless `no_origin`, `Connection: close`, `Content-Length`). `http()` becomes `raw_request(addr, &request_bytes(origin, &req))`.
 - Produces, where the MCP request is built today (`api_support::mcp_request` / `mcp_call`, lines 504–550):
-  - `pub fn mcp_call_bytes(host: &str, token: Option<&str>, tool: &str, arguments_json: &str) -> Vec<u8>`: the bytes of one `tools/call` POST with the given `Host`. Extract it from the existing function if the bytes are built inline; if a builder already exists, use that and add nothing.
+  - `pub fn mcp_call_bytes(host: &str, token: Option<&str>, tool: &str, arguments_json: &str) -> Vec<u8>`: the bytes of one `tools/call` POST with the given `Host`. Extract it from the existing function if the bytes are built inline; if a builder already exists, use that and add nothing. Step 4 also produced `post_mcp_raw_bytes` and `mcp_request_bytes` (the byte builders `mcp_call_bytes` sits on).
 
-- [ ] **Step 1: Write the failing test** in the new test file (not `#[ignore]`d):
+- [x] **Step 1: Write the failing test** in the new test file (not `#[ignore]`d):
 
 ```rust
 #[tokio::test]
@@ -99,12 +99,12 @@ fn request_bytes_matches_what_http_sends() {
 }
 ```
 
-- [ ] **Step 2: Run them, expect a compile failure** (`https_raw`, `edge_pki`, `request_bytes` not found):
+- [x] **Step 2: Run them, expect a compile failure** (`https_raw`, `edge_pki`, `request_bytes` not found):
   `cargo test -p kharond --test req_oau_234_compose_connect_e2e`
-- [ ] **Step 3: Move `edge_pki`, add `https_raw`** (reuse the private `tls_client` at `compose_support:494`), **extract `request_bytes`**.
-- [ ] **Step 4: Extract `mcp_call_bytes`** as described under Interfaces.
-- [ ] **Step 5: Run** the new file (both tests pass), then `cargo test -p kharond --test req_arch_002_compose_ws_e2e --test req_apr_009_edge --test req_oau_005_connections --test req_oau_006_007_scopes` (pass, same counts as on `origin/master`), then fmt and clippy as in Global Constraints.
-- [ ] **Step 6: Commit** `test(e2e): shared TLS request helpers for the compose tests (#234)`.
+- [x] **Step 3: Move `edge_pki`, add `https_raw`** (reuse the private `tls_client` at `compose_support:494`), **extract `request_bytes`**.
+- [x] **Step 4: Extract `mcp_call_bytes`** as described under Interfaces.
+- [x] **Step 5: Run** the new file (both tests pass), then `cargo test -p kharond --test req_arch_002_compose_ws_e2e --test req_apr_009_edge --test req_oau_005_connections --test req_oau_006_007_scopes` (pass, same counts as on `origin/master`), then fmt and clippy as in Global Constraints.
+- [x] **Step 6: Commit** `test(e2e): shared TLS request helpers for the compose tests (#234)`.
 
 ---
 
@@ -119,11 +119,11 @@ fn request_bytes_matches_what_http_sends() {
 **Interfaces:**
 - Consumes: Task 1's `edge_pki`, `https_raw`, `request_bytes`, `mcp_call_bytes`; `owner_ui_support::{Http, VirtAuth, b64url}`; `compose_support::{env, manifest, write_public, fixture_scope, data_volume_of, redact}`; `docker_support::{docker, docker_raw, wait_for_log}`.
 - Produces, in the test file, for Task 3:
-  - `struct Run` (behind the same `run()` / `static RUN` pattern as `req_arch_002_compose_ws_e2e.rs:359–363`) holding at least: `edge_ca: String`, `cookie: String` (the `__Host-kharon_owner=…` pair), `auth: Mutex<VirtAuth>`, `dashboard: Dashboard`, `client_id: String`, `redirect_uri: String`, `discovery: Discovered`.
+  - `struct Run` (behind the same `run()` / `static RUN` pattern as `req_arch_002_compose_ws_e2e.rs:359–363`, plus a `static RT: LazyLock<Runtime>` with `block_on`, because the dashboard listener must outlive `setup()`) holding at least: `edge_ca: String`, `cookie: String` (the `__Host-kharon_owner=…` pair), `auth: Mutex<VirtAuth>`, `dashboard: Dashboard`, `client_id: String`, `redirect_uri: String`, `discovery: Discovered`.
   - `struct Dashboard { port: u16, fetches: Arc<AtomicUsize> }`.
   - `struct Discovered { resource: String, issuer: String, authorization_endpoint: String, token_endpoint: String, revocation_endpoint: String }`.
-  - `async fn owner(run_edge_ca: &str, req: Http<'_>) -> RawResponse`: `https_raw("203.0.113.1:8444", "kharon-owner.e2e.test", ca, &request_bytes(OWNER_ORIGIN, &req.host(OWNER_HOST).header("CF-Connecting-IP", "198.51.100.10")))`.
-  - `async fn agent_edge(ca: &str, request: &[u8]) -> RawResponse`: the same to `203.0.113.1:8443` with SNI `kharon.e2e.test`.
+  - `async fn owner(run_edge_ca: &str, req: Http<'_>) -> Result<RawResponse, String>`: `https_raw("203.0.113.1:8444", "kharon-owner.e2e.test", ca, &request_bytes(OWNER_ORIGIN, &req.host(OWNER_HOST).header("CF-Connecting-IP", "198.51.100.10")))`.
+  - `async fn agent_edge(ca: &str, request: &[u8]) -> Result<RawResponse, String>`: the same to `203.0.113.1:8443` with SNI `kharon.e2e.test`.
 
 **The overlay.** Copy `compose.e2e-ws.yml` and change only this:
 - container names and the header comment to the `kharon-e2e-oauth` names;
@@ -169,7 +169,7 @@ public_origin = "https://kharon-owner.e2e.test"
 clients = ["{client_id}"]
 ```
 
-If `[agents.alpha]` needs a `cdp` key to parse, copy the ws harness's line. The broker stays **locked** for the whole test: nothing here needs the vault, and `kharon_status` and the `no_browser` refusal both answer while locked.
+The dummy agent has `cdp = { endpoint = "ws://127.0.0.1:9/devtools/browser" }` (no `via`); it is never dialled. The broker stays **locked** for the whole test: nothing here needs the vault, and `kharon_status` and the `no_browser` refusal both answer while locked.
 
 **The dashboard's metadata server** (`async fn serve_dashboard(bind_ip: &str, leaf_pem, key_pem) -> Dashboard`, modelled on `compose_support::serve_page`): a rustls listener that reads one request head, and
 - for `GET /client.json` answers `200`, `Content-Type: application/json`, `Cache-Control: max-age=3600`, `Connection: close`, with the typed document `{ client_id, client_name: "E2E Dashboard", redirect_uris: [redirect_uri], token_endpoint_auth_method: "none" }`, and adds one to `fetches`;
@@ -194,7 +194,7 @@ If `[agents.alpha]` needs a `cdp` key to parse, copy the ws harness's line. The 
 3. `GET /.well-known/oauth-authorization-server` on the owner edge: `issuer == "https://kharon-owner.e2e.test"`; the three endpoints are `{issuer}/oauth/authorize`, `/oauth/token`, `/oauth/revoke`; `code_challenge_methods_supported == ["S256"]`; `token_endpoint_auth_methods_supported == ["none"]`; `client_id_metadata_document_supported == true`.
 4. Task 3 uses the **paths of the discovered endpoints**, not literals.
 
-- [ ] **Step 1: Write the failing non-ignored tests:**
+- [x] **Step 1: Write the failing non-ignored tests:**
 
 ```rust
 #[test]
@@ -218,16 +218,16 @@ async fn dashboard_serves_its_metadata_document_and_counts_fetches() {
 ```
 
   Use the real token-hash format if `"0".repeat(64)` does not parse; the ws config test shows it.
-- [ ] **Step 2: Run, expect failure** (functions missing).
-- [ ] **Step 3: Write** `kharond_toml`, `serve_dashboard`, the overlay and the `.gitignore` line. Run the two tests: pass. Run `docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/e2e/compose.e2e-oauth.yml -p kharon-e2e-oauth --profile vaultwarden config >/dev/null` after creating the files the overlay mounts as empty placeholders in `run-oauth/` (then delete them): exit 0.
-- [ ] **Step 4: Write `setup()`, `run()`, `owner()`, `agent_edge()` and the ignored tests:**
+- [x] **Step 2: Run, expect failure** (functions missing).
+- [x] **Step 3: Write** `kharond_toml`, `serve_dashboard`, the overlay and the `.gitignore` line. Run the two tests: pass. Run `docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/e2e/compose.e2e-oauth.yml -p kharon-e2e-oauth --profile vaultwarden config >/dev/null` after creating the files the overlay mounts as empty placeholders in `run-oauth/` (then delete them): exit 0.
+- [x] **Step 4: Write `setup()`, `run()`, `owner()`, `agent_edge()` and the ignored tests:**
   - `req_oau_001_compose_discovery_chain_leads_from_mcp_to_the_owner_hostname` asserts the three discovery steps from `Run`.
   - `req_apr_009_compose_owner_signs_in_with_a_passkey_through_the_edge` asserts `GET /owner/session` with the cookie is 200 and without it 401.
   - Both carry `#[ignore = "needs the compose E2E stack (image.yml)"]`.
-- [ ] **Step 5: CI.** In `.github/workflows/image.yml`:
+- [x] **Step 5: CI.** In `.github/workflows/image.yml`:
   - add to `pull_request.paths`: `crates/kharond/tests/req_oau_234_compose_connect_e2e.rs` and `crates/kharond/tests/owner_ui_support/**`;
   - add job `compose-e2e-oauth`, a copy of `compose-e2e-ws` with: `COMPOSE` using `compose.e2e-oauth.yml` and `-p kharon-e2e-oauth`; the build step `docker build -t "$KHARON_IMAGE" .` and `docker build -t kharon-e2e-agent-host:local deploy/compose/e2e/agent-host`; the same fixture start-and-seed step; the test step `cargo test -p kharond --test req_oau_234_compose_connect_e2e -- --ignored` with the same three `KHARON_FIXTURE_*` variables; the same log and teardown steps; add the new job to the header comment.
-- [ ] **Step 6: Run** the non-ignored tests, fmt, clippy. **Commit** `test(e2e): N3 compose stack with two fake edges, discovery and passkey sign-in (#234)`. Report `DONE`; the controller pushes and reads the `compose-e2e-oauth` job before Task 3 starts.
+- [x] **Step 6: Run** the non-ignored tests, fmt, clippy. **Commit** `test(e2e): N3 compose stack with two fake edges, discovery and passkey sign-in (#234)`. Report `DONE`; the controller pushes and reads the `compose-e2e-oauth` job before Task 3 starts.
 
 ---
 
@@ -238,7 +238,7 @@ async fn dashboard_serves_its_metadata_document_and_counts_fetches() {
 
 **Interfaces:**
 - Consumes: Task 2's `Run`, `owner()`, `agent_edge()`, `Discovered`, `Dashboard`.
-- Produces: a `Scenario` record in `Run`, filled once by `async fn scenario(run: &…) -> Result<Scenario, String>` called at the end of `setup()`. Each step that gets an unexpected status returns `Err` with the step's name, the status and the redacted body, so every test reports the same first failure.
+- Produces: a `Scenario` record in `Run`, filled once by `async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String>` called at the end of `setup()`. Each step that gets an unexpected status returns `Err` with the step's name, the status and the redacted body, so every test reports the same first failure.
 
 **Request shapes** (read the handler before writing each call; file and line are from master `2c92533`):
 - `GET {authorization_endpoint path}?response_type=code&client_id=…&redirect_uri=…&code_challenge=…&code_challenge_method=S256&state=…&resource=https%3A%2F%2Fkharon.e2e.test%2Fmcp` on the owner edge, percent-encoded, no `scope` (absent means all three). Success is `302` with a relative `Location: /oauth/consent/<pending>` (`owner_ui/oauth.rs:362–404`). `code_challenge` is base64url of SHA-256 of a fresh 43-character verifier.
@@ -264,8 +264,11 @@ async fn dashboard_serves_its_metadata_document_and_counts_fetches() {
 4. **Rotation.** Refresh `rt0`: 200 with `at1`, `rt1`, both different from the first pair. `kharon_status` with `at1`: 200. Record `Instant` `rotated_at`.
 5. **The single retry.** Refresh `rt0` again at once: 200 with `at2`, `rt2`. Then `kharon_status` with `at1`: 401 (the pair the retry superseded is dead), and with `at2`: 200. Record the time since `rotated_at`.
 6. **Reuse kills the Connect.** Refresh `rt0` a third time: `400 invalid_grant`. Then `kharon_status` with `at2`: 401, and refresh `rt2`: `400 invalid_grant`. (Intended 4xx answers so far: two.)
+   6b. **The 30 s bound (Connect C).** Connect C; refresh `rtC0` to `(atC1, rtC1)`; sleep 31 s (the only sleep); present `rtC0` again: `400 invalid_grant` (third intended 4xx); `kharon_status` with `atC1`: 401. C ends here, so step 8's one-row check holds.
+   7b. **An access token is not a credential on the owner hostname.** After Connect B: `GET /owner/connections` with `Authorization: Bearer <atB>` and no cookie: 401 or 403, and no connections list.
+   8b. **Each edge refuses the other hostname.** Owner edge with `Host: kharon.e2e.test` on `GET /`: 421; agent edge `POST /mcp` with `Host: kharon-owner.e2e.test`: 404.
 7. **Connect B.** A second authorize and consent with a new verifier and `state`, redeemed to `atB`, `rtB`. Record `dashboard.fetches` again.
-8. **Disconnect.** `GET /owner/connections`: exactly one row (A is ended, and the page lists live Connects only), with `client_name == "E2E Dashboard"`; take its id. `POST /owner/connections/disconnect`: 200. Then `kharon_status` with `atB`: 401; refresh `rtB`: `400 invalid_grant` (the third and last intended 4xx); `GET /owner/connections`: no rows.
+8. **Disconnect.** `GET /owner/connections`: exactly one row (A is ended, and the page lists live Connects only), with `client_name == "E2E Dashboard"`; take its id. `POST /owner/connections/disconnect`: 200. Then `kharon_status` with `atB`: 401; refresh `rtB`: `400 invalid_grant` (the fourth and last intended 4xx); `GET /owner/connections`: no rows.
 9. **Evidence.** After the scenario:
    - kharond's log (`docker logs`, stdout and stderr);
    - `/data/oauth/state.json` and `/data/audit/audit.jsonl`, read with `docker run --rm --user 10001:10001 --entrypoint cat -v <data volume>:/data:ro kharon-e2e-agent-host:local <path>` (`compose_support::data_volume_of`);
@@ -278,14 +281,17 @@ async fn dashboard_serves_its_metadata_document_and_counts_fetches() {
 - `req_oau_004_compose_refresh_rotates_and_allows_one_retry`: steps 4 and 5, and the retry was sent within 20 s of the rotation (else the "runner too slow" failure).
 - `req_oau_004_compose_reusing_a_retired_refresh_token_ends_the_connect`: step 6, and the audit log has one `oauth_refresh_reuse` for Connect A's id.
 - `req_oau_005_compose_disconnect_from_the_owner_page_ends_the_connect`: step 8, and the audit log has `oauth_disconnect` with `detail_code == "owner"` and `channel == "web_ui"` for Connect B's id.
+- `req_oau_004_compose_a_retired_refresh_token_after_the_window_ends_the_connect`: step 6b, at least 30 s between rotation and second presentation, one `oauth_refresh_reuse` for C.
+- `req_oau_006_compose_an_access_token_is_refused_on_the_owner_hostname`: step 7b.
+- `req_apr_009_compose_each_edge_refuses_the_other_hostname`: step 8b.
 - `req_oau_007_compose_a_connect_has_no_browser`: steps 2 and 3.
-- `req_oau_compose_audit_chain_records_both_connects_and_verifies`: two `oauth_connect` entries (`result == "connected"`, `origin` containing `dashboard.e2e.test`), in order before their endings; the `audit verify` output says the log is OK. Audit lines are read into a typed struct with `event`, `agent_id`, `result`, `detail_code`, `channel`, `origin`, all optional but `event`.
+- `req_oau_compose_audit_chain_records_both_connects_and_verifies`: three `oauth_connect` entries (A, C, B; `result == "connected"`, `origin` containing `dashboard.e2e.test`), in order before their endings; the `audit verify` output says the log is OK. Audit lines are read into a typed struct with `event`, `agent_id`, `result`, `detail_code`, `channel`, `origin`, all optional but `event`.
 - `req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state`: after the positive controls in Review Focus 4, none of `at0 at1 at2 atB rt0 rt1 rt2 rtB`, the two codes, the enrolment code and the session cookie's value appears in kharond's log, `state.json` or `audit.jsonl`. `state.json` holds no string that starts with `kh_at_` or `kh_rt_` at all (tokens are stored as hashes).
 
-- [ ] **Step 1: Write the nine ignored tests first**, against a `Scenario` struct with the fields they need. They compile and are skipped locally.
-- [ ] **Step 2: Write `scenario()`** and call it from `setup()`.
-- [ ] **Step 3: Run** the non-ignored tests, fmt, clippy; `cargo test -p kharond --test req_oau_234_compose_connect_e2e -- --list` shows the nine new names plus Task 2's two as ignored.
-- [ ] **Step 4: Commit** `test(e2e): fake dashboard runs Connect, refresh, reuse-kill and Disconnect through the edges (#234)`. Report `DONE`; the controller pushes and reads the job.
+- [x] **Step 1: Write the twelve ignored tests first**, against a `Scenario` struct with the fields they need. They compile and are skipped locally.
+- [x] **Step 2: Write `scenario()`** and call it from `setup()`.
+- [x] **Step 3: Run** the non-ignored tests, fmt, clippy; `cargo test -p kharond --test req_oau_234_compose_connect_e2e -- --list` shows the twelve new names plus Task 2's two as ignored.
+- [x] **Step 4: Commit** `test(e2e): fake dashboard runs Connect, refresh, reuse-kill and Disconnect through the edges (#234)`. Report `DONE`; the controller pushes and reads the job.
 
 ## If CI shows the CIMD fetch failing
 

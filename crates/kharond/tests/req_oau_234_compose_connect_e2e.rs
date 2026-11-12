@@ -19,8 +19,9 @@
 //! compose` and the images `kharon:e2e` and `kharon-e2e-agent-host:local`
 //! (the fake edges use its socat) must exist (`image.yml`).
 //!
-//! Every secret (the enrolment code, the session cookie) is generated
-//! fresh and never printed: each error string that could hold one goes
+//! Every secret (the enrolment code, the session cookie, authorization
+//! codes, PKCE verifiers, access and refresh tokens) is generated fresh
+//! and never printed: each error string that could hold one goes
 //! through `compose_support::redact`.
 
 mod api_support;
@@ -73,6 +74,8 @@ const OWNER_UI: &str = "127.0.0.1:8788";
 const OWNER_SRC_IP: &str = "198.51.100.10";
 /// `CF-Connecting-IP` of the dashboard's backend (`/oauth/token`, `/mcp`).
 const DASHBOARD_SRC_IP: &str = "198.51.100.20";
+/// The retry must go out this soon after the rotation (the window is 30 s).
+const RETRY_BUDGET: Duration = Duration::from_secs(20);
 const SESSION_COOKIE: &str = "__Host-kharon_owner";
 /// The image the one-off containers run (it has `cat` and `socat`).
 const AGENT_HOST_IMAGE: &str = "kharon-e2e-agent-host:local";
@@ -320,7 +323,10 @@ async fn agent_edge(ca: &str, request: &[u8]) -> Result<RawResponse, String> {
 
 /// `GET path` on the agent edge, with the agent hostname as `Host`.
 async fn agent_get(ca: &str, path: &str) -> Result<RawResponse, String> {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {AGENT_HOST}\r\nConnection: close\r\n\r\n");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {AGENT_HOST}\r\nCF-Connecting-IP: {DASHBOARD_SRC_IP}\r\n\
+         Connection: close\r\n\r\n"
+    );
     agent_edge(ca, request.as_bytes()).await
 }
 
@@ -473,7 +479,14 @@ async fn discover(ca: &str) -> Result<Discovered, String> {
     let step = "POST /mcp without a token";
     let r = expect(
         step,
-        agent_edge(ca, &mcp_call_bytes(AGENT_HOST, None, "kharon_status", "{}")).await,
+        agent_edge(
+            ca,
+            &with_header(
+                mcp_call_bytes(AGENT_HOST, None, "kharon_status", "{}"),
+                &format!("CF-Connecting-IP: {DASHBOARD_SRC_IP}"),
+            ),
+        )
+        .await,
         401,
         &[],
     )?;
@@ -749,8 +762,8 @@ struct Retry {
     pair: TokenAnswer,
     old_access_status: u16,
     new_access: ToolOutcome,
-    /// From just before the rotation was sent to the retry's answer: an
-    /// upper bound on the time the retry spent in the 30 s window.
+    /// From just before the rotation was sent to just before the retry
+    /// was sent.
     since_rotation: Duration,
 }
 
@@ -760,6 +773,29 @@ struct Kill {
     third_presentation_error: String,
     access_status: u16,
     successor_refresh_error: String,
+}
+
+/// Step 6b: a third Connect whose retired refresh token is presented
+/// after the 30 s window.
+struct Window {
+    pair: TokenAnswer,
+    /// From the rotation's answer to just before the second presentation.
+    since_rotation: Duration,
+    second_presentation_error: String,
+    new_access_status: u16,
+}
+
+/// Step 7b: the owner hostname given an access token and no cookie.
+struct OwnerBearer {
+    status: u16,
+    /// The body names the Connect or looks like a connections list.
+    leaked: bool,
+}
+
+/// Step 8b: each edge asked for the other's hostname.
+struct HostChecks {
+    owner_edge_with_agent_host: u16,
+    agent_edge_with_owner_host: u16,
 }
 
 /// Step 8.
@@ -787,6 +823,11 @@ struct Scenario {
     a_agent_id: String,
     b: Connect,
     b_agent_id: String,
+    c: Connect,
+    c_agent_id: String,
+    window: Window,
+    owner_bearer: OwnerBearer,
+    hosts: HostChecks,
     status_call: ToolOutcome,
     no_browser_context: ToolOutcome,
     no_browser_fill: ToolOutcome,
@@ -794,7 +835,7 @@ struct Scenario {
     retry: Retry,
     kill: Kill,
     disconnection: Disconnection,
-    /// The 4xx answers `/oauth/token` gave (three on purpose; the
+    /// The 4xx answers `/oauth/token` gave (four on purpose; the
     /// endpoint throttles one source at 10 in 600 s).
     token_4xx: usize,
     evidence: Evidence,
@@ -1054,7 +1095,7 @@ impl Driver<'_> {
     }
 
     /// A refresh that must be refused: `400 invalid_grant`. One of the
-    /// three intended 4xx answers.
+    /// four intended 4xx answers (counted from the answers).
     async fn refresh_refused(&mut self, step: &str, refresh_token: &str) -> Result<String, String> {
         let r = self
             .token_post(
@@ -1066,7 +1107,9 @@ impl Driver<'_> {
                 ],
             )
             .await;
-        self.token_4xx += 1;
+        if matches!(&r, Ok(x) if (400..500).contains(&x.status)) {
+            self.token_4xx += 1;
+        }
         let r = expect_scrubbed(step, r, 400, &self.sec())?;
         let e: TokenError = parse(step, &r, &self.sec())?;
         ensure(e.error == "invalid_grant", step, || {
@@ -1305,19 +1348,21 @@ async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String> {
     };
 
     // 5. The single retry: the retired rt0 once more, inside the grace.
+    // The one measurement: just before the retry is sent. The test asserts
+    // the same bound on the same value.
+    let since_rotation = rotated_at.elapsed();
     ensure(
-        rotated_at.elapsed() <= Duration::from_secs(20),
+        since_rotation <= RETRY_BUDGET,
         "refresh rt0 (the single retry)",
         || {
             format!(
                 "runner too slow, not a product failure: {} s since the rotation, the retry \
                  must go out within 20 s (the grace window is 30 s)",
-                rotated_at.elapsed().as_secs()
+                since_rotation.as_secs()
             )
         },
     )?;
     let pair2 = d.refresh_ok("refresh rt0 (the single retry)", &rt0).await?;
-    let since_rotation = rotated_at.elapsed();
     let old_access_status = d
         .status_refused(
             "kharon_status with at1 after the retry",
@@ -1350,8 +1395,58 @@ async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String> {
         successor_refresh_error,
     };
 
+    // 6b. The 30 s bound: a third Connect, rotated, then its retired
+    // refresh token presented after the window.
+    let c = d.connect("Connect C").await?;
+    let step = "Connect C: GET /owner/connections";
+    let rows = d.connections(step).await?;
+    ensure(rows.len() == 1, step, || {
+        format!("expected one live Connect (A is ended), got {}", rows.len())
+    })?;
+    let c_agent_id = rows[0].agent_id.clone();
+    let rt_c0 = c.token.refresh_token.clone();
+    let pair_c1 = d.refresh_ok("refresh rtC0 (rotation)", &rt_c0).await?;
+    let c_rotated_at = Instant::now();
+    // The only sleep in the scenario: a retired refresh token is accepted
+    // once more for 30 s of wall-clock time, and the only way to see it
+    // refused as reuse is to let that window pass.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let since_c_rotation = c_rotated_at.elapsed();
+    let second_presentation_error = d
+        .refresh_refused("refresh rtC0 (after the window)", &rt_c0)
+        .await?;
+    let new_access_status = d
+        .status_refused("kharon_status with atC1 after reuse", &pair_c1.access_token)
+        .await?;
+    let window = Window {
+        pair: pair_c1,
+        since_rotation: since_c_rotation,
+        second_presentation_error,
+        new_access_status,
+    };
+
     // 7. Connect B.
     let b = d.connect("Connect B").await?;
+
+    // 7b. An access token is not a credential on the owner hostname.
+    let step = "GET /owner/connections with a bearer token and no cookie";
+    let r = owner(
+        d.ca,
+        Http::get("/owner/connections").bearer(&b.token.access_token),
+    )
+    .await
+    .map_err(|e| format!("{step}: {}", redact(&e, &d.sec())))?;
+    // 401 today; 403 once OAuth bearers are refused on every owner route
+    // (PR #279). Either is a refusal.
+    ensure(r.status == 401 || r.status == 403, step, || {
+        format!(
+            "expected 401 or 403, got {}: {}",
+            r.status,
+            redact(&scrub_tokens(&r.body), &d.sec())
+        )
+    })?;
+    let bearer_body = r.body;
+    let bearer_status = r.status;
 
     // 8. Disconnect.
     let step = "Connect B: GET /owner/connections";
@@ -1366,9 +1461,15 @@ async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String> {
         format!("client_name is {:?}", rows_before[0].client_name)
     })?;
     let b_agent_id = rows_before[0].agent_id.clone();
-    ensure(b_agent_id != a_agent_id, step, || {
-        "the listed Connect is A's, not B's".to_owned()
-    })?;
+    ensure(
+        b_agent_id != a_agent_id && b_agent_id != c_agent_id,
+        step,
+        || "the listed Connect is A's or C's, not B's".to_owned(),
+    )?;
+    let owner_bearer = OwnerBearer {
+        status: bearer_status,
+        leaked: bearer_body.contains(&b_agent_id) || bearer_body.contains("connections"),
+    };
     let step = "POST /owner/connections/disconnect";
     let r = d
         .owner_post(
@@ -1401,12 +1502,39 @@ async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String> {
         rows_after,
     };
 
-    ensure(d.token_4xx == 3, "the scenario", || {
+    ensure(d.token_4xx == 4, "the scenario", || {
         format!(
-            "{} intended 4xx answers on /oauth/token, expected 3",
+            "{} intended 4xx answers on /oauth/token, expected 4",
             d.token_4xx
         )
     })?;
+
+    // 8b. Each edge refuses the other hostname. SNI stays what the
+    // leaf covers (it holds both names); only `Host` changes.
+    let ip = format!("CF-Connecting-IP: {DASHBOARD_SRC_IP}");
+    let req = Http::get("/")
+        .host(AGENT_HOST)
+        .header("CF-Connecting-IP", DASHBOARD_SRC_IP);
+    let owner_edge_with_agent_host = https_raw(
+        socket(OWNER_EDGE_ADDR),
+        OWNER_HOST,
+        d.ca,
+        &request_bytes(OWNER_ORIGIN, &req),
+    )
+    .await
+    .map_err(|e| format!("owner edge with the agent Host: {e}"))?
+    .status;
+    let agent_edge_with_owner_host = agent_edge(
+        d.ca,
+        &with_header(mcp_call_bytes(OWNER_HOST, None, "kharon_status", "{}"), &ip),
+    )
+    .await
+    .map_err(|e| format!("agent edge with the owner Host: {e}"))?
+    .status;
+    let hosts = HostChecks {
+        owner_edge_with_agent_host,
+        agent_edge_with_owner_host,
+    };
 
     // 9. Evidence.
     let volume = data_volume_of(KHAROND);
@@ -1443,6 +1571,11 @@ async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String> {
         a_agent_id,
         b,
         b_agent_id,
+        c,
+        c_agent_id,
+        window,
+        owner_bearer,
+        hosts,
         status_call,
         no_browser_context,
         no_browser_fill,
@@ -1469,16 +1602,12 @@ struct Run {
     edge_ca: String,
     /// The `__Host-kharon_owner=…` pair of the signed-in owner session.
     cookie: String,
-    /// The owner's passkey (its signature counter advances per sign-in).
-    /// Kept for the tests that sign in again; none does yet.
-    #[allow(dead_code)]
-    auth: Mutex<VirtAuth>,
     dashboard: Dashboard,
     /// The dashboard's `client_id` (its CIMD URL) and `redirect_uri`.
     client_id: String,
     redirect_uri: String,
     discovery: Discovered,
-    /// The enrolment code and the cookie, for `redact`.
+    /// The enrolment code, the cookie pair and the cookie value, for `redact`.
     secrets: Vec<String>,
     /// What the dashboard scenario recorded.
     scenario: Scenario,
@@ -1633,7 +1762,7 @@ async fn setup() -> Run {
         client_id: &client_id,
         redirect_uri: &redirect_uri,
         discovery: &discovery,
-        secrets: vec![code.clone(), cookie.clone(), cookie_value],
+        secrets: vec![code.clone(), cookie.clone(), cookie_value.clone()],
         token_4xx: 0,
     };
     let scenario = must(scenario(&mut driver).await);
@@ -1641,9 +1770,8 @@ async fn setup() -> Run {
 
     Run {
         edge_ca,
-        secrets: vec![code, cookie.clone()],
+        secrets: vec![code, cookie.clone(), cookie_value],
         cookie,
-        auth: Mutex::new(auth),
         dashboard,
         client_id,
         redirect_uri,
@@ -2030,7 +2158,7 @@ fn req_oau_004_compose_refresh_rotates_and_allows_one_retry() {
         "kharon_status with the retry's access token is not a tool error"
     );
     assert!(
-        s.retry.since_rotation < Duration::from_secs(20),
+        s.retry.since_rotation <= RETRY_BUDGET,
         "the retry was sent {:?} after the rotation, outside the 20 s the test allows \
          (the grace window is 30 s): the runner was too slow",
         s.retry.since_rotation
@@ -2065,11 +2193,73 @@ fn req_oau_004_compose_reusing_a_retired_refresh_token_ends_the_connect() {
         s.a_agent_id
     );
     assert_eq!(reuse[0].1.result.as_deref(), Some("revoked"));
+    assert_eq!(
+        audit_events(s, "oauth_refresh_reuse").len(),
+        2,
+        "two reuse entries in all: one for Connect A, one for Connect C"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_004_compose_a_retired_refresh_token_after_the_window_ends_the_connect() {
+    let r = run();
+    let s = &r.scenario;
+    let w = &s.window;
+    assert_pair("Connect C's rotation", &w.pair);
     assert!(
-        audit_events(s, "oauth_refresh_reuse")
-            .iter()
-            .all(|(_, l)| l.agent_id.as_deref() == Some(s.a_agent_id.as_str())),
-        "no other Connect saw a reuse"
+        w.since_rotation >= Duration::from_secs(30),
+        "the second presentation was only {:?} after the rotation, inside the 30 s window",
+        w.since_rotation
+    );
+    assert_eq!(
+        w.second_presentation_error, "invalid_grant",
+        "a retired token presented after the window"
+    );
+    assert_eq!(
+        w.new_access_status, 401,
+        "the rotated access token after the reuse"
+    );
+    let reuse: Vec<_> = audit_events(s, "oauth_refresh_reuse")
+        .into_iter()
+        .filter(|(_, l)| l.agent_id.as_deref() == Some(s.c_agent_id.as_str()))
+        .collect();
+    assert_eq!(
+        reuse.len(),
+        1,
+        "one oauth_refresh_reuse entry for Connect C ({})",
+        s.c_agent_id
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_006_compose_an_access_token_is_refused_on_the_owner_hostname() {
+    let r = run();
+    let b = &r.scenario.owner_bearer;
+    assert!(
+        b.status == 401 || b.status == 403,
+        "GET /owner/connections with a bearer token and no cookie answered {}",
+        b.status
+    );
+    assert!(
+        !b.leaked,
+        "the refusal's body names the Connect or lists connections"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_apr_009_compose_each_edge_refuses_the_other_hostname() {
+    let r = run();
+    let h = &r.scenario.hosts;
+    assert_eq!(
+        h.owner_edge_with_agent_host, 421,
+        "the owner edge with Host {AGENT_HOST}"
+    );
+    assert_eq!(
+        h.agent_edge_with_owner_host, 404,
+        "the agent edge with Host {OWNER_HOST}"
     );
 }
 
@@ -2107,8 +2297,8 @@ fn req_oau_005_compose_disconnect_from_the_owner_page_ends_the_connect() {
     assert_eq!(ended[0].1.detail_code.as_deref(), Some("owner"));
     assert_eq!(ended[0].1.channel.as_deref(), Some("web_ui"));
     assert_eq!(
-        s.token_4xx, 3,
-        "the scenario made its three intended 4xx on /oauth/token"
+        s.token_4xx, 4,
+        "the scenario made its four intended 4xx on /oauth/token"
     );
 }
 
@@ -2144,7 +2334,7 @@ fn req_oau_compose_audit_chain_records_both_connects_and_verifies() {
     let r = run();
     let s = &r.scenario;
     let connects = audit_events(s, "oauth_connect");
-    assert_eq!(connects.len(), 2, "two oauth_connect entries");
+    assert_eq!(connects.len(), 3, "three oauth_connect entries (A, C, B)");
     for (_, l) in &connects {
         assert_eq!(l.result.as_deref(), Some("connected"));
         assert!(
@@ -2161,22 +2351,54 @@ fn req_oau_compose_audit_chain_records_both_connects_and_verifies() {
     );
     assert_eq!(
         connects[1].1.agent_id.as_deref(),
+        Some(s.c_agent_id.as_str())
+    );
+    assert_eq!(
+        connects[2].1.agent_id.as_deref(),
         Some(s.b_agent_id.as_str())
     );
     let reuse = audit_events(s, "oauth_refresh_reuse");
     let ended = audit_events(s, "oauth_disconnect");
-    assert!(
-        reuse.iter().all(|(i, _)| *i > connects[0].0),
-        "A's connect precedes A's ending"
-    );
-    assert!(
-        ended
+    let ending_of = |events: &[(usize, &AuditLine)], id: &str| {
+        events
             .iter()
-            .filter(|(_, l)| l.agent_id.as_deref() == Some(s.b_agent_id.as_str()))
-            .all(|(i, _)| *i > connects[1].0),
-        "B's connect precedes B's ending"
+            .filter(|(_, l)| l.agent_id.as_deref() == Some(id))
+            .map(|(i, _)| *i)
+            .collect::<Vec<_>>()
+    };
+    for (id, ends, connect_at, what) in [
+        (
+            &s.a_agent_id,
+            ending_of(&reuse, &s.a_agent_id),
+            connects[0].0,
+            "A",
+        ),
+        (
+            &s.c_agent_id,
+            ending_of(&reuse, &s.c_agent_id),
+            connects[1].0,
+            "C",
+        ),
+        (
+            &s.b_agent_id,
+            ending_of(&ended, &s.b_agent_id),
+            connects[2].0,
+            "B",
+        ),
+    ] {
+        assert!(
+            !ends.is_empty(),
+            "Connect {what} ({id}) has an ending entry"
+        );
+        assert!(
+            ends.iter().all(|i| *i > connect_at),
+            "{what}'s connect precedes {what}'s ending"
+        );
+    }
+    assert!(
+        connects[0].0 < connects[1].0 && connects[1].0 < connects[2].0,
+        "the Connects were recorded in the order A, C, B"
     );
-    assert!(connects[0].0 < connects[1].0, "A connected before B");
     assert!(
         s.evidence.verify_out.contains("audit log OK"),
         "kharon audit verify said: {}",
@@ -2221,6 +2443,10 @@ fn req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state() {
         ("rt2", &s.retry.pair.refresh_token),
         ("atB", &s.b.token.access_token),
         ("rtB", &s.b.token.refresh_token),
+        ("at C0", &s.c.token.access_token),
+        ("rt C0", &s.c.token.refresh_token),
+        ("at C1", &s.window.pair.access_token),
+        ("rt C1", &s.window.pair.refresh_token),
     ];
     assert!(
         tokens.iter().any(|(_, t)| e
@@ -2229,16 +2455,13 @@ fn req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state() {
         "state.json holds no token hash: tokens are stored as hashes, so one must be there"
     );
 
-    let cookie_value = r
-        .cookie
-        .split_once('=')
-        .map_or(r.cookie.as_str(), |(_, v)| v);
     let mut secrets = tokens;
     secrets.extend([
         ("code A", s.a.code.as_str()),
         ("code B", s.b.code.as_str()),
+        ("code C", s.c.code.as_str()),
         ("the enrolment code", r.secrets[0].as_str()),
-        ("the session cookie value", cookie_value),
+        ("the session cookie value", r.secrets[2].as_str()),
     ]);
     for (what, secret) in &secrets {
         assert!(secret.len() >= 16, "{what} is a real secret (not empty)");
@@ -2251,6 +2474,12 @@ fn req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state() {
         for (what, secret) in &secrets {
             assert!(!text.contains(secret), "{what} appears in {file}");
         }
+    }
+    for (file, text) in [("kharond's log", &e.log), ("audit.jsonl", &e.audit_raw)] {
+        assert!(
+            !text.contains("kh_at_") && !text.contains("kh_rt_"),
+            "{file} holds a kh_at_ or kh_rt_ string"
+        );
     }
     assert!(
         !e.state_json.contains("\"kh_at_") && !e.state_json.contains("\"kh_rt_"),

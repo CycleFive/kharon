@@ -14,6 +14,11 @@
 #         203.0.113.1. kharond refuses to fetch a CIMD from a private,
 #         loopback, CGNAT or link-local address, so the dashboard needs
 #         a public-looking one.
+#         This stack relies on kharond's CIMD fetch accepting a TEST-NET-3
+#         address: hardening v4_class_refused (crates/kharond/src/api/cimd.rs)
+#         to refuse documentation ranges would break this E2E at
+#         /oauth/authorize (a 400); the authorize step's error shows the
+#         dashboard's fetch count and kharond's log tail.
 # - fake-edge joins the holder's network namespace (as cloudflared does)
 #   and terminates TLS on 203.0.113.1:8443 for kharon.e2e.test,
 #   forwarding to kharond's public ingress on 127.0.0.1:8790;

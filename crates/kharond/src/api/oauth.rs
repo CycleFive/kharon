@@ -80,7 +80,10 @@ impl Discovery {
     }
 
     /// RFC 9728 protected-resource metadata, served on
-    /// `[public_ingress]` at both well-known paths.
+    /// `[public_ingress]` at both well-known paths. Known deviation:
+    /// §3.3 wants the root document's `resource` to be the origin,
+    /// but both paths serve the same document naming the `/mcp`
+    /// resource — the one the 401 challenge points at (#228).
     pub fn protected_resource_metadata(&self) -> Value {
         json!({
             "resource": self.resource,

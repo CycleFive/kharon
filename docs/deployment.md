@@ -1034,6 +1034,15 @@ changes, as everywhere in this guide):
 | `kharon.twkr.io` | `^/.well-known/oauth-protected-resource$` and `^/.well-known/oauth-protected-resource/mcp$` | RFC 9728 protected-resource metadata on `[public_ingress]`, unauthenticated |
 | `kharon-owner.twkr.io` | `^/.well-known/oauth-authorization-server$` | RFC 8414 authorization-server metadata on the owner UI listener |
 
+If the owner hostname sits behind a Cloudflare Access application
+(the `[owner_ui.access]` shape), that application also needs a
+**Bypass** policy for the exact path
+`/.well-known/oauth-authorization-server`. MCP clients fetch the
+RFC 8414 document before any sign-in and hold no Access token, so
+without the bypass discovery is refused at the edge — kharond
+itself exempts the path from its own Access check, but it never
+sees the request if the edge stops it first.
+
 ```toml
 [oauth]
 # client_id URLs (CIMD) this deploy accepts for Connect; see

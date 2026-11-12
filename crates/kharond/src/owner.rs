@@ -52,6 +52,21 @@
 //!   passkey. It is zeroized with the reply buffer. Without an
 //!   owner UI configured the op is `unknown_op`. A failed audit
 //!   append is `audit_failed` and no code is minted (#249).
+//! - `{"op":"passkey_list"}` — list enrolled passkeys (#258). The
+//!   reply is `{"ok":true,"passkeys":[{"id","enrolled_at","last_used_at"}]}`.
+//!   `id` is the first 8 lowercase hex chars of the credential
+//!   fingerprint. Timestamps are RFC3339 UTC, or null when the store
+//!   does not have them yet. The reply carries no credential id and
+//!   no public key. A failed audit append is `audit_failed` and no
+//!   list is returned.
+//! - `{"op":"passkey_remove","id":"<8 hex>"}` — remove that passkey
+//!   and end every live owner session opened with it (#258).
+//!   Removing the last passkey is allowed on this socket. `not_found`
+//!   when no passkey has that id, `ambiguous` when two share it,
+//!   `bad_request` when the id is not 8 lowercase hex characters,
+//!   `audit_failed` when the append failed (the passkey stays),
+//!   `store_failed` when the file could not be written (the passkey
+//!   stays). Without an owner UI the op is `unknown_op`.
 //!
 //!   The CLI/ntfy presentation of the grant ops is #16; this socket
 //!   is the broker-side seam they drive. The web UI never accepts
@@ -75,7 +90,8 @@
 //! `scan_unavailable`, `unlock_failed` (wrong password,
 //! unreachable server, bad export — deliberately indistinguishable),
 //! and for the grant ops `not_found`, `not_pending`,
-//! `standing_disabled`, `invalid_terms`.
+//! `standing_disabled`, `invalid_terms`. Passkey remove also uses
+//! `not_found`, `ambiguous`, `store_failed` and `bad_request`.
 //!
 //! The codes are indistinguishable; the *timing* is not, in sync
 //! mode: an unreachable server fails during `prepare`, before any
@@ -193,6 +209,18 @@ pub trait OwnerOps: Send + Sync + 'static {
         async { Err(OwnerFailure::Unsupported) }
     }
 
+    /// List enrolled passkeys (#258). Default: no owner UI (`unknown_op`).
+    fn passkey_list(&self) -> impl Future<Output = Result<Vec<PasskeyRow>, OwnerFailure>> + Send {
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Remove one passkey by its short id and end sessions opened
+    /// with it (#258). Default: no owner UI (`unknown_op`).
+    fn passkey_remove(&self, id: String) -> impl Future<Output = Result<(), OwnerFailure>> + Send {
+        let _ = id;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
     /// Revoke one grant (REQ-REV-001). Default: unsupported.
     fn revoke_grant(
         &self,
@@ -272,6 +300,17 @@ pub enum OwnerFailure {
     StandingDisabled,
     /// Grant terms outside SPEC §5's bounds (grant ops, #20).
     InvalidTerms,
+    /// The passkey id is not 8 lowercase hex characters (#258).
+    BadId,
+    /// Two passkeys share that short id. Nothing was removed (#258).
+    Ambiguous,
+    /// The passkey file could not be written. The passkey is still
+    /// enrolled (#258).
+    StoreFailed,
+    /// The web UI refused to remove the last passkey (#258). The
+    /// socket allows it; this exists so that refusal cannot be
+    /// reported as success if it is ever reached here.
+    LastPasskey,
 }
 
 impl OwnerFailure {
@@ -289,6 +328,10 @@ impl OwnerFailure {
             Self::NotPending => "not_pending",
             Self::StandingDisabled => "standing_disabled",
             Self::InvalidTerms => "invalid_terms",
+            Self::BadId => "bad_request",
+            Self::Ambiguous => "ambiguous",
+            Self::StoreFailed => "store_failed",
+            Self::LastPasskey => "last_passkey",
         }
     }
 
@@ -300,6 +343,19 @@ impl OwnerFailure {
     pub fn is_auth_failure(&self) -> bool {
         matches!(self, Self::UnlockFailed | Self::ScopeTooBroad)
     }
+}
+
+/// One enrolled passkey, as `passkey_list` reports it (#258). No
+/// credential id, no fingerprint, no public key.
+#[derive(Debug, Clone, Serialize)]
+pub struct PasskeyRow {
+    /// First 8 lowercase hex chars of the credential fingerprint.
+    pub id: String,
+    /// RFC3339 UTC when the passkey was stored, or null on a store
+    /// written before that was recorded.
+    pub enrolled_at: Option<String>,
+    /// RFC3339 UTC of the last successful assertion, or null until one.
+    pub last_used_at: Option<String>,
 }
 
 /// The owner-facing hint for [`OwnerFailure::ScopeTooBroad`] (#243),
@@ -341,6 +397,9 @@ struct Request {
     /// Revoke agent / unsuspend: agent id.
     #[serde(default)]
     agent_id: Option<String>,
+    /// `passkey_remove`: the short id from `passkey_list` (#258).
+    #[serde(default)]
+    id: Option<String>,
 }
 
 /// The socket path for a daemon with this `data_dir`.
@@ -762,6 +821,23 @@ async fn dispatch_line<O: OwnerOps>(
             Ok(token) => format!("{{\"ok\":true,\"enroll_token\":\"{}\"}}\n", token.as_str()),
             Err(e) => error_response(e.code()),
         },
+        "passkey_list" => match ops.passkey_list().await {
+            Ok(passkeys) => {
+                let mut out = serde_json::json!({ "ok": true, "passkeys": passkeys }).to_string();
+                out.push('\n');
+                out
+            }
+            Err(e) => error_response(e.code()),
+        },
+        "passkey_remove" => {
+            let Some(id) = req.id.clone() else {
+                return error_response("bad_request");
+            };
+            match ops.passkey_remove(id).await {
+                Ok(()) => ok_response(None),
+                Err(e) => error_response(e.code()),
+            }
+        }
         _ => error_response("unknown_op"),
     }
 }

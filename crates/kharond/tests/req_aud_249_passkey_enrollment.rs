@@ -271,6 +271,18 @@ impl OwnerAudit for Gate {
             Ok(())
         }
     }
+    fn passkey_listed(
+        &self,
+        _listed: kharond::owner_ui::PasskeyListed,
+    ) -> Result<(), OwnerAuditError> {
+        Ok(())
+    }
+    fn passkey_removed(
+        &self,
+        _removed: kharond::owner_ui::PasskeyRemoved,
+    ) -> Result<(), OwnerAuditError> {
+        Ok(())
+    }
 }
 
 struct NoRedeem;

@@ -17,6 +17,8 @@
 //! session, and does not set a session cookie. Signing in still
 //! requires an assertion. Minting a code and storing a passkey each
 //! append an audit entry first; a failed append does neither (#249).
+//! Listing passkeys and removing one do the same (#258). The signed-in
+//! page lists them and can remove one, but not the last.
 //!
 //! Fixed routes (no token in the path):
 //!
@@ -187,6 +189,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/owner/grants"),
     ("POST", "/owner/grants/revoke"),
     ("GET", "/owner/audit"),
+    ("GET", "/owner/passkeys"),
+    ("POST", "/owner/passkeys/remove"),
     ("POST", "/owner/panic"),
     ("POST", "/owner/unlock/begin"),
     ("POST", "/owner/unlock"),
@@ -246,6 +250,14 @@ pub trait OwnerAudit: Send + Sync + 'static {
     /// stored. Called while the passkey store lock is held, so the
     /// sink must not call back into the UI. `Err` stores nothing.
     fn passkey_enrolled(&self, enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError>;
+    /// `passkey_listed` before the list is returned (#258). Called
+    /// while the passkey store lock is held, so the sink must not
+    /// call back into the UI. `Err` returns no list.
+    fn passkey_listed(&self, listed: PasskeyListed) -> Result<(), OwnerAuditError>;
+    /// `passkey_removed` before the passkey is removed (#258). Called
+    /// while the passkey store lock is held, so the sink must not
+    /// call back into the UI. `Err` removes nothing.
+    fn passkey_removed(&self, removed: PasskeyRemoved) -> Result<(), OwnerAuditError>;
 }
 
 /// A passkey that is about to be stored (#249). No credential id.
@@ -254,6 +266,62 @@ pub struct PasskeyEnrolled {
     pub credential_fingerprint: String,
     /// Enrolled passkeys once this one is stored.
     pub passkey_count: u64,
+}
+
+/// Which owner surface is listing or removing a passkey (#258).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasskeyChannel {
+    /// The owner socket (`kharon passkey …`). May remove the last passkey.
+    Cli,
+    /// The signed-in owner page. Refuses to remove the last passkey.
+    WebUi,
+}
+
+impl PasskeyChannel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::WebUi => "web_ui",
+        }
+    }
+}
+
+/// A passkey list that is about to be returned (#258). No credential ids.
+pub struct PasskeyListed {
+    /// `cli` or `web_ui`.
+    pub channel: &'static str,
+    /// One 32-hex fingerprint per enrolled passkey, list order. Empty
+    /// when the store is empty.
+    pub credential_fingerprints: Vec<String>,
+    /// Enrolled passkeys this list names.
+    pub passkey_count: u64,
+}
+
+/// A passkey that is about to be removed (#258). No credential id.
+pub struct PasskeyRemoved {
+    /// `cli` or `web_ui`.
+    pub channel: &'static str,
+    /// Truncated SHA-256 of the raw credential id, 32 lowercase hex chars.
+    pub credential_fingerprint: String,
+    /// Enrolled passkeys once this one is gone.
+    pub passkey_count: u64,
+}
+
+/// Why a passkey was not listed or removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasskeyOpError {
+    /// The audit entry was not appended. Nothing was listed or removed.
+    Audit,
+    /// No passkey has that short id.
+    NotFound,
+    /// More than one passkey shares that short id. Nothing was removed.
+    Ambiguous,
+    /// The web UI will not remove the last passkey.
+    LastPasskey,
+    /// The id is not 8 lowercase hex characters.
+    BadId,
+    /// The passkey file could not be written. The passkey is still there.
+    Store,
 }
 
 /// The enrollment entry was not appended.
@@ -282,6 +350,12 @@ impl OwnerAudit for NoAudit {
         Ok(())
     }
     fn passkey_enrolled(&self, _enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
+        Ok(())
+    }
+    fn passkey_listed(&self, _listed: PasskeyListed) -> Result<(), OwnerAuditError> {
+        Ok(())
+    }
+    fn passkey_removed(&self, _removed: PasskeyRemoved) -> Result<(), OwnerAuditError> {
         Ok(())
     }
 }
@@ -364,6 +438,10 @@ impl CeremonyKind {
 struct Session {
     hash: [u8; 32],
     expires: Instant,
+    /// Raw credential id that opened this session (#258). Empty for a
+    /// session a test issued without a passkey. Removing the passkey
+    /// ends every session that carries its id.
+    credential_id: Vec<u8>,
 }
 
 struct Enroll {
@@ -879,7 +957,7 @@ impl OwnerUi {
         }
         let allowed = match req.path.as_str() {
             "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants"
-            | "/owner/audit" => Some(Method::GET),
+            | "/owner/audit" | "/owner/passkeys" => Some(Method::GET),
             "/owner/login/options"
             | "/owner/login/finish"
             | "/owner/register/options"
@@ -888,6 +966,7 @@ impl OwnerUi {
             | "/owner/approvals/approve"
             | "/owner/approvals/deny"
             | "/owner/grants/revoke"
+            | "/owner/passkeys/remove"
             | "/owner/panic"
             | "/owner/unlock/begin"
             | "/owner/unlock" => Some(Method::POST),
@@ -918,6 +997,8 @@ impl OwnerUi {
             "/owner/grants" => self.grants_list(&req),
             "/owner/grants/revoke" => self.grants_revoke(&req),
             "/owner/audit" => self.audit_tail(&req),
+            "/owner/passkeys" => self.passkeys_list(&req),
+            "/owner/passkeys/remove" => self.passkeys_remove(&req),
             "/owner/panic" => self.panic(&req),
             "/owner/unlock/begin" => self.unlock_begin(&req),
             "/owner/unlock" => self.unlock_finish(&req),
@@ -1346,18 +1427,19 @@ impl OwnerUi {
         if let Some(refused) = self.burn_ceremony(req, &opened) {
             return refused;
         }
-        if self
-            .passkeys
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_sign_count(&cred.id, new_count)
-            .is_err()
-        {
-            self.fail(req, "bad_assertion");
-            return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
-        }
+        // Hold the passkey lock across the session issue so a remove
+        // cannot land between the assertion and the session that
+        // records it (#258).
+        let cookie = {
+            let mut store = self.passkeys.lock().unwrap_or_else(|p| p.into_inner());
+            if store.set_sign_count(&cred.id, new_count).is_err() {
+                drop(store);
+                self.fail(req, "bad_assertion");
+                return respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None);
+            }
+            self.issue_session(&cred.id)
+        };
         self.forgive(req);
-        let cookie = self.issue_session();
         json_body(
             StatusCode::OK,
             json!({"ok": true}).to_string(),
@@ -1542,7 +1624,7 @@ impl OwnerUi {
         }
     }
 
-    fn issue_session(&self) -> String {
+    fn issue_session(&self, credential_id: &[u8]) -> String {
         let raw = random_bytes::<32>();
         let token = b64url_encode(&raw);
         let hash = sha256(token.as_bytes());
@@ -1555,8 +1637,15 @@ impl OwnerUi {
         guard.push(Session {
             hash,
             expires: now + SESSION_TTL,
+            credential_id: credential_id.to_vec(),
         });
         session_cookie(self.cookie_name, &token, self.secure_cookie)
+    }
+
+    /// End every live session opened with this credential (#258).
+    fn end_sessions_for(&self, credential_id: &[u8]) {
+        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|s| !ct_eq(&s.credential_id, credential_id));
     }
 
     fn session_alive(&self, cookie_header: Option<&str>) -> bool {
@@ -1606,9 +1695,137 @@ impl OwnerUi {
                 id: cred.credential_id,
                 public_key: cred.public_key,
                 sign_count: cred.sign_count,
+                enrolled_at: Some(unix_now()),
+                last_used_at: None,
             })
             .map_err(|_| EnrollStore::Store)
     }
+
+    /// List enrolled passkeys after `passkey_listed` is durable (#258).
+    /// The passkey lock is held across the append. The rows carry the
+    /// short id and the two timestamps, never a credential id, a
+    /// fingerprint, or a public key.
+    pub(crate) fn list_passkeys(
+        &self,
+        channel: PasskeyChannel,
+    ) -> Result<Vec<crate::owner::PasskeyRow>, PasskeyOpError> {
+        let guard = self.passkeys.lock().unwrap_or_else(|p| p.into_inner());
+        let fingerprints: Vec<String> = guard
+            .credentials()
+            .iter()
+            .map(|c| store::fingerprint(&c.id))
+            .collect();
+        self.audit
+            .passkey_listed(PasskeyListed {
+                channel: channel.as_str(),
+                credential_fingerprints: fingerprints,
+                passkey_count: guard.credentials().len() as u64,
+            })
+            .map_err(|_| PasskeyOpError::Audit)?;
+        Ok(guard
+            .credentials()
+            .iter()
+            .map(|c| crate::owner::PasskeyRow {
+                id: store::short_id(&c.id),
+                enrolled_at: rfc3339(c.enrolled_at),
+                last_used_at: rfc3339(c.last_used_at),
+            })
+            .collect())
+    }
+
+    /// Remove one passkey after `passkey_removed` is durable, then end
+    /// every session opened with it (#258). The web UI refuses when it
+    /// is the last passkey and writes no entry. A failed append or a
+    /// failed write leaves the passkey and its sessions in place.
+    pub(crate) fn remove_passkey(
+        &self,
+        channel: PasskeyChannel,
+        id: &str,
+    ) -> Result<(), PasskeyOpError> {
+        if !store::valid_short_id(id) {
+            return Err(PasskeyOpError::BadId);
+        }
+        let mut guard = self.passkeys.lock().unwrap_or_else(|p| p.into_inner());
+        let matches: Vec<usize> = guard
+            .credentials()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| store::short_id(&c.id) == id)
+            .map(|(i, _)| i)
+            .collect();
+        let index = match matches.as_slice() {
+            [] => return Err(PasskeyOpError::NotFound),
+            [index] => *index,
+            _ => return Err(PasskeyOpError::Ambiguous),
+        };
+        if channel == PasskeyChannel::WebUi && guard.credentials().len() == 1 {
+            return Err(PasskeyOpError::LastPasskey);
+        }
+        let credential_id = guard.credentials()[index].id.clone();
+        let passkey_count = guard.credentials().len() as u64 - 1;
+        self.audit
+            .passkey_removed(PasskeyRemoved {
+                channel: channel.as_str(),
+                credential_fingerprint: store::fingerprint(&credential_id),
+                passkey_count,
+            })
+            .map_err(|_| PasskeyOpError::Audit)?;
+        guard
+            .remove(&credential_id)
+            .map_err(|_| PasskeyOpError::Store)?;
+        drop(guard);
+        self.end_sessions_for(&credential_id);
+        Ok(())
+    }
+
+    /// The signed-in passkey list (#258). A missing session is the
+    /// same 401 as the grants list, and is not an auth failure.
+    /// Listing writes `passkey_listed` on `web_ui` before the rows
+    /// are returned.
+    fn passkeys_list(&self, req: &Incoming) -> Response {
+        if !self.session_alive(req.cookie.as_deref()) {
+            return respond(StatusCode::UNAUTHORIZED, "unauthenticated", None);
+        }
+        match self.list_passkeys(PasskeyChannel::WebUi) {
+            Ok(rows) => json_body(
+                StatusCode::OK,
+                json!({"ok": true, "passkeys": rows}).to_string(),
+                None,
+            ),
+            Err(PasskeyOpError::Audit) => {
+                respond(StatusCode::INTERNAL_SERVER_ERROR, "audit_failed", None)
+            }
+            Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR, "store_failed", None),
+        }
+    }
+
+    /// Remove one passkey from the signed-in page (#258). The last
+    /// passkey is refused, so the page cannot end the session it is
+    /// using by removing every way back in.
+    fn passkeys_remove(&self, req: &Incoming) -> Response {
+        if let Some(err) = self.gate_owner_post(req) {
+            return err;
+        }
+        let Ok(body) = serde_json::from_slice::<PasskeyRemoveBody>(&req.body) else {
+            return respond(StatusCode::BAD_REQUEST, "bad_request", None);
+        };
+        match self.remove_passkey(PasskeyChannel::WebUi, &body.id) {
+            Ok(()) => json_body(StatusCode::OK, json!({"ok": true}).to_string(), None),
+            Err(e) => passkey_error(e),
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// RFC3339 UTC, or `None` when the store has no timestamp.
+fn rfc3339(secs: Option<i64>) -> Option<String> {
+    let secs = secs?;
+    let dt = time::OffsetDateTime::from_unix_timestamp(secs).ok()?;
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 /// Why a verified registration was not stored.
@@ -1640,6 +1857,38 @@ struct DecideBody {
 #[serde(deny_unknown_fields)]
 struct RevokeBody {
     grant_id: String,
+}
+
+/// Body of `/owner/passkeys/remove`. The id is the short id from the list.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRemoveBody {
+    id: String,
+}
+
+/// A passkey-op refusal as its fixed code and status.
+fn passkey_error(e: PasskeyOpError) -> Response {
+    let (status, code) = match e {
+        PasskeyOpError::BadId => (StatusCode::BAD_REQUEST, "bad_request"),
+        PasskeyOpError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        PasskeyOpError::Ambiguous | PasskeyOpError::LastPasskey => (StatusCode::CONFLICT, e.code()),
+        PasskeyOpError::Audit => (StatusCode::INTERNAL_SERVER_ERROR, "audit_failed"),
+        PasskeyOpError::Store => (StatusCode::INTERNAL_SERVER_ERROR, "store_failed"),
+    };
+    respond(status, code, None)
+}
+
+impl PasskeyOpError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Audit => "audit_failed",
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::LastPasskey => "last_passkey",
+            Self::BadId => "bad_request",
+            Self::Store => "store_failed",
+        }
+    }
 }
 
 /// Body of `/owner/unlock/begin`: an empty JSON object.
@@ -2105,7 +2354,9 @@ fn shell_page(locked: &str, pending: usize) -> String {
 
 /// The signed-in shell: broker state, the approvals queue (#131
 /// slice 1), the live grants (slice 2), the panic button (slice 3,
-/// two clicks: arm, then confirm) and the audit tail (slice 4).
+/// two clicks: arm, then confirm), the audit tail (slice 4) and the
+/// passkey list (#258). The list is fetched once, not on the 5 s
+/// refresh: each fetch writes an audit entry.
 /// Rows are built with `textContent` only: origins come from agents
 /// (the page the tab was on, or the origin a grant was approved for),
 /// so nothing from a row is ever parsed as markup.
@@ -2153,6 +2404,13 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <thead><tr><th>Seq</th><th>Time</th><th>Event</th><th>Agent</th><th>Origin</th><th>Result</th><th>Channel</th></tr></thead>
 <tbody id="audit-rows"></tbody>
 </table>
+<h2>Passkeys</h2>
+<p id="passkeys-empty">No passkeys.</p>
+<table id="passkeys" hidden>
+<thead><tr><th>Id</th><th>Enrolled</th><th>Last used</th><th></th></tr></thead>
+<tbody id="passkey-rows"></tbody>
+</table>
+<p>Removing the last passkey is refused here. Use <code>kharon passkey remove</code> on the box for that.</p>
 <h2>Panic</h2>
 <p>Lock the broker and revoke every grant. Fills stop until the next unlock.</p>
 <button id="panic" type="button">Panic</button>
@@ -2229,6 +2487,50 @@ async function refreshAudit() {
   }
   document.getElementById("audit").hidden = data.entries.length === 0;
   document.getElementById("audit-empty").hidden = data.entries.length !== 0;
+}
+function dash(v) { return v || "\u2014"; }
+async function refreshPasskeys() {
+  const r = await fetch("/owner/passkeys", { credentials: "same-origin" });
+  if (r.status === 401) { location.assign("/"); return; }
+  if (!r.ok) {
+    let code = "error";
+    try { code = (await r.json()).error || code; } catch (e) {}
+    document.getElementById("err").textContent = "Passkeys: " + code;
+    return;
+  }
+  const data = await r.json();
+  const rows = document.getElementById("passkey-rows");
+  rows.replaceChildren();
+  for (const p of data.passkeys) {
+    const tr = document.createElement("tr");
+    tr.dataset.passkeyId = p.id;
+    tr.append(cell(p.id), cell(dash(p.enrolled_at)), cell(dash(p.last_used_at)));
+    const actions = document.createElement("td");
+    actions.append(button("Remove", async () => {
+      const err = document.getElementById("err");
+      err.textContent = "";
+      const resp = await fetch("/owner/passkeys/remove", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: p.id }),
+      });
+      if (resp.status === 401) { location.assign("/"); return; }
+      if (!resp.ok) {
+        let code = "error";
+        try { code = (await resp.json()).error || code; } catch (e) {}
+        err.textContent = code === "last_passkey"
+          ? "Not done: last_passkey: use kharon passkey remove on the box to remove the last passkey"
+          : "Not done: " + code;
+        return;
+      }
+      await refreshPasskeys();
+    }));
+    tr.append(actions);
+    rows.append(tr);
+  }
+  document.getElementById("passkeys").hidden = data.passkeys.length === 0;
+  document.getElementById("passkeys-empty").hidden = data.passkeys.length !== 0;
 }
 window.kharonRefresh = async function () {
   await refreshGrants();
@@ -2357,6 +2659,7 @@ document.getElementById("signout").addEventListener("click", async () => {
   await fetch("/owner/logout", { method: "POST", credentials: "same-origin" });
   location.assign("/");
 });
+refreshPasskeys();
 window.kharonRefresh();
 setInterval(window.kharonRefresh, 5000);
 </script>
@@ -2506,7 +2809,7 @@ mod tests {
             Arc::new(NoApprovals),
         )
         .unwrap();
-        let cookie = ui.issue_session();
+        let cookie = ui.issue_session(&[]);
         let header = cookie.split(';').next().unwrap();
         assert!(ui.session_alive(Some(header)));
         ui.expire_sessions();
@@ -2566,8 +2869,8 @@ mod tests {
             Arc::new(NoApprovals),
         )
         .unwrap();
-        let kept = ui.issue_session();
-        let dropped = ui.issue_session();
+        let kept = ui.issue_session(&[]);
+        let dropped = ui.issue_session(&[]);
         let kept_header = kept.split(';').next().unwrap().to_owned();
         let dropped_header = dropped.split(';').next().unwrap().to_owned();
         let response = ui.dispatch(Incoming {
@@ -2752,6 +3055,14 @@ mod tests {
         fn passkey_enrolled(&self, _enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
             Ok(())
         }
+
+        fn passkey_listed(&self, _listed: PasskeyListed) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
+
+        fn passkey_removed(&self, _removed: PasskeyRemoved) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
     }
 
     const ORIGIN: &str = "http://localhost:9";
@@ -2804,7 +3115,7 @@ mod tests {
                 fake.clone(),
             )
             .unwrap();
-            let cookie = ui.issue_session().split(';').next().unwrap().to_owned();
+            let cookie = ui.issue_session(&[]).split(';').next().unwrap().to_owned();
             Self {
                 origin,
                 client_ip: public.then(|| "198.51.100.9".parse().unwrap()),
@@ -3545,7 +3856,13 @@ mod tests {
         let body = ApprovalsRig::sealed(&id, &key, "right horse");
         // Another live session cannot spend this session's attempt,
         // and trying burns it.
-        let other = rig.ui.issue_session().split(';').next().unwrap().to_owned();
+        let other = rig
+            .ui
+            .issue_session(&[])
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
         let response = rig.ui.dispatch(Incoming {
             method: Method::POST,
             path: "/owner/unlock".into(),
@@ -3905,6 +4222,14 @@ mod tests {
         fn passkey_enrolled(&self, _enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
             Ok(())
         }
+
+        fn passkey_listed(&self, _listed: PasskeyListed) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
+
+        fn passkey_removed(&self, _removed: PasskeyRemoved) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
     }
 
     const PUBLIC: &str = "https://owner.example.com";
@@ -3953,7 +4278,7 @@ mod tests {
             let r = ui.dispatch(post("/owner/login/finish", None, PUBLIC, "{}"));
             assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
         }
-        let cookie = ui.issue_session().split(';').next().unwrap().to_owned();
+        let cookie = ui.issue_session(&[]).split(';').next().unwrap().to_owned();
         let r = ui.dispatch(post(
             "/owner/approvals/approve",
             Some(&cookie),
@@ -3970,7 +4295,7 @@ mod tests {
     fn req_apr_009_wrong_origin_with_a_session_is_still_capped() {
         let rec = Arc::new(Recorder::default());
         let (ui, _dir) = public_ui(rec.clone());
-        let cookie = ui.issue_session().split(';').next().unwrap().to_owned();
+        let cookie = ui.issue_session(&[]).split(';').next().unwrap().to_owned();
         for _ in 0..40 {
             let r = ui.dispatch(post(
                 "/owner/approvals/approve",
@@ -4229,5 +4554,171 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn point() -> [u8; webauthn::P256_POINT_LEN] {
+        let mut pk = [0u8; webauthn::P256_POINT_LEN];
+        pk[0] = 0x04;
+        pk
+    }
+
+    fn enroll(ui: &OwnerUi, id: &[u8]) {
+        ui.store_enrolled(webauthn::RegisteredCredential {
+            credential_id: id.to_vec(),
+            public_key: point(),
+            sign_count: 0,
+        })
+        .unwrap();
+    }
+
+    fn cookie_header(set_cookie: &str) -> String {
+        set_cookie.split(';').next().unwrap().to_owned()
+    }
+
+    /// #258: removing a passkey ends only the sessions it opened.
+    /// The web UI refuses the last one; the CLI does not. A failed
+    /// append removes nothing and leaves the session.
+    #[test]
+    fn passkey_remove_ends_its_sessions_and_the_web_ui_keeps_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = OwnerUi::open(
+            dir.path(),
+            "localhost",
+            ORIGIN,
+            Arc::new(StaticShell(ShellView {
+                locked: true,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        let id_a = vec![0x11u8; 16];
+        let id_b = vec![0x22u8; 16];
+        enroll(&ui, &id_a);
+        enroll(&ui, &id_b);
+        let cookie_a = cookie_header(&ui.issue_session(&id_a));
+        let cookie_b = cookie_header(&ui.issue_session(&id_b));
+        let rows = ui.list_passkeys(PasskeyChannel::Cli).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.enrolled_at.is_some()));
+        assert!(rows.iter().all(|r| r.last_used_at.is_none()));
+        let short_a = store::short_id(&id_a);
+        let short_b = store::short_id(&id_b);
+        assert_ne!(short_a, short_b);
+        assert!(rows.iter().any(|r| r.id == short_a));
+        assert!(rows.iter().any(|r| r.id == short_b));
+        for row in &rows {
+            assert_eq!(row.id.len(), store::PASSKEY_SHORT_ID_LEN);
+        }
+
+        ui.remove_passkey(PasskeyChannel::WebUi, &short_b).unwrap();
+        assert!(!ui.session_alive(Some(&cookie_b)));
+        assert!(ui.session_alive(Some(&cookie_a)));
+        assert_eq!(
+            ui.remove_passkey(PasskeyChannel::WebUi, &short_a),
+            Err(PasskeyOpError::LastPasskey)
+        );
+        assert!(ui.session_alive(Some(&cookie_a)));
+        assert_eq!(ui.list_passkeys(PasskeyChannel::Cli).unwrap().len(), 1);
+
+        ui.remove_passkey(PasskeyChannel::Cli, &short_a).unwrap();
+        assert!(!ui.session_alive(Some(&cookie_a)));
+        assert!(ui.list_passkeys(PasskeyChannel::Cli).unwrap().is_empty());
+        assert_eq!(
+            ui.remove_passkey(PasskeyChannel::Cli, &short_a),
+            Err(PasskeyOpError::NotFound)
+        );
+        assert_eq!(
+            ui.remove_passkey(PasskeyChannel::Cli, "ZZZZZZZZ"),
+            Err(PasskeyOpError::BadId)
+        );
+    }
+
+    /// #258: a failed list or remove append does not disclose the list
+    /// and does not remove the passkey or its session.
+    #[test]
+    fn passkey_list_and_remove_fail_closed_when_the_append_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(ListGate::default());
+        let ui = OwnerUi::open(
+            dir.path(),
+            "localhost",
+            ORIGIN,
+            Arc::new(StaticShell(ShellView {
+                locked: true,
+                pending: 0,
+            })),
+            gate.clone(),
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        let id = vec![0x33u8; 16];
+        enroll(&ui, &id);
+        let cookie = cookie_header(&ui.issue_session(&id));
+        gate.fail_list
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            ui.list_passkeys(PasskeyChannel::WebUi).unwrap_err(),
+            PasskeyOpError::Audit
+        );
+        gate.fail_list
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        gate.fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let short = store::short_id(&id);
+        assert_eq!(
+            ui.remove_passkey(PasskeyChannel::Cli, &short).unwrap_err(),
+            PasskeyOpError::Audit
+        );
+        assert!(ui.session_alive(Some(&cookie)));
+        gate.fail_remove
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let rows = ui.list_passkeys(PasskeyChannel::Cli).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, short);
+    }
+
+    #[derive(Default)]
+    struct ListGate {
+        fail_list: std::sync::atomic::AtomicBool,
+        fail_remove: std::sync::atomic::AtomicBool,
+    }
+
+    impl OwnerAudit for ListGate {
+        fn auth_failed(&self, _failure: AuthFailure) {}
+        fn suppressed_only(&self, _count: u64) {}
+        fn passkey_enroll_code(&self) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
+        fn passkey_enrolled(&self, _enrolled: PasskeyEnrolled) -> Result<(), OwnerAuditError> {
+            Ok(())
+        }
+        fn passkey_listed(&self, _listed: PasskeyListed) -> Result<(), OwnerAuditError> {
+            if self.fail_list.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(OwnerAuditError)
+            } else {
+                Ok(())
+            }
+        }
+        fn passkey_removed(&self, _removed: PasskeyRemoved) -> Result<(), OwnerAuditError> {
+            if self.fail_remove.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(OwnerAuditError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn signed_in_page_lists_passkeys_with_a_remove_button() {
+        let shell = shell_page("unlocked", 0);
+        assert!(shell.contains("<h2>Passkeys</h2>"));
+        assert!(shell.contains("/owner/passkeys/remove"));
+        assert!(shell.contains("\"Remove\""));
+        assert!(shell.contains("kharon passkey remove"));
+        assert!(!LOGIN_PAGE.contains("/owner/passkeys"));
+        assert!(ROUTES.contains(&("GET", "/owner/passkeys")));
+        assert!(ROUTES.contains(&("POST", "/owner/passkeys/remove")));
     }
 }

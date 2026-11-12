@@ -9,7 +9,9 @@
 //! §8): `kharon unlock` / `kharon lock` / `kharon status` talk to
 //! the daemon's unix owner socket. `kharon passkey-enroll` prints a
 //! one-time WebAuthn enrollment code (REQ-APR-005); it is not a
-//! password and does not sign in. The unlock password is read
+//! password and does not sign in. `kharon passkey list` and
+//! `kharon passkey remove <id>` list and remove enrolled passkeys
+//! over the same socket (#258). The unlock password is read
 //! from the terminal with echo disabled — never from argv, env,
 //! or a file (REQ-EXP-003). A non-terminal stdin is refused, not
 //! read (SPEC §8 "CLI (tty, no echo)"): a piped password would sit
@@ -81,6 +83,9 @@ enum Command {
         #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
         socket: PathBuf,
     },
+    /// List enrolled passkeys, or remove one (#258).
+    #[command(subcommand)]
+    Passkey(PasskeyCommand),
     /// List pending grant requests (REQ-APR-006).
     Grants {
         /// The daemon's owner socket.
@@ -146,6 +151,29 @@ enum Command {
     /// the connector must not be given a token that can call `fill`.
     #[command(subcommand)]
     Tunnel(TunnelCommand),
+}
+
+/// `kharon passkey` — list or remove an enrolled owner passkey (#258).
+#[derive(Subcommand)]
+enum PasskeyCommand {
+    /// List passkeys: short id, when it was enrolled, when it was last used.
+    List {
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Remove one passkey by the short id from `passkey list`.
+    ///
+    /// Ends every live owner session opened with that passkey.
+    /// Removing the last passkey is allowed; enroll again afterwards.
+    /// The signed-in owner page refuses that last removal.
+    Remove {
+        /// The 8-character id printed by `passkey list`.
+        id: String,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
 }
 
 /// `kharon token` — out-of-band agent token provisioning (REQ-API-003).
@@ -468,6 +496,68 @@ fn unlock_frame(password: &str) -> Zeroizing<String> {
     frame
 }
 
+/// Print one line per passkey: short id, enrolled-at, last-used-at.
+/// A missing timestamp is `-`. Stdout is the list; stderr is refusals.
+fn passkey_list(socket: &PathBuf) -> ExitCode {
+    let request = Zeroizing::new("{\"op\":\"passkey_list\"}".to_owned());
+    match owner_request(socket, &request) {
+        Ok(reply) if reply.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+            let Some(rows) = reply.get("passkeys").and_then(|v| v.as_array()) else {
+                eprintln!("kharon: daemon reply had no passkey list");
+                return ExitCode::FAILURE;
+            };
+            if rows.is_empty() {
+                println!("no passkeys");
+                return ExitCode::SUCCESS;
+            }
+            for row in rows {
+                let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let enrolled = row
+                    .get("enrolled_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let used = row
+                    .get("last_used_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                println!("{id}\tenrolled={enrolled}\tlast_used={used}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(reply) => {
+            let code = reply["error"].as_str().unwrap_or("unknown");
+            eprintln!("{}", refusal_line(code));
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("kharon: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Remove one passkey. The id is the owner's own short id, echoed
+/// only on success.
+fn passkey_remove(socket: &PathBuf, id: &str) -> ExitCode {
+    let request =
+        Zeroizing::new(serde_json::json!({ "op": "passkey_remove", "id": id }).to_string());
+    match owner_request(socket, &request) {
+        Ok(reply) if reply.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+            println!("removed {id}");
+            ExitCode::SUCCESS
+        }
+        Ok(reply) => {
+            let code = reply["error"].as_str().unwrap_or("unknown");
+            eprintln!("{}", refusal_line(code));
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("kharon: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// Print the enrollment code once, to stdout only. Stderr is for
 /// refusals, which do not include the code.
 fn passkey_enroll(socket: &PathBuf) -> ExitCode {
@@ -571,7 +661,8 @@ fn owner_command(command: &Command) -> ExitCode {
         | Command::Init
         | Command::Token(_)
         | Command::Tunnel(_)
-        | Command::PasskeyEnroll { .. } => {
+        | Command::PasskeyEnroll { .. }
+        | Command::Passkey(_) => {
             unreachable!()
         }
     };
@@ -853,6 +944,8 @@ fn main() -> ExitCode {
             owner_command(&cli.command)
         }
         Command::PasskeyEnroll { socket } => passkey_enroll(&socket),
+        Command::Passkey(PasskeyCommand::List { socket }) => passkey_list(&socket),
+        Command::Passkey(PasskeyCommand::Remove { id, socket }) => passkey_remove(&socket, &id),
         Command::Audit(AuditCommand::Verify { data, checkpoints }) => {
             let key_path = data.join("keys").join("audit_sign.pub");
             let key_bytes = match std::fs::read(&key_path) {

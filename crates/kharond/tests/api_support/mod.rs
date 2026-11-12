@@ -440,7 +440,11 @@ pub async fn raw_request(addr: std::net::SocketAddr, head: &[u8]) -> RawResponse
     s.write_all(head).await.unwrap();
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).await.unwrap();
-    let text = String::from_utf8(buf).unwrap();
+    parse_response(&String::from_utf8(buf).unwrap())
+}
+
+/// Parse a whole `Connection: close` HTTP/1.1 response.
+pub fn parse_response(text: &str) -> RawResponse {
     let (head, body) = text.split_once("\r\n\r\n").unwrap();
     let mut lines = head.split("\r\n");
     let status = lines
@@ -483,7 +487,17 @@ pub async fn post_mcp_raw(
     headers: &[(&str, &str)],
     body: &str,
 ) -> RawResponse {
-    let mut head = String::from("POST /mcp HTTP/1.1\r\nHost: localhost\r\n");
+    raw_request(addr, &post_mcp_raw_bytes("localhost", token, headers, body)).await
+}
+
+/// The bytes [`post_mcp_raw`] sends, with `Host: host`.
+pub fn post_mcp_raw_bytes(
+    host: &str,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Vec<u8> {
+    let mut head = format!("POST /mcp HTTP/1.1\r\nHost: {host}\r\n");
     if let Some(t) = token {
         head.push_str(&format!("Authorization: Bearer {t}\r\n"));
     }
@@ -494,7 +508,7 @@ pub async fn post_mcp_raw(
         "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     ));
-    raw_request(addr, head.as_bytes()).await
+    head.into_bytes()
 }
 
 /// A 2026-07-28 MCP request: JSON-RPC envelope, `_meta` protocol
@@ -507,6 +521,11 @@ pub async fn mcp_request(
     method: &str,
     params: &str,
 ) -> RawResponse {
+    raw_request(addr, &mcp_request_bytes("localhost", token, method, params)).await
+}
+
+/// The bytes [`mcp_request`] sends, with `Host: host`.
+pub fn mcp_request_bytes(host: &str, token: Option<&str>, method: &str, params: &str) -> Vec<u8> {
     let meta = format!(r#""_meta":{{"io.modelcontextprotocol/protocolVersion":"{MCP_VERSION}"}}"#);
     let inner = params
         .trim()
@@ -535,7 +554,7 @@ pub async fn mcp_request(
     if let Some(n) = name.as_deref() {
         headers.push(("Mcp-Name", n));
     }
-    post_mcp_raw(addr, token, &headers, &body).await
+    post_mcp_raw_bytes(host, token, &headers, &body)
 }
 
 /// `tools/call` of `tool` with raw JSON `arguments`.
@@ -545,8 +564,18 @@ pub async fn mcp_call(
     tool: &str,
     arguments: &str,
 ) -> RawResponse {
-    let params = format!(r#"{{"name":"{tool}","arguments":{arguments}}}"#);
-    mcp_request(addr, token, "tools/call", &params).await
+    raw_request(addr, &mcp_call_bytes("localhost", token, tool, arguments)).await
+}
+
+/// The bytes of one `tools/call` POST to `/mcp` with `Host: host`.
+pub fn mcp_call_bytes(
+    host: &str,
+    token: Option<&str>,
+    tool: &str,
+    arguments_json: &str,
+) -> Vec<u8> {
+    let params = format!(r#"{{"name":"{tool}","arguments":{arguments_json}}}"#);
+    mcp_request_bytes(host, token, "tools/call", &params)
 }
 
 /// Raw JSON object text with `pairs` in order (duplicates kept).

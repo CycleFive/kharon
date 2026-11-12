@@ -507,6 +507,63 @@ fn tls_client(ca_pem: &str) -> tokio_rustls::TlsConnector {
     tokio_rustls::TlsConnector::from(Arc::new(cfg))
 }
 
+/// A CA and a server leaf with SANs `hosts` signed by it: (ca pem,
+/// leaf cert pem, leaf key pem).
+pub fn edge_pki(hosts: &[&str]) -> (String, String, String) {
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf =
+        rcgen::CertificateParams::new(hosts.iter().map(|h| (*h).to_owned()).collect::<Vec<_>>())
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+    (ca.pem(), leaf.pem(), leaf_key.serialize_pem())
+}
+
+/// One TLS connection to `addr` (SNI `sni`, trusting only `ca_pem`):
+/// write `request`, read to EOF, parse the response. 30 s overall.
+pub async fn https_raw(
+    addr: std::net::SocketAddr,
+    sni: &str,
+    ca_pem: &str,
+    request: &[u8],
+) -> Result<crate::api_support::RawResponse, String> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tcp = TcpStream::connect(addr)
+            .await
+            .map_err(|e| format!("connect {addr}: {e}"))?;
+        let name = rustls_pki_types::ServerName::try_from(sni.to_owned())
+            .map_err(|e| format!("bad SNI {sni}: {e}"))?;
+        let mut tls = tls_client(ca_pem)
+            .connect(name, tcp)
+            .await
+            .map_err(|e| format!("TLS to {addr} as {sni}: {e}"))?;
+        tls.write_all(request)
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match tls.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(format!("read from {addr}: {e}")),
+            }
+        }
+        let text = String::from_utf8(buf).map_err(|_| "response is not UTF-8".to_owned())?;
+        if !text.contains("\r\n\r\n") {
+            return Err(format!("no HTTP response ({} bytes)", text.len()));
+        }
+        Ok(crate::api_support::parse_response(&text))
+    })
+    .await
+    .map_err(|_| format!("no complete reply from {addr} within 30 s"))?
+}
+
 /// `tools/call` of `tool` through `POST /mcp` over TLS to `addr` (SNI
 /// and `Host` `sni`, trusting `ca_pem`), with the headers and body of
 /// `api_support::mcp_request`. Returns the tool result's text (the

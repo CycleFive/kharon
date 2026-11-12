@@ -8,8 +8,12 @@
 //! Tokens are opaque (`kh_at_<64 hex>`, `kh_rt_<64 hex>`); the file
 //! holds only their SHA-256 hashes, with the identities (D3). Codes
 //! are never written here: they live in the authorize side's memory
-//! (#230), and the redeemed-code set that makes a second redemption
-//! revoke is memory-only too, expiring with the code.
+//! (#230). The redeemed-code set that makes a second redemption
+//! revoke is memory-only too, expiring with the code. A pending
+//! marker is recorded in that set atomically with the code take
+//! ([`OauthStore::begin_redemption`]); [`OauthStore::connect`]
+//! resolves it under the store lock, so a second presentation that
+//! arrives after the take and before the commit is not missed.
 //!
 //! Ordering follows I5 / REQ-AUD-003, and the two directions fail
 //! closed opposite ways, on purpose:
@@ -253,13 +257,36 @@ impl FileState {
     }
 }
 
-/// A code redeemed once, remembered until the code would have
-/// expired: a second presentation in that window revokes what the
-/// first one issued (D4). Memory only, like the codes themselves.
+/// A code taken for redemption, remembered until the code would have
+/// expired. A second presentation in that window revokes what the
+/// first one issued (D4, RFC 6749 §4.1.2). Memory only, like the
+/// codes themselves.
+///
+/// The marker is recorded when the code is taken, before the Connect
+/// commits. `identity_id` stays `None` until that commit, and `reused`
+/// is set by a second presentation whenever it arrives — including
+/// while the first is still between the take and the commit.
 struct RedeemedUse {
     code_hash: [u8; 32],
-    identity_id: String,
+    /// `None` until [`OauthStore::connect`] commits the identity.
+    identity_id: Option<String>,
+    /// A second presentation has been seen. Monotonic.
+    reused: bool,
     expires_at: u64,
+}
+
+/// What [`OauthStore::begin_redemption`] decided about a presented code.
+#[derive(Debug)]
+pub enum CodeClaim<T> {
+    /// This caller took the code. A pending marker is recorded;
+    /// [`OauthStore::connect`] resolves it.
+    Taken(T),
+    /// The code was already taken. `identity_id` is `Some` once that
+    /// redemption has committed a Connect, and `None` while it is
+    /// still in flight or it failed without committing.
+    Reuse { identity_id: Option<String> },
+    /// Unknown or expired, and no redemption is on record.
+    Unknown,
 }
 
 struct Inner {
@@ -347,9 +374,11 @@ impl OauthStore {
         write_private(&self.path, text.as_bytes())
     }
 
-    /// The identity a code's first redemption created, while the
-    /// code would still be live. The token endpoint checks this
-    /// before redeeming: a hit is a second redemption.
+    /// The identity a code's first redemption committed, while the
+    /// code would still be live. Pending markers (taken, not yet
+    /// committed) are not visible here. The token endpoint does not
+    /// use this to detect a second redemption: that goes through
+    /// [`Self::begin_redemption`], which also sees an in-flight take.
     pub fn redeemed_identity(&self, code_hash: &[u8; 32], now: u64) -> Option<String> {
         let mut inner = self.lock();
         inner.redeemed.retain(|r| r.expires_at > now);
@@ -357,15 +386,72 @@ impl OauthStore {
             .redeemed
             .iter()
             .find(|r| ct_eq(&r.code_hash, code_hash))
-            .map(|r| r.identity_id.clone())
+            .and_then(|r| r.identity_id.clone())
+    }
+
+    /// Take `code_hash` for redemption, atomically with the pending
+    /// marker that makes a second presentation detectable.
+    ///
+    /// `redeem` runs while the store lock is held, so it must not
+    /// call back into the store (this mutex is not re-entrant). The
+    /// lock order is store, then whatever `redeem` locks (the
+    /// authorize side's code store). It returns the taken value and
+    /// the consent time the code's TTL is counted from, or `None`
+    /// when the code is unknown or expired.
+    ///
+    /// A second call for the same hash, at any point after the first
+    /// returned [`CodeClaim::Taken`], returns [`CodeClaim::Reuse`]
+    /// and sets the marker's `reused` flag. It does not call `redeem`.
+    /// The in-flight [`Self::connect`] observes that flag under the
+    /// store lock and does not leave a live Connect.
+    pub fn begin_redemption<T>(
+        &self,
+        code_hash: [u8; 32],
+        now: u64,
+        redeem: impl FnOnce() -> Option<(T, u64)>,
+    ) -> CodeClaim<T> {
+        let mut inner = self.lock();
+        inner.redeemed.retain(|r| r.expires_at > now);
+        if let Some(existing) = inner
+            .redeemed
+            .iter_mut()
+            .find(|r| ct_eq(&r.code_hash, &code_hash))
+        {
+            existing.reused = true;
+            return CodeClaim::Reuse {
+                identity_id: existing.identity_id.clone(),
+            };
+        }
+        let Some((body, consented_at)) = redeem() else {
+            return CodeClaim::Unknown;
+        };
+        inner.redeemed.push(RedeemedUse {
+            code_hash,
+            identity_id: None,
+            reused: false,
+            expires_at: consented_at.saturating_add(CODE_TTL_SECS),
+        });
+        CodeClaim::Taken(body)
     }
 
     /// Create a Connect identity from a redeemed code and issue its
     /// first token pair (I5 ordering: append `oauth_connect`, then
     /// persist, then answer; a failed persist writes a compensating
     /// `oauth_disconnect`/`persist_failed` and creates nothing).
-    /// The caller has already taken the code from the authorize
-    /// side's store: the code is spent whatever happens here.
+    ///
+    /// The caller has already taken the code. When it did so through
+    /// [`Self::begin_redemption`], a pending marker is already
+    /// recorded; this resolves it. A direct caller (no marker yet)
+    /// gets one recorded on a successful commit. Either way the code
+    /// is spent: a failure here leaves no live Connect, and a marker
+    /// from `begin_redemption` stays so a later presentation is still
+    /// refused.
+    ///
+    /// A marker already flagged `reused` — a second presentation
+    /// arrived after the take and before this commit — is refused
+    /// under the store lock. The `oauth_connect` append has already
+    /// happened (I5), so the refusal writes the compensating
+    /// `oauth_disconnect` with `code_reuse` and persists nothing.
     pub fn connect(
         &self,
         grant: &CodeGrant,
@@ -401,7 +487,9 @@ impl OauthStore {
         // concurrent writer (another connect, a refresh, an ending
         // path) cannot be overwritten by a stale swap; on failure
         // roll back what was pushed, so the running state is
-        // untouched.
+        // untouched. The reuse check is in that same critical
+        // section: a second presentation that set the flag after the
+        // take cannot be committed over.
         let identity = Identity {
             id: id.clone(),
             client_id: grant.client_id.clone(),
@@ -413,46 +501,97 @@ impl OauthStore {
             revoked: false,
         };
         let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now);
-        let persisted = {
+        enum Commit {
+            Issued(IssuedPair),
+            /// A second presentation landed before this commit.
+            Reused,
+            PersistFailed,
+        }
+        let outcome = {
             let mut inner = self.lock();
-            let identities_len = inner.file.identities.len();
-            let tokens_len = inner.file.tokens.len();
-            inner.file.identities.push(identity);
-            inner.file.tokens.push(access_rec);
-            inner.file.tokens.push(refresh_rec);
-            inner.redeemed.retain(|r| r.expires_at > now);
-            inner.redeemed.push(RedeemedUse {
-                code_hash,
-                identity_id: id.clone(),
-                expires_at: grant.consented_at.saturating_add(CODE_TTL_SECS),
-            });
-            match self.persist(&inner.file) {
-                Ok(()) => true,
-                Err(_) => {
-                    inner.file.identities.truncate(identities_len);
-                    inner.file.tokens.truncate(tokens_len);
-                    inner.redeemed.retain(|r| r.identity_id != id);
-                    false
+            // Keep this code's own marker even if its TTL elapsed
+            // while the redemption was in flight: its `reused` flag
+            // is the signal a second presentation already landed.
+            inner
+                .redeemed
+                .retain(|r| r.expires_at > now || ct_eq(&r.code_hash, &code_hash));
+            let reused = inner
+                .redeemed
+                .iter()
+                .find(|r| ct_eq(&r.code_hash, &code_hash))
+                .is_some_and(|r| r.reused);
+            if reused {
+                Commit::Reused
+            } else {
+                let identities_len = inner.file.identities.len();
+                let tokens_len = inner.file.tokens.len();
+                let had_marker = inner
+                    .redeemed
+                    .iter()
+                    .any(|r| ct_eq(&r.code_hash, &code_hash));
+                inner.file.identities.push(identity);
+                inner.file.tokens.push(access_rec);
+                inner.file.tokens.push(refresh_rec);
+                if let Some(marker) = inner
+                    .redeemed
+                    .iter_mut()
+                    .find(|r| ct_eq(&r.code_hash, &code_hash))
+                {
+                    marker.identity_id = Some(id.clone());
+                } else {
+                    inner.redeemed.push(RedeemedUse {
+                        code_hash,
+                        identity_id: Some(id.clone()),
+                        reused: false,
+                        expires_at: grant.consented_at.saturating_add(CODE_TTL_SECS),
+                    });
+                }
+                match self.persist(&inner.file) {
+                    Ok(()) => Commit::Issued(pair),
+                    Err(_) => {
+                        inner.file.identities.truncate(identities_len);
+                        inner.file.tokens.truncate(tokens_len);
+                        if had_marker {
+                            // The take already spent the code. Drop
+                            // the identity binding and keep the marker,
+                            // so a later presentation is still refused
+                            // and there is no live Connect to end.
+                            if let Some(marker) = inner
+                                .redeemed
+                                .iter_mut()
+                                .find(|r| ct_eq(&r.code_hash, &code_hash))
+                            {
+                                marker.identity_id = None;
+                            }
+                        } else {
+                            inner.redeemed.retain(|r| !ct_eq(&r.code_hash, &code_hash));
+                        }
+                        Commit::PersistFailed
+                    }
                 }
             }
         };
-        if !persisted {
-            // Best-effort compensation (I5): the chain reads connect,
-            // then disconnect, for an identity that never served.
-            let entry = Entry::new(Event::OauthDisconnect)
-                .agent_id(id)
-                .channel("web_ui")
-                .result("revoked")
-                .detail_code("persist_failed");
-            let entry = match &origin {
-                Some(host) => entry.origin(host.clone()),
-                None => entry,
-            };
-            self.append(entry);
-            return Err(TokenError::PersistFailed);
+        match outcome {
+            Commit::Issued(pair) => Ok(pair),
+            Commit::PersistFailed => {
+                // Best-effort compensation (I5): the chain reads connect,
+                // then disconnect, for an identity that never served.
+                self.append(disconnect_entry(&id, &origin, "persist_failed"));
+                Err(TokenError::PersistFailed)
+            }
+            Commit::Reused => {
+                // Same shape as a failed persist (I5: the append
+                // already happened), with the reuse detail. Nothing
+                // was persisted, so there is no Connect to revoke
+                // first; the refusal is the ending.
+                self.append(disconnect_entry(
+                    &id,
+                    &origin,
+                    DisconnectDetail::CodeReuse.detail_code(),
+                ));
+                Err(TokenError::InvalidGrant)
+            }
         }
-        // 3. Answer.
-        Ok(pair)
     }
 
     /// `grant_type=refresh_token`: rotate, applying the idle and
@@ -737,6 +876,20 @@ impl OauthStore {
         };
         self.connect_ended(identity_id);
         Some(identity)
+    }
+}
+
+/// An `oauth_disconnect` for a Connect that was audited and then not
+/// left live (persist failure, or a reuse caught before commit).
+fn disconnect_entry(agent_id: &str, origin: &Option<String>, detail: &str) -> Entry {
+    let entry = Entry::new(Event::OauthDisconnect)
+        .agent_id(agent_id)
+        .channel("web_ui")
+        .result("revoked")
+        .detail_code(detail);
+    match origin {
+        Some(host) => entry.origin(host.clone()),
+        None => entry,
     }
 }
 
@@ -1382,5 +1535,145 @@ mod tests {
                 .is_none()
         );
         assert_ne!(id, id2);
+    }
+
+    #[test]
+    fn unknown_code_records_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let claim = store.begin_redemption(sha256(b"missing"), NOW, || None::<((), u64)>);
+        assert!(matches!(claim, CodeClaim::Unknown));
+        // A code that does exist afterwards is a first redemption.
+        let claim = store.begin_redemption(sha256(b"real"), NOW, || Some(((), NOW)));
+        assert!(matches!(claim, CodeClaim::Taken(())));
+    }
+
+    #[test]
+    fn second_claim_before_commit_leaves_no_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        let (g, verifier) = grant("correct-verifier");
+        let code_hash = sha256(b"the-code");
+        let taken = store.begin_redemption(code_hash, NOW, || Some(((), g.consented_at)));
+        assert!(matches!(taken, CodeClaim::Taken(())));
+        // The racer, after the take and before the commit. The code
+        // store must not be consulted: the marker is the record.
+        let second = store.begin_redemption(code_hash, NOW, || -> Option<((), u64)> {
+            unreachable!("a pending marker must not consult the code store");
+        });
+        assert!(matches!(second, CodeClaim::Reuse { identity_id: None }));
+        let err = store.connect(&g, &verifier, code_hash, NOW).err().unwrap();
+        assert_eq!(err, TokenError::InvalidGrant);
+        assert!(!std::fs::exists(dir.path().join("oauth/state.json")).unwrap());
+        assert_eq!(
+            recording.events(),
+            [
+                ("oauth_connect".to_owned(), None),
+                ("oauth_disconnect".to_owned(), Some("code_reuse".to_owned())),
+            ]
+        );
+        // The code stays spent: a later presentation is still refused,
+        // and there is still no Connect to end.
+        let third = store.begin_redemption(code_hash, NOW, || -> Option<((), u64)> {
+            unreachable!("the marker outlives the failed commit");
+        });
+        assert!(matches!(third, CodeClaim::Reuse { identity_id: None }));
+        assert!(recording.ended.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn claim_then_commit_names_the_identity_for_a_later_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (g, verifier) = grant("correct-verifier");
+        let code_hash = sha256(b"the-code");
+        assert!(matches!(
+            store.begin_redemption(code_hash, NOW, || Some(((), g.consented_at))),
+            CodeClaim::Taken(())
+        ));
+        let pair = store.connect(&g, &verifier, code_hash, NOW).unwrap();
+        let id = store
+            .authenticate_access(&pair.access_token, NOW)
+            .unwrap()
+            .agent_id;
+        assert_eq!(store.redeemed_identity(&code_hash, NOW), Some(id.clone()));
+        let second = store.begin_redemption(code_hash, NOW, || -> Option<((), u64)> {
+            unreachable!("a committed marker must not consult the code store");
+        });
+        match second {
+            CodeClaim::Reuse {
+                identity_id: Some(got),
+            } => assert_eq!(got, id),
+            other => panic!("expected the committed identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_claim_redemption_leaves_no_connect_and_stays_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = store(dir.path());
+        let (g, verifier) = grant("correct-verifier");
+        let code_hash = sha256(b"the-code");
+        assert!(matches!(
+            store.begin_redemption(code_hash, NOW, || Some(((), g.consented_at))),
+            CodeClaim::Taken(())
+        ));
+        // Bad PKCE: nothing is audited, nothing is persisted.
+        assert_eq!(
+            store.connect(&g, "wrong", code_hash, NOW),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(recording.events().is_empty());
+        assert!(!std::fs::exists(dir.path().join("oauth/state.json")).unwrap());
+        let again = store.begin_redemption(code_hash, NOW, || -> Option<((), u64)> {
+            unreachable!("a failed redemption stays spent");
+        });
+        assert!(matches!(again, CodeClaim::Reuse { identity_id: None }));
+
+        // Audit failure, same shape.
+        let code_hash = sha256(b"other");
+        assert!(matches!(
+            store.begin_redemption(code_hash, NOW, || Some(((), g.consented_at))),
+            CodeClaim::Taken(())
+        ));
+        *recording.fail_append.lock().unwrap() = true;
+        assert_eq!(
+            store.connect(&g, &verifier, code_hash, NOW),
+            Err(TokenError::AuditFailed)
+        );
+        *recording.fail_append.lock().unwrap() = false;
+        assert!(recording.events().is_empty());
+        let again = store.begin_redemption(code_hash, NOW, || -> Option<((), u64)> {
+            unreachable!("an audit failure stays spent");
+        });
+        assert!(matches!(again, CodeClaim::Reuse { identity_id: None }));
+
+        // Persist failure: the chain reads connect then disconnect,
+        // and the marker stays with no identity.
+        let code_hash = sha256(b"third");
+        assert!(matches!(
+            store.begin_redemption(code_hash, NOW, || Some(((), g.consented_at))),
+            CodeClaim::Taken(())
+        ));
+        std::fs::write(dir.path().join("oauth"), b"not a directory").unwrap();
+        assert_eq!(
+            store.connect(&g, &verifier, code_hash, NOW),
+            Err(TokenError::PersistFailed)
+        );
+        assert_eq!(
+            recording.events(),
+            [
+                ("oauth_connect".to_owned(), None),
+                (
+                    "oauth_disconnect".to_owned(),
+                    Some("persist_failed".to_owned())
+                ),
+            ]
+        );
+        let again = store.begin_redemption(code_hash, NOW, || -> Option<((), u64)> {
+            unreachable!("a persist failure stays spent");
+        });
+        assert!(matches!(again, CodeClaim::Reuse { identity_id: None }));
+        assert!(recording.ended.lock().unwrap().is_empty());
     }
 }

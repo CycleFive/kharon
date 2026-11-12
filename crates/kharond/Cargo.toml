@@ -46,6 +46,9 @@ futures-util = { version = "0.3", features = ["sink"] }
 # the upgraded socket, hyper-util adapts it to tokio's I/O traits.
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
+# `tower_service::Service`: the owner-UI shutdown server drives the axum
+# router on a hyper connection it owns, so the task can be dropped (#255).
+tower-service = "0.3"
 
 zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
 

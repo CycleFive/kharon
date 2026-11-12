@@ -1636,11 +1636,25 @@ impl Daemon {
             .as_ref()
             .map(|(_, ui)| Arc::clone(ui))
             .filter(|ui| ui.is_public());
+        // #255: graceful shutdown, same shape as the public ingress.
+        // The serve future itself applies OWNER_UI_DRAIN and drops
+        // whatever is still open, so awaiting it finishes before the
+        // audit drain below.
+        let (owner_ui_stop, owner_ui_stopped) = tokio::sync::oneshot::channel::<()>();
         let owner_ui = self.owner_ui.map(|(listener, ui)| {
             let broker = Arc::clone(&self.broker);
             let redeem: Arc<dyn crate::api::http::ApprovalRedeemer> = broker;
             tokio::spawn(async move {
-                let _ = crate::owner_ui::serve(listener, ui, redeem).await;
+                let _ = crate::owner_ui::serve_with_shutdown(
+                    listener,
+                    ui,
+                    redeem,
+                    async move {
+                        let _ = owner_ui_stopped.await;
+                    },
+                    OWNER_UI_DRAIN,
+                )
+                .await;
             })
         });
         // #198: the public-ingress listener stops with the agent API,
@@ -1757,12 +1771,20 @@ impl Daemon {
         checkpoint_timer.abort();
         request_expiry.abort();
         owner.abort();
-        if let Some(task) = owner_ui {
-            task.abort();
-        }
         owner_ops.stop_live_sync();
         if let Some(p) = probe {
             p.abort();
+        }
+        // Owner UI connections that were already accepted: finish the
+        // request they are serving, or drop them at OWNER_UI_DRAIN.
+        // Aborting the serve task would only stop the accept loop, and
+        // a failure on a connection cloudflared kept open could then
+        // be dispatched after the drain (#255). Housekeeping has
+        // already stopped, so this is the last owner-UI audit write
+        // before `drain_audit`.
+        let _ = owner_ui_stop.send(());
+        if let Some(task) = owner_ui {
+            let _ = task.await;
         }
         // Anchor the tail before exiting (#127): whatever was appended
         // since the last checkpoint (the final lock, say) leaves the
@@ -1770,8 +1792,9 @@ impl Daemon {
         // a dead sink must not hang or fail the shutdown; the cadence
         // counters were not reset, so the next run retries.
         // The audit counts the rate limiter swallowed go first (#219), in
-        // the same blocking task, so the checkpoint covers them. A failing
-        // sink only prints a line; it cannot hang this.
+        // the same blocking task, so the checkpoint covers them. The
+        // owner UI's pending suppressed count is in that same task
+        // (#255). A failing sink only prints a line; it cannot hang this.
         let _ = tokio::task::spawn_blocking(move || {
             if let Some(ui) = public_ui {
                 ui.drain_audit();
@@ -1873,6 +1896,13 @@ pub const CONNECTOR_AUDIT_FLUSH_PERIOD: std::time::Duration = std::time::Duratio
 /// never finishes a request, or a WebSocket on `/connector` (#199) that
 /// never closes, cannot hold daemon shutdown open past this.
 pub const PUBLIC_INGRESS_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the owner UI (#255) may finish requests already accepted
+/// when shutdown is signaled. An idle keep-alive closes without
+/// consuming this. A connection still open when it elapses is dropped,
+/// and the final `drain_audit` runs only after that, so a suppressed
+/// failure cannot be counted past the exit checkpoint.
+pub const OWNER_UI_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the daemon's checkpoint timer wakes to ask the audit log
 /// whether its 10-minute checkpoint is due (REQ-AUD-002, #127). The

@@ -95,9 +95,12 @@ pub use self::approvals::{
 pub use self::oauth::OauthAs;
 pub use self::unlock::OwnerUnlock;
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -106,11 +109,14 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
+use hyper_util::rt::TokioIo;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tower_service::Service as TowerService;
 use zeroize::Zeroizing;
 
 use self::sealed::{Burn, Sealed};
@@ -684,6 +690,81 @@ impl OwnerUi {
 struct OwnerServer {
     ui: Arc<OwnerUi>,
     redeem: Arc<dyn ApprovalRedeemer>,
+    /// Handlers on the blocking pool. Shutdown waits for these after
+    /// dropping sockets, so a failure already being recorded is in the
+    /// budget before [`OwnerUi::drain_audit`] (#255).
+    in_flight: Arc<InFlight>,
+}
+
+/// How many owner-UI handlers are on the blocking pool.
+///
+/// The count is taken before `spawn_blocking` and released when that
+/// closure finishes, including when the connection task has already
+/// been dropped. [`InFlight::drained`] waits until it is zero.
+struct InFlight {
+    n: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl InFlight {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            n: AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.n.fetch_add(1, Ordering::AcqRel);
+        InFlightGuard(Arc::clone(self))
+    }
+
+    /// Resolves once every [`Self::enter`] guard has dropped.
+    async fn drained(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // Subscribe before the load, or a drop that lands in
+            // between stores a permit `enable` consumes.
+            let ready = notified.as_mut().enable();
+            if self.n.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            if ready {
+                continue;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct InFlightGuard(Arc<InFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.0.n.fetch_sub(1, Ordering::Release) == 1 {
+            self.0.idle.notify_one();
+        }
+    }
+}
+
+/// Run `work` on the blocking pool and keep it visible to
+/// [`InFlight::drained`] until it returns. Dropping the returned
+/// future does not cancel `work`.
+async fn on_blocking_pool<T, F>(
+    in_flight: &Arc<InFlight>,
+    work: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let guard = in_flight.enter();
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        work()
+    })
+    .await
 }
 
 /// Serve until the future is dropped.
@@ -696,34 +777,162 @@ pub async fn serve(
     ui: Arc<OwnerUi>,
     redeem: Arc<dyn ApprovalRedeemer>,
 ) -> std::io::Result<()> {
+    let (app, _) = router(ui, redeem);
     axum::serve(
         listener,
-        router(ui, redeem).into_make_service_with_connect_info::<SocketAddr>(),
+        app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
 }
 
-/// [`serve`], returning once `shutdown` resolves.
+/// [`serve`], but stop accepting when `shutdown` resolves, then wait at
+/// most `drain_for` for connections already accepted.
+///
+/// Idle keep-alives close with hyper's graceful shutdown and do not
+/// consume the bound. A connection still open when the bound elapses is
+/// dropped: its task goes with this future's [`JoinSet`], so it cannot
+/// be dispatched afterwards. A handler already on the blocking pool is
+/// allowed to finish first, which is what puts its failure in the audit
+/// budget before the daemon's `drain_audit` (#255).
 pub async fn serve_with_shutdown<F>(
     listener: TcpListener,
     ui: Arc<OwnerUi>,
     redeem: Arc<dyn ApprovalRedeemer>,
     shutdown: F,
+    drain_for: Duration,
 ) -> std::io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(
-        listener,
-        router(ui, redeem).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    let (app, in_flight) = router(ui, redeem);
+    let mut shutdown = std::pin::pin!(shutdown);
+    let mut tasks = JoinSet::new();
+    // `true` tells each connection to finish the request it is serving
+    // and close. An idle keep-alive is not serving one, so hyper closes
+    // it on the next poll.
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((tcp, peer)) => {
+                        tasks.spawn(serve_owner_conn(
+                            tcp,
+                            peer,
+                            app.clone(),
+                            shutdown_tx.subscribe(),
+                        ));
+                    }
+                    Err(_) => {
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(listener);
+    let _ = shutdown_tx.send(true);
+
+    let deadline = tokio::time::sleep(drain_for);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            joined = tasks.join_next() => {
+                if joined.is_none() {
+                    in_flight.drained().await;
+                    return Ok(());
+                }
+            }
+            _ = &mut deadline => break,
+        }
+    }
+    // Still open at the bound. Abort drops each connection future, and
+    // with it the socket, before this function returns.
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    in_flight.drained().await;
+    Ok(())
 }
 
-fn router(ui: Arc<OwnerUi>, redeem: Arc<dyn ApprovalRedeemer>) -> Router {
-    let state = Arc::new(OwnerServer { ui, redeem });
-    Router::new().fallback(handle).with_state(state)
+fn router(ui: Arc<OwnerUi>, redeem: Arc<dyn ApprovalRedeemer>) -> (Router, Arc<InFlight>) {
+    let in_flight = InFlight::new();
+    let state = Arc::new(OwnerServer {
+        ui,
+        redeem,
+        in_flight: Arc::clone(&in_flight),
+    });
+    (Router::new().fallback(handle).with_state(state), in_flight)
+}
+
+/// One accepted owner-UI connection. `shutdown` becoming `true` is
+/// hyper's graceful shutdown: finish the current request, close an
+/// idle keep-alive immediately.
+async fn serve_owner_conn(
+    tcp: tokio::net::TcpStream,
+    peer: SocketAddr,
+    app: Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let io = TokioIo::new(tcp);
+    let service = HyperOwner { app, peer };
+    let mut conn =
+        std::pin::pin!(hyper::server::conn::http1::Builder::new().serve_connection(io, service));
+    let mut closing = *shutdown.borrow();
+    if closing {
+        conn.as_mut().graceful_shutdown();
+    }
+    loop {
+        tokio::select! {
+            result = conn.as_mut() => {
+                // A client that went away, or a socket dropped at the
+                // shutdown bound. Not a daemon failure.
+                let _ = result;
+                break;
+            }
+            changed = shutdown.changed(), if !closing => {
+                if changed.is_err() || *shutdown.borrow() {
+                    closing = true;
+                    conn.as_mut().graceful_shutdown();
+                }
+            }
+        }
+    }
+}
+
+/// Axum router as a hyper service, with the TCP peer in extensions so
+/// [`ConnectInfo`] still resolves. The ordinary [`serve`] path gets the
+/// peer from axum; this shutdown path owns the connection itself.
+struct HyperOwner {
+    app: Router,
+    peer: SocketAddr,
+}
+
+impl hyper::service::Service<axum::http::Request<hyper::body::Incoming>> for HyperOwner {
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
+
+    fn call(&self, req: axum::http::Request<hyper::body::Incoming>) -> Self::Future {
+        let mut app = self.app.clone();
+        let peer = self.peer;
+        Box::pin(async move {
+            let mut req: axum::http::Request<Body> = req.map(Body::new);
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let Ok(()) = std::future::poll_fn(|cx| {
+                TowerService::<axum::http::Request<Body>>::poll_ready(&mut app, cx)
+            })
+            .await;
+            TowerService::call(&mut app, req).await
+        })
+    }
 }
 
 async fn handle(
@@ -782,7 +991,9 @@ async fn handle(
         let audit_ui = Arc::clone(&ui);
         // Never counted by the throttle: not a sign-in attempt. Audited
         // within the ceiling, on the blocking pool like every append.
-        let _ = tokio::task::spawn_blocking(move || {
+        // The guard outlives this task so shutdown can wait for the
+        // append before `drain_audit` (#255).
+        let _ = on_blocking_pool(&state.in_flight, move || {
             audit_ui.record_failure(
                 Instant::now(),
                 FailureCtx {
@@ -821,7 +1032,9 @@ async fn handle(
     if path == "/oauth/authorize" {
         return ui.authorize_response(&incoming).await;
     }
-    let joined = tokio::task::spawn_blocking(move || ui.dispatch(incoming)).await;
+    // Same guard as the Access refusal above: a dispatch already on
+    // the pool finishes, and is counted, before shutdown drains.
+    let joined = on_blocking_pool(&state.in_flight, move || ui.dispatch(incoming)).await;
     match joined {
         Ok(response) => response,
         Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR, "error", None),
@@ -5262,6 +5475,7 @@ mod tests {
         let state = Arc::new(OwnerServer {
             ui,
             redeem: Arc::new(NoRedeem),
+            in_flight: InFlight::new(),
         });
         let req = Request::builder()
             .uri("/owner/session")
@@ -5312,6 +5526,7 @@ mod tests {
                 Arc::new(OwnerServer {
                     ui,
                     redeem: Arc::new(NoRedeem),
+                    in_flight: InFlight::new(),
                 }),
                 dir,
             )

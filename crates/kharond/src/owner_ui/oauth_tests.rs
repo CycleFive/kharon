@@ -419,6 +419,7 @@ async fn the_http_handler_audits_one_refusal() {
     let state = Arc::new(super::super::OwnerServer {
         ui,
         redeem: Arc::new(NoRedeem),
+        in_flight: super::super::InFlight::new(),
     });
     let req = axum::http::Request::builder()
         .uri("/oauth/authorize?client_id=https%3A%2F%2Fevil.example%2Fcimd.json")

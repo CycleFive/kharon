@@ -288,13 +288,18 @@ mod tests {
         let handle = webauthn::b64url_encode(&[0x22; 32]);
         let path = dir.path().join("owner");
         std::fs::create_dir_all(&path).unwrap();
+        let file = path.join("passkeys.json");
         std::fs::write(
-            path.join("passkeys.json"),
+            &file,
             format!(
                 r#"{{"user_handle":"{handle}","credentials":[{{"id":"{id}","public_key":"{pk}","sign_count":0}}]}}"#
             ),
         )
         .unwrap();
+        // `write` follows the umask. A 0660 file (umask 007) is refused
+        // as group-writable, so pin the mode the store requires.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut store = PasskeyStore::load(dir.path()).unwrap();
         assert_eq!(store.credentials().len(), 1);
         assert!(store.credentials()[0].enrolled_at.is_none());

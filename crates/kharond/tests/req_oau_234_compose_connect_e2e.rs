@@ -568,7 +568,7 @@ async fn discover(ca: &str) -> Result<Discovered, String> {
 // ------------------------------------------------------------ the scenario
 
 /// The token endpoint's success answer.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct TokenAnswer {
     access_token: String,
     token_type: String,
@@ -718,7 +718,7 @@ struct AuditLine {
 }
 
 /// What one Connect (authorize, consent, redemption) recorded.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Connect {
     client_name: String,
     client_host: String,
@@ -739,14 +739,12 @@ struct Connect {
 }
 
 /// Step 4.
-#[derive(Debug)]
 struct Rotation {
     pair: TokenAnswer,
     status_with_new_access: ToolOutcome,
 }
 
 /// Step 5.
-#[derive(Debug)]
 struct Retry {
     pair: TokenAnswer,
     old_access_status: u16,
@@ -842,6 +840,22 @@ fn expect_scrubbed(
     };
     expect(step, shown, want, secrets)?;
     r
+}
+
+/// A 429 is the per-source throttle answering: a bug in the test, so it
+/// fails the run naming the source.
+fn throttled(
+    step: &str,
+    path: &str,
+    r: Result<RawResponse, String>,
+) -> Result<RawResponse, String> {
+    match r {
+        Ok(x) if x.status == 429 => Err(format!(
+            "{step}: 429 from {DASHBOARD_SRC_IP} on {path}: this source is throttled \
+             (10 failures in 600 s); a bug in the test, not a product failure"
+        )),
+        other => other,
+    }
 }
 
 /// `bytes` (an HTTP request) with the header `line` added.
@@ -998,7 +1012,7 @@ impl Driver<'_> {
     /// `POST` to the token endpoint as the dashboard's backend: no
     /// cookie, no `Origin`, no `Authorization` (a public client sends
     /// none; kharond refuses one there).
-    async fn token_post(&self, pairs: &[(&str, &str)]) -> Result<RawResponse, String> {
+    async fn token_post(&self, step: &str, pairs: &[(&str, &str)]) -> Result<RawResponse, String> {
         let body = form(pairs);
         let path = path_of(&self.discovery.token_endpoint)?;
         let req = Http::post(&path, Some("application/x-www-form-urlencoded"), &body)
@@ -1006,13 +1020,18 @@ impl Driver<'_> {
             .without_origin()
             .header("CF-Connecting-IP", DASHBOARD_SRC_IP);
         let bytes = request_bytes(OWNER_ORIGIN, &req);
-        https_raw(socket(OWNER_EDGE_ADDR), OWNER_HOST, self.ca, &bytes).await
+        let r = https_raw(socket(OWNER_EDGE_ADDR), OWNER_HOST, self.ca, &bytes).await;
+        throttled(step, "/oauth/token", r)
     }
 
     /// The token answer in `r`, its tokens added to the secrets.
     fn take_tokens(&mut self, step: &str, r: &RawResponse) -> Result<TokenAnswer, String> {
-        let t: TokenAnswer = serde_json::from_str(&r.body)
-            .map_err(|e| format!("{step}: token answer is not the expected JSON ({e})"))?;
+        let t: TokenAnswer = serde_json::from_str(&r.body).map_err(|e| {
+            format!(
+                "{step}: token answer is not the expected JSON ({})",
+                scrub_tokens(&redact(&e.to_string(), &self.sec()))
+            )
+        })?;
         self.secrets.push(t.access_token.clone());
         self.secrets.push(t.refresh_token.clone());
         Ok(t)
@@ -1021,11 +1040,14 @@ impl Driver<'_> {
     /// A refresh that must succeed.
     async fn refresh_ok(&mut self, step: &str, refresh_token: &str) -> Result<TokenAnswer, String> {
         let r = self
-            .token_post(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", self.client_id),
-            ])
+            .token_post(
+                step,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token),
+                    ("client_id", self.client_id),
+                ],
+            )
             .await;
         let r = expect_scrubbed(step, r, 200, &self.sec())?;
         self.take_tokens(step, &r)
@@ -1035,11 +1057,14 @@ impl Driver<'_> {
     /// three intended 4xx answers.
     async fn refresh_refused(&mut self, step: &str, refresh_token: &str) -> Result<String, String> {
         let r = self
-            .token_post(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", self.client_id),
-            ])
+            .token_post(
+                step,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token),
+                    ("client_id", self.client_id),
+                ],
+            )
             .await;
         self.token_4xx += 1;
         let r = expect_scrubbed(step, r, 400, &self.sec())?;
@@ -1051,12 +1076,18 @@ impl Driver<'_> {
     }
 
     /// `tools/call` of `tool` as the dashboard's backend.
-    async fn mcp(&self, token: &str, tool: &str, arguments: &str) -> Result<RawResponse, String> {
+    async fn mcp(
+        &self,
+        step: &str,
+        token: &str,
+        tool: &str,
+        arguments: &str,
+    ) -> Result<RawResponse, String> {
         let bytes = with_header(
             mcp_call_bytes(AGENT_HOST, Some(token), tool, arguments),
             &format!("CF-Connecting-IP: {DASHBOARD_SRC_IP}"),
         );
-        agent_edge(self.ca, &bytes).await
+        throttled(step, "/mcp", agent_edge(self.ca, &bytes).await)
     }
 
     /// A `/mcp` call that must answer 200; a tool error is parsed.
@@ -1067,7 +1098,7 @@ impl Driver<'_> {
         tool: &str,
         arguments: &str,
     ) -> Result<ToolOutcome, String> {
-        let r = self.mcp(token, tool, arguments).await;
+        let r = self.mcp(step, token, tool, arguments).await;
         let r = expect_scrubbed(step, r, 200, &self.sec())?;
         let reply: McpReply = parse(step, &r, &self.sec())?;
         let result = reply
@@ -1109,7 +1140,7 @@ impl Driver<'_> {
 
     /// `kharon_status` with a token that must be refused: 401.
     async fn status_refused(&self, step: &str, token: &str) -> Result<u16, String> {
-        let r = self.mcp(token, "kharon_status", "{}").await;
+        let r = self.mcp(step, token, "kharon_status", "{}").await;
         Ok(expect_scrubbed(step, r, 401, &self.sec())?.status)
     }
 
@@ -1164,8 +1195,12 @@ impl Driver<'_> {
             )
             .await?;
         let approve_had_location = r.header("location").is_some();
-        let reply: ApproveReply = serde_json::from_str(&r.body)
-            .map_err(|e| format!("{step}: answer is not {{redirect}} ({e})"))?;
+        let reply: ApproveReply = serde_json::from_str(&r.body).map_err(|e| {
+            format!(
+                "{step}: answer is not {{redirect}} ({})",
+                scrub_tokens(&redact(&e.to_string(), &self.sec()))
+            )
+        })?;
         let redirect = Url::parse(&reply.redirect)
             .map_err(|e| format!("{step}: redirect is not a URL ({e})"))?;
         let query = |name: &str| {
@@ -1181,14 +1216,17 @@ impl Driver<'_> {
 
         let step = format!("{label}: POST /oauth/token (code)");
         let r = self
-            .token_post(&[
-                ("grant_type", "authorization_code"),
-                ("code", &code),
-                ("client_id", self.client_id),
-                ("redirect_uri", self.redirect_uri),
-                ("code_verifier", &verifier),
-                ("resource", RESOURCE),
-            ])
+            .token_post(
+                &step,
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("code", &code),
+                    ("client_id", self.client_id),
+                    ("redirect_uri", self.redirect_uri),
+                    ("code_verifier", &verifier),
+                    ("resource", RESOURCE),
+                ],
+            )
             .await;
         let r = expect_scrubbed(&step, r, 200, &self.sec())?;
         let cache_control = r.header("cache-control").map(str::to_owned);
@@ -1267,6 +1305,17 @@ async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String> {
     };
 
     // 5. The single retry: the retired rt0 once more, inside the grace.
+    ensure(
+        rotated_at.elapsed() <= Duration::from_secs(20),
+        "refresh rt0 (the single retry)",
+        || {
+            format!(
+                "runner too slow, not a product failure: {} s since the rotation, the retry \
+                 must go out within 20 s (the grace window is 30 s)",
+                rotated_at.elapsed().as_secs()
+            )
+        },
+    )?;
     let pair2 = d.refresh_ok("refresh rt0 (the single retry)", &rt0).await?;
     let since_rotation = rotated_at.elapsed();
     let old_access_status = d
@@ -2154,8 +2203,14 @@ fn req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state() {
         "audit.jsonl names both Connects"
     );
     assert!(
-        e.state_json.contains(&s.a_agent_id) && e.state_json.contains("E2E Dashboard"),
-        "state.json was read and holds the Connect identities"
+        e.state_json.contains(&s.a_agent_id)
+            && e.state_json.contains(&s.b_agent_id)
+            && e.state_json.contains("E2E Dashboard"),
+        "state.json was read and holds both Connect identities"
+    );
+    assert!(
+        e.audit_raw.contains("oauth_connect"),
+        "audit.jsonl holds oauth_connect entries"
     );
     let tokens: Vec<(&str, &str)> = vec![
         ("at0", &s.a.token.access_token),

@@ -37,6 +37,11 @@ pub enum ErrorCode {
     AuditFailed,
     /// Per-agent rate limit or suspension (REQ-RL-*; HTTP 429).
     RateLimited,
+    /// The OAuth token's scopes do not cover the called tool
+    /// (REQ-OAU-001/-006; HTTP 403). The OAuth error name, not the
+    /// generic `forbidden`: a dashboard client must be able to tell
+    /// "reconnect with more scope" from "never allowed".
+    InsufficientScope,
 }
 
 impl ErrorCode {
@@ -52,6 +57,7 @@ impl ErrorCode {
             Self::PayloadTooLarge => "payload_too_large",
             Self::AuditFailed => "audit_failed",
             Self::RateLimited => "rate_limited",
+            Self::InsufficientScope => "insufficient_scope",
         }
     }
 
@@ -67,11 +73,12 @@ impl ErrorCode {
             Self::PayloadTooLarge => 413,
             Self::AuditFailed => 500,
             Self::RateLimited => 429,
+            Self::InsufficientScope => 403,
         }
     }
 
     /// Every code (for the REQ-API-006 tests and the OpenAPI enum).
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::Locked,
@@ -81,6 +88,7 @@ impl ErrorCode {
         Self::PayloadTooLarge,
         Self::AuditFailed,
         Self::RateLimited,
+        Self::InsufficientScope,
     ];
 }
 
@@ -148,6 +156,14 @@ pub enum Detail {
     InvalidGrantRequest,
     /// Rate limited or agent suspended (REQ-RL-*).
     RateLimited,
+    /// The OAuth token lacks the scope bundle the called tool is in
+    /// (REQ-OAU-006; #232). The tool's bundle is fixed, so the fixed
+    /// text loses nothing.
+    InsufficientScope,
+    /// A Connect identity (`c-…`) has no browser attached yet, so
+    /// context/fill cannot run (REQ-OAU-007 phase 1; #232). The
+    /// typed error's name is `no_browser`; this is its plain message.
+    NoBrowser,
 }
 
 impl Detail {
@@ -183,11 +199,13 @@ impl Detail {
             Self::FrameIdUnsupported => "frame_id is not supported; use the frame's cdp_target_id",
             Self::InvalidGrantRequest => "grant request does not match the schema",
             Self::RateLimited => "rate limited; retry later or ask the owner to unsuspend",
+            Self::InsufficientScope => "token does not have the scope this tool needs",
+            Self::NoBrowser => "this connection has no browser attached yet",
         }
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 31] = [
         Self::MissingToken,
         Self::InvalidToken,
         Self::ToolNotAllowed,
@@ -217,6 +235,8 @@ impl Detail {
         Self::FrameIdUnsupported,
         Self::InvalidGrantRequest,
         Self::RateLimited,
+        Self::InsufficientScope,
+        Self::NoBrowser,
     ];
 }
 
@@ -242,6 +262,14 @@ impl ApiError {
     pub const INVALID_TOKEN: Self = Self::new(ErrorCode::Unauthorized, Detail::InvalidToken);
     /// 403, the tool is outside the agent's allow-list (#200).
     pub const TOOL_NOT_ALLOWED: Self = Self::new(ErrorCode::Forbidden, Detail::ToolNotAllowed);
+    /// 403 `insufficient_scope`, the tool is outside the OAuth
+    /// token's granted scope bundles (REQ-OAU-006; #232).
+    pub const INSUFFICIENT_SCOPE: Self =
+        Self::new(ErrorCode::InsufficientScope, Detail::InsufficientScope);
+    /// 403, a Connect identity has no browser attached yet
+    /// (REQ-OAU-007 phase 1; #232). The detail variant is the typed
+    /// error `no_browser`.
+    pub const NO_BROWSER: Self = Self::new(ErrorCode::Forbidden, Detail::NoBrowser);
     /// 423.
     pub const LOCKED: Self = Self::new(ErrorCode::Locked, Detail::Locked);
     /// 500, REQ-AUD-003 fail-closed.

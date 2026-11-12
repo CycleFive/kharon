@@ -50,7 +50,10 @@
 //! (400; 413 past the caps), then JSON-RPC. Everything before JSON-RPC answers with the `/v1/*` error
 //! body. JSON-RPC protocol errors use fixed messages ([`RpcError`]);
 //! tool errors are results with `isError: true` whose text is the
-//! [`ApiError`] body. No response here interpolates request data,
+//! [`ApiError`] body. One exception (REQ-OAU-001): a `tools/call`
+//! refused for scope answers HTTP 403 with the RFC 6750 step-up
+//! challenge, so an OAuth client can re-authorize and retry. No
+//! response here interpolates request data,
 //! except the requested protocol version in an unsupported-version
 //! error, which is echoed only when it has the `YYYY-MM-DD` shape
 //! (REQ-API-006).
@@ -470,6 +473,10 @@ enum Reply {
     /// Notification or client response: 202, no body.
     Accepted,
     Json(StatusCode, Value),
+    /// A JSON body carrying a `WWW-Authenticate` challenge: the
+    /// RFC 6750 step-up refusal of a `tools/call` whose token lacks
+    /// the called tool's scope (REQ-OAU-001; HTTP 403).
+    Challenged(StatusCode, Value, HeaderValue),
 }
 
 fn rpc_error(id: Option<&Value>, e: RpcError, status: StatusCode) -> Reply {
@@ -630,6 +637,27 @@ fn tool_result(id: &Value, era: Era, body: Value, is_error: bool) -> Reply {
             "isError": is_error,
         })),
     )
+}
+
+/// The step-up challenge for a `tools/call` the agent's token may
+/// not make (REQ-OAU-001, D1): the token's granted scopes plus the
+/// called tool's scope, against the discovery document. `None`
+/// unless discovery is configured and the identity carries a scope
+/// set — a scope refusal implies both, so `None` is only a fallback
+/// that keeps the plain tool-error reply.
+fn step_up_challenge<S, C>(
+    broker: &Broker<S, C>,
+    agent: &AgentId,
+    tool: Tool,
+) -> Option<HeaderValue>
+where
+    S: VaultView,
+    C: Clock,
+{
+    let discovery = broker.oauth_discovery()?;
+    let granted = agent.scopes()?;
+    let needed = super::oauth::scope_for_tool(tool.name())?;
+    HeaderValue::from_str(&discovery.step_up_challenge(granted, needed)).ok()
 }
 
 /// Handle one JSON-RPC message from an authenticated agent.
@@ -820,7 +848,28 @@ where
             };
             match outcome {
                 Ok(o) => tool_result(id, era, o.body(), false),
-                Err(e) => tool_result(id, era, e.body(), true),
+                Err(e) => {
+                    // REQ-OAU-001 / D1: a scope refusal on `/mcp`
+                    // is the RFC 6750 step-up, not a plain tool
+                    // error — HTTP 403 and the challenge naming
+                    // every scope the retry needs, so the client
+                    // can re-authorize with the missing scope and
+                    // call again. The body stays the tool-error
+                    // result. Every other error — `no_browser`
+                    // included — keeps the tool-result shape.
+                    let challenge = (e == ApiError::INSUFFICIENT_SCOPE)
+                        .then(|| step_up_challenge(broker, agent, tool))
+                        .flatten();
+                    match challenge {
+                        Some(challenge) => {
+                            let Reply::Json(_, v) = tool_result(id, era, e.body(), true) else {
+                                unreachable!("tool results are JSON replies")
+                            };
+                            Reply::Challenged(StatusCode::FORBIDDEN, v, challenge)
+                        }
+                        None => tool_result(id, era, e.body(), true),
+                    }
+                }
             }
         }
         _ => rpc_error(Some(id), RpcError::MethodNotFound, not_found),
@@ -918,6 +967,12 @@ where
             .body(axum::body::Body::empty())
             .expect("invariant: static response is valid"),
         Reply::Json(status, v) => json_response(status, v.to_string()),
+        Reply::Challenged(status, v, challenge) => {
+            let mut resp = json_response(status, v.to_string());
+            resp.headers_mut()
+                .insert(header::WWW_AUTHENTICATE, challenge);
+            resp
+        }
     }
 }
 

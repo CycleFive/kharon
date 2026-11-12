@@ -447,7 +447,8 @@
               "method_not_allowed",
               "payload_too_large",
               "audit_failed",
-              "rate_limited"
+              "rate_limited",
+              "insufficient_scope"
             ]
           },
           "detail": {

@@ -116,8 +116,8 @@ impl std::fmt::Debug for IssuedPair {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated {
     pub agent_id: String,
-    /// The Connect's granted scopes (their tool enforcement is
-    /// #232; the store carries them from here).
+    /// The Connect's granted scopes (the store carries them from
+    /// here; the broker enforces them via `AgentId`, #232).
     pub scopes: Vec<String>,
 }
 

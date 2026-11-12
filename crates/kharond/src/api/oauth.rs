@@ -20,8 +20,9 @@
 //! ([`Discovery::challenge`]). Without `[oauth]` the challenge is
 //! the bare `Bearer realm="kharon"` it has always been. Scope
 //! *enforcement* — the 403 `insufficient_scope` for a token missing
-//! a scope — is #232: until tokens carry scopes there is nothing to
-//! enforce against, and this module only names the scopes.
+//! a scope — is #232: this module owns the bundle mapping
+//! ([`scope_for_tool`]); the broker enforces it through the scope
+//! set an OAuth token's [`super::AgentId`] carries.
 
 use serde_json::{Value, json};
 
@@ -41,6 +42,37 @@ pub const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-se
 /// The scopes every deploy supports (REQ-OAU-006's bundles; the
 /// bundle membership is #232, the names are discovery's from here).
 pub const SCOPES_SUPPORTED: [&str; 3] = ["kharon:read", "kharon:fill", "kharon:request"];
+
+/// The scope bundles (REQ-OAU-006, design D5): each scope names a
+/// fixed set of MCP tools. This table is the one place the mapping
+/// lives — enforcement ([`scope_for_tool`]), `tools/list`
+/// filtering and the tests all read it from here.
+pub const SCOPE_TOOLS: [(&str, &[&str]); 3] = [
+    (
+        "kharon:read",
+        &["kharon_status", "kharon_list", "kharon_search"],
+    ),
+    (
+        "kharon:fill",
+        &["kharon_context", "kharon_fill", "kharon_fill_totp"],
+    ),
+    ("kharon:request", &["kharon_request_grant"]),
+];
+
+/// The one scope whose bundle contains `tool`, if any. Every tool
+/// is in exactly one bundle, so a call needs exactly one scope.
+pub fn scope_for_tool(tool: &str) -> Option<&'static str> {
+    SCOPE_TOOLS
+        .iter()
+        .find(|(_, tools)| tools.contains(&tool))
+        .map(|(scope, _)| *scope)
+}
+
+/// Whether a granted scope set (as the token store carries it)
+/// covers `tool`'s bundle.
+pub fn scopes_allow(scopes: &[String], tool: &str) -> bool {
+    scope_for_tool(tool).is_some_and(|needed| scopes.iter().any(|s| s == needed))
+}
 
 /// Everything discovery serves, derived once from the config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +165,27 @@ impl Discovery {
             SCOPES_SUPPORTED.join(" ")
         )
     }
+
+    /// The `WWW-Authenticate` value of a `/mcp` 403 refusing a call
+    /// the token's scopes do not cover (REQ-OAU-001, D1): the RFC
+    /// 6750 §3.1 step-up challenge — the 401 challenge's shape plus
+    /// `error="insufficient_scope"` and a `scope` naming what the
+    /// retry needs: the token's granted scopes plus the one the
+    /// call needs, so re-authorizing does not drop a scope the
+    /// token already holds. Only fixed scope names go in: nothing
+    /// from the request is interpolated (REQ-API-006).
+    pub fn step_up_challenge(&self, granted: &[String], needed: &str) -> String {
+        let mut scopes: Vec<&str> = granted.iter().map(String::as_str).collect();
+        if !scopes.contains(&needed) {
+            scopes.push(needed);
+        }
+        format!(
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"{}\", resource_metadata=\"{}\"",
+            scopes.join(" "),
+            self.resource_metadata
+        )
+    }
 }
 
 #[cfg(test)]
@@ -184,12 +237,68 @@ mod tests {
     }
 
     #[test]
+    fn scope_bundles_cover_every_tool_exactly_once() {
+        // REQ-OAU-006: the bundles partition the tool registry — a
+        // tool in no bundle could never be called by a Connect, and
+        // a tool in two would make "the scope this call needs"
+        // ambiguous.
+        for tool in crate::api::mcp::TOOL_NAMES {
+            let bundles = SCOPE_TOOLS
+                .iter()
+                .filter(|(_, tools)| tools.contains(&tool))
+                .count();
+            assert_eq!(bundles, 1, "{tool}");
+            assert!(scope_for_tool(tool).is_some(), "{tool}");
+        }
+        assert_eq!(scope_for_tool("kharon_approve"), None);
+        // The bundle names are exactly the supported scopes.
+        for (scope, _) in SCOPE_TOOLS {
+            assert!(SCOPES_SUPPORTED.contains(&scope), "{scope}");
+        }
+    }
+
+    #[test]
+    fn scopes_allow_checks_the_tools_bundle() {
+        let read_only = vec!["kharon:read".to_owned()];
+        assert!(scopes_allow(&read_only, "kharon_status"));
+        assert!(scopes_allow(&read_only, "kharon_search"));
+        assert!(!scopes_allow(&read_only, "kharon_fill"));
+        assert!(!scopes_allow(&read_only, "kharon_request_grant"));
+        assert!(!scopes_allow(&[], "kharon_status"));
+    }
+
+    #[test]
     fn challenge_names_the_metadata_url_and_every_scope() {
         assert_eq!(
             discovery().challenge(),
             "Bearer realm=\"kharon\", \
              resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\", \
              scope=\"kharon:read kharon:fill kharon:request\""
+        );
+    }
+
+    #[test]
+    fn step_up_challenge_names_the_error_and_the_full_retry_scope_set() {
+        // Granted scopes keep their order; the missing one is
+        // appended, and an already-held scope is not repeated.
+        let granted = vec!["kharon:read".to_owned()];
+        assert_eq!(
+            discovery().step_up_challenge(&granted, "kharon:fill"),
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"kharon:read kharon:fill\", \
+             resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\""
+        );
+        assert_eq!(
+            discovery().step_up_challenge(&granted, "kharon:read"),
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"kharon:read\", \
+             resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\""
+        );
+        assert_eq!(
+            discovery().step_up_challenge(&[], "kharon:request"),
+            "Bearer realm=\"kharon\", error=\"insufficient_scope\", \
+             scope=\"kharon:request\", \
+             resource_metadata=\"https://kharon.twkr.io/.well-known/oauth-protected-resource/mcp\""
         );
     }
 }

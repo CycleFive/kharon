@@ -114,6 +114,19 @@ impl RefusalCode {
             Self::RedirectMismatch => "redirect_mismatch",
         }
     }
+
+    /// The plain text the authorize page shows for this refusal.
+    /// The `cimd_unavailable` text is I4's, verbatim.
+    pub fn plain_message(self) -> &'static str {
+        match self {
+            Self::NotAllowlisted => "This dashboard is not on this kharon's allow-list.",
+            Self::CimdUnavailable => "We couldn't check this dashboard. Try again in a minute.",
+            Self::CimdInvalid => "This dashboard's client metadata is not valid.",
+            Self::RedirectMismatch => {
+                "The address this dashboard sent does not match its client metadata."
+            }
+        }
+    }
 }
 
 /// A refused admission. The authorize endpoint renders
@@ -132,18 +145,8 @@ impl Refusal {
     }
 
     /// The plain text the authorize page shows for this refusal.
-    /// The `cimd_unavailable` text is I4's, verbatim.
     pub fn plain_message(&self) -> &'static str {
-        match self.code {
-            RefusalCode::NotAllowlisted => "This dashboard is not on this kharon's allow-list.",
-            RefusalCode::CimdUnavailable => {
-                "We couldn't check this dashboard. Try again in a minute."
-            }
-            RefusalCode::CimdInvalid => "This dashboard's client metadata is not valid.",
-            RefusalCode::RedirectMismatch => {
-                "The address this dashboard sent does not match its client metadata."
-            }
-        }
+        self.code.plain_message()
     }
 }
 
@@ -196,6 +199,18 @@ impl ClientAdmission {
     /// Admission over the production fetch (resolve, pin, HTTPS).
     pub fn new(clients: &[String], audit: Arc<dyn RefusalAudit>) -> Self {
         Self::with_source(clients, audit, Source::Remote)
+    }
+
+    /// Admission over canned fetch answers, for tests of callers
+    /// (the authorize endpoint). Each cache miss pops one outcome;
+    /// `Err(())` is a fetch fault. An allow-list miss never pops.
+    #[cfg(test)]
+    pub(crate) fn from_canned(
+        clients: &[String],
+        outcomes: Vec<Result<(String, Option<String>), ()>>,
+        audit: Arc<dyn RefusalAudit>,
+    ) -> Self {
+        Self::with_source(clients, audit, Source::Fake(FakeFetch::new(outcomes)))
     }
 
     fn with_source(clients: &[String], audit: Arc<dyn RefusalAudit>, source: Source) -> Self {

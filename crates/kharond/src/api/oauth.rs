@@ -79,6 +79,12 @@ impl Discovery {
         &self.issuer
     }
 
+    /// The protected resource: this deploy's public `/mcp` URL.
+    /// Authorize requires `resource` to equal it (REQ-OAU-003).
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
     /// RFC 9728 protected-resource metadata, served on
     /// `[public_ingress]` at both well-known paths. Known deviation:
     /// §3.3 wants the root document's `resource` to be the origin,

@@ -203,6 +203,7 @@ impl<'de> Deserialize<'de> for Event {
             "passkey_enrolled" => Event::PasskeyEnrolled,
             "passkey_listed" => Event::PasskeyListed,
             "passkey_removed" => Event::PasskeyRemoved,
+            "oauth_client_refused" => Event::OauthClientRefused,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"

@@ -1278,10 +1278,9 @@ async fn bind_owner_ui(
             .as_ref()
             .and_then(|p| p.public_host.as_deref()),
     ) {
-        (Some(_), Some(host)) => Some(Arc::new(crate::api::oauth::Discovery::new(
-            origin.clone(),
-            host,
-        ))),
+        (Some(_), Some(host)) => Some(crate::owner_ui::OauthAs {
+            discovery: Arc::new(crate::api::oauth::Discovery::new(origin.clone(), host)),
+        }),
         _ => None,
     };
     // REQ-OAU-002 (#229): with `[oauth]` set, the authorize endpoint

@@ -251,6 +251,24 @@ where
     S: VaultView + 'static,
     C: Clock + Send + 'static,
 {
+    // The same refusal the owner UI applies (REQ-OAU-006): an
+    // OAuth token presented as `Authorization` is not the ntfy
+    // credential, and it must not reach redeem.
+    if req
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .any(|value| {
+            value
+                .to_str()
+                .is_ok_and(super::oauth::authorization_is_oauth_bearer)
+        })
+    {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            r#"{"ok":false,"error":"forbidden"}"#.to_owned(),
+        );
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     dispatch_owner_approval(broker, method, path).await
@@ -503,7 +521,10 @@ fn owner_approval_response(redeem: &dyn ApprovalRedeemer, method: &Method, path:
     } else {
         return error(ApiError::new(ErrorCode::NotFound, Detail::NoSuchRoute));
     };
-    if token.is_empty() || token.contains('/') {
+    // An OAuth token in the path is not an approval link
+    // (REQ-OAU-006). Same answer as an unknown link, and nothing
+    // is redeemed.
+    if token.is_empty() || token.contains('/') || super::oauth::is_oauth_token(token) {
         return token_gone();
     }
     if method == Method::GET {

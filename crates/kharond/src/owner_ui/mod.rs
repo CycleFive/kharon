@@ -970,6 +970,24 @@ async fn handle(
     {
         return respond(StatusCode::MISDIRECTED_REQUEST, "misdirected", None);
     }
+    // REQ-OAU-006: an OAuth access or refresh token is not a
+    // credential on this listener. Refuse before redeem, Access,
+    // the body and every route, and do not audit — a stranger
+    // spraying tokens must not grow the log. A session cookie
+    // does not override the refusal, and the approval link is
+    // not consulted, so it is not consumed.
+    if req
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .any(|value| {
+            value
+                .to_str()
+                .is_ok_and(crate::api::oauth::authorization_is_oauth_bearer)
+        })
+    {
+        return respond(StatusCode::FORBIDDEN, "forbidden", None);
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let query = req.uri().query().map(str::to_owned);

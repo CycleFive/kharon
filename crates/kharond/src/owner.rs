@@ -8,7 +8,12 @@
 //! `audit/` directory below `data_dir` is created 0700, `data_dir`
 //! itself is the operator's), and every connection's peer uid must
 //! equal the daemon's effective uid — the socket is an owner-only
-//! channel on the owner's own host.
+//! channel on the owner's own host. An OAuth access or refresh
+//! token (`kh_at_`, `kh_rt_`) is not a credential here
+//! (REQ-OAU-006): a request that carries one is refused before
+//! the op runs. When the token is the unlock password, the
+//! answer is `unlock_failed`, the same as any other wrong
+//! password, and the password is not sent to the vault.
 //!
 //! Protocol: one request per connection, one JSON object on one
 //! line, one JSON response line, then the daemon closes. Requests:
@@ -520,7 +525,22 @@ async fn handle<O: OwnerOps>(mut stream: UnixStream, ops: Arc<O>) -> std::io::Re
     raw.zeroize();
 
     let response = match parsed {
-        Ok((req, password)) => dispatch(req, password, ops).await,
+        Ok((req, password, carries_oauth)) => {
+            // REQ-OAU-006. The password was overwritten with `x`s
+            // in the copy the scan saw, so it is checked on its
+            // own and never reaches the vault.
+            if password
+                .as_deref()
+                .is_some_and(|password| crate::api::oauth::is_oauth_token(password))
+            {
+                ops.auth_failed("unlock_failed").await;
+                Zeroizing::new(error_response("unlock_failed"))
+            } else if carries_oauth {
+                Zeroizing::new(error_response("forbidden"))
+            } else {
+                dispatch(req, password, ops).await
+            }
+        }
         Err(()) => Zeroizing::new(error_response("bad_request")),
     };
     stream.write_all(response.as_bytes()).await?;
@@ -533,15 +553,36 @@ async fn handle<O: OwnerOps>(mut stream: UnixStream, ops: Arc<O>) -> std::io::Re
 /// zeroizing buffer ([`decode_json_string`]); the copy serde sees
 /// has that content overwritten with `x`s, so serde's internal
 /// escape-decoding scratch never holds the real password.
-fn parse_request(line: &[u8]) -> Result<(Request, Option<Zeroizing<String>>), ()> {
+fn parse_request(line: &[u8]) -> Result<(Request, Option<Zeroizing<String>>, bool), ()> {
     let mut password = None;
     let mut redacted = Zeroizing::new(line.to_vec());
     if let Some(content) = find_string_field(line, b"password") {
         password = Some(decode_json_string(&line[content.clone()]).ok_or(())?);
         redacted[content].fill(b'x');
     }
+    // The password bytes in this copy are `x`s. Any other string
+    // that is an OAuth token refuses the op (REQ-OAU-006).
+    let carries_oauth = json_carries_oauth_token(&redacted);
     let req: Request = serde_json::from_slice(&redacted).map_err(|_| ())?;
-    Ok((req, password))
+    Ok((req, password, carries_oauth))
+}
+
+/// Whether any JSON string in `redacted` is an OAuth token. A
+/// line that does not parse is `false`: the caller refuses it as
+/// `bad_request`.
+fn json_carries_oauth_token(redacted: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(redacted) else {
+        return false;
+    };
+    fn walk(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(s) => crate::api::oauth::is_oauth_token(s),
+            serde_json::Value::Array(items) => items.iter().any(walk),
+            serde_json::Value::Object(map) => map.values().any(walk),
+            _ => false,
+        }
+    }
+    walk(&value)
 }
 
 /// The content range (between the quotes) of the first
@@ -941,7 +982,8 @@ mod tests {
     use super::*;
 
     fn request(line: &[u8]) -> (Request, Option<Zeroizing<String>>) {
-        parse_request(line).expect("request parses")
+        let (req, password, _) = parse_request(line).expect("request parses");
+        (req, password)
     }
 
     #[test]
@@ -1000,10 +1042,13 @@ mod tests {
     struct MockOps {
         auth_failed: std::sync::Mutex<Vec<&'static str>>,
         unlock_err: Option<OwnerFailure>,
+        unlocks: std::sync::atomic::AtomicUsize,
     }
 
     impl OwnerOps for MockOps {
         async fn unlock(&self, _password: Zeroizing<String>) -> Result<(), OwnerFailure> {
+            self.unlocks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.unlock_err.map_or(Ok(()), Err)
         }
 
@@ -1074,6 +1119,52 @@ mod tests {
         assert!(!peer_uid_accepted(Some(0), 1000));
         // Unreadable credentials are a rejection, never a pass.
         assert!(!peer_uid_accepted(None, 1000));
+    }
+
+    /// REQ-OAU-006: a `kh_at_` / `kh_rt_` on the socket does not run
+    /// the op. The unlock password case answers `unlock_failed` and
+    /// never calls the vault.
+    #[tokio::test]
+    async fn an_oauth_token_on_the_owner_socket_does_not_run_the_op() {
+        async fn exchange(line: &str) -> (String, Arc<MockOps>) {
+            let (client, server) = UnixStream::pair().unwrap();
+            let (mut read_half, mut write_half) = client.into_split();
+            let ops = Arc::new(MockOps::default());
+            let serve = tokio::spawn(handle(server, Arc::clone(&ops)));
+            write_half.write_all(line.as_bytes()).await.unwrap();
+            write_half.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            read_half.read_to_end(&mut buf).await.unwrap();
+            serve.await.unwrap().unwrap();
+            (String::from_utf8(buf).unwrap(), ops)
+        }
+
+        let (reply, ops) = exchange("{\"op\":\"status\",\"access_token\":\"kh_at_abcd\"}\n").await;
+        assert_eq!(reply, error_response("forbidden"));
+        assert_eq!(ops.unlocks.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let (reply, ops) = exchange("{\"op\":\"unlock\",\"password\":\"kh_rt_abcd\"}\n").await;
+        assert_eq!(reply, error_response("unlock_failed"));
+        assert_eq!(ops.unlocks.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            ops.auth_failed.lock().unwrap().as_slice(),
+            ["unlock_failed"]
+        );
+
+        let (reply, _) =
+            exchange("{\"op\":\"approve\",\"request_id\":\"gr_1\",\"token\":\"kh_at_abcd\"}\n")
+                .await;
+        assert_eq!(reply, error_response("forbidden"));
+
+        let (reply, _) = exchange("{\"op\":\"status\",\"meta\":{\"note\":\"kh_rt_abcd\"}}\n").await;
+        assert_eq!(reply, error_response("forbidden"));
+
+        // Without a token the op runs, and a real password reaches unlock.
+        let (reply, _) = exchange("{\"op\":\"status\"}\n").await;
+        assert_eq!(reply, "{\"ok\":true,\"locked\":true}\n");
+        let (reply, ops) = exchange("{\"op\":\"unlock\",\"password\":\"secret\"}\n").await;
+        assert!(reply.contains("\"ok\":true"), "{reply}");
+        assert_eq!(ops.unlocks.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[cfg(feature = "canary-scan")]

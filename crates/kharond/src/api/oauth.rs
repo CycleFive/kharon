@@ -74,6 +74,27 @@ pub fn scopes_allow(scopes: &[String], tool: &str) -> bool {
     scope_for_tool(tool).is_some_and(|needed| scopes.iter().any(|s| s == needed))
 }
 
+/// Whether `token` is an OAuth access or refresh token.
+///
+/// Owner surfaces refuse these (REQ-OAU-006): no scope approves
+/// anything, and neither token is an enrollment code, a session,
+/// or an ntfy approval link. The prefix is the whole check, so a
+/// truncated token is refused too.
+pub fn is_oauth_token(token: &str) -> bool {
+    token.starts_with("kh_at_") || token.starts_with("kh_rt_")
+}
+
+/// Whether an `Authorization` header value is `Bearer` with an
+/// OAuth token. The scheme is case-insensitive (RFC 9110); the
+/// token prefix is not.
+pub fn authorization_is_oauth_bearer(value: &str) -> bool {
+    let Some((scheme, cred)) = value.split_once(' ') else {
+        return false;
+    };
+    let cred = cred.trim_matches(' ');
+    scheme.eq_ignore_ascii_case("bearer") && is_oauth_token(cred)
+}
+
 /// Everything discovery serves, derived once from the config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
@@ -255,6 +276,18 @@ mod tests {
         for (scope, _) in SCOPE_TOOLS {
             assert!(SCOPES_SUPPORTED.contains(&scope), "{scope}");
         }
+    }
+
+    #[test]
+    fn oauth_token_prefixes_are_recognized_and_bearer_is_case_insensitive() {
+        assert!(is_oauth_token("kh_at_ab"));
+        assert!(is_oauth_token("kh_rt_ab"));
+        assert!(!is_oauth_token("kh_agent_ab"));
+        assert!(!is_oauth_token("not-kh_at_ab"));
+        assert!(authorization_is_oauth_bearer("Bearer kh_at_ab"));
+        assert!(authorization_is_oauth_bearer("bearer  kh_rt_ab"));
+        assert!(!authorization_is_oauth_bearer("Bearer enroll-code"));
+        assert!(!authorization_is_oauth_bearer("Basic kh_at_ab"));
     }
 
     #[test]

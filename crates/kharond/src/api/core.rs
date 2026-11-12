@@ -186,14 +186,61 @@ impl AuditSink for AuditLog {
     }
 }
 
-/// An authenticated agent. Only [`Broker::authenticate`] makes one.
+/// An authenticated agent. Only [`Broker::authenticate`] and
+/// [`Broker::authenticate_on_mcp`] make one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentId(String);
+pub struct AgentId {
+    id: String,
+    /// The OAuth scope set this identity's token carries
+    /// (REQ-OAU-006; #232, design I3). `None` for a config agent:
+    /// no scope set, so #200's per-agent allow-list alone decides
+    /// what its token may call. `Some` only for a Connect identity
+    /// authenticated by an OAuth access token, carrying that
+    /// token's granted scopes.
+    scopes: Option<Vec<String>>,
+}
 
 impl AgentId {
+    /// A config-agent identity: no scope set.
+    fn config(id: String) -> Self {
+        Self { id, scopes: None }
+    }
+
+    /// A Connect identity carrying its token's granted scopes.
+    fn connect(id: String, scopes: Vec<String>) -> Self {
+        Self {
+            id,
+            scopes: Some(scopes),
+        }
+    }
+
     /// The agent id.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.id
+    }
+
+    /// The granted OAuth scopes, for a Connect identity; `None`
+    /// for a config agent.
+    pub fn scopes(&self) -> Option<&[String]> {
+        self.scopes.as_deref()
+    }
+
+    /// Whether this identity is an OAuth Connect (`c-…`): it came
+    /// from an access token, so it carries a scope set. Phase 1
+    /// Connects have no browser (REQ-OAU-007).
+    pub fn is_connect(&self) -> bool {
+        self.scopes.is_some()
+    }
+
+    /// Whether this identity's token may call `tool`, by scope
+    /// alone: config agents always pass (their allow-list is the
+    /// only gate); a Connect passes only when one of its granted
+    /// scopes' bundles contains the tool (REQ-OAU-006).
+    fn scope_allows(&self, tool: &str) -> bool {
+        match &self.scopes {
+            None => true,
+            Some(scopes) => super::oauth::scopes_allow(scopes, tool),
+        }
     }
 }
 
@@ -875,7 +922,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         {
             return Err(ApiError::INVALID_TOKEN);
         }
-        Ok(AgentId(id))
+        Ok(AgentId::config(id))
     }
 
     /// Authenticate a bearer token presented on `POST /mcp`
@@ -904,7 +951,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             {
                 return Err(ApiError::INVALID_TOKEN);
             }
-            return Ok(AgentId(conn.agent_id));
+            return Ok(AgentId::connect(conn.agent_id, conn.scopes));
         }
         self.authenticate(token)
     }
@@ -920,23 +967,49 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
 
     /// Transport budget for one authenticated `/mcp` request (#200).
     pub fn transport_agent_admit(&self, agent: &AgentId, now: Instant) -> bool {
-        self.transport.check_agent(&agent.0, now)
+        self.transport.check_agent(&agent.id, now)
     }
 
-    /// Whether `agent`'s token may call `tool` (#200; the allow-list
-    /// bound to the token's identity in [`TokenStore`]). Both
-    /// transports enforce it — the broker methods below refuse before
-    /// any state is read, and `tools/list` filters by it — so a
-    /// restricted token is restricted everywhere, not just on /mcp.
+    /// Whether `agent`'s token may call `tool`: #200's allow-list
+    /// (bound to the token's identity in [`TokenStore`]) *and*, for
+    /// a Connect identity, its OAuth scope bundles (REQ-OAU-006;
+    /// #232). Both transports enforce it — the broker methods below
+    /// refuse before any state is read, and `tools/list` filters by
+    /// it — so a restricted token is restricted everywhere, not
+    /// just on /mcp. Config agents carry no scope set, so for them
+    /// this is exactly #200's check.
     pub fn tool_allowed(&self, agent: &AgentId, tool: &str) -> bool {
-        self.tokens.allows(&agent.0, tool)
+        self.tokens.allows(&agent.id, tool) && agent.scope_allows(tool)
     }
 
     fn require_tool(&self, agent: &AgentId, tool: &str) -> Result<(), ApiError> {
+        // Scope first for a Connect (REQ-OAU-001): a call outside
+        // its scopes is `insufficient_scope`, a distinct refusal
+        // from #200's allow-list refusal. A `c-…` id has no config
+        // allow-list entry (the store's default is unrestricted),
+        // so this is the only check that can refuse it on scope
+        // grounds — and for a config agent it always passes.
+        if !agent.scope_allows(tool) {
+            return Err(ApiError::INSUFFICIENT_SCOPE);
+        }
         if self.tool_allowed(agent, tool) {
             Ok(())
         } else {
             Err(ApiError::TOOL_NOT_ALLOWED)
+        }
+    }
+
+    /// Phase 1 (REQ-OAU-007; #232): a Connect identity has no CDP
+    /// endpoint and no browser attached, so context and fill calls
+    /// refuse `no_browser` here — before the lock gate, any rate
+    /// bucket, any grant work and above all before the fill backend
+    /// is consulted, so a Connect can never fall back to a
+    /// configured endpoint. Config agents pass.
+    fn require_browser(&self, agent: &AgentId) -> Result<(), ApiError> {
+        if agent.is_connect() {
+            Err(ApiError::NO_BROWSER)
+        } else {
+            Ok(())
         }
     }
 
@@ -976,7 +1049,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let now = self.grant_now();
         StatusBody {
             locked: lock.is_locked(),
-            agent_id: agent.0.clone(),
+            agent_id: agent.id.clone(),
             // The agent's live grants (SPEC §4). Status is unaudited
             // and never transitions anything: grants past their TTL
             // simply stop being live, and timed-out requests deny on
@@ -1018,7 +1091,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             };
             self.append(stamp(
                 Entry::new(Event::RateLimit)
-                    .agent_id(agent.0.clone())
+                    .agent_id(agent.id.clone())
                     .result("rate_limited")
                     .detail_code(detail),
                 client_ip,
@@ -1047,7 +1120,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         };
         // Same entry whichever transport carried the request (the
         // contract test compares them). `q` is not logged.
-        let mut entry = stamp(Entry::new(event).agent_id(agent.0.clone()), client_ip);
+        let mut entry = stamp(Entry::new(event).agent_id(agent.id.clone()), client_ip);
         if let Some(o) = &origin {
             entry = entry.origin(o.clone());
         }
@@ -1121,6 +1194,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         client_ip: Option<std::net::IpAddr>,
     ) -> Result<Outcome, ApiError> {
         self.require_tool(agent, req.operation.tool_name())?;
+        self.require_browser(agent)?;
         let deadline = received + self.fill_policy.deadline;
         let request_id = new_request_id();
         let event = match req.operation {
@@ -1138,7 +1212,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .filter(|g| super::grant::is_grant_id_shaped(g));
         let base = |e: Event| {
             let entry = Entry::new(e)
-                .agent_id(agent.0.clone())
+                .agent_id(agent.id.clone())
                 .item_id(req.item_id.clone())
                 .request_id(request_id.clone());
             let entry = match presented {
@@ -1188,7 +1262,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 self.append(base(event).result("rate_limited").detail_code(detail))?;
                 self.append(stamp(
                     Entry::new(Event::RateLimit)
-                        .agent_id(agent.0.clone())
+                        .agent_id(agent.id.clone())
                         .item_id(req.item_id.clone())
                         .result("rate_limited")
                         .detail_code(detail),
@@ -1303,7 +1377,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 if newly {
                     let _ = self.append(stamp(
                         Entry::new(Event::RateLimit)
-                            .agent_id(agent.0.clone())
+                            .agent_id(agent.id.clone())
                             .result("suspended")
                             .detail_code("origin_mismatch_streak"),
                         &client_ip,
@@ -1441,7 +1515,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 drop(store);
                 let _ = self.append(stamp(
                     Entry::new(Event::RateLimit)
-                        .agent_id(agent.0.clone())
+                        .agent_id(agent.id.clone())
                         .item_id(req.item_id.clone())
                         .result("rate_limited")
                         .detail_code("pending_grant_cap"),
@@ -1511,7 +1585,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let base = |result: &'static str| {
             stamp(
                 Entry::new(Event::GrantRequest)
-                    .agent_id(agent.0.clone())
+                    .agent_id(agent.id.clone())
                     .item_id(args.item_id.clone())
                     .result(result),
                 &client_ip,
@@ -2289,12 +2363,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         client_ip: Option<std::net::IpAddr>,
     ) -> Result<Outcome, ApiError> {
         self.require_tool(agent, "kharon_context")?;
+        self.require_browser(agent)?;
         let deadline = received + self.fill_policy.deadline;
         let request_id = new_request_id();
         let base = |e: Event| {
             stamp(
                 Entry::new(e)
-                    .agent_id(agent.0.clone())
+                    .agent_id(agent.id.clone())
                     .request_id(request_id.clone()),
                 &client_ip,
             )

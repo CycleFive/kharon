@@ -468,6 +468,11 @@ fn v4_class_refused(a: Ipv4Addr) -> bool {
         // 0.0.0.0/8, "this host on this network": never a host to
         // connect to (`is_unspecified` covers only 0.0.0.0 itself).
         || a.octets()[0] == 0
+        // 100.64.0.0/10 (RFC 6598 shared address space): the
+        // CGNAT / Tailscale range. `is_private` covers only
+        // RFC 1918, so this passes it — but the tailnet carries
+        // the owner UI, vault and raw CDP, so it is refused here.
+        || (a.octets()[0] == 100 && (a.octets()[1] & 0xc0) == 0x40)
 }
 
 fn v6_class_refused(a: Ipv6Addr) -> bool {
@@ -575,6 +580,10 @@ fn redirect_uri_ok(uri: &str) -> bool {
     match url.host() {
         Some(url::Host::Domain(d)) => {
             let d = d.to_ascii_lowercase();
+            // The WHATWG parser keeps a trailing root dot, so
+            // `localhost.` is not `localhost`: trim one trailing
+            // `.` before comparing.
+            let d = d.strip_suffix('.').unwrap_or(&d);
             d != "localhost" && !d.ends_with(".localhost")
         }
         Some(url::Host::Ipv4(a)) => !a.is_loopback(),
@@ -729,6 +738,14 @@ mod tests {
                 valid_doc().replace(REDIRECT, "https://app.localhost/callback"),
             ),
             (
+                "redirect_uri is localhost with a trailing dot",
+                valid_doc().replace(REDIRECT, "https://localhost./callback"),
+            ),
+            (
+                "redirect_uri is a localhost subdomain with a trailing dot",
+                valid_doc().replace(REDIRECT, "https://app.localhost./callback"),
+            ),
+            (
                 "redirect_uri is a loopback address",
                 valid_doc().replace(REDIRECT, "https://127.0.0.1/callback"),
             ),
@@ -839,6 +856,8 @@ mod tests {
             "172.31.255.255",
             "192.168.1.1",
             "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
             "0.0.0.0",
             "0.1.2.3",
             "255.255.255.255",
@@ -858,6 +877,8 @@ mod tests {
         let allowed = [
             "8.8.8.8",
             "1.1.1.1",
+            "100.63.255.255",
+            "100.128.0.1",
             "172.32.0.1",
             "2606:4700:4700::1111",
             "::ffff:8.8.8.8",

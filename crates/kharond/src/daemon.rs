@@ -1278,10 +1278,12 @@ async fn bind_owner_ui(
             .as_ref()
             .and_then(|p| p.public_host.as_deref()),
     ) {
-        (Some(_), Some(host)) => Some(Arc::new(crate::api::oauth::Discovery::new(
-            origin.clone(),
-            host,
-        ))),
+        (Some(oauth_cfg), Some(host)) => Some(crate::owner_ui::OauthAs {
+            discovery: Arc::new(crate::api::oauth::Discovery::new(origin.clone(), host)),
+            clients: Arc::new(crate::api::oauth_clients::AllowlistAdmission::new(
+                oauth_cfg.clients.clone(),
+            )),
+        }),
         _ => None,
     };
     let ui = crate::owner_ui::OwnerUi::open_with(
@@ -1425,6 +1427,13 @@ impl crate::owner_ui::OwnerAudit for DaemonUiAudit {
         self.broker
             .append_audit(entry)
             .map_err(|_| crate::owner_ui::OwnerAuditError)
+    }
+
+    fn oauth_client_refused(&self, refusal: crate::owner_ui::OauthClientRefusal) {
+        let entry = crate::owner_ui::oauth_client_refused_entry(&refusal);
+        if self.broker.append_audit(entry).is_err() {
+            eprintln!("kharond: oauth_client_refused audit append failed");
+        }
     }
 }
 

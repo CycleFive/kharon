@@ -106,6 +106,13 @@ pub enum Event {
     /// changes; a failed append removes nothing (REQ-APR-005,
     /// REQ-AUD-003).
     PasskeyRemoved,
+    /// N3: an authorize request was refused before a redirect was
+    /// trusted (REQ-OAU-002/-003, I7). No `agent_id` and no `channel`:
+    /// there is no Connect yet, and the event is the client's request.
+    /// `detail_code` is `not_allowlisted`, `cimd_unavailable`,
+    /// `cimd_invalid` or `redirect_mismatch`. `origin` is the CIMD
+    /// hostname when the client was on the allow-list.
+    OauthClientRefused,
 }
 
 impl Event {
@@ -145,6 +152,7 @@ impl Event {
             Event::PasskeyEnrolled => "passkey_enrolled",
             Event::PasskeyListed => "passkey_listed",
             Event::PasskeyRemoved => "passkey_removed",
+            Event::OauthClientRefused => "oauth_client_refused",
         }
     }
 }
@@ -192,6 +200,7 @@ impl<'de> Deserialize<'de> for Event {
             "passkey_enrolled" => Event::PasskeyEnrolled,
             "passkey_listed" => Event::PasskeyListed,
             "passkey_removed" => Event::PasskeyRemoved,
+            "oauth_client_refused" => Event::OauthClientRefused,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"

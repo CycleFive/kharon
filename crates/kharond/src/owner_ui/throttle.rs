@@ -29,6 +29,10 @@ pub const THROTTLED_ROUTES: &[&str] = &[
     "/owner/register/finish",
     "/owner/unlock/begin",
     "/owner/unlock",
+    "/oauth/consent/view",
+    "/oauth/consent/options",
+    "/oauth/consent/approve",
+    "/oauth/consent/deny",
 ];
 
 /// Per-source failure counts.

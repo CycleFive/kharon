@@ -27,6 +27,12 @@
 //! | GET | `/` | Login page, or the signed-in shell |
 //! | GET | `/enroll` | Enrollment page (one-time code, not a password) |
 //! | GET | `/.well-known/oauth-authorization-server` | RFC 8414 metadata, only with `[oauth]` set (REQ-OAU-001); no session |
+//! | GET | `/oauth/authorize` | Start a Connect (REQ-OAU-003); no session |
+//! | GET | `/oauth/consent/<token>` | Consent page, or the passkey sign-in that returns to it |
+//! | POST | `/oauth/consent/view` | Consent JSON for the signed-in shell |
+//! | POST | `/oauth/consent/options` | Begin the fresh consent assertion |
+//! | POST | `/oauth/consent/approve` | Approve; returns `{redirect}` |
+//! | POST | `/oauth/consent/deny` | Deny; returns `{redirect}` with `access_denied` |
 //! | POST | `/owner/login/options` | Begin an assertion ceremony |
 //! | POST | `/owner/login/finish` | Finish it; sets the session cookie |
 //! | POST | `/owner/register/options` | Begin registration |
@@ -73,6 +79,7 @@
 pub mod access;
 mod approvals;
 mod audit_budget;
+mod oauth;
 mod sealed;
 mod store;
 mod throttle;
@@ -82,6 +89,7 @@ mod webauthn;
 pub use self::approvals::{
     AUDIT_TAIL_LEN, AuditRow, DecideError, NoApprovals, OwnerApprovals, PendingRow, WebGrantKind,
 };
+pub use self::oauth::{OauthAs, OauthClientRefusal, oauth_client_refused_entry};
 pub use self::unlock::OwnerUnlock;
 
 use std::future::Future;
@@ -108,7 +116,7 @@ use self::webauthn::{RegisteredCredential, b64url_decode, b64url_encode, ct_eq};
 use crate::api::http::{
     ApprovalRedeemer, OWNER_APPROVE_PREFIX, OWNER_DENY_PREFIX, dispatch_owner_approval,
 };
-use crate::api::oauth::{AUTHORIZATION_SERVER_PATH, Discovery};
+use crate::api::oauth::AUTHORIZATION_SERVER_PATH;
 
 /// SPEC §5: an owner web session is at most 15 minutes.
 pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -177,6 +185,11 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/"),
     ("GET", "/enroll"),
     ("GET", AUTHORIZATION_SERVER_PATH),
+    ("GET", "/oauth/authorize"),
+    ("POST", "/oauth/consent/view"),
+    ("POST", "/oauth/consent/options"),
+    ("POST", "/oauth/consent/approve"),
+    ("POST", "/oauth/consent/deny"),
     ("POST", "/owner/login/options"),
     ("POST", "/owner/login/finish"),
     ("POST", "/owner/register/options"),
@@ -258,6 +271,12 @@ pub trait OwnerAudit: Send + Sync + 'static {
     /// while the passkey store lock is held, so the sink must not
     /// call back into the UI. `Err` removes nothing.
     fn passkey_removed(&self, removed: PasskeyRemoved) -> Result<(), OwnerAuditError>;
+    /// `oauth_client_refused` when authorize refuses a client before
+    /// it will redirect (REQ-OAU-003). Best effort, like
+    /// [`Self::auth_failed`]: the page is shown either way. The
+    /// default discards, so test sinks that don't model OAuth stay
+    /// as they are. The daemon's sink records it.
+    fn oauth_client_refused(&self, _refusal: OauthClientRefusal) {}
 }
 
 /// A passkey that is about to be stored (#249). No credential id.
@@ -397,11 +416,13 @@ pub struct OwnerUi {
     /// `unknown_op`.
     unlocker: OnceLock<Arc<dyn OwnerUnlock>>,
     unlock_attempts: Mutex<Vec<unlock::Attempt>>,
-    /// OAuth discovery (REQ-OAU-001; #228): when `[oauth]` is
-    /// configured, this hostname is the authorization server and
-    /// serves its RFC 8414 metadata. `None` → the well-known path
-    /// 404s like any other unknown one.
-    oauth: Option<Arc<Discovery>>,
+    /// OAuth authorization server (REQ-OAU-001/-003). `None` → the
+    /// well-known path and `/oauth/*` 404 like any other unknown route.
+    oauth: Option<OauthAs>,
+    /// Authorization codes (D4). Memory only; a panic clears them.
+    codes: oauth::CodeStore,
+    /// Per-source budget for `GET /oauth/authorize` (REQ-OAU-008).
+    authorize_budget: oauth::AuthorizeBudget,
 }
 
 /// A ceremony as `options` hands it out: the sealed token (the
@@ -457,9 +478,9 @@ pub struct OwnerUiOptions {
     pub public: bool,
     /// The Access check, when `[owner_ui.access]` is set (public mode).
     pub access: Option<Arc<access::AccessVerifier>>,
-    /// OAuth discovery, when `[oauth]` is set (REQ-OAU-001): this
-    /// hostname then serves the RFC 8414 metadata document.
-    pub oauth: Option<Arc<Discovery>>,
+    /// OAuth authorization server, when `[oauth]` is set: discovery
+    /// plus client admission (REQ-OAU-001/-003).
+    pub oauth: Option<OauthAs>,
 }
 
 impl OwnerUi {
@@ -539,6 +560,8 @@ impl OwnerUi {
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
             oauth,
+            codes: oauth::CodeStore::new(),
+            authorize_budget: oauth::AuthorizeBudget::new(),
         }))
     }
 
@@ -667,6 +690,7 @@ async fn handle(
     }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    let query = req.uri().query().map(str::to_owned);
     let exempt = edge_exempt(&path);
     // The ntfy redeem routes: on `EDGE_EXEMPT`, so they take no `Origin`
     // and no Access token, and the approval redeemer answers them.
@@ -739,6 +763,7 @@ async fn handle(
             body: bytes,
             client_ip,
             throttle_key: edge_ip,
+            query,
         })
     })
     .await;
@@ -764,6 +789,9 @@ struct Incoming {
     /// behind the tunnel the peer is cloudflared, so if the edge stripped
     /// the header every visitor would share one bucket (#253).
     throttle_key: Option<IpAddr>,
+    /// The request URI's query, without the leading `?`. Authorize
+    /// reads it; other routes ignore it.
+    query: Option<String>,
 }
 
 /// The detail code of a refused `Origin`: always capped by the audit
@@ -930,14 +958,24 @@ impl OwnerUi {
         };
         if origin_refused {
             self.fail(&req, "origin");
-            return respond(StatusCode::FORBIDDEN, "origin", None);
+            let response = respond(StatusCode::FORBIDDEN, "origin", None);
+            return if req.path.starts_with("/oauth/") {
+                oauth::frame_deny(response)
+            } else {
+                response
+            };
         }
         if let Some(ip) = req.throttle_key
             && self.public
             && throttle::THROTTLED_ROUTES.contains(&req.path.as_str())
             && let Some(left) = self.throttle.blocked(ip, Instant::now())
         {
-            return rate_limited(left);
+            let response = rate_limited(left);
+            return if req.path.starts_with("/oauth/") {
+                oauth::frame_deny(response)
+            } else {
+                response
+            };
         }
         // RFC 8414 discovery (REQ-OAU-001): public metadata, no
         // session — it is how an unauthenticated client finds the
@@ -951,9 +989,14 @@ impl OwnerUi {
             }
             return json_body(
                 StatusCode::OK,
-                oauth.authorization_server_metadata().to_string(),
+                oauth.discovery.authorization_server_metadata().to_string(),
                 None,
             );
+        }
+        if self.oauth.is_some()
+            && (req.path == "/oauth/authorize" || req.path.starts_with("/oauth/consent"))
+        {
+            return self.oauth_dispatch(&req);
         }
         let allowed = match req.path.as_str() {
             "/" | "/enroll" | "/owner/session" | "/owner/approvals" | "/owner/grants"
@@ -1012,7 +1055,7 @@ impl OwnerUi {
             let state = if view.locked { "locked" } else { "unlocked" };
             return html(&shell_page(state, view.pending));
         }
-        html(LOGIN_PAGE)
+        html(&login_page("/"))
     }
 
     fn session_json(&self, req: &Incoming) -> Response {
@@ -1557,11 +1600,14 @@ impl OwnerUi {
         self.take_enroll(token)
     }
 
-    /// A panic happened: every outstanding ceremony token (and any
-    /// later pending authorization sealed the same way) must stop
-    /// working at once (REQ-OAU-005, REQ-REV-002).
+    /// A panic happened: every outstanding ceremony token and every
+    /// pending authorization stop opening, because both are sealed
+    /// under this key, and every unredeemed authorization code is
+    /// dropped (REQ-OAU-005, REQ-REV-002). An ordinary lock does not
+    /// call this.
     pub fn invalidate_sealed(&self) {
         self.sealed.invalidate();
+        self.codes.clear();
     }
 
     fn begin(&self, kind: CeremonyKind) -> Ceremony {
@@ -2242,7 +2288,7 @@ window.kharonSignIn = async function () {
   return true;
 };
 document.getElementById("signin").addEventListener("click", async () => {
-  if (await window.kharonSignIn()) location.assign("/");
+  if (await window.kharonSignIn()) location.assign({next});
 });
 </script>
 </body>
@@ -2346,10 +2392,27 @@ document.getElementById("register").addEventListener("click", async () => {
 </html>
 "#;
 
+fn login_page(next_path: &str) -> String {
+    let next = serde_json::to_string(next_path).expect("a path serializes");
+    LOGIN_PAGE.replace("{next}", &next)
+}
+
 fn shell_page(locked: &str, pending: usize) -> String {
+    render_shell(locked, pending, "")
+}
+
+/// The signed-in shell with the consent script filled in. `{connect}`
+/// is substituted last so the script is not scanned for `{locked}`
+/// or `{pending}`.
+fn consent_shell(locked: &str, pending: usize, connect: &str) -> String {
+    render_shell(locked, pending, connect)
+}
+
+fn render_shell(locked: &str, pending: usize, connect: &str) -> String {
     SHELL_PAGE
         .replace("{locked}", locked)
         .replace("{pending}", &pending.to_string())
+        .replace("{connect}", connect)
 }
 
 /// The signed-in shell: broker state, the approvals queue (#131
@@ -2377,6 +2440,16 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 </head>
 <body>
 <h1>kharon</h1>
+<section id="connect" hidden>
+<h2>Connect a dashboard</h2>
+<p id="connect-who"></p>
+<p id="connect-hosts"></p>
+<div id="connect-scopes"></div>
+<p id="connect-notice">Connecting does not let it sign in anywhere on its own. Every sign-in still needs your approval in kharon.</p>
+<p><button id="connect-approve" type="button">Connect</button>
+<button id="connect-deny" type="button">Don't connect</button></p>
+<p id="connect-err" class="err" role="alert"></p>
+</section>
 <p id="state">signed-in</p>
 <p>Broker: <span id="locked">{locked}</span></p>
 <form id="unlock" hidden>
@@ -2663,6 +2736,7 @@ refreshPasskeys();
 window.kharonRefresh();
 setInterval(window.kharonRefresh, 5000);
 </script>
+{connect}
 </body>
 </html>
 "#;
@@ -2670,6 +2744,19 @@ setInterval(window.kharonRefresh, 5000);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::oauth::Discovery;
+
+    /// Discovery with the fail-closed admission. These tests only
+    /// serve the metadata document.
+    fn metadata_oauth(discovery: Discovery) -> OauthAs {
+        OauthAs {
+            discovery: Arc::new(discovery),
+            clients: Arc::new(crate::api::oauth_clients::AllowlistAdmission::new(Vec::<
+                String,
+            >::new(
+            ))),
+        }
+    }
 
     #[test]
     fn req_apr_005_routes_have_no_password_login() {
@@ -2746,7 +2833,7 @@ mod tests {
             locked: true,
             pending: 0,
         }));
-        let mk = |oauth: Option<Arc<Discovery>>| {
+        let mk = |oauth: Option<OauthAs>| {
             OwnerUi::open_with(
                 dir.path(),
                 OwnerUiOptions {
@@ -2773,6 +2860,7 @@ mod tests {
                 body: Vec::new(),
                 client_ip: None,
                 throttle_key: None,
+                query: None,
             })
         };
         // Without `[oauth]`: an unknown route, like any other.
@@ -2783,7 +2871,7 @@ mod tests {
             "https://kharon-owner.example.com".to_owned(),
             "kharon.example.com",
         );
-        let ui = mk(Some(Arc::new(discovery.clone())));
+        let ui = mk(Some(metadata_oauth(discovery.clone())));
         let response = call(&ui, Method::GET, None);
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = serde_json::from_str(&futures_body(response)).unwrap();
@@ -2848,6 +2936,7 @@ mod tests {
             body: br#"{"password":"hunter2","ceremony_id":"x"}"#.to_vec(),
             client_ip: None,
             throttle_key: None,
+            query: None,
         });
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
@@ -2883,6 +2972,7 @@ mod tests {
             body: Vec::new(),
             client_ip: None,
             throttle_key: None,
+            query: None,
         });
         assert_eq!(response.status(), StatusCode::OK);
         let cleared = response
@@ -2910,6 +3000,7 @@ mod tests {
             body: Vec::new(),
             client_ip: None,
             throttle_key: None,
+            query: None,
         });
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
@@ -3150,6 +3241,7 @@ mod tests {
                 body: body.as_bytes().to_vec(),
                 client_ip: self.client_ip,
                 throttle_key: self.client_ip,
+                query: None,
             });
             let status = response.status();
             let bytes = futures_body(response);
@@ -3873,6 +3965,7 @@ mod tests {
             body: body.as_bytes().to_vec(),
             client_ip: None,
             throttle_key: None,
+            query: None,
         });
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let (status, _) = rig.post("/owner/unlock", &body);
@@ -4083,6 +4176,7 @@ mod tests {
             body: body.to_vec(),
             client_ip: None,
             throttle_key: None,
+            query: None,
         });
         let status = response.status();
         (status, futures_body(response))
@@ -4185,6 +4279,7 @@ mod tests {
             body: Vec::new(),
             client_ip: None,
             throttle_key: None,
+            query: None,
         };
         let refused = ui.burn_ceremony(&req, &opened).expect("refused");
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
@@ -4267,6 +4362,7 @@ mod tests {
             body: body.as_bytes().to_vec(),
             client_ip: None,
             throttle_key: None,
+            query: None,
         }
     }
 
@@ -4486,7 +4582,7 @@ mod tests {
         // the rest of the UI stays gated. Without `[oauth]` the path
         // keeps the uniform 404, gate or no gate.
         let doc = r#"{"keys":[{"kid":"k1","kty":"RSA","n":"AQAB","e":"AQAB"}]}"#;
-        let mk = |oauth: Option<Arc<Discovery>>| {
+        let mk = |oauth: Option<OauthAs>| {
             let verifier = access::AccessVerifier::new(&crate::config::AccessConfig {
                 team_domain: "test.cloudflareaccess.com".into(),
                 audience: "aud123".into(),
@@ -4528,7 +4624,7 @@ mod tests {
                 .unwrap()
         };
         let discovery = Discovery::new(PUBLIC.to_owned(), "kharon.example.com");
-        let (state, _dir) = mk(Some(Arc::new(discovery.clone())));
+        let (state, _dir) = mk(Some(metadata_oauth(discovery.clone())));
         // No Access token: the metadata answers anyway...
         let resp = handle(
             State(Arc::clone(&state)),

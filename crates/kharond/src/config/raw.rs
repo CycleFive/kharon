@@ -99,6 +99,9 @@ struct RawPublicIngress {
     tls_key_file: Option<PathBuf>,
     #[serde(default)]
     public_host: Option<String>,
+    /// Non-loopback peers allowed to set `CF-Connecting-IP`.
+    #[serde(default)]
+    trusted_proxies: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -499,11 +502,38 @@ fn validate_public_ingress(raw: RawPublicIngress) -> Result<PublicIngressConfig,
             }
         })
         .transpose()?;
+    let trusted_proxies = validate_trusted_proxies(raw.trusted_proxies)?;
     Ok(PublicIngressConfig {
         listen,
         tls,
         public_host,
+        trusted_proxies,
     })
+}
+
+/// `trusted_proxies`: exact unicast addresses, stored in canonical
+/// form so `::ffff:203.0.113.7` and `203.0.113.7` are one entry.
+fn validate_trusted_proxies(entries: Vec<String>) -> Result<Vec<IpAddr>, ConfigError> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let ip: IpAddr = entry
+            .parse()
+            .map_err(|_| ConfigError::PublicIngressTrustedProxy {
+                entry: entry.clone(),
+            })?;
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            v4 => v4,
+        };
+        if check_listen_ip(ip).is_err() {
+            return Err(ConfigError::PublicIngressTrustedProxy { entry });
+        }
+        if out.contains(&ip) {
+            return Err(ConfigError::PublicIngressTrustedProxyDuplicate { entry });
+        }
+        out.push(ip);
+    }
+    Ok(out)
 }
 
 /// Two configured addresses contend for one socket when they are equal

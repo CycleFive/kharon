@@ -12,12 +12,21 @@
 
 mod api_support;
 
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 use api_support::{Harness, TestBroker, mcp_call, raw_request};
 use kharond::api::transport::{PER_AGENT_PER_MINUTE, PER_IP_PER_MINUTE};
 
 async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
+    serve_public_proxies(broker, Arc::from([])).await
+}
+
+async fn serve_public_proxies(
+    broker: Arc<TestBroker>,
+    trusted: Arc<[std::net::IpAddr]>,
+) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(kharond::api::public::serve_with_shutdown(
@@ -25,6 +34,7 @@ async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
         broker,
         None,
         None,
+        trusted,
         std::future::pending(),
     ));
     addr
@@ -170,15 +180,93 @@ async fn audit_entries_carry_the_effective_client_ip() {
     assert_eq!(list.client_ip.as_deref(), Some("127.0.0.1"));
 }
 
-/// The redaction probe (#200): canary-shaped secrets — the fixture
+/// Records every tracing event and span field emitted on this thread.
+struct TracingCapture(Arc<Mutex<String>>);
+
+struct TracingRecorder<'a>(&'a mut String);
+
+impl tracing::field::Visit for TracingRecorder<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for TracingCapture
+where
+    S: tracing::Subscriber,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut line = format!("span {}", attrs.metadata().name());
+        attrs.record(&mut TracingRecorder(&mut line));
+        self.push(line);
+    }
+
+    fn on_record(
+        &self,
+        _id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut line = String::from("record");
+        values.record(&mut TracingRecorder(&mut line));
+        self.push(line);
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut line = format!(
+            "event {} {}",
+            event.metadata().target(),
+            event.metadata().name()
+        );
+        event.record(&mut TracingRecorder(&mut line));
+        self.push(line);
+    }
+}
+
+impl TracingCapture {
+    fn push(&self, line: String) {
+        let mut buf = self.0.lock().unwrap();
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+}
+
+/// The redaction probe (#200, #239): canary-shaped secrets — the fixture
 /// vault's passwords and full usernames, the agent's own bearer
 /// token, and a canary used as a search query — must appear in no
-/// response body and no audit entry the public surface produces,
-/// across success and error paths alike.
-#[tokio::test]
+/// response body, no audit entry, and no tracing output the public
+/// surface produces, across success and error paths alike. One
+/// `kharon_fill` runs through it, and that fill really decrypts a
+/// vault password, so the scan is not of a path that never held one.
+///
+/// `current_thread` keeps the server task on this thread, where the
+/// capture subscriber is installed. kharond's own lines are
+/// `eprintln!`, not tracing events; the subscriber is what a later
+/// `tracing` event is checked against, and the sentinel proves it
+/// was recording.
+#[tokio::test(flavor = "current_thread")]
 async fn public_surface_never_echoes_secrets() {
-    use api_support::{assert_no_canary, canaries, mcp_request};
-    let h = Harness::new(false);
+    use api_support::{FakeAnswer, FakeFill, ITEM_A, assert_no_canary, canaries, mcp_request};
+    use tracing_subscriber::prelude::*;
+
+    let captured = Arc::new(Mutex::new(String::new()));
+    let subscriber = tracing_subscriber::registry().with(TracingCapture(Arc::clone(&captured)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!(target: "kharon_redaction_probe", "subscriber armed");
+
+    let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://login.example.com/");
+    let recorded = fake.clone();
+    let h = Harness::with(false, move |b| b.with_fill_backend(Box::new(fake)));
+    h.grant_fixture_items();
     let addr = serve_public(h.broker.clone()).await;
     let token = h.alpha.clone();
 
@@ -197,6 +285,27 @@ async fn public_surface_never_echoes_secrets() {
     let q = canaries()[0].clone();
     let params = format!(r#"{{"name":"kharon_search","arguments":{{"q":"{q}"}}}}"#);
     let r = mcp_request(addr, Some(&token), "tools/call", &params).await;
+    bodies.push(r.body);
+    // One fill. The password is decrypted into the plan the backend
+    // sees; the reply is status only.
+    let fill = format!(
+        r#"{{"item_id":"{ITEM_A}","target":{{"cdp_target_id":"tab-1","expected_origin":"https://login.example.com"}},"fields":[{{"kind":"username"}},{{"kind":"password"}}]}}"#
+    );
+    let r = mcp_call(addr, Some(&token), "kharon_fill", &fill).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let reply = r.json();
+    assert_eq!(reply["result"]["isError"], false, "{}", r.body);
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    let filled: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(filled["status"], "filled", "{filled}");
+    assert!(
+        recorded.seen().iter().any(|plan| {
+            plan.fields.iter().any(|(kind, _, value)| {
+                *kind == "password" && canaries().iter().any(|c| c == value)
+            })
+        }),
+        "kharon_fill did not decrypt a vault password, so the scan would be vacuous"
+    );
     bodies.push(r.body);
     // A near-miss token (the real one, corrupted) is refused; the
     // refusal must not echo what was presented.
@@ -220,11 +329,152 @@ async fn public_surface_never_echoes_secrets() {
     for body in &bodies {
         assert_no_canary(body);
         assert!(!body.contains(&token), "response echoed the bearer token");
+        assert!(!body.contains(&q), "response echoed the search query");
     }
     let audit = serde_json::to_string(&*h.audit.entries.lock().unwrap()).unwrap();
     assert_no_canary(&audit);
     assert!(
         !audit.contains(&token),
         "audit entry holds the bearer token"
+    );
+    assert!(!audit.contains(&q), "audit entry holds the search query");
+    let logs = captured.lock().unwrap().clone();
+    assert!(
+        logs.contains("subscriber armed"),
+        "the tracing subscriber recorded nothing, so the scan would be vacuous"
+    );
+    assert_no_canary(&logs);
+    assert!(
+        !logs.contains(&token),
+        "tracing output holds the bearer token"
+    );
+    assert!(!logs.contains(&q), "tracing output holds the search query");
+}
+
+/// `POST /mcp` as if the TCP peer were `peer`, through the real router.
+/// A missing [`ConnectInfo`] is a 500, so a 401 or 429 means the peer
+/// was the one the handler read.
+async fn post_as(
+    app: &axum::Router,
+    peer: SocketAddr,
+    headers: &[(&str, &str)],
+    body: &'static str,
+) -> u16 {
+    use axum::body::Body;
+    use axum::extract::connect_info::ConnectInfo;
+    use axum::http::Request;
+    use kharond::api::public::Peer;
+    use tower::ServiceExt;
+
+    let mut builder = Request::builder().method("POST").uri("/mcp");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder
+        .extension(ConnectInfo(Peer(peer)))
+        .body(Body::from(body))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status().as_u16()
+}
+
+fn bad_headers(cf: &str) -> Vec<(&str, String)> {
+    vec![
+        ("host", "kharon.test".to_owned()),
+        ("content-type", "application/json".to_owned()),
+        ("authorization", "Bearer bogus".to_owned()),
+        ("cf-connecting-ip", cf.to_owned()),
+    ]
+}
+
+/// A non-loopback peer that is not in `trusted_proxies` cannot pick its
+/// throttle key. Rotating `CF-Connecting-IP` still fills one window,
+/// the peer's, and a second peer is unaffected.
+#[tokio::test]
+async fn untrusted_peer_cannot_choose_its_throttle_key() {
+    let h = Harness::new(false);
+    let app = kharond::api::public::router(h.broker.clone(), None, None, Arc::from([]));
+    let peer: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+    for i in 0..PER_IP_PER_MINUTE {
+        let cf = format!("198.51.100.{}", i + 1);
+        let headers = bad_headers(&cf);
+        let pairs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let status = post_as(&app, peer, &pairs, "{}").await;
+        assert_eq!(status, 401, "request {i} must reach auth");
+    }
+    let headers = bad_headers("198.51.100.200");
+    let pairs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    assert_eq!(
+        post_as(&app, peer, &pairs, "{}").await,
+        429,
+        "the peer's own window is exhausted; the rotating header did not mint keys"
+    );
+    let other: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+    assert_eq!(
+        post_as(&app, other, &pairs, "{}").await,
+        401,
+        "a different peer has its own budget"
+    );
+}
+
+/// Audit `client_ip` is the same address the throttle uses. A listed
+/// proxy's header is recorded; an unlisted peer is recorded as itself.
+/// Loopback stays trusted even when the list names someone else.
+#[tokio::test]
+async fn audit_client_ip_follows_the_proxy_list() {
+    let h = Harness::new(false);
+    let listed: IpAddr = "203.0.113.9".parse().unwrap();
+    let proxies: Arc<[IpAddr]> = Arc::from([listed]);
+    let app = kharond::api::public::router(h.broker.clone(), None, None, Arc::clone(&proxies));
+    let payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"kharon_list\",\"arguments\":{},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}";
+    let list_from = async |peer: SocketAddr| {
+        let headers = [
+            ("host", "kharon.test".to_owned()),
+            ("content-type", "application/json".to_owned()),
+            ("authorization", format!("Bearer {}", h.alpha)),
+            ("cf-connecting-ip", "198.51.100.23".to_owned()),
+            ("mcp-protocol-version", "2026-07-28".to_owned()),
+            ("mcp-method", "tools/call".to_owned()),
+            ("mcp-name", "kharon_list".to_owned()),
+        ];
+        let pairs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        post_as(&app, peer, &pairs, payload).await
+    };
+    let trusted: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+    assert_eq!(list_from(trusted).await, 200);
+    let stranger: SocketAddr = "203.0.113.8:40000".parse().unwrap();
+    assert_eq!(list_from(stranger).await, 200);
+    let ips: Vec<_> = {
+        let entries = h.audit.entries.lock().unwrap();
+        entries
+            .iter()
+            .filter(|e| e.event == kharond::audit::Event::List)
+            .filter_map(|e| e.client_ip.clone())
+            .collect()
+    };
+    assert_eq!(
+        ips,
+        vec!["198.51.100.23".to_owned(), "203.0.113.8".to_owned()],
+        "listed proxy records the header; an unlisted peer records itself"
+    );
+
+    // A real loopback accept, with a list that does not name 127.0.0.1.
+    let h = Harness::new(false);
+    let addr = serve_public_proxies(h.broker.clone(), proxies).await;
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: kharon.test\r\nAuthorization: Bearer {}\r\nCF-Connecting-IP: 198.51.100.23\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: kharon_list\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        h.alpha,
+        payload.len()
+    );
+    let r = raw_request(addr, req.as_bytes()).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let entries = h.audit.entries.lock().unwrap();
+    let list = entries
+        .iter()
+        .find(|e| e.event == kharond::audit::Event::List)
+        .expect("a list entry");
+    assert_eq!(
+        list.client_ip.as_deref(),
+        Some("198.51.100.23"),
+        "loopback stays trusted when the list names another proxy"
     );
 }

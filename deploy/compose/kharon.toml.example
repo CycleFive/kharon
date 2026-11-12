@@ -56,6 +56,10 @@ cdp = { endpoint = "ws://10.66.0.2:9222", via = "wireguard" }
 listen = "127.0.0.1:8790"
 # Set this on any published deploy: requests for another Host get 404.
 # public_host = "kharon.example.com"
+# Non-loopback peers allowed to set CF-Connecting-IP (throttle key and
+# audit client_ip only; never auth). Loopback, this listener, needs none.
+# A tailnet cloudflared lists the address it connects from:
+# trusted_proxies = ["100.64.0.2"]
 
 [approval]
 # ntfy is both the approval-prompt channel (REQ-APR-004) and the

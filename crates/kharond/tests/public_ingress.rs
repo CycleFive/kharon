@@ -64,6 +64,7 @@ async fn serve_public_for(
         broker,
         None,
         public_host.map(Arc::from),
+        Arc::<[std::net::IpAddr]>::from([]),
         std::future::pending(),
     ));
     addr

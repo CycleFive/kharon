@@ -94,6 +94,14 @@ ciborium = "0.2"
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys", "alloc", "ring-sig-verify"] }
 
 [dev-dependencies]
+# Integration tests drive the public-ingress router with an injected
+# peer (REQ-API-010). The library already depends on axum; the test
+# crate needs it named to call it.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tower = { version = "0.5", features = ["util"] }
+# The redaction probe's tracing capture subscriber (REQ-API-010, #239).
+tracing = "0.1"
+tracing-subscriber = "0.3"
 # Self-dependency solely to enable the canary-scan feature for test
 # builds (feature unification): the daemon binary the REQ-MEM-003
 # test spawns must carry the scan op, release builds must not.

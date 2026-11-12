@@ -19,10 +19,11 @@
 //! 404 says nothing about which exist on another listener.
 //!
 //! Requests admitted here carry a [`PublicIngress`] extension, so the
-//! MCP handler can tell a public request from a tailnet one (#200 keys
-//! its trusted-proxy and client-IP handling on it). The extension is the
-//! only such signal: the TCP peer here is always the edge, so it says
-//! nothing about the client. The listener has its
+//! MCP handler can tell a public request from a tailnet one. The client
+//! address is [`effective_client_ip`]: `CF-Connecting-IP` only when the
+//! TCP peer is loopback or listed in `trusted_proxies`, and the peer
+//! itself otherwise (#200, #239). That address keys throttling and
+//! stamps audit `client_ip`; it never gates auth. The listener has its
 //! own token-verification semaphore ([`AppState::new`]): a flood of bad
 //! tokens from the internet cannot starve tailnet agents of Argon2id
 //! permits.
@@ -54,21 +55,62 @@ pub const CONNECTOR_PATH: &str = "/connector";
 /// proxied (`CF-Connecting-IP`).
 pub const CF_CONNECTING_IP: &str = "cf-connecting-ip";
 
-/// The client address of a request, taken from
-/// [`CF_CONNECTING_IP`] — the trusted-proxy helper (#200; the
-/// contract below is the one recorded on #206, and #208 reuses this
-/// helper for the owner UI).
+/// Canonical form of an address for proxy comparison. An IPv4-mapped
+/// IPv6 address is its IPv4 address; everything else is unchanged.
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+    }
+}
+
+/// Whether `peer` may name the client via [`CF_CONNECTING_IP`].
 ///
-/// **The trust root is placement.** The header is honoured *only*
-/// on a public-ingress request ([`PublicIngress`]): that listener's
-/// loopback is one only cloudflared shares by placement (a shared
-/// network-namespace holder in compose; host networking on VM 125).
-/// On any other listener the header is ignored — there the peer
-/// identity comes from the connection itself, and a client must not
-/// be able to name its own address. On a host-networked deploy every
-/// local process shares that loopback and could set the header; that
-/// residual is accepted for single-purpose hosts, and it is
-/// acceptable only because of the next paragraph.
+/// Loopback — `127.0.0.0/8`, `::1`, and those addresses in IPv4-mapped
+/// form — is trusted by placement: the edge shares it (B6). Any other
+/// peer is trusted only when its canonical address is in
+/// `trusted_proxies`.
+pub fn peer_trusts_connecting_ip(peer: IpAddr, trusted_proxies: &[IpAddr]) -> bool {
+    let peer = canonical_ip(peer);
+    peer.is_loopback()
+        || trusted_proxies
+            .iter()
+            .copied()
+            .any(|p| canonical_ip(p) == peer)
+}
+
+/// Parse one [`CF_CONNECTING_IP`] value. `None` when the header is
+/// absent, appears more than once, or is not a single IP address.
+fn connecting_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let mut values = headers.get_all(CF_CONNECTING_IP).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().ok()?,
+        _ => return None,
+    };
+    value.trim().parse().ok()
+}
+
+/// The client address taken from [`CF_CONNECTING_IP`], when it may
+/// be honoured (#200; the contract below is the one recorded on
+/// #206, and #208 reuses this helper for the owner UI).
+///
+/// **When the header is read.** `honour` is true on `[public_ingress]`
+/// and on the owner UI in public mode. Even then the header is
+/// honoured only when [`peer_trusts_connecting_ip`]: the peer is
+/// loopback, or it is listed in `trusted_proxies`. A non-loopback
+/// peer that is not listed does not get to choose an address. The
+/// `[api]` listener does not call this helper; its peer is the
+/// client by construction.
+///
+/// **The trust root is placement, plus that list.** A loopback
+/// listener is one only the edge shares by placement (a shared
+/// network-namespace holder in compose; host networking on a
+/// single-purpose host). `trusted_proxies` is the same idea for a
+/// non-loopback listen: the edge's address, named explicitly. On a
+/// host-networked deploy every local process shares loopback and
+/// could set the header; that residual is accepted for
+/// single-purpose hosts, and it is acceptable only because of the
+/// next paragraph.
 ///
 /// **What the result may decide: nothing next to auth.** An address
 /// taken from this helper may key throttling and may appear in
@@ -79,21 +121,35 @@ pub const CF_CONNECTING_IP: &str = "cf-connecting-ip";
 /// A `None` is not a throttle key. The owner UI audits such a
 /// request with its TCP peer and does not throttle it (REQ-APR-009):
 /// behind the tunnel every header-less request shares one peer, and
-/// one shared bucket would let a stranger lock the owner out.
+/// one shared bucket would let a stranger lock the owner out. A
+/// non-trusted peer also gets `None`, and the caller uses that peer.
 ///
-/// Returns `None` when the request is not public-ingress, the
-/// header is absent, appears more than once, or does not parse as
-/// one IP address (v4 or v6).
-pub fn client_ip(headers: &HeaderMap, public_ingress: bool) -> Option<IpAddr> {
-    if !public_ingress {
+/// Returns `None` when the header must not be honoured, is absent,
+/// appears more than once, or does not parse as one IP address
+/// (v4 or v6).
+pub fn client_ip(
+    headers: &HeaderMap,
+    honour: bool,
+    peer: IpAddr,
+    trusted_proxies: &[IpAddr],
+) -> Option<IpAddr> {
+    if !honour || !peer_trusts_connecting_ip(peer, trusted_proxies) {
         return None;
     }
-    let mut values = headers.get_all(CF_CONNECTING_IP).iter();
-    let value = match (values.next(), values.next()) {
-        (Some(v), None) => v.to_str().ok()?,
-        _ => return None,
-    };
-    value.trim().parse().ok()
+    connecting_ip(headers)
+}
+
+/// The effective client address of a `[public_ingress]` request.
+///
+/// The honoured header when [`client_ip`] returns one, otherwise
+/// `peer`. This is the throttle key and the audit `client_ip`. It
+/// is never an auth input.
+pub fn effective_client_ip(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trusted_proxies: &[IpAddr],
+) -> IpAddr {
+    client_ip(headers, true, peer, trusted_proxies).unwrap_or(peer)
 }
 
 /// True when the request carries exactly one `Host` header equal, ASCII
@@ -126,9 +182,13 @@ pub fn host_matches(headers: &HeaderMap, host: &str, port: u16) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicIngress;
 
-/// The TCP peer of a public-ingress connection: the edge, not the client.
+/// The TCP peer of a public-ingress connection: the edge, not the client,
+/// when the edge dials a trusted address.
+///
+/// Axum's [`ConnectInfo`] carries this. Tests inject one to exercise a
+/// peer the sandbox cannot bind.
 #[derive(Debug, Clone, Copy)]
-struct Peer(SocketAddr);
+pub struct Peer(pub SocketAddr);
 
 impl Connected<IncomingStream<'_, TcpListener>> for Peer {
     fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
@@ -149,6 +209,7 @@ pub fn router<S, C>(
     broker: Arc<Broker<S, C>>,
     ws: Option<Arc<WsEntry>>,
     public_host: Option<Arc<str>>,
+    trusted_proxies: Arc<[IpAddr]>,
 ) -> Router
 where
     S: VaultView + 'static,
@@ -159,7 +220,14 @@ where
             move |state: State<Arc<AppState<S, C>>>,
                   ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
                   req: Request| {
-                handle(state, ws.clone(), public_host.clone(), peer, req)
+                handle(
+                    state,
+                    ws.clone(),
+                    public_host.clone(),
+                    trusted_proxies.clone(),
+                    peer,
+                    req,
+                )
             },
         )
         .with_state(AppState::new(broker))
@@ -172,6 +240,7 @@ pub async fn serve_with_shutdown<S, C, F>(
     broker: Arc<Broker<S, C>>,
     ws: Option<Arc<WsEntry>>,
     public_host: Option<Arc<str>>,
+    trusted_proxies: Arc<[IpAddr]>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -181,7 +250,8 @@ where
 {
     axum::serve(
         listener,
-        router(broker, ws, public_host).into_make_service_with_connect_info::<Peer>(),
+        router(broker, ws, public_host, trusted_proxies)
+            .into_make_service_with_connect_info::<Peer>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -196,6 +266,7 @@ pub async fn serve_tls_with_shutdown<S, C, F>(
     broker: Arc<Broker<S, C>>,
     ws: Option<Arc<WsEntry>>,
     public_host: Option<Arc<str>>,
+    trusted_proxies: Arc<[IpAddr]>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -205,7 +276,8 @@ where
 {
     axum::serve(
         TlsListener::new(listener, tls),
-        router(broker, ws, public_host).into_make_service_with_connect_info::<Peer>(),
+        router(broker, ws, public_host, trusted_proxies)
+            .into_make_service_with_connect_info::<Peer>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -239,6 +311,7 @@ async fn handle<S, C>(
     State(state): State<Arc<AppState<S, C>>>,
     ws: Option<Arc<WsEntry>>,
     public_host: Option<Arc<str>>,
+    trusted_proxies: Arc<[IpAddr]>,
     peer: SocketAddr,
     mut req: Request,
 ) -> Response
@@ -256,10 +329,12 @@ where
     match admit(req.method(), req.uri().path()) {
         Some(Admit::Mcp) => {
             req.extensions_mut().insert(PublicIngress);
-            // This listener is the trusted-proxy trust root (#200):
-            // only here may CF-Connecting-IP name the client. No
-            // usable header value: the edge peer is the key.
-            let ip = client_ip(req.headers(), true).unwrap_or_else(|| peer.ip());
+            // The only place a public-ingress client address is chosen
+            // (#239). A loopback peer or a listed proxy may set
+            // CF-Connecting-IP; every other peer is its own key. The
+            // result is the throttle key and the audit client_ip, and
+            // nothing else.
+            let ip = effective_client_ip(req.headers(), peer.ip(), &trusted_proxies);
             req.extensions_mut().insert(ClientIp(ip));
             super::mcp::handle(state, req).await
         }
@@ -313,33 +388,91 @@ mod tests {
         assert!(!m(&with(&["evil.example.com"])));
     }
 
+    fn v4(o: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, o))
+    }
+
+    fn header(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CF_CONNECTING_IP, value.parse().unwrap());
+        h
+    }
+
     #[test]
-    fn client_ip_is_honoured_only_on_public_ingress() {
-        let mut h = HeaderMap::new();
-        h.insert(CF_CONNECTING_IP, "203.0.113.7".parse().unwrap());
+    fn client_ip_is_honoured_only_from_a_trusted_peer() {
+        let loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let edge = v4(9);
+        let claimed = header("203.0.113.7");
+        let listed = [edge];
         assert_eq!(
-            client_ip(&h, false),
+            client_ip(&claimed, false, loopback, &listed),
             None,
-            "spoofed on the private listener"
+            "a listener that does not honour the header ignores it"
         );
         assert_eq!(
-            client_ip(&h, true),
-            Some("203.0.113.7".parse::<IpAddr>().unwrap())
+            client_ip(&claimed, true, loopback, &[]),
+            Some(v4(7)),
+            "loopback is trusted with an empty list"
         );
-        let mut h = HeaderMap::new();
-        h.insert(CF_CONNECTING_IP, "2001:db8::1".parse().unwrap());
         assert_eq!(
-            client_ip(&h, true),
-            Some("2001:db8::1".parse::<IpAddr>().unwrap())
+            client_ip(
+                &claimed,
+                true,
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                &[]
+            ),
+            Some(v4(7))
         );
-        assert_eq!(client_ip(&HeaderMap::new(), true), None);
-        let mut h = HeaderMap::new();
-        h.insert(CF_CONNECTING_IP, "not-an-ip".parse().unwrap());
-        assert_eq!(client_ip(&h, true), None);
-        let mut h = HeaderMap::new();
-        h.append(CF_CONNECTING_IP, "203.0.113.7".parse().unwrap());
-        h.append(CF_CONNECTING_IP, "203.0.113.8".parse().unwrap());
-        assert_eq!(client_ip(&h, true), None, "two values is not one address");
+        assert_eq!(
+            client_ip(&claimed, true, "127.1.2.3".parse().unwrap(), &[]),
+            Some(v4(7)),
+            "the whole 127.0.0.0/8 is loopback"
+        );
+        assert_eq!(
+            client_ip(&claimed, true, "::ffff:127.0.0.1".parse().unwrap(), &[]),
+            Some(v4(7)),
+            "an IPv4-mapped loopback is loopback"
+        );
+        assert_eq!(
+            client_ip(&claimed, true, edge, &[]),
+            None,
+            "a non-loopback peer is not trusted just because it connected"
+        );
+        assert_eq!(
+            effective_client_ip(&claimed, edge, &[]),
+            edge,
+            "the untrusted peer is the client address"
+        );
+        assert_eq!(client_ip(&claimed, true, edge, &listed), Some(v4(7)));
+        assert_eq!(
+            client_ip(
+                &claimed,
+                true,
+                "::ffff:203.0.113.9".parse().unwrap(),
+                &listed
+            ),
+            Some(v4(7)),
+            "the mapped form of a listed proxy is that proxy"
+        );
+        assert_eq!(
+            client_ip(&header("2001:db8::1"), true, loopback, &[]),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(client_ip(&HeaderMap::new(), true, loopback, &[]), None);
+        assert_eq!(
+            effective_client_ip(&HeaderMap::new(), loopback, &[]),
+            loopback,
+            "no usable header: the trusted peer itself"
+        );
+        assert_eq!(client_ip(&header("not-an-ip"), true, loopback, &[]), None);
+        let mut two = HeaderMap::new();
+        two.append(CF_CONNECTING_IP, "203.0.113.7".parse().unwrap());
+        two.append(CF_CONNECTING_IP, "203.0.113.8".parse().unwrap());
+        assert_eq!(
+            client_ip(&two, true, loopback, &[]),
+            None,
+            "two values is not one address"
+        );
     }
 
     #[test]

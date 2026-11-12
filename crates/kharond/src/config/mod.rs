@@ -472,6 +472,19 @@ pub enum ConfigError {
         "[public_ingress].listen must differ from [api].listen, [connector].listen and [owner_ui].listen"
     )]
     PublicIngressListenConflict,
+    /// A `trusted_proxies` entry is not one unicast IP address.
+    #[error("`public_ingress.trusted_proxies` entry `{entry}` must be one unicast IP address")]
+    PublicIngressTrustedProxy {
+        /// The offending entry.
+        entry: String,
+    },
+    /// The same proxy address is listed twice. An IPv4-mapped form and
+    /// the plain address are the same entry.
+    #[error("`public_ingress.trusted_proxies` lists `{entry}` more than once")]
+    PublicIngressTrustedProxyDuplicate {
+        /// The offending entry.
+        entry: String,
+    },
     /// `[oauth]` without `[public_ingress]` (REQ-OAU-001): the
     /// protected-resource metadata and the `/mcp` challenge live there.
     #[error("[oauth] requires [public_ingress]")]
@@ -581,6 +594,10 @@ impl ConfigError {
             Self::PublicIngressListenNotUnicast => "public_ingress_listen_not_unicast",
             Self::PublicIngressPlainHttpNonLoopback => "public_ingress_plain_http_non_loopback",
             Self::PublicIngressListenConflict => "public_ingress_listen_conflict",
+            Self::PublicIngressTrustedProxy { .. } => "public_ingress_trusted_proxy",
+            Self::PublicIngressTrustedProxyDuplicate { .. } => {
+                "public_ingress_trusted_proxy_duplicate"
+            }
             Self::OauthNeedsPublicIngress => "oauth_needs_public_ingress",
             Self::OauthNeedsPublicHost => "oauth_needs_public_host",
             Self::OauthNeedsOwnerUi => "oauth_needs_owner_ui",
@@ -609,6 +626,10 @@ pub enum ConfigWarning {
     /// `bitwarden.api_key_file` is not owned by kharond's effective uid
     /// (REQ-DEP-008).
     ApiKeyFileForeignOwner,
+    /// `[public_ingress]` listens off loopback with no `trusted_proxies`,
+    /// so `CF-Connecting-IP` is ignored and every client shares the
+    /// peer's throttle key (REQ-API-010).
+    PublicIngressNoTrustedProxy,
 }
 
 impl fmt::Display for ConfigWarning {
@@ -630,6 +651,9 @@ impl fmt::Display for ConfigWarning {
             }
             Self::ApiKeyFileForeignOwner => {
                 "bitwarden.api_key_file is not owned by kharond's effective uid"
+            }
+            Self::PublicIngressNoTrustedProxy => {
+                "public_ingress.listen is not loopback and trusted_proxies is empty: CF-Connecting-IP is ignored, so every client shares the peer's throttle key and audit client_ip"
             }
         })
     }
@@ -1071,6 +1095,10 @@ pub struct PublicIngressConfig {
     /// Hostname the edge serves this listener under, lower-case. When set,
     /// requests for any other `Host` are refused.
     pub public_host: Option<String>,
+    /// Non-loopback peers allowed to set `CF-Connecting-IP` (REQ-API-010).
+    /// Empty means only a loopback peer may. Each entry is one unicast
+    /// address; an IPv4-mapped form is stored as its IPv4 address.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 /// `[api]`.
@@ -1171,6 +1199,12 @@ impl Config {
             && bw.allow_extra_orgs
         {
             w.push(ConfigWarning::ExtraOrgsAllowed);
+        }
+        if let Some(public) = &self.public_ingress
+            && !public.listen.ip().is_loopback()
+            && public.trusted_proxies.is_empty()
+        {
+            w.push(ConfigWarning::PublicIngressNoTrustedProxy);
         }
         w
     }

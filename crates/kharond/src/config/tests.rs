@@ -521,6 +521,79 @@ fn public_ingress_public_host_is_optional_and_validated() {
     }
 }
 
+#[test]
+fn public_ingress_trusted_proxies_are_canonical_unicast_addresses() {
+    let load = |extra: &str| {
+        Config::from_toml_str(&format!(
+            "{}\n[public_ingress]\nlisten = \"127.0.0.1:8790\"\n{extra}\n",
+            spec_example()
+        ))
+    };
+    assert!(
+        load("")
+            .unwrap()
+            .public_ingress
+            .unwrap()
+            .trusted_proxies
+            .is_empty()
+    );
+    let proxies =
+        load("trusted_proxies = [\"203.0.113.7\", \"2001:db8::1\", \"::ffff:198.51.100.23\"]")
+            .unwrap()
+            .public_ingress
+            .unwrap()
+            .trusted_proxies;
+    assert_eq!(
+        proxies,
+        vec![
+            "203.0.113.7".parse::<std::net::IpAddr>().unwrap(),
+            "2001:db8::1".parse::<std::net::IpAddr>().unwrap(),
+            "198.51.100.23".parse::<std::net::IpAddr>().unwrap(),
+        ]
+    );
+    for bad in [
+        "example.com",
+        "203.0.113.0/24",
+        "0.0.0.0",
+        "::",
+        "224.0.0.1",
+    ] {
+        let err = load(&format!("trusted_proxies = [\"{bad}\"]")).unwrap_err();
+        assert_eq!(err.code(), "public_ingress_trusted_proxy", "{bad}: {err}");
+    }
+    let err = load("trusted_proxies = [\"203.0.113.7\", \"::ffff:203.0.113.7\"]").unwrap_err();
+    assert_eq!(err.code(), "public_ingress_trusted_proxy_duplicate");
+
+    // Off loopback with no list: the header is ignored, and startup says so.
+    let tailnet = Config::from_toml_str(&format!(
+        "{}\n[public_ingress]\nlisten = \"100.64.0.10:8790\"\ntls_cert_file = \"/tmp/c.pem\"\ntls_key_file = \"/tmp/k.pem\"\n",
+        spec_example()
+    ))
+    .unwrap();
+    assert!(
+        tailnet
+            .warnings()
+            .contains(&ConfigWarning::PublicIngressNoTrustedProxy)
+    );
+    let listed = Config::from_toml_str(&format!(
+        "{}\n[public_ingress]\nlisten = \"100.64.0.10:8790\"\ntls_cert_file = \"/tmp/c.pem\"\ntls_key_file = \"/tmp/k.pem\"\ntrusted_proxies = [\"100.64.0.2\"]\n",
+        spec_example()
+    ))
+    .unwrap();
+    assert!(
+        !listed
+            .warnings()
+            .contains(&ConfigWarning::PublicIngressNoTrustedProxy)
+    );
+    assert!(
+        !load("")
+            .unwrap()
+            .warnings()
+            .contains(&ConfigWarning::PublicIngressNoTrustedProxy),
+        "loopback needs no list"
+    );
+}
+
 /// `[oauth]` on the spec example, with the `[public_ingress]` and
 /// `[owner_ui]` tables it depends on spelled by the caller.
 fn oauth_config(public_ingress: &str, owner_ui: &str, oauth: &str) -> String {

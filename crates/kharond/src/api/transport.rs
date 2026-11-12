@@ -7,8 +7,9 @@
 //! never gate auth — is [`super::public::client_ip`] (#208 reuses it
 //! from there). This module holds the two things every `/mcp`
 //! listener shares: the [`ClientIp`] request extension the admitting
-//! listener stamps (the header's address on `[public_ingress]`, the
-//! connection peer elsewhere), and [`TransportLimits`].
+//! listener stamps (on `[public_ingress]`, the header's address when
+//! the peer is loopback or a trusted proxy, and the connection peer
+//! otherwise; on `[api]`, the peer), and [`TransportLimits`].
 //!
 //! # Transport budgets
 //!

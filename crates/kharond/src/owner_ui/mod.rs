@@ -3072,7 +3072,14 @@ mod tests {
         let r = post_token(
             &fx.ui,
             oauth_token::TOKEN_PATH,
-            form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]),
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
             None,
             None,
         );
@@ -3099,6 +3106,10 @@ mod tests {
             form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh2),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
             ]),
             None,
             None,
@@ -3121,6 +3132,10 @@ mod tests {
             form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh3),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
             ]),
             None,
             None,
@@ -3130,6 +3145,72 @@ mod tests {
             fx.lifecycle.ended.lock().unwrap().as_slice(),
             [auth.agent_id]
         );
+    }
+
+    #[test]
+    fn oauth_token_refresh_requires_the_issuing_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture(dir.path(), true);
+        plant_code(&fx, "code-7", "verifier-7");
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("code-7", "verifier-7", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&futures_body(r)).unwrap();
+        let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+        // No client_id at all: `invalid_request`.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&futures_body(r)).unwrap()["error"],
+            "invalid_request"
+        );
+        // The wrong client: `invalid_grant`, and nothing is spent —
+        // the issuing client still rotates with the same token.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                (
+                    "client_id",
+                    "https://other.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&futures_body(r)).unwrap()["error"],
+            "invalid_grant"
+        );
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[test]
@@ -3267,6 +3348,10 @@ mod tests {
                 form(&[
                     ("grant_type", "refresh_token"),
                     ("refresh_token", "kh_rt_unknown"),
+                    (
+                        "client_id",
+                        "https://dashboard.example/.well-known/kharon-client.json",
+                    ),
                 ]),
                 None,
                 Some(ip),
@@ -3279,6 +3364,10 @@ mod tests {
             form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", "kh_rt_unknown"),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
             ]),
             None,
             Some(ip),
@@ -3293,6 +3382,10 @@ mod tests {
             form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", "kh_rt_unknown"),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
             ]),
             None,
             Some(other),

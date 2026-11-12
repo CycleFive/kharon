@@ -14,10 +14,13 @@
 //! Ordering follows I5 / REQ-AUD-003, and the two directions fail
 //! closed opposite ways, on purpose:
 //! - **Issuance** (connect, refresh): audit first where an entry is
-//!   owed (`oauth_connect`), then persist, then answer. Work happens
-//!   on a clone of the file state and is only swapped in once the
-//!   write lands, so a failed write answers 500 with no tokens and
-//!   leaves the previous state — in memory and on disk — untouched.
+//!   owed (`oauth_connect`), then persist, then answer. Re-check,
+//!   mutation, persist and commit all happen under the one store
+//!   lock, so concurrent writers cannot overwrite each other (or
+//!   resurrect a Connect an ending path just revoked); a failed
+//!   write rolls the in-memory state back from a snapshot taken
+//!   under the same lock, answers 500 with no tokens, and leaves
+//!   the previous state — in memory and on disk — untouched.
 //! - **Ending a Connect** (revoke, reuse, panic): revoke first, in
 //!   memory and in the state file, then audit (the #135 precedent).
 //!   A failed write is reported but cannot un-revoke what memory
@@ -394,8 +397,11 @@ impl OauthStore {
         if !self.append(entry) {
             return Err(TokenError::AuditFailed);
         }
-        // 2. Persist. Work on a clone; swap in only once the write
-        // lands, so a failure leaves the running state untouched.
+        // 2. Persist. Mutate and write under the one lock, so a
+        // concurrent writer (another connect, a refresh, an ending
+        // path) cannot be overwritten by a stale swap; on failure
+        // roll back what was pushed, so the running state is
+        // untouched.
         let identity = Identity {
             id: id.clone(),
             client_id: grant.client_id.clone(),
@@ -407,14 +413,30 @@ impl OauthStore {
             revoked: false,
         };
         let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now);
-        let mut next = {
-            let inner = self.lock();
-            inner.file.clone()
+        let persisted = {
+            let mut inner = self.lock();
+            let identities_len = inner.file.identities.len();
+            let tokens_len = inner.file.tokens.len();
+            inner.file.identities.push(identity);
+            inner.file.tokens.push(access_rec);
+            inner.file.tokens.push(refresh_rec);
+            inner.redeemed.retain(|r| r.expires_at > now);
+            inner.redeemed.push(RedeemedUse {
+                code_hash,
+                identity_id: id.clone(),
+                expires_at: grant.consented_at.saturating_add(CODE_TTL_SECS),
+            });
+            match self.persist(&inner.file) {
+                Ok(()) => true,
+                Err(_) => {
+                    inner.file.identities.truncate(identities_len);
+                    inner.file.tokens.truncate(tokens_len);
+                    inner.redeemed.retain(|r| r.identity_id != id);
+                    false
+                }
+            }
         };
-        next.identities.push(identity);
-        next.tokens.push(access_rec);
-        next.tokens.push(refresh_rec);
-        if self.persist(&next).is_err() {
+        if !persisted {
             // Best-effort compensation (I5): the chain reads connect,
             // then disconnect, for an identity that never served.
             let entry = Entry::new(Event::OauthDisconnect)
@@ -429,75 +451,130 @@ impl OauthStore {
             self.append(entry);
             return Err(TokenError::PersistFailed);
         }
-        let mut inner = self.lock();
-        inner.file = next;
-        inner.redeemed.retain(|r| r.expires_at > now);
-        inner.redeemed.push(RedeemedUse {
-            code_hash,
-            identity_id: id,
-            expires_at: grant.consented_at.saturating_add(CODE_TTL_SECS),
-        });
         // 3. Answer.
         Ok(pair)
     }
 
     /// `grant_type=refresh_token`: rotate, applying the idle and
     /// absolute limits, the 30 s grace and reuse detection (D4, I5).
-    pub fn refresh(&self, presented: &str, now: u64) -> Result<IssuedPair, TokenError> {
+    /// `client_id` must name the client the token was issued to
+    /// (OAuth 2.1 §4.3); it is compared under the store lock.
+    pub fn refresh(
+        &self,
+        presented: &str,
+        client_id: &str,
+        now: u64,
+    ) -> Result<IssuedPair, TokenError> {
         let hash = hex(&sha256(presented.as_bytes()));
-        enum Plan {
-            Invalid,
-            Rotate,
-            GraceRetry,
+        enum Outcome {
             Reuse(String),
+            Pair(IssuedPair),
+            PersistFailed,
         }
-        let plan = {
-            let inner = self.lock();
-            let file = &inner.file;
-            let Some(rec) = file.tokens.iter().find(|t| t.hash == hash) else {
+        // Re-check, mutate, persist and commit under the one lock:
+        // concurrent refreshes serialize into exactly the
+        // sequential outcomes (rotate, then grace, then reuse), and
+        // a concurrent ending path (panic, disconnect, reuse) can
+        // neither be overwritten nor resurrected by a stale swap.
+        // The one exception is the reuse outcome itself, handled
+        // after the lock drops because `end_connect` takes it.
+        let outcome = {
+            let mut inner = self.lock();
+            let Some(pos) = inner.file.tokens.iter().position(|t| t.hash == hash) else {
                 return Err(TokenError::InvalidGrant);
             };
+            let rec = inner.file.tokens[pos].clone();
             if rec.kind != TokenKind::Refresh {
                 return Err(TokenError::InvalidGrant);
             }
-            let Some(identity) = file.identity(&rec.identity_id) else {
+            let Some(identity) = inner.file.identity(&rec.identity_id).cloned() else {
                 return Err(TokenError::InvalidGrant);
             };
+            // The token must have been issued to this client. A
+            // mismatch is a plain `invalid_grant`, checked before
+            // any status handling, so a wrong-client replay of a
+            // retired token cannot trigger the reuse kill either.
+            if identity.client_id != client_id {
+                return Err(TokenError::InvalidGrant);
+            }
             if identity.revoked || rec.status == TokenStatus::Revoked {
                 return Err(TokenError::InvalidGrant);
             }
-            match rec.status {
-                TokenStatus::Live => {
-                    if now >= rec.expires_at || refresh_deadline(identity, now) <= now {
-                        Plan::Invalid
-                    } else {
-                        Plan::Rotate
+            let grace = rec.status == TokenStatus::Retired
+                && !rec.grace_used
+                && rec
+                    .retired_at
+                    .is_some_and(|t| now.saturating_sub(t) <= GRACE_SECS)
+                && rec.successor.as_ref().is_some_and(|succ| {
+                    inner.file.tokens.iter().any(|t| {
+                        t.hash == *succ
+                            && t.status == TokenStatus::Live
+                            && t.identity_id == rec.identity_id
+                    })
+                });
+            if rec.status == TokenStatus::Retired && !grace {
+                Outcome::Reuse(rec.identity_id.clone())
+            } else {
+                if rec.status == TokenStatus::Live
+                    && (now >= rec.expires_at || refresh_deadline(&identity, now) <= now)
+                {
+                    return Err(TokenError::InvalidGrant);
+                }
+                // Snapshot for rollback only: mutation and persist
+                // happen on the live state, under the lock; a
+                // failed write restores the snapshot, so the
+                // presented token stays as it was for a retry.
+                let backup = inner.file.clone();
+                let (pair, access_rec, refresh_rec) =
+                    issue_pair(&identity, Some(hash.clone()), now);
+                if grace {
+                    inner.file.tokens[pos].grace_used = true;
+                    // The pair issued moments before is superseded,
+                    // both tokens (I5). Its refresh token is
+                    // *retired* — reuse-detectable, with the grace
+                    // already spent — not silently revoked, so a
+                    // later presentation still ends the Connect as
+                    // reuse (detection delayed, never lost). Its
+                    // access token is revoked outright.
+                    if let Some(succ) = rec.successor.clone() {
+                        for t in inner.file.tokens.iter_mut() {
+                            if (t.hash == succ || t.parent.as_deref() == Some(succ.as_str()))
+                                && t.status == TokenStatus::Live
+                            {
+                                if t.kind == TokenKind::Refresh {
+                                    t.status = TokenStatus::Retired;
+                                    t.retired_at = Some(now);
+                                    t.grace_used = true;
+                                    t.successor = Some(refresh_rec.hash.clone());
+                                } else {
+                                    t.status = TokenStatus::Revoked;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let old = &mut inner.file.tokens[pos];
+                    old.status = TokenStatus::Retired;
+                    old.retired_at = Some(now);
+                    old.successor = Some(refresh_rec.hash.clone());
+                    old.grace_used = false;
+                }
+                inner.file.tokens.push(access_rec);
+                inner.file.tokens.push(refresh_rec);
+                // The store is written before the response (I5).
+                match self.persist(&inner.file) {
+                    Ok(()) => Outcome::Pair(pair),
+                    Err(_) => {
+                        inner.file = backup;
+                        Outcome::PersistFailed
                     }
                 }
-                TokenStatus::Retired => {
-                    let grace = !rec.grace_used
-                        && rec
-                            .retired_at
-                            .is_some_and(|t| now.saturating_sub(t) <= GRACE_SECS)
-                        && rec.successor.as_ref().is_some_and(|succ| {
-                            file.tokens.iter().any(|t| {
-                                t.hash == *succ
-                                    && t.status == TokenStatus::Live
-                                    && t.identity_id == rec.identity_id
-                            })
-                        });
-                    if grace {
-                        Plan::GraceRetry
-                    } else {
-                        Plan::Reuse(rec.identity_id.clone())
-                    }
-                }
-                TokenStatus::Revoked => Plan::Invalid,
             }
         };
-        match plan {
-            Plan::Invalid => Err(TokenError::InvalidGrant),
-            Plan::Reuse(identity_id) => {
+        match outcome {
+            Outcome::Pair(pair) => Ok(pair),
+            Outcome::PersistFailed => Err(TokenError::PersistFailed),
+            Outcome::Reuse(identity_id) => {
                 // Reuse (I5): revoke first — memory and the state
                 // file — then audit `oauth_refresh_reuse`. The
                 // answer is `invalid_grant` whatever the write did.
@@ -514,68 +591,6 @@ impl OauthStore {
                     self.append(entry);
                 }
                 Err(TokenError::InvalidGrant)
-            }
-            Plan::Rotate | Plan::GraceRetry => {
-                let grace = matches!(plan, Plan::GraceRetry);
-                let mut next = {
-                    let inner = self.lock();
-                    inner.file.clone()
-                };
-                // Re-check under the clone: a racing request may
-                // have moved the chain since the plan was made. The
-                // store mutex is not held across the plan, so this
-                // second look is what makes rotation atomic enough:
-                // the record must still be in the planned state.
-                let Some(pos) = next.tokens.iter().position(|t| t.hash == hash) else {
-                    return Err(TokenError::InvalidGrant);
-                };
-                let rec = next.tokens[pos].clone();
-                let Some(identity) = next.identity(&rec.identity_id).cloned() else {
-                    return Err(TokenError::InvalidGrant);
-                };
-                if identity.revoked {
-                    return Err(TokenError::InvalidGrant);
-                }
-                if grace {
-                    if rec.status != TokenStatus::Retired || rec.grace_used {
-                        return Err(TokenError::InvalidGrant);
-                    }
-                    let successor = rec.successor.clone();
-                    next.tokens[pos].grace_used = true;
-                    // The pair issued moments before dies, both
-                    // tokens (I5): the successor refresh, and the
-                    // access token issued alongside it.
-                    if let Some(succ) = &successor {
-                        for t in next.tokens.iter_mut() {
-                            if (t.hash == *succ || t.parent.as_deref() == Some(succ.as_str()))
-                                && t.status == TokenStatus::Live
-                            {
-                                t.status = TokenStatus::Revoked;
-                            }
-                        }
-                    }
-                } else {
-                    if rec.status != TokenStatus::Live || now >= rec.expires_at {
-                        return Err(TokenError::InvalidGrant);
-                    }
-                }
-                let (pair, access_rec, refresh_rec) = issue_pair(&identity, Some(hash), now);
-                if !grace {
-                    let old = &mut next.tokens[pos];
-                    old.status = TokenStatus::Retired;
-                    old.retired_at = Some(now);
-                    old.successor = Some(refresh_rec.hash.clone());
-                    old.grace_used = false;
-                }
-                next.tokens.push(access_rec);
-                next.tokens.push(refresh_rec);
-                // The store is written before the response (I5); a
-                // failed write fails the request with no tokens,
-                // and the clone is dropped, so the presented token
-                // stays live for a retry.
-                self.persist(&next).map_err(|_| TokenError::PersistFailed)?;
-                self.lock().file = next;
-                Ok(pair)
             }
         }
     }
@@ -1037,7 +1052,7 @@ mod tests {
         assert!(ended);
         assert!(store.authenticate_access(&pair.access_token, NOW).is_none());
         assert_eq!(
-            store.refresh(&pair.refresh_token, NOW),
+            store.refresh(&pair.refresh_token, CLIENT, NOW),
             Err(TokenError::InvalidGrant)
         );
         assert_eq!(recording.ended.lock().unwrap().as_slice(), [id.as_str()]);
@@ -1060,7 +1075,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, _rec) = store(dir.path());
         let (pair, _id) = connect_one(&store);
-        let pair2 = store.refresh(&pair.refresh_token, NOW + 60).unwrap();
+        let pair2 = store
+            .refresh(&pair.refresh_token, CLIENT, NOW + 60)
+            .unwrap();
         assert_ne!(pair2.refresh_token, pair.refresh_token);
         assert_ne!(pair2.access_token, pair.access_token);
         // Rotation retires the old refresh; its access token lives
@@ -1072,7 +1089,7 @@ mod tests {
         );
         // After the grace, the retired token is reuse.
         assert_eq!(
-            store.refresh(&pair.refresh_token, NOW + 60 + GRACE_SECS + 1),
+            store.refresh(&pair.refresh_token, CLIENT, NOW + 60 + GRACE_SECS + 1),
             Err(TokenError::InvalidGrant)
         );
     }
@@ -1080,13 +1097,15 @@ mod tests {
     #[test]
     fn grace_retry_rotates_again_and_retires_the_superseded_pair() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _rec) = store(dir.path());
+        let (store, recording) = store(dir.path());
         let (pair, _id) = connect_one(&store);
-        let pair2 = store.refresh(&pair.refresh_token, NOW + 100).unwrap();
+        let pair2 = store
+            .refresh(&pair.refresh_token, CLIENT, NOW + 100)
+            .unwrap();
         // The client lost pair2's response and retries with the
         // just-retired token inside 30 s (I5).
         let pair3 = store
-            .refresh(&pair.refresh_token, NOW + 100 + GRACE_SECS)
+            .refresh(&pair.refresh_token, CLIENT, NOW + 100 + GRACE_SECS)
             .unwrap();
         // The superseded pair is retired, both tokens.
         assert!(
@@ -1094,20 +1113,37 @@ mod tests {
                 .authenticate_access(&pair2.access_token, NOW + 100)
                 .is_none()
         );
-        assert_eq!(
-            store.refresh(&pair2.refresh_token, NOW + 100),
-            Err(TokenError::InvalidGrant)
-        );
         // pair3 works.
         assert!(
             store
                 .authenticate_access(&pair3.access_token, NOW + 100)
                 .is_some()
         );
-        // A second presentation of the original token is reuse, and
-        // reuse ends the Connect.
+        // Presenting the superseded refresh token is reuse, not a
+        // silent invalid_grant: its record was retired (grace
+        // spent), so the presentation ends the Connect and writes
+        // `oauth_refresh_reuse`.
         assert_eq!(
-            store.refresh(&pair.refresh_token, NOW + 100 + GRACE_SECS),
+            store.refresh(&pair2.refresh_token, CLIENT, NOW + 100),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(
+            store
+                .authenticate_access(&pair3.access_token, NOW + 100)
+                .is_none()
+        );
+        assert_eq!(
+            recording.events(),
+            [
+                ("oauth_connect".to_owned(), None),
+                ("oauth_refresh_reuse".to_owned(), None),
+            ]
+        );
+        // pair3 worked until that reuse presentation ended it.
+        // A second presentation of the original token is likewise
+        // refused (the Connect is already ended).
+        assert_eq!(
+            store.refresh(&pair.refresh_token, CLIENT, NOW + 100 + GRACE_SECS),
             Err(TokenError::InvalidGrant)
         );
         assert!(
@@ -1122,9 +1158,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, recording) = store(dir.path());
         let (pair, id) = connect_one(&store);
-        let _pair2 = store.refresh(&pair.refresh_token, NOW).unwrap();
+        let _pair2 = store.refresh(&pair.refresh_token, CLIENT, NOW).unwrap();
         let err = store
-            .refresh(&pair.refresh_token, NOW + GRACE_SECS + 1)
+            .refresh(&pair.refresh_token, CLIENT, NOW + GRACE_SECS + 1)
             .err()
             .unwrap();
         assert_eq!(err, TokenError::InvalidGrant);
@@ -1141,27 +1177,94 @@ mod tests {
     }
 
     #[test]
+    fn refresh_requires_the_issuing_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, _id) = connect_one(&store);
+        // A token presented by a different client is refused, and
+        // the refusal spends nothing: the issuing client can still
+        // rotate with it.
+        assert_eq!(
+            store.refresh(
+                &pair.refresh_token,
+                "https://other.example/.well-known/kharon-client.json",
+                NOW + 1,
+            ),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(store.refresh(&pair.refresh_token, CLIENT, NOW + 1).is_ok());
+    }
+
+    #[test]
+    fn concurrent_refreshers_and_revoke_all_end_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        let (pair, _id) = connect_one(&store);
+        let presented = pair.refresh_token.clone();
+        // N refreshers of one token race a panic-style revoke_all.
+        // Serialized writers may only produce the sequential
+        // outcomes — at most a rotate and a grace retry succeed —
+        // and whatever happens, the Connect ends revoked: no
+        // racing swap resurrects it, in memory or on disk.
+        let results: Vec<Result<IssuedPair, TokenError>> = std::thread::scope(|scope| {
+            let refreshers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| store.refresh(&presented, CLIENT, NOW + 10)))
+                .collect();
+            let revoker = scope.spawn(|| store.revoke_all());
+            let mut results = Vec::new();
+            for h in refreshers {
+                results.push(h.join().unwrap());
+            }
+            let _ = revoker.join().unwrap();
+            results
+        });
+        let issued: Vec<&IssuedPair> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert!(issued.len() <= 2, "{}", issued.len());
+        for pair in &issued {
+            assert!(
+                store
+                    .authenticate_access(&pair.access_token, NOW + 10)
+                    .is_none()
+            );
+        }
+        assert!(
+            store
+                .authenticate_access(&pair.access_token, NOW + 10)
+                .is_none()
+        );
+        assert!(store.revoke_all().is_empty());
+        // The end state is the persisted one.
+        let reloaded = OauthStore::load(dir.path()).unwrap();
+        assert!(
+            reloaded
+                .authenticate_access(&pair.access_token, NOW + 10)
+                .is_none()
+        );
+        assert!(reloaded.revoke_all().is_empty());
+    }
+
+    #[test]
     fn refresh_idle_and_absolute_limits() {
         let dir = tempfile::tempdir().unwrap();
         let (store, _rec) = store(dir.path());
         let (pair, _id) = connect_one(&store);
         // Idle: 30 days after the last rotation the token is dead.
         assert_eq!(
-            store.refresh(&pair.refresh_token, NOW + REFRESH_IDLE_SECS),
+            store.refresh(&pair.refresh_token, CLIENT, NOW + REFRESH_IDLE_SECS),
             Err(TokenError::InvalidGrant)
         );
         // Just inside the idle limit it rotates…
         let mut current = store
-            .refresh(&pair.refresh_token, NOW + REFRESH_IDLE_SECS - 1)
+            .refresh(&pair.refresh_token, CLIENT, NOW + REFRESH_IDLE_SECS - 1)
             .unwrap();
         // …but nothing outlives 90 days from consent.
         let mut t = NOW + REFRESH_IDLE_SECS - 1;
         while t + REFRESH_IDLE_SECS - 1 < NOW + REFRESH_ABSOLUTE_SECS {
             t += REFRESH_IDLE_SECS - 1;
-            current = store.refresh(&current.refresh_token, t).unwrap();
+            current = store.refresh(&current.refresh_token, CLIENT, t).unwrap();
         }
         assert_eq!(
-            store.refresh(&current.refresh_token, NOW + REFRESH_ABSOLUTE_SECS),
+            store.refresh(&current.refresh_token, CLIENT, NOW + REFRESH_ABSOLUTE_SECS),
             Err(TokenError::InvalidGrant)
         );
     }
@@ -1174,7 +1277,7 @@ mod tests {
         store.revoke(&pair.access_token, NOW).unwrap();
         assert!(store.authenticate_access(&pair.access_token, NOW).is_none());
         // The refresh token still works.
-        let pair2 = store.refresh(&pair.refresh_token, NOW + 1).unwrap();
+        let pair2 = store.refresh(&pair.refresh_token, CLIENT, NOW + 1).unwrap();
         // Revoking by the refresh token ends the whole Connect.
         store.revoke(&pair2.refresh_token, NOW + 2).unwrap();
         assert!(
@@ -1183,7 +1286,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            store.refresh(&pair2.refresh_token, NOW + 3),
+            store.refresh(&pair2.refresh_token, CLIENT, NOW + 3),
             Err(TokenError::InvalidGrant)
         );
         // Unknown tokens are a quiet success (RFC 7009).
@@ -1235,7 +1338,7 @@ mod tests {
         );
         // An access token is not a refresh token.
         assert_eq!(
-            store.refresh(&pair.access_token, NOW),
+            store.refresh(&pair.access_token, CLIENT, NOW),
             Err(TokenError::InvalidGrant)
         );
     }

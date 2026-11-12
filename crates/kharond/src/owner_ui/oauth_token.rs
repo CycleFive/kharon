@@ -121,7 +121,14 @@ impl OwnerUi {
                 let Some(presented) = form.get("refresh_token") else {
                     return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
                 };
-                match side.store.refresh(presented, now) {
+                // `client_id` is required for a public client's
+                // refresh (OAuth 2.1 §4.3); the store compares it
+                // with the issuing client under its lock and a
+                // mismatch answers `invalid_grant`.
+                let Some(client_id) = form.get("client_id") else {
+                    return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+                };
+                match side.store.refresh(presented, client_id, now) {
                     Ok(pair) => token_answer(pair),
                     Err(TokenError::InvalidGrant) => {
                         oauth_error(StatusCode::BAD_REQUEST, "invalid_grant")

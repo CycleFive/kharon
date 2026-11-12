@@ -2018,6 +2018,32 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// `grant_request` denial (detail `agent_revoked`) per dropped
     /// pending request (#196).
     pub fn revoke_agent(&self, agent_id: &str) -> Result<usize, GrantError> {
+        // A Connect identity ends through its own store instead
+        // (REQ-OAU-005, #233): the socket's `revoke_agent` accepts
+        // `c-…` ids and means Disconnect — identity, tokens and
+        // live grants at once, audited `oauth_disconnect` on the
+        // `cli` channel (D9). There is no `token_revoke`: that
+        // entry binds a configured token, which a Connect does not
+        // have. The count is the Connect's live grants at the call,
+        // the number the socket answers with either way.
+        if let Some(store) = &self.oauth_store
+            && store.is_connect(agent_id)
+        {
+            let grants = self
+                .live_grants()
+                .iter()
+                .filter(|g| g.agent_id == agent_id)
+                .count();
+            return match store.disconnect(
+                agent_id,
+                super::oauth_store::DisconnectDetail::Owner,
+                Channel::Cli.as_str(),
+                self.grant_now().as_secs(),
+            ) {
+                Ok(_) => Ok(grants),
+                Err(_) => Err(GrantError::AuditFailed),
+            };
+        }
         let mut ctrl = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let removed = self
             .grants
@@ -2119,7 +2145,10 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// Clear an agent's suspension (REQ-RL-002 owner reset). Does
     /// not restore a revoked token; a revocation lasts until the
     /// token is rotated (mint, new `token_hash`, restart; #132).
-    pub fn unsuspend_agent(&self, agent_id: &str) -> Result<(), GrantError> {
+    /// The entry carries the caller's `channel` (#233 review): the
+    /// owner page (`web_ui`) and the owner socket (`cli`) both reset
+    /// suspensions, and the log must say which surface did it.
+    pub fn unsuspend_agent(&self, agent_id: &str, channel: Channel) -> Result<(), GrantError> {
         self.rates
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2127,10 +2156,61 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         self.append(
             Entry::new(Event::RateLimit)
                 .agent_id(agent_id.to_owned())
+                .channel(channel.as_str())
                 .result("unsuspended")
                 .detail_code("owner_reset"),
         )
         .map_err(|_| GrantError::AuditFailed)
+    }
+
+    /// The live Connect identities, in creation order, for the
+    /// owner UI's Connections page (D3, #233). Empty without
+    /// `[oauth]`. Read-only and unaudited, like the grants list.
+    pub fn connect_identities(&self) -> Vec<super::oauth_store::Identity> {
+        let Some(store) = &self.oauth_store else {
+            return Vec::new();
+        };
+        store
+            .identities()
+            .into_iter()
+            .filter(|i| !i.revoked)
+            .collect()
+    }
+
+    /// Whether `agent_id` is currently suspended (REQ-RL-002), for
+    /// the Connections page's Unsuspend button (#233).
+    pub fn agent_suspended(&self, agent_id: &str) -> bool {
+        self.rates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_suspended(agent_id)
+    }
+
+    /// End a Connect from the owner UI's Disconnect button
+    /// (REQ-OAU-005, #233): the identity, its tokens and its live
+    /// grants, audited `oauth_disconnect` on the `web_ui` channel.
+    /// `Ok(false)` when no live Connect has that id.
+    pub fn disconnect_connect(&self, agent_id: &str) -> Result<bool, GrantError> {
+        let Some(store) = &self.oauth_store else {
+            return Ok(false);
+        };
+        store
+            .disconnect(
+                agent_id,
+                super::oauth_store::DisconnectDetail::Owner,
+                Channel::WebUi.as_str(),
+                self.grant_now().as_secs(),
+            )
+            .map_err(|_| GrantError::AuditFailed)
+    }
+
+    /// The `client_name` a Connect identity is displayed under on
+    /// the owner surfaces (D9, #233). `None` for config agents and
+    /// unknown ids.
+    pub fn connect_client_name(&self, agent_id: &str) -> Option<String> {
+        self.oauth_store
+            .as_ref()
+            .and_then(|store| store.client_name(agent_id))
     }
 
     /// `kharon panic` (REQ-REV-002): revoke every grant and end every

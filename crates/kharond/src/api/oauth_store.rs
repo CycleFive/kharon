@@ -858,6 +858,25 @@ impl OauthStore {
         self.lock().file.identity(agent_id).is_some()
     }
 
+    /// Every identity, live and ended, in creation order (D3). The
+    /// Connections page lists the live ones; the display-name lookup
+    /// below also resolves ended ones, because an audit entry can
+    /// name a Connect that has since been disconnected.
+    pub fn identities(&self) -> Vec<Identity> {
+        self.lock().file.identities.clone()
+    }
+
+    /// The `client_name` an identity was shown under at consent,
+    /// for owner-facing display (D9, #233): approvals, grants and
+    /// the audit view name a Connect by it. `None` for an id this
+    /// store never issued (a config agent, or nothing at all).
+    pub fn client_name(&self, agent_id: &str) -> Option<String> {
+        self.lock()
+            .file
+            .identity(agent_id)
+            .map(|i| i.client_name.clone())
+    }
+
     /// The shared tail of every Connect-ending path: mutate memory
     /// first (fail closed in-process), then persist, then the
     /// grants hook. Returns the identity as it stood, when a live

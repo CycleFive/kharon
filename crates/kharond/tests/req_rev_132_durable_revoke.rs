@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use api_support::{CHEAP_FLOOR, ITEM_A, TestSession, cheap_argon, get};
+use kharond::api::grant::Channel;
 use kharond::api::revocation::DurableState;
 use kharond::api::token::{TokenStore, generate, generate_with};
 use kharond::api::{ApiError, Broker, FillOperation, Outcome, Request, parse_fill};
@@ -126,7 +127,7 @@ async fn req_rev_132_rebuild_restores_revocation_and_latest_suspension_word() {
         Ok(Outcome::Fill(r)) => assert_eq!(r.status, "rate_limited"),
         other => panic!("suspended fill: {other:?}"),
     }
-    broker.unsuspend_agent("alpha").unwrap();
+    broker.unsuspend_agent("alpha", Channel::Cli).unwrap();
     assert!(
         matches!(
             broker.dispatch(&alpha_id, Request::List { origin: None }),

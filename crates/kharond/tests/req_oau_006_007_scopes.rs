@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use api_support::*;
 use base64ct::{Base64UrlUnpadded, Encoding};
-use kharond::api::grant::{GrantAction, GrantRequestArgs};
+use kharond::api::grant::{Channel, GrantAction, GrantRequestArgs};
 use kharond::api::oauth::Discovery;
 use kharond::api::oauth_store::{CodeGrant, ConnectLifecycle, OauthStore};
 use kharond::api::rate::RatePolicy;
@@ -445,7 +445,7 @@ fn a_suspended_connect_is_refused_until_the_owner_resets_it() {
     );
     // …and the owner's reset clears it, by id, as for a config
     // agent.
-    broker.unsuspend_agent(&agent_id).unwrap();
+    broker.unsuspend_agent(&agent_id, Channel::Cli).unwrap();
     assert!(
         broker
             .dispatch(&agent, Request::List { origin: None })

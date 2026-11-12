@@ -377,7 +377,7 @@ async fn req_rl_002_fifth_consecutive_origin_mismatch_suspends_agent() {
         .iter()
         .any(|e| e.event == Event::RateLimit && e.result.as_deref() == Some("suspended"));
     assert!(suspended, "suspension audited");
-    rig.broker.unsuspend_agent("alpha").unwrap();
+    rig.broker.unsuspend_agent("alpha", Channel::Cli).unwrap();
     // After reset, mismatch is allowed again (not rate_limited).
     let r = rig
         .fill_password(ITEM_A, "https://login.example.com")

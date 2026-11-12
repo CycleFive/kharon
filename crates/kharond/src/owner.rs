@@ -30,7 +30,11 @@
 //!   grants). Durable (#132): the `token_revoke` entry binds the
 //!   revocation to the configured token's fingerprint, so a restart
 //!   keeps refusing the same token; `unsuspend` does not clear it,
-//!   and there is no un-revoke op. Recovery is token rotation.
+//!   and there is no un-revoke op. Recovery is token rotation. A
+//!   Connect identity (`c-…`) is accepted too and means Disconnect
+//!   (REQ-OAU-005, #233): the identity and its tokens end through
+//!   the OAuth store, audited `oauth_disconnect` on the `cli`
+//!   channel, with no `token_revoke`.
 //! - `{"op":"unsuspend","agent_id":"…"}` — REQ-RL-002 owner reset of
 //!   a suspension. Does not restore a revoked token.
 //! - `{"op":"panic"}` — REQ-REV-002.

@@ -984,9 +984,15 @@ async fn handle(
     let cookie = header_str(&headers, header::COOKIE);
     let origin = header_str(&headers, header::ORIGIN);
     let authorization = header_str(&headers, header::AUTHORIZATION);
+    // Public mode only. The shared helper honours CF-Connecting-IP
+    // only from a loopback peer or a trusted_proxies entry
+    // (REQ-API-010). This listener binds loopback and has no proxy
+    // list of its own: every peer it can accept is loopback, so the
+    // header still names the client. A non-loopback peer — which the
+    // bind rules refuse — would be audited as itself and not throttled.
     let edge_ip = ui
         .public
-        .then(|| crate::api::public::client_ip(&headers, true))
+        .then(|| crate::api::public::client_ip(&headers, true, peer.ip(), &[]))
         .flatten();
     let client_ip = ui.public.then(|| {
         edge_ip.unwrap_or_else(|| {

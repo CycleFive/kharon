@@ -995,7 +995,29 @@ guest, which reaches kharond over the tailnet:
 listen = "100.64.0.10:8790"
 tls_cert_file = "/etc/kharon/tls.crt"
 tls_key_file = "/etc/kharon/tls.key"
+# The address cloudflared connects *from*, not the listen address.
+trusted_proxies = ["100.64.0.2"]
 ```
+
+`CF-Connecting-IP` is the client address for throttling and audit, and
+for nothing else. kharond honours it only when the TCP peer is
+loopback or listed in `trusted_proxies`. Loopback — the compose
+holder, and a host-networked kharond beside cloudflared — needs no
+list. The separate-guest shape above does: cloudflared's tailnet
+address is not loopback, so without the list every visitor shares
+that peer's throttle bucket and audit `client_ip`. kharond prints a
+startup warning in that case. The header never decides authentication
+(no allow-list, no exemption from a token or the passkey, no choice
+of mode).
+
+Each `trusted_proxies` entry is one unicast IP address. An
+IPv4-mapped form and the plain address are the same entry, so listing
+both is refused. A hostname or a prefix is refused at startup
+(`public_ingress_trusted_proxy`).
+
+The owner UI listener binds loopback and has no list of its own. The
+same rule honours the header there, because every peer that listener
+can accept is loopback.
 
 `100.64.0.10` stands for the broker's own tailnet address; use yours.
 The same certificate as `[api]` is fine. It must carry the listen

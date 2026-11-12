@@ -929,6 +929,8 @@ pub struct Daemon {
 struct PublicIngressRuntime {
     /// `[public_ingress] public_host`: the one `Host` served (#208).
     public_host: Option<Arc<str>>,
+    /// Peers besides loopback that may set `CF-Connecting-IP`.
+    trusted_proxies: Arc<[std::net::IpAddr]>,
     listener: TcpListener,
     tls: Option<Arc<rustls::ServerConfig>>,
     addr: SocketAddr,
@@ -1199,6 +1201,7 @@ async fn bind_public_ingress(cfg: &Config) -> Result<Option<PublicIngressRuntime
     let addr = listener.local_addr().map_err(bind_err)?;
     Ok(Some(PublicIngressRuntime {
         public_host: public.public_host.as_deref().map(Arc::from),
+        trusted_proxies: Arc::from(public.trusted_proxies.as_slice()),
         listener,
         tls,
         addr,
@@ -1668,6 +1671,7 @@ impl Daemon {
                 let _ = public_stopped.await;
             };
             tokio::spawn(async move {
+                let trusted = rt.trusted_proxies;
                 let _ = match rt.tls {
                     Some(tls) => {
                         crate::api::public::serve_tls_with_shutdown(
@@ -1676,6 +1680,7 @@ impl Daemon {
                             broker,
                             ws,
                             rt.public_host,
+                            trusted,
                             stopped,
                         )
                         .await
@@ -1686,6 +1691,7 @@ impl Daemon {
                             broker,
                             ws,
                             rt.public_host,
+                            trusted,
                             stopped,
                         )
                         .await

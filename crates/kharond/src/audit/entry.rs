@@ -324,7 +324,8 @@ pub struct Entry {
     /// Effective client address of the call that produced this entry
     /// (only on agent-call entries written by a network transport,
     /// #200). On `[public_ingress]` it is the `CF-Connecting-IP`
-    /// address — audit is one of its two sanctioned uses (see
+    /// address when the peer is loopback or a trusted proxy, and the
+    /// peer otherwise — audit is one of its two sanctioned uses (see
     /// `api::public::client_ip`); on `[api]`, the connection peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,

@@ -123,6 +123,7 @@ async fn rig_with(sink: &ConnectorAudit) -> Rig {
         harness.broker.clone(),
         Some(ws),
         None,
+        Arc::<[std::net::IpAddr]>::from([]),
         std::future::pending(),
     ));
     Rig {

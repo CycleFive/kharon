@@ -94,6 +94,11 @@ ciborium = "0.2"
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys", "alloc", "ring-sig-verify"] }
 
 [dev-dependencies]
+# Integration tests drive the public-ingress router with an injected
+# peer (REQ-API-010). The library already depends on axum; the test
+# crate needs it named to call it.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tower = { version = "0.5", features = ["util"] }
 # Self-dependency solely to enable the canary-scan feature for test
 # builds (feature unification): the daemon binary the REQ-MEM-003
 # test spawns must carry the scan op, release builds must not.
@@ -107,3 +112,8 @@ tempfile = "3"
 rcgen = { version = "0.13", features = ["crypto", "ring"] }
 # Paused clock for the REQ-API-009 deadline tests.
 tokio = { version = "1", features = ["test-util"] }
+# Redaction probe (#239 N4): a capture subscriber over the public
+# surface. Already in the tree via hyper-util and h2. No default
+# features: `attributes` would pull tracing-attributes, which nothing
+# else in the graph enables.
+tracing = { version = "0.1", default-features = false, features = ["std"] }

@@ -960,7 +960,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// checked *before* [`Self::authenticate`] so a bad-token flood
     /// is refused before it costs an Argon2id evaluation (#200).
     /// `ip` is the effective client address (see
-    /// [`super::transport::client_ip`]): a throttle key only.
+    /// [`super::public::effective_client_ip`]): a throttle key only.
     pub fn transport_ip_admit(&self, ip: std::net::IpAddr, now: Instant) -> bool {
         self.transport.check_ip(ip, now)
     }

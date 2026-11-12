@@ -10,7 +10,10 @@
 //!
 //! One shared run (`run()`, set up once per test binary) backs the tests:
 //! it enrols a software passkey and signs in through the owner edge, then
-//! walks discovery the way an MCP client would. Ignored by default. Env:
+//! walks discovery the way an MCP client would, then plays a dashboard
+//! (`scenario()`): Connect, tokens, `/mcp`, refresh, the single retry,
+//! the reuse kill, Disconnect, and the evidence the tests assert on.
+//! Ignored by default. Env:
 //! `KHARON_FIXTURE_BASE_URL`, `KHARON_FIXTURE_CA_CERT`,
 //! `KHARON_FIXTURE_API_KEY_JSON`, as for the other compose E2E. `docker
 //! compose` and the images `kharon:e2e` and `kharon-e2e-agent-host:local`
@@ -33,11 +36,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use api_support::{RawResponse, mcp_call_bytes};
-use compose_support::{edge_pki, env, fixture_scope, https_raw, manifest, redact, write_public};
+use compose_support::{
+    data_volume_of, edge_pki, env, fixture_scope, https_raw, manifest, redact, write_public,
+};
 use docker_support::{docker, docker_raw, wait_for_log};
-use owner_ui_support::{Http, VirtAuth, b64url_dec, request_bytes};
+use owner_ui_support::{Http, VirtAuth, b64url, b64url_dec, request_bytes};
+use rand::RngCore;
 use rustls_pki_types::{PrivateKeyDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
@@ -64,7 +71,11 @@ const PUBLIC_INGRESS: &str = "127.0.0.1:8790";
 const OWNER_UI: &str = "127.0.0.1:8788";
 /// `CF-Connecting-IP`, as the real edge would add it.
 const OWNER_SRC_IP: &str = "198.51.100.10";
+/// `CF-Connecting-IP` of the dashboard's backend (`/oauth/token`, `/mcp`).
+const DASHBOARD_SRC_IP: &str = "198.51.100.20";
 const SESSION_COOKIE: &str = "__Host-kharon_owner";
+/// The image the one-off containers run (it has `cat` and `socat`).
+const AGENT_HOST_IMAGE: &str = "kharon-e2e-agent-host:local";
 
 /// `kharon-e2e-oauth` compose arguments for `args`, in the order the
 /// overlay's header documents.
@@ -554,16 +565,864 @@ async fn discover(ca: &str) -> Result<Discovered, String> {
     })
 }
 
+// ------------------------------------------------------------ the scenario
+
+/// The token endpoint's success answer.
+#[derive(Debug, Clone, Deserialize)]
+struct TokenAnswer {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+    refresh_token: String,
+    scope: String,
+}
+
+/// The token endpoint's failure answer.
+#[derive(Deserialize)]
+struct TokenError {
+    error: String,
+}
+
+/// `{"pending"}`: the body of `consent/view` and `consent/options`.
+#[derive(Serialize)]
+struct PendingRequest<'a> {
+    pending: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ConsentScope {
+    id: String,
+}
+
+/// `consent/view`'s answer.
+#[derive(Deserialize)]
+struct ConsentView {
+    client_name: String,
+    client_host: String,
+    redirect_host: String,
+    scopes: Vec<ConsentScope>,
+}
+
+#[derive(Deserialize)]
+struct ConsentChallenge {
+    challenge: String,
+}
+
+/// `consent/options`' answer.
+#[derive(Deserialize)]
+struct ConsentOptions {
+    ceremony_id: String,
+    nonce: String,
+    #[serde(rename = "publicKey")]
+    public_key: ConsentChallenge,
+}
+
+/// `consent/approve`'s body (`ApproveBody` in `owner_ui/oauth.rs`, which
+/// refuses unknown fields). The credential is what `VirtAuth` builds.
+#[derive(Serialize)]
+struct ApproveRequest<'a> {
+    pending: &'a str,
+    ceremony_id: &'a str,
+    nonce: &'a str,
+    credential: &'a serde_json::Value,
+    scopes: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct ApproveReply {
+    redirect: String,
+}
+
+/// `GET /owner/connections`.
+#[derive(Deserialize)]
+struct ConnectionsReply {
+    connections: Vec<ConnectionRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConnectionRow {
+    agent_id: String,
+    client_name: String,
+}
+
+#[derive(Serialize)]
+struct AgentRequest<'a> {
+    agent_id: &'a str,
+}
+
+/// `kharon_fill`'s arguments, well-formed (the ws E2E's shape).
+#[derive(Serialize)]
+struct FillArgs<'a> {
+    item_id: &'a str,
+    target: FillTarget<'a>,
+    fields: [FieldSpec; 2],
+    submit: bool,
+}
+
+#[derive(Serialize)]
+struct FillTarget<'a> {
+    cdp_target_id: &'a str,
+    expected_origin: &'a str,
+}
+
+#[derive(Serialize)]
+struct FieldSpec {
+    kind: &'static str,
+}
+
+/// A JSON-RPC reply to `tools/call`.
+#[derive(Deserialize)]
+struct McpReply {
+    result: Option<McpResult>,
+}
+
+#[derive(Deserialize)]
+struct McpResult {
+    #[serde(rename = "isError", default)]
+    is_error: bool,
+    #[serde(default)]
+    content: Vec<McpText>,
+}
+
+#[derive(Deserialize)]
+struct McpText {
+    text: String,
+}
+
+/// A tool error's text.
+#[derive(Deserialize)]
+struct ToolError {
+    error: String,
+    detail: Option<String>,
+}
+
+/// What a `/mcp` call answered with.
+#[derive(Debug, Clone)]
+struct ToolOutcome {
+    status: u16,
+    www_authenticate: bool,
+    is_error: bool,
+    error: Option<String>,
+    detail: Option<String>,
+}
+
+/// One audit line, as far as the test reads it.
+#[derive(Debug, Clone, Deserialize)]
+struct AuditLine {
+    event: String,
+    agent_id: Option<String>,
+    result: Option<String>,
+    detail_code: Option<String>,
+    channel: Option<String>,
+    origin: Option<String>,
+}
+
+/// What one Connect (authorize, consent, redemption) recorded.
+#[derive(Debug, Clone)]
+struct Connect {
+    client_name: String,
+    client_host: String,
+    redirect_host: String,
+    /// The scope ids the consent view listed (all granted).
+    scope_ids: Vec<String>,
+    state_sent: String,
+    state_returned: Option<String>,
+    iss: Option<String>,
+    /// The approve answer's redirect without its query.
+    redirect_base: String,
+    approve_had_location: bool,
+    code: String,
+    token: TokenAnswer,
+    cache_control: Option<String>,
+    /// The dashboard's fetch count right after authorize.
+    fetches_after_authorize: usize,
+}
+
+/// Step 4.
+#[derive(Debug)]
+struct Rotation {
+    pair: TokenAnswer,
+    status_with_new_access: ToolOutcome,
+}
+
+/// Step 5.
+#[derive(Debug)]
+struct Retry {
+    pair: TokenAnswer,
+    old_access_status: u16,
+    new_access: ToolOutcome,
+    /// From just before the rotation was sent to the retry's answer: an
+    /// upper bound on the time the retry spent in the 30 s window.
+    since_rotation: Duration,
+}
+
+/// Step 6.
+#[derive(Debug)]
+struct Kill {
+    third_presentation_error: String,
+    access_status: u16,
+    successor_refresh_error: String,
+}
+
+/// Step 8.
+#[derive(Debug)]
+struct Disconnection {
+    rows_before: Vec<ConnectionRow>,
+    disconnect_status: u16,
+    access_status: u16,
+    refresh_error: String,
+    rows_after: usize,
+}
+
+/// Step 9.
+struct Evidence {
+    log: String,
+    state_json: String,
+    audit_raw: String,
+    audit: Vec<AuditLine>,
+    verify_out: String,
+}
+
+/// Everything the scenario recorded, for the tests to assert on.
+struct Scenario {
+    a: Connect,
+    a_agent_id: String,
+    b: Connect,
+    b_agent_id: String,
+    status_call: ToolOutcome,
+    no_browser_context: ToolOutcome,
+    no_browser_fill: ToolOutcome,
+    rotation: Rotation,
+    retry: Retry,
+    kill: Kill,
+    disconnection: Disconnection,
+    /// The 4xx answers `/oauth/token` gave (three on purpose; the
+    /// endpoint throttles one source at 10 in 600 s).
+    token_4xx: usize,
+    evidence: Evidence,
+}
+
+/// `text` with every `kh_at_…` / `kh_rt_…` token replaced: a body that
+/// was not supposed to hold tokens may, if the product is wrong.
+fn scrub_tokens(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = ["kh_at_", "kh_rt_"]
+        .iter()
+        .filter_map(|p| rest.find(p))
+        .min()
+    {
+        out.push_str(&rest[..i]);
+        out.push_str("<token>");
+        let after = &rest[i + "kh_at_".len()..];
+        let n = after
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after.len());
+        rest = &after[n..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// [`expect`] with tokens scrubbed from the body it would print; on
+/// success the original response comes back.
+fn expect_scrubbed(
+    step: &str,
+    r: Result<RawResponse, String>,
+    want: u16,
+    secrets: &[&str],
+) -> Result<RawResponse, String> {
+    let shown = match &r {
+        Ok(x) => Ok(RawResponse {
+            status: x.status,
+            headers: Vec::new(),
+            body: scrub_tokens(&x.body),
+        }),
+        Err(e) => Err(e.clone()),
+    };
+    expect(step, shown, want, secrets)?;
+    r
+}
+
+/// `bytes` (an HTTP request) with the header `line` added.
+fn with_header(bytes: Vec<u8>, line: &str) -> Vec<u8> {
+    let text = String::from_utf8(bytes).expect("request is UTF-8");
+    let (head, body) = text.split_once("\r\n\r\n").expect("request has a head");
+    format!("{head}\r\n{line}\r\n\r\n{body}").into_bytes()
+}
+
+/// The path of `url`.
+fn path_of(url: &str) -> Result<String, String> {
+    Url::parse(url)
+        .map(|u| u.path().to_owned())
+        .map_err(|e| format!("{url:?} is not a URL: {e}"))
+}
+
+fn random_b64url() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    b64url(&bytes)
+}
+
+fn form(pairs: &[(&str, &str)]) -> String {
+    let mut s = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in pairs {
+        s.append_pair(k, v);
+    }
+    s.finish()
+}
+
+/// kharond's log, stdout and stderr.
+fn kharond_log(tail: Option<usize>) -> String {
+    let mut args = vec!["logs".to_owned()];
+    if let Some(n) = tail {
+        args.push("--tail".to_owned());
+        args.push(n.to_string());
+    }
+    args.push(KHAROND.to_owned());
+    let out = docker_raw(&args.iter().map(String::as_str).collect::<Vec<_>>(), None);
+    let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    log
+}
+
+/// `path` in kharond's data volume, read by a one-off container running
+/// as the daemon's uid (the files are 0600).
+fn read_data_file(volume: &str, path: &str) -> Result<String, String> {
+    let mount = format!("{volume}:/data:ro");
+    let out = docker_raw(
+        &[
+            "run",
+            "--rm",
+            "--user",
+            "10001:10001",
+            "--entrypoint",
+            "cat",
+            "-v",
+            &mount,
+            AGENT_HOST_IMAGE,
+            path,
+        ],
+        None,
+    );
+    if !out.status.success() {
+        return Err(format!(
+            "reading {path} from the data volume: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The dashboard's backend: plays the real HTTP OAuth surface.
+struct Driver<'a> {
+    ca: &'a str,
+    cookie: &'a str,
+    auth: &'a mut VirtAuth,
+    dashboard: &'a Dashboard,
+    client_id: &'a str,
+    redirect_uri: &'a str,
+    discovery: &'a Discovered,
+    /// Every secret seen so far (the enrolment code, the cookie, codes,
+    /// verifiers, tokens): what `redact` hides.
+    secrets: Vec<String>,
+    token_4xx: usize,
+}
+
+impl Driver<'_> {
+    fn sec(&self) -> Vec<&str> {
+        self.secrets.iter().map(String::as_str).collect()
+    }
+
+    /// `POST path` with a JSON `body`, the session cookie and `Origin`.
+    async fn owner_post<B: Serialize>(
+        &self,
+        step: &str,
+        path: &str,
+        body: &B,
+    ) -> Result<RawResponse, String> {
+        let body = serde_json::to_string(body).unwrap();
+        let r = owner(
+            self.ca,
+            Http::post(path, Some("application/json"), &body).cookie(self.cookie),
+        )
+        .await;
+        expect_scrubbed(step, r, 200, &self.sec())
+    }
+
+    /// `GET /owner/connections`.
+    async fn connections(&self, step: &str) -> Result<Vec<ConnectionRow>, String> {
+        let r = owner(self.ca, Http::get("/owner/connections").cookie(self.cookie)).await;
+        let r = expect_scrubbed(step, r, 200, &self.sec())?;
+        let reply: ConnectionsReply = parse(step, &r, &self.sec())?;
+        Ok(reply.connections)
+    }
+
+    /// The authorize request; returns the pending token. A refusal here
+    /// has three look-alike causes, so the error carries what tells them
+    /// apart: the dashboard's fetch count and kharond's log.
+    async fn authorize(&self, challenge: &str, state: &str) -> Result<String, String> {
+        let step = "GET /oauth/authorize";
+        let query = form(&[
+            ("response_type", "code"),
+            ("client_id", self.client_id),
+            ("redirect_uri", self.redirect_uri),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("state", state),
+            ("resource", RESOURCE),
+        ]);
+        let path = format!(
+            "{}?{query}",
+            path_of(&self.discovery.authorization_endpoint)?
+        );
+        let r = owner(self.ca, Http::get(&path)).await;
+        let r = expect(step, r, 302, &self.sec()).map_err(|e| {
+            format!(
+                "{e}\nthe dashboard's document was fetched {} time(s)\n\
+                 kharond's log, last 50 lines:\n{}",
+                self.dashboard.fetches.load(Ordering::SeqCst),
+                redact(&kharond_log(Some(50)), &self.sec())
+            )
+        })?;
+        let location = r.header("location").unwrap_or("");
+        location
+            .strip_prefix("/oauth/consent/")
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!("{step}: Location is {location:?}, not /oauth/consent/<pending>")
+            })
+    }
+
+    /// `POST` to the token endpoint as the dashboard's backend: no
+    /// cookie, no `Origin`, no `Authorization` (a public client sends
+    /// none; kharond refuses one there).
+    async fn token_post(&self, pairs: &[(&str, &str)]) -> Result<RawResponse, String> {
+        let body = form(pairs);
+        let path = path_of(&self.discovery.token_endpoint)?;
+        let req = Http::post(&path, Some("application/x-www-form-urlencoded"), &body)
+            .host(OWNER_HOST)
+            .without_origin()
+            .header("CF-Connecting-IP", DASHBOARD_SRC_IP);
+        let bytes = request_bytes(OWNER_ORIGIN, &req);
+        https_raw(socket(OWNER_EDGE_ADDR), OWNER_HOST, self.ca, &bytes).await
+    }
+
+    /// The token answer in `r`, its tokens added to the secrets.
+    fn take_tokens(&mut self, step: &str, r: &RawResponse) -> Result<TokenAnswer, String> {
+        let t: TokenAnswer = serde_json::from_str(&r.body)
+            .map_err(|e| format!("{step}: token answer is not the expected JSON ({e})"))?;
+        self.secrets.push(t.access_token.clone());
+        self.secrets.push(t.refresh_token.clone());
+        Ok(t)
+    }
+
+    /// A refresh that must succeed.
+    async fn refresh_ok(&mut self, step: &str, refresh_token: &str) -> Result<TokenAnswer, String> {
+        let r = self
+            .token_post(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", self.client_id),
+            ])
+            .await;
+        let r = expect_scrubbed(step, r, 200, &self.sec())?;
+        self.take_tokens(step, &r)
+    }
+
+    /// A refresh that must be refused: `400 invalid_grant`. One of the
+    /// three intended 4xx answers.
+    async fn refresh_refused(&mut self, step: &str, refresh_token: &str) -> Result<String, String> {
+        let r = self
+            .token_post(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", self.client_id),
+            ])
+            .await;
+        self.token_4xx += 1;
+        let r = expect_scrubbed(step, r, 400, &self.sec())?;
+        let e: TokenError = parse(step, &r, &self.sec())?;
+        ensure(e.error == "invalid_grant", step, || {
+            format!("error is {:?}, want invalid_grant", e.error)
+        })?;
+        Ok(e.error)
+    }
+
+    /// `tools/call` of `tool` as the dashboard's backend.
+    async fn mcp(&self, token: &str, tool: &str, arguments: &str) -> Result<RawResponse, String> {
+        let bytes = with_header(
+            mcp_call_bytes(AGENT_HOST, Some(token), tool, arguments),
+            &format!("CF-Connecting-IP: {DASHBOARD_SRC_IP}"),
+        );
+        agent_edge(self.ca, &bytes).await
+    }
+
+    /// A `/mcp` call that must answer 200; a tool error is parsed.
+    async fn mcp_ok(
+        &self,
+        step: &str,
+        token: &str,
+        tool: &str,
+        arguments: &str,
+    ) -> Result<ToolOutcome, String> {
+        let r = self.mcp(token, tool, arguments).await;
+        let r = expect_scrubbed(step, r, 200, &self.sec())?;
+        let reply: McpReply = parse(step, &r, &self.sec())?;
+        let result = reply
+            .result
+            .ok_or_else(|| format!("{step}: the reply has no result"))?;
+        let (error, detail) = if result.is_error {
+            let text = result
+                .content
+                .first()
+                .map(|c| c.text.as_str())
+                .unwrap_or("");
+            let e: ToolError = serde_json::from_str(text).map_err(|e| {
+                format!(
+                    "{step}: tool error text is not {{error, detail}} ({e}): {}",
+                    scrub_tokens(text)
+                )
+            })?;
+            (Some(e.error), e.detail)
+        } else {
+            (None, None)
+        };
+        Ok(ToolOutcome {
+            status: r.status,
+            www_authenticate: r.header("www-authenticate").is_some(),
+            is_error: result.is_error,
+            error,
+            detail,
+        })
+    }
+
+    /// `kharon_status` with a token that must be accepted.
+    async fn status_accepted(&self, step: &str, token: &str) -> Result<ToolOutcome, String> {
+        let o = self.mcp_ok(step, token, "kharon_status", "{}").await?;
+        ensure(!o.is_error, step, || {
+            format!("kharon_status answered a tool error: {:?}", o.error)
+        })?;
+        Ok(o)
+    }
+
+    /// `kharon_status` with a token that must be refused: 401.
+    async fn status_refused(&self, step: &str, token: &str) -> Result<u16, String> {
+        let r = self.mcp(token, "kharon_status", "{}").await;
+        Ok(expect_scrubbed(step, r, 401, &self.sec())?.status)
+    }
+
+    /// One Connect: authorize, consent view, options, approve, redeem.
+    async fn connect(&mut self, label: &str) -> Result<Connect, String> {
+        let verifier = random_b64url();
+        self.secrets.push(verifier.clone());
+        let challenge = b64url(&Sha256::digest(verifier.as_bytes()));
+        let mut state_bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut state_bytes);
+        let state_sent = hex::encode(state_bytes);
+
+        let pending = self.authorize(&challenge, &state_sent).await?;
+        let fetches_after_authorize = self.dashboard.fetches.load(Ordering::SeqCst);
+
+        let step = format!("{label}: POST /oauth/consent/view");
+        let r = self
+            .owner_post(
+                &step,
+                "/oauth/consent/view",
+                &PendingRequest { pending: &pending },
+            )
+            .await?;
+        let view: ConsentView = parse(&step, &r, &self.sec())?;
+
+        let step = format!("{label}: POST /oauth/consent/options");
+        let r = self
+            .owner_post(
+                &step,
+                "/oauth/consent/options",
+                &PendingRequest { pending: &pending },
+            )
+            .await?;
+        let options: ConsentOptions = parse(&step, &r, &self.sec())?;
+
+        let step = format!("{label}: POST /oauth/consent/approve");
+        let credential =
+            self.auth
+                .assertion(&options.public_key.challenge, OWNER_ORIGIN, OWNER_HOST);
+        let scope_ids: Vec<String> = view.scopes.iter().map(|s| s.id.clone()).collect();
+        let r = self
+            .owner_post(
+                &step,
+                "/oauth/consent/approve",
+                &ApproveRequest {
+                    pending: &pending,
+                    ceremony_id: &options.ceremony_id,
+                    nonce: &options.nonce,
+                    credential: &credential,
+                    scopes: &scope_ids,
+                },
+            )
+            .await?;
+        let approve_had_location = r.header("location").is_some();
+        let reply: ApproveReply = serde_json::from_str(&r.body)
+            .map_err(|e| format!("{step}: answer is not {{redirect}} ({e})"))?;
+        let redirect = Url::parse(&reply.redirect)
+            .map_err(|e| format!("{step}: redirect is not a URL ({e})"))?;
+        let query = |name: &str| {
+            redirect
+                .query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+        };
+        let code = query("code").ok_or_else(|| format!("{step}: the redirect has no code"))?;
+        self.secrets.push(code.clone());
+        let mut base = redirect.clone();
+        base.set_query(None);
+
+        let step = format!("{label}: POST /oauth/token (code)");
+        let r = self
+            .token_post(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", self.client_id),
+                ("redirect_uri", self.redirect_uri),
+                ("code_verifier", &verifier),
+                ("resource", RESOURCE),
+            ])
+            .await;
+        let r = expect_scrubbed(&step, r, 200, &self.sec())?;
+        let cache_control = r.header("cache-control").map(str::to_owned);
+        let token = self.take_tokens(&step, &r)?;
+
+        Ok(Connect {
+            client_name: view.client_name,
+            client_host: view.client_host,
+            redirect_host: view.redirect_host,
+            scope_ids,
+            state_sent,
+            state_returned: query("state"),
+            iss: query("iss"),
+            redirect_base: base.to_string(),
+            approve_had_location,
+            code,
+            token,
+            cache_control,
+            fetches_after_authorize,
+        })
+    }
+}
+
+/// Plays a dashboard against the stack: Connect A proves rotation, the
+/// retry and the kill; Connect B proves Disconnect; then the evidence
+/// is collected. The first unexpected answer is an `Err` naming the step.
+async fn scenario(d: &mut Driver<'_>) -> Result<Scenario, String> {
+    // 1. Connect A.
+    let a = d.connect("Connect A").await?;
+    let rows = d.connections("Connect A: GET /owner/connections").await?;
+    ensure(rows.len() == 1, "Connect A: GET /owner/connections", || {
+        format!("expected one row, got {}", rows.len())
+    })?;
+    let a_agent_id = rows[0].agent_id.clone();
+    let at0 = a.token.access_token.clone();
+    let rt0 = a.token.refresh_token.clone();
+
+    // 2. An /mcp call.
+    let status_call = d.status_accepted("kharon_status with at0", &at0).await?;
+
+    // 3. no_browser: a Connect has no browser attached.
+    let no_browser_context = d
+        .mcp_ok("kharon_context with at0", &at0, "kharon_context", "{}")
+        .await?;
+    let fill = serde_json::to_string(&FillArgs {
+        item_id: "00000000-0000-4000-8000-000000000000",
+        target: FillTarget {
+            cdp_target_id: "E2E-TARGET",
+            expected_origin: "https://dashboard.e2e.test",
+        },
+        fields: [
+            FieldSpec { kind: "username" },
+            FieldSpec { kind: "password" },
+        ],
+        submit: false,
+    })
+    .unwrap();
+    let no_browser_fill = d
+        .mcp_ok("kharon_fill with at0", &at0, "kharon_fill", &fill)
+        .await?;
+
+    // 4. Rotation.
+    let rotated_at = Instant::now();
+    let pair1 = d.refresh_ok("refresh rt0 (rotation)", &rt0).await?;
+    ensure(
+        pair1.access_token != at0 && pair1.refresh_token != rt0,
+        "refresh rt0 (rotation)",
+        || "the rotation returned a token it had issued before".to_owned(),
+    )?;
+    let status_with_new_access = d
+        .status_accepted("kharon_status with at1", &pair1.access_token)
+        .await?;
+    let rotation = Rotation {
+        pair: pair1.clone(),
+        status_with_new_access,
+    };
+
+    // 5. The single retry: the retired rt0 once more, inside the grace.
+    let pair2 = d.refresh_ok("refresh rt0 (the single retry)", &rt0).await?;
+    let since_rotation = rotated_at.elapsed();
+    let old_access_status = d
+        .status_refused(
+            "kharon_status with at1 after the retry",
+            &pair1.access_token,
+        )
+        .await?;
+    let new_access = d
+        .status_accepted("kharon_status with at2", &pair2.access_token)
+        .await?;
+    let retry = Retry {
+        pair: pair2.clone(),
+        old_access_status,
+        new_access,
+        since_rotation,
+    };
+
+    // 6. Reuse kills the Connect.
+    let third_presentation_error = d
+        .refresh_refused("refresh rt0 (third presentation)", &rt0)
+        .await?;
+    let access_status = d
+        .status_refused("kharon_status with at2 after reuse", &pair2.access_token)
+        .await?;
+    let successor_refresh_error = d
+        .refresh_refused("refresh rt2 after reuse", &pair2.refresh_token)
+        .await?;
+    let kill = Kill {
+        third_presentation_error,
+        access_status,
+        successor_refresh_error,
+    };
+
+    // 7. Connect B.
+    let b = d.connect("Connect B").await?;
+
+    // 8. Disconnect.
+    let step = "Connect B: GET /owner/connections";
+    let rows_before = d.connections(step).await?;
+    ensure(rows_before.len() == 1, step, || {
+        format!(
+            "expected one live Connect (A is ended), got {}",
+            rows_before.len()
+        )
+    })?;
+    ensure(rows_before[0].client_name == "E2E Dashboard", step, || {
+        format!("client_name is {:?}", rows_before[0].client_name)
+    })?;
+    let b_agent_id = rows_before[0].agent_id.clone();
+    ensure(b_agent_id != a_agent_id, step, || {
+        "the listed Connect is A's, not B's".to_owned()
+    })?;
+    let step = "POST /owner/connections/disconnect";
+    let r = d
+        .owner_post(
+            step,
+            "/owner/connections/disconnect",
+            &AgentRequest {
+                agent_id: &b_agent_id,
+            },
+        )
+        .await?;
+    let disconnect_status = r.status;
+    let access_status = d
+        .status_refused(
+            "kharon_status with atB after Disconnect",
+            &b.token.access_token,
+        )
+        .await?;
+    let refresh_error = d
+        .refresh_refused("refresh rtB after Disconnect", &b.token.refresh_token)
+        .await?;
+    let rows_after = d
+        .connections("GET /owner/connections after Disconnect")
+        .await?
+        .len();
+    let disconnection = Disconnection {
+        rows_before,
+        disconnect_status,
+        access_status,
+        refresh_error,
+        rows_after,
+    };
+
+    ensure(d.token_4xx == 3, "the scenario", || {
+        format!(
+            "{} intended 4xx answers on /oauth/token, expected 3",
+            d.token_4xx
+        )
+    })?;
+
+    // 9. Evidence.
+    let volume = data_volume_of(KHAROND);
+    let state_json = read_data_file(&volume, "/data/oauth/state.json")?;
+    let audit_raw = read_data_file(&volume, "/data/audit/audit.jsonl")?;
+    let audit = audit_raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str::<AuditLine>(l)
+                .map_err(|e| format!("audit.jsonl: a line is not an audit entry ({e})"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let verify = docker_raw(
+        &[
+            "exec",
+            KHAROND,
+            "kharon",
+            "audit",
+            "verify",
+            "--data",
+            "/data/audit",
+        ],
+        None,
+    );
+    let verify_out = String::from_utf8_lossy(&verify.stdout).into_owned();
+    ensure(verify.status.success(), "kharon audit verify", || {
+        format!("{verify_out}{}", String::from_utf8_lossy(&verify.stderr))
+    })?;
+    let log = kharond_log(None);
+
+    Ok(Scenario {
+        a,
+        a_agent_id,
+        b,
+        b_agent_id,
+        status_call,
+        no_browser_context,
+        no_browser_fill,
+        rotation,
+        retry,
+        kill,
+        disconnection,
+        token_4xx: d.token_4xx,
+        evidence: Evidence {
+            log,
+            state_json,
+            audit_raw,
+            audit,
+            verify_out,
+        },
+    })
+}
+
 // ------------------------------------------------------------ the run
 
 /// What the shared run set up, for the tests to use.
-#[allow(dead_code)]
 struct Run {
     /// The edges' CA: the only root the test trusts.
     edge_ca: String,
     /// The `__Host-kharon_owner=…` pair of the signed-in owner session.
     cookie: String,
     /// The owner's passkey (its signature counter advances per sign-in).
+    /// Kept for the tests that sign in again; none does yet.
+    #[allow(dead_code)]
     auth: Mutex<VirtAuth>,
     dashboard: Dashboard,
     /// The dashboard's `client_id` (its CIMD URL) and `redirect_uri`.
@@ -572,6 +1431,8 @@ struct Run {
     discovery: Discovered,
     /// The enrolment code and the cookie, for `redact`.
     secrets: Vec<String>,
+    /// What the dashboard scenario recorded.
+    scenario: Scenario,
 }
 
 /// One runtime for the whole binary: the dashboard's listener lives on
@@ -707,6 +1568,28 @@ async fn setup() -> Run {
     // 8. Discovery.
     let discovery = must(discover(&edge_ca).await);
 
+    // 9. The dashboard scenario. Its driver keeps its own list of
+    // secrets (the codes and tokens it obtains join it); the run keeps
+    // the enrolment code and the cookie.
+    let cookie_value = cookie
+        .split_once('=')
+        .map_or(cookie.as_str(), |(_, v)| v)
+        .to_owned();
+    let mut auth = auth;
+    let mut driver = Driver {
+        ca: &edge_ca,
+        cookie: &cookie,
+        auth: &mut auth,
+        dashboard: &dashboard,
+        client_id: &client_id,
+        redirect_uri: &redirect_uri,
+        discovery: &discovery,
+        secrets: vec![code.clone(), cookie.clone(), cookie_value],
+        token_4xx: 0,
+    };
+    let scenario = must(scenario(&mut driver).await);
+    drop(driver);
+
     Run {
         edge_ca,
         secrets: vec![code, cookie.clone()],
@@ -716,6 +1599,7 @@ async fn setup() -> Run {
         client_id,
         redirect_uri,
         discovery,
+        scenario,
     }
 }
 
@@ -918,4 +1802,403 @@ fn req_apr_009_compose_owner_signs_in_with_a_passkey_through_the_edge() {
         &secrets,
     )
     .unwrap_or_else(|e| panic!("{e}"));
+}
+
+// ------------------------------------------------------------ the scenario's tests
+//
+// Assertion messages name the fact, never a token, code or cookie: a
+// token compared with `assert_eq!` would be printed on failure.
+
+/// `kh_at_` / `kh_rt_` followed by 64 hex digits.
+fn is_token(t: &str, prefix: &str) -> bool {
+    t.strip_prefix(prefix)
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn assert_pair(what: &str, t: &TokenAnswer) {
+    assert!(
+        is_token(&t.access_token, "kh_at_"),
+        "{what}: access_token is not kh_at_ + 64 hex"
+    );
+    assert!(
+        is_token(&t.refresh_token, "kh_rt_"),
+        "{what}: refresh_token is not kh_rt_ + 64 hex"
+    );
+}
+
+/// The audit entries of `event`, in log order.
+fn audit_events<'a>(s: &'a Scenario, event: &str) -> Vec<(usize, &'a AuditLine)> {
+    s.evidence
+        .audit
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.event == event)
+        .collect()
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_002_compose_kharond_fetches_the_dashboard_document_once() {
+    let r = run();
+    let s = &r.scenario;
+    assert_eq!(
+        s.a.fetches_after_authorize, 1,
+        "the dashboard's document was fetched once for Connect A's authorize"
+    );
+    assert_eq!(
+        s.b.fetches_after_authorize, 1,
+        "Connect B's authorize was answered from the cache (the document is cached for an hour)"
+    );
+    assert_eq!(
+        r.dashboard.fetches.load(Ordering::SeqCst),
+        1,
+        "the document was fetched exactly once in the whole run"
+    );
+    for (name, c) in [("A", &s.a), ("B", &s.b)] {
+        assert_eq!(
+            c.client_name, "E2E Dashboard",
+            "Connect {name}'s client_name"
+        );
+        assert!(
+            c.client_host.contains(DASHBOARD_HOST),
+            "Connect {name}'s client_host {:?} lacks {DASHBOARD_HOST}",
+            c.client_host
+        );
+    }
+    assert!(
+        r.client_id.contains(DASHBOARD_HOST),
+        "the test's client_id names the dashboard host"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_003_compose_consent_returns_the_code_in_json_with_state_and_iss() {
+    let r = run();
+    for (name, c) in [("A", &r.scenario.a), ("B", &r.scenario.b)] {
+        assert!(
+            !c.approve_had_location,
+            "Connect {name}: approve answered with a Location header (the code travels in the JSON)"
+        );
+        assert_eq!(
+            c.redirect_base, r.redirect_uri,
+            "Connect {name}: the redirect goes to the registered redirect_uri"
+        );
+        assert!(
+            !c.code.is_empty(),
+            "Connect {name}: the redirect has a code"
+        );
+        assert_eq!(
+            c.state_returned.as_deref(),
+            Some(c.state_sent.as_str()),
+            "Connect {name}: state is returned unchanged"
+        );
+        assert_eq!(
+            c.iss.as_deref(),
+            Some(OWNER_ORIGIN),
+            "Connect {name}: iss is the issuer"
+        );
+        assert!(
+            c.redirect_host.contains(DASHBOARD_HOST),
+            "Connect {name}: redirect_host {:?}",
+            c.redirect_host
+        );
+    }
+    assert!(
+        r.scenario.a.state_sent != r.scenario.b.state_sent,
+        "the two Connects used different state values"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_004_compose_code_redeems_to_a_token_pair() {
+    let r = run();
+    for (name, c) in [("A", &r.scenario.a), ("B", &r.scenario.b)] {
+        let what = format!("Connect {name}");
+        assert_pair(&what, &c.token);
+        assert_eq!(c.token.token_type, "Bearer", "{what}: token_type");
+        assert_eq!(c.token.expires_in, 3600, "{what}: expires_in");
+        assert_eq!(
+            c.cache_control.as_deref(),
+            Some("no-store"),
+            "{what}: Cache-Control on the token answer"
+        );
+        for scope in ["kharon:read", "kharon:fill", "kharon:request"] {
+            assert!(
+                c.token.scope.split(' ').any(|s| s == scope),
+                "{what}: scope {:?} lacks {scope}",
+                c.token.scope
+            );
+            assert!(
+                c.scope_ids.iter().any(|s| s == scope),
+                "{what}: the consent view did not list {scope}"
+            );
+        }
+    }
+    assert!(
+        r.scenario.a.token.access_token != r.scenario.b.token.access_token
+            && r.scenario.a.token.refresh_token != r.scenario.b.token.refresh_token,
+        "the two Connects hold different tokens"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_004_compose_refresh_rotates_and_allows_one_retry() {
+    let r = run();
+    let s = &r.scenario;
+    let a = &s.a.token;
+    assert_pair("rotation", &s.rotation.pair);
+    assert_pair("retry", &s.retry.pair);
+    let (p1, p2) = (&s.rotation.pair, &s.retry.pair);
+    assert!(
+        p1.access_token != a.access_token && p1.refresh_token != a.refresh_token,
+        "the rotation issued a new pair"
+    );
+    assert!(
+        p2.access_token != a.access_token
+            && p2.refresh_token != a.refresh_token
+            && p2.access_token != p1.access_token
+            && p2.refresh_token != p1.refresh_token,
+        "the retry issued a third pair"
+    );
+    assert_eq!(s.status_call.status, 200, "kharon_status with at0");
+    assert_eq!(
+        s.rotation.status_with_new_access.status, 200,
+        "kharon_status with the rotated access token"
+    );
+    assert_eq!(
+        s.retry.old_access_status, 401,
+        "the access token the retry superseded is dead"
+    );
+    assert_eq!(
+        s.retry.new_access.status, 200,
+        "the retry's access token works"
+    );
+    assert!(
+        !s.retry.new_access.is_error,
+        "kharon_status with the retry's access token is not a tool error"
+    );
+    assert!(
+        s.retry.since_rotation < Duration::from_secs(20),
+        "the retry was sent {:?} after the rotation, outside the 20 s the test allows \
+         (the grace window is 30 s): the runner was too slow",
+        s.retry.since_rotation
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_004_compose_reusing_a_retired_refresh_token_ends_the_connect() {
+    let r = run();
+    let s = &r.scenario;
+    assert_eq!(
+        s.kill.third_presentation_error, "invalid_grant",
+        "the third presentation of the retired refresh token"
+    );
+    assert_eq!(
+        s.kill.access_status, 401,
+        "the retry's access token after the reuse"
+    );
+    assert_eq!(
+        s.kill.successor_refresh_error, "invalid_grant",
+        "the retry's refresh token after the reuse"
+    );
+    let reuse: Vec<_> = audit_events(s, "oauth_refresh_reuse")
+        .into_iter()
+        .filter(|(_, l)| l.agent_id.as_deref() == Some(s.a_agent_id.as_str()))
+        .collect();
+    assert_eq!(
+        reuse.len(),
+        1,
+        "one oauth_refresh_reuse entry for Connect A ({})",
+        s.a_agent_id
+    );
+    assert_eq!(reuse[0].1.result.as_deref(), Some("revoked"));
+    assert!(
+        audit_events(s, "oauth_refresh_reuse")
+            .iter()
+            .all(|(_, l)| l.agent_id.as_deref() == Some(s.a_agent_id.as_str())),
+        "no other Connect saw a reuse"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_005_compose_disconnect_from_the_owner_page_ends_the_connect() {
+    let r = run();
+    let s = &r.scenario;
+    let d = &s.disconnection;
+    assert_eq!(
+        d.rows_before.len(),
+        1,
+        "the page lists live Connects only (A is ended)"
+    );
+    assert_eq!(d.rows_before[0].client_name, "E2E Dashboard");
+    assert_eq!(d.rows_before[0].agent_id, s.b_agent_id);
+    assert!(s.b_agent_id != s.a_agent_id, "B is a new identity");
+    assert_eq!(
+        d.disconnect_status, 200,
+        "POST /owner/connections/disconnect"
+    );
+    assert_eq!(d.access_status, 401, "atB after Disconnect");
+    assert_eq!(d.refresh_error, "invalid_grant", "rtB after Disconnect");
+    assert_eq!(d.rows_after, 0, "the page lists no Connect afterwards");
+    let ended: Vec<_> = audit_events(s, "oauth_disconnect")
+        .into_iter()
+        .filter(|(_, l)| l.agent_id.as_deref() == Some(s.b_agent_id.as_str()))
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "one oauth_disconnect entry for Connect B ({})",
+        s.b_agent_id
+    );
+    assert_eq!(ended[0].1.detail_code.as_deref(), Some("owner"));
+    assert_eq!(ended[0].1.channel.as_deref(), Some("web_ui"));
+    assert_eq!(
+        s.token_4xx, 3,
+        "the scenario made its three intended 4xx on /oauth/token"
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_007_compose_a_connect_has_no_browser() {
+    let r = run();
+    let s = &r.scenario;
+    assert_eq!(
+        s.status_call.status, 200,
+        "kharon_status answers (the broker is locked)"
+    );
+    assert!(!s.status_call.is_error, "kharon_status is not a tool error");
+    for (tool, o) in [
+        ("kharon_context", &s.no_browser_context),
+        ("kharon_fill", &s.no_browser_fill),
+    ] {
+        assert_eq!(o.status, 200, "{tool}: HTTP status");
+        assert!(o.is_error, "{tool}: isError");
+        assert_eq!(o.error.as_deref(), Some("forbidden"), "{tool}: error");
+        assert_eq!(
+            o.detail.as_deref(),
+            Some("this connection has no browser attached yet"),
+            "{tool}: detail"
+        );
+        assert!(!o.www_authenticate, "{tool}: no step-up challenge");
+    }
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_oau_compose_audit_chain_records_both_connects_and_verifies() {
+    let r = run();
+    let s = &r.scenario;
+    let connects = audit_events(s, "oauth_connect");
+    assert_eq!(connects.len(), 2, "two oauth_connect entries");
+    for (_, l) in &connects {
+        assert_eq!(l.result.as_deref(), Some("connected"));
+        assert!(
+            l.origin
+                .as_deref()
+                .is_some_and(|o| o.contains(DASHBOARD_HOST)),
+            "origin {:?} names the dashboard host",
+            l.origin
+        );
+    }
+    assert_eq!(
+        connects[0].1.agent_id.as_deref(),
+        Some(s.a_agent_id.as_str())
+    );
+    assert_eq!(
+        connects[1].1.agent_id.as_deref(),
+        Some(s.b_agent_id.as_str())
+    );
+    let reuse = audit_events(s, "oauth_refresh_reuse");
+    let ended = audit_events(s, "oauth_disconnect");
+    assert!(
+        reuse.iter().all(|(i, _)| *i > connects[0].0),
+        "A's connect precedes A's ending"
+    );
+    assert!(
+        ended
+            .iter()
+            .filter(|(_, l)| l.agent_id.as_deref() == Some(s.b_agent_id.as_str()))
+            .all(|(i, _)| *i > connects[1].0),
+        "B's connect precedes B's ending"
+    );
+    assert!(connects[0].0 < connects[1].0, "A connected before B");
+    assert!(
+        s.evidence.verify_out.contains("audit log OK"),
+        "kharon audit verify said: {}",
+        s.evidence.verify_out
+    );
+}
+
+#[test]
+#[ignore = "needs the compose E2E stack (image.yml)"]
+fn req_goal_002_compose_oauth_secrets_stay_out_of_logs_and_state() {
+    let r = run();
+    let s = &r.scenario;
+    let e = &s.evidence;
+
+    // Positive controls: the files were read and are the right ones, and
+    // the state file holds the tokens' hashes (so the scan below looks
+    // where a leak would be).
+    assert!(
+        e.log.contains("public ingress listening"),
+        "kharond's log was read (no startup line)"
+    );
+    assert!(
+        e.audit_raw.contains(&s.a_agent_id) && e.audit_raw.contains(&s.b_agent_id),
+        "audit.jsonl names both Connects"
+    );
+    assert!(
+        e.state_json.contains(&s.a_agent_id) && e.state_json.contains("E2E Dashboard"),
+        "state.json was read and holds the Connect identities"
+    );
+    let tokens: Vec<(&str, &str)> = vec![
+        ("at0", &s.a.token.access_token),
+        ("rt0", &s.a.token.refresh_token),
+        ("at1", &s.rotation.pair.access_token),
+        ("rt1", &s.rotation.pair.refresh_token),
+        ("at2", &s.retry.pair.access_token),
+        ("rt2", &s.retry.pair.refresh_token),
+        ("atB", &s.b.token.access_token),
+        ("rtB", &s.b.token.refresh_token),
+    ];
+    assert!(
+        tokens.iter().any(|(_, t)| e
+            .state_json
+            .contains(&hex::encode(Sha256::digest(t.as_bytes())))),
+        "state.json holds no token hash: tokens are stored as hashes, so one must be there"
+    );
+
+    let cookie_value = r
+        .cookie
+        .split_once('=')
+        .map_or(r.cookie.as_str(), |(_, v)| v);
+    let mut secrets = tokens;
+    secrets.extend([
+        ("code A", s.a.code.as_str()),
+        ("code B", s.b.code.as_str()),
+        ("the enrolment code", r.secrets[0].as_str()),
+        ("the session cookie value", cookie_value),
+    ]);
+    for (what, secret) in &secrets {
+        assert!(secret.len() >= 16, "{what} is a real secret (not empty)");
+    }
+    for (file, text) in [
+        ("kharond's log", &e.log),
+        ("state.json", &e.state_json),
+        ("audit.jsonl", &e.audit_raw),
+    ] {
+        for (what, secret) in &secrets {
+            assert!(!text.contains(secret), "{what} appears in {file}");
+        }
+    }
+    assert!(
+        !e.state_json.contains("\"kh_at_") && !e.state_json.contains("\"kh_rt_"),
+        "state.json holds a string that starts with kh_at_ or kh_rt_"
+    );
 }

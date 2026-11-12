@@ -3,9 +3,9 @@
 Status: design, 2026-11-12, for #235. Follow-up 9 of the N3 design
 ([`2026-11-10-n3-mcp-oauth-connect-design.md`](2026-11-10-n3-mcp-oauth-connect-design.md),
 #213, #226), section D7. Builder: Nyx. Reviewers: Muse and Duet.
-Q3 (the malicious-edge residual) was accepted by Lothrop on
-2026-11-12, and confirmed the same day in the sharpened form below.
-Q1 and Q2 stay open.
+Q1 (pin provisioning) and Q3 (the malicious-edge residual) were
+accepted by Lothrop on 2026-11-12. Q2, the consent-screen words, stays
+open. The recommendation is to change nothing the customer reads.
 
 This note is the phase 2 design D7 deferred. Where it and the D7 sketch
 disagree, this note is the one to implement. It confirms assumption A7
@@ -49,14 +49,15 @@ a token. That is the target user from #213.
 | 2 | Whether wire v1 suffices | **Wire v1 suffices.** No `WIRE_VERSION` bump, no new hello field, no new server-hello status, no subprotocol change. |
 | 3 | Who owns refresh | **Two refresh families, one Connect.** The dashboard backend owns the MCP family and performs one spawn. The runtime owns the connector family and is the only component that rotates it. `kharon-agent-connector` does not become an OAuth client. |
 
-Two things are not decided here. They need Lothrop, and they are
-written as open questions at the end rather than as assumptions: the
-operational acceptance of provisioning the pin, and the consent-screen
-words. The residual that a malicious TLS-terminating edge can use a
-connector credential it sees on the token endpoint was accepted by
-Lothrop on 2026-11-12 (Q3, below). Phase 2 adds no further mitigation.
-The known later closure, an identity key beside the pin, is recorded
-and is not part of this design.
+One thing is not decided here. It needs Lothrop, and it is written as
+an open question at the end rather than as an assumption: the
+consent-screen words. The recommendation is to change nothing the
+customer reads. Provisioning the pin out of band was accepted by
+Lothrop on 2026-11-12 (Q1, below). The residual that a malicious
+TLS-terminating edge can use a connector credential it sees on the
+token endpoint was accepted the same day (Q3, below). Phase 2 adds no
+further mitigation. The known later closure, an identity key beside
+the pin, is recorded and is not part of this design.
 
 ## Goals
 
@@ -218,9 +219,12 @@ substitute its own key, and the runtime cannot detect that without a
 trust anchor it already holds. That anchor would be another provisioned
 pin. This design provisions the pin itself and stops there.
 
-Whether the dashboard will store a per-deploy pin is open question Q1.
-Kharond's half does not depend on the answer: it publishes the pin and
-never treats HTTP as the root of trust.
+Whether the dashboard will store a per-deploy pin was open question Q1.
+Lothrop accepted it on 2026-11-12: the runtime is given `broker_pin`
+out of band, operator to operator, and the pin is stored in the
+dashboard's per-deploy config. The pin is a root of verification, not
+a secret, and it stays distinct from the connector credential. Kharond
+publishes the pin and never treats HTTP as the root of trust.
 
 ### D2. Wire v1 suffices
 
@@ -612,16 +616,16 @@ passive case.
 
 **Known future closure, not a phase-2 requirement.** Provision a
 connector identity key alongside `broker_pin`, through the same
-out-of-band channel Q1 decides, and require proof of possession when
+out-of-band channel Q1 settled (operator to operator, stored in the
+dashboard's per-deploy config), and require proof of possession when
 the connector family is refreshed and in the `/connector` hello. A
 copied refresh token is then inert, and reuse detection applies to a
 presenter who does not hold the key. Registering that key over the
 terminated HTTP token endpoint stays rejected: the edge can substitute
 its own key in that request, which is why D1 spends the trust anchor
 on the pin instead. This note does not specify the proof, the hello
-change, or whether wire v1 still holds once the proof exists. Q1
-remains the decision about the channel. The closure cannot be built
-until that channel exists, and it is not built here.
+change, or whether wire v1 still holds once the proof exists. The
+closure is not built here.
 
 **Expiry mid-session.** The server drops the session at the token's
 stored `expires_at`. The runtime's five-minute lead is what makes a
@@ -880,27 +884,27 @@ recording assertion is the one above.
 
 ## Open questions for Lothrop
 
-Q1 and Q2 are not decided. Reviewers should not treat a recommendation
-as his answer. Neither changes the token endpoint, which keeps refusing
+Q2 is not decided. Reviewers should not treat the recommendation as
+his answer. It does not change the token endpoint, which keeps refusing
 `/connector` until the implementation.
-
-**Q1. Provisioning the pin.** D1's recommendation is that the dashboard
-runtime is given `broker_pin` out of band, operator to operator, when
-the tenant is stood up, and that the customer never sees a pin. The
-alternative he might want — a dashboard that can attach with nothing
-provisioned except the Connect — needs a trust anchor in the dashboard
-build and a design this note does not contain. Kharond can publish the
-pin either way. Please confirm that storing the pin in the dashboard's
-per-deploy config is acceptable. The later closure recorded under Q3,
-a connector identity key beside the pin, uses this same channel once
-it exists. That does not decide this question.
 
 **Q2. Consent-screen words.** The recommendation is to change nothing
 the customer reads. `kharon:fill` already says the dashboard may ask to
 sign in, and that every sign-in is approved in kharon. `kharon:connector`
 is not a checkbox and not a fourth bundle. Unticking fill is what
 refuses the browser. If the screen should name the dashboard's browser
-in its own sentence, that sentence is his. This note does not draft it.
+in its own sentence, that sentence is his to supply. This note does
+not draft it.
+
+## Q1, ruled
+
+**Provisioning the pin.** Lothrop, 2026-11-12, relayed by Muse on #284.
+Acceptable. D1 stands. The dashboard runtime is given `broker_pin` out
+of band, operator to operator, when the tenant is stood up, and the
+pin is stored in the dashboard's per-deploy config. The customer never
+sees it. The pin is a root of verification, not a secret, and it is
+distinct from the connector credential. The runtime still does not
+adopt a pin it learned from HTTP.
 
 ## Q3, ruled
 
@@ -920,14 +924,14 @@ registering a key over the token endpoint stays out, for the
 substitution reason in the threat model.
 
 The known later closure, not required here, is a connector identity key
-provisioned beside the pin on the channel Q1 decides, with proof of
+provisioned beside the pin on the channel Q1 settled, with proof of
 possession at refresh and at the hello. A copied refresh token is then
 inert. This note does not design that proof.
 
 ## Assumptions
 
-The design's call, for Muse and Duet to overturn. They are not
-substitutes for Q1 and Q2.
+The design's call, for Muse and Duet to overturn. They are not a
+substitute for Q2.
 
 - **A1.** The extension grant type is `urn:kharon:oauth:grant-type:connector`. Advertising it does not remove `authorization_code` or `refresh_token` from AS metadata.
 - **A2.** Spawn's lost-response grace is 30 s and one retry, the same window as I5. A further spawn is `invalid_grant` and does not end the Connect.

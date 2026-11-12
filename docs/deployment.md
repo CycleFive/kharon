@@ -1297,11 +1297,54 @@ curl -s -o /dev/null -w '%{http_code}\n' --cacert /etc/kharon/tls.crt \
   -X POST https://100.64.0.10:8790/mcp -H 'Content-Type: application/json' -d '{}'   # 401
 ```
 
-### Optional: WAF and rate limits for `/mcp` and `/connector`
+### Per-customer deploy checklist: the `/connector` rate limit (required, #223)
+
+Every deploy that exposes `/connector` to anyone but a short pilot
+must have this edge rule in place, and checked, before an agent other
+than the pilot's is pointed at it. It is a step of the per-customer
+deploy, not a suggestion. The owner applies it in the zone's Security
+rules (see the note above: Cloudflare-side changes are the owner's).
+
+- [ ] **Rate limiting rule, `/connector`:** on
+  `http.host eq "kharon.twkr.io" and http.request.uri.path eq "/connector"`
+  (the customer's gateway hostname), counted per IP, 20 requests per
+  minute, then block for ten minutes. A healthy connector dials once
+  and holds the socket; even a flapping one backs off to 30-second
+  retries, so it stays far below the threshold. kharond's pre-auth
+  budget (8 sockets, shared by everyone) is global and bounds what an
+  unauthenticated peer costs (#219), but it does not stop a stranger
+  from keeping those 8 slots full, which delays a *reconnecting* agent.
+  This rule is what protects the slots from starvation. Live sessions
+  are untouched.
+- [ ] **Verified:** from an internet host that is *not* an agent host
+  (the check gets that IP blocked for ten minutes), send a burst of
+  plain `GET /connector` requests:
+
+  ```sh
+  for i in $(seq 1 40); do
+    curl -s -o /dev/null -w '%{http_code}\n' https://kharon.twkr.io/connector
+  done | sort | uniq -c
+  ```
+
+  The first requests reach kharond and get `400` (an upgrade request
+  with no WebSocket headers, counted as `protocol`, and it takes no
+  pre-auth slot). Once the edge has counted about 20, the rest get
+  `429`. kharond never answers `429` on `/connector` (a full budget is
+  `503`), so a `429` is the edge's rule. Cloudflare's counting is
+  approximate, so the switch can come a few requests late; no `429` in
+  40 requests means the rule is missing or does not match the hostname
+  and path. Re-run one request after the ten-minute block to confirm
+  the IP is let back in (`400` again), and check that the pilot's
+  connector still shows `agent connector attached` in kharond's log.
+
+The pilot (#201) ran without this rule on purpose: the window was short
+and #219 bounds the cost.
+
+### Optional: WAF and the `/mcp` rate limit
 
 These cost little and stop junk at the edge, before it reaches the
 tunnel. Suggestions, for the owner to apply in the zone's Security
-rules:
+rules (the required `/connector` rule is in the checklist above):
 
 - **Custom rule, block:** `http.host eq "kharon.twkr.io" and not
   (http.request.uri.path in {"/mcp" "/connector"})`. The tunnel would
@@ -1311,14 +1354,6 @@ rules:
 - **Rate limiting rule:** on `http.request.uri.path eq "/mcp"`,
   counted per IP, for example 120 requests per minute, then block for
   ten minutes. An agent filling forms makes a few calls a minute.
-- **Rate limiting rule, `/connector`:** on
-  `http.request.uri.path eq "/connector"`, counted per IP, for example
-  20 requests per minute, then block for ten minutes. A healthy
-  connector dials once and holds the socket; even a flapping one backs
-  off to 30-second retries. kharond's pre-auth budget (8 sockets, shared by
-  everyone) is global, so a stranger who keeps it full can delay a
-  *reconnecting* agent; this rule is what protects those 8 pre-auth
-  slots from starvation. Live sessions are untouched.
 - **Bot Fight Mode and "I'm Under Attack":** keep them off for this
   hostname. MCP clients and the connector cannot answer a browser
   challenge.
@@ -1593,7 +1628,7 @@ When the failing leg is `upgrade`, the status is printed as received:
 |---|---|
 | `websocket upgrade answered 404` | the route is missing at the edge, or kharond has `websocket` off or no `[public_ingress]` |
 | `websocket upgrade answered 502` | the origin is down (kharond or cloudflared); also 52x from Cloudflare |
-| `websocket upgrade answered 503` | kharond's pre-auth budget is full; retry, and see the rate-limit rule |
+| `websocket upgrade answered 503` | kharond's pre-auth budget is full; retry, and see the [`/connector` rate-limit rule](#per-customer-deploy-checklist-the-connector-rate-limit-required-223) |
 | `websocket upgrade answered 400` / `403` | the request was malformed, or something added an `Origin` header |
 | `websocket upgrade answered 101 without the kharon-connector.v1 subprotocol` | the upgrade succeeded, but whatever answered is not kharond's `/connector` (or is an older build): check the route |
 

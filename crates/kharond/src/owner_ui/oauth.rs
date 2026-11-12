@@ -102,7 +102,7 @@ pub(super) enum Scope {
 impl Scope {
     const ALL: [Scope; 3] = [Scope::Read, Scope::Fill, Scope::Request];
 
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Read => "kharon:read",
             Self::Fill => "kharon:fill",
@@ -210,8 +210,8 @@ impl CodeStore {
 
     /// Single use. `None` when the code is unknown, expired, or already
     /// redeemed. The lookup removes it either way once it matches.
-    /// #231's token endpoint is the production caller.
-    #[allow(dead_code)]
+    /// #231's token endpoint is the production caller, through the
+    /// `CodeRedeemer` adapter in `oauth_token`.
     pub(super) fn redeem(&self, plaintext: &str, now: Instant) -> Option<CodeBody> {
         let hash = super::sha256(plaintext.as_bytes());
         let mut codes = self.lock();

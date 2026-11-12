@@ -33,6 +33,8 @@
 //! | POST | `/oauth/consent/options` | Begin the fresh consent assertion |
 //! | POST | `/oauth/consent/approve` | Approve; returns `{redirect}` |
 //! | POST | `/oauth/consent/deny` | Deny; returns `{redirect}` with `access_denied` |
+//! | POST | `/oauth/token` | OAuth token endpoint, only with `[oauth]` set (REQ-OAU-004); no session, no `Origin`, exempt |
+//! | POST | `/oauth/revoke` | OAuth revocation endpoint, only with `[oauth]` set (REQ-OAU-005); no session, no `Origin`, exempt |
 //! | POST | `/owner/login/options` | Begin an assertion ceremony |
 //! | POST | `/owner/login/finish` | Finish it; sets the session cookie |
 //! | POST | `/owner/register/options` | Begin registration |
@@ -80,6 +82,7 @@ pub mod access;
 mod approvals;
 mod audit_budget;
 mod oauth;
+pub mod oauth_token;
 mod sealed;
 mod store;
 mod throttle;
@@ -146,15 +149,23 @@ pub enum EdgeExempt {
 
 /// The one list of routes that take no `Origin` and no Access login:
 /// the ntfy redeem routes, whose clients are not browsers, and the
-/// RFC 8414 metadata route, whose clients are not browsers behind
-/// Access either — discovery is how an unauthenticated client finds
-/// the authorize endpoint (REQ-OAU-001). The two kinds route
-/// differently: the redeem prefixes are answered by the approval
-/// redeemer, the metadata path by the UI's own dispatch.
+/// OAuth routes (the RFC 8414 metadata route and the token
+/// endpoints), whose clients are not browsers behind Access either —
+/// discovery is how an unauthenticated client finds the authorize
+/// endpoint (REQ-OAU-001), and a token client holds no Access login
+/// (REQ-OAU-008). The two kinds route differently: the redeem
+/// prefixes are answered by the approval redeemer, the OAuth paths
+/// by the UI's own dispatch.
 pub const EDGE_EXEMPT: &[EdgeExempt] = &[
     EdgeExempt::Prefix(OWNER_APPROVE_PREFIX),
     EdgeExempt::Prefix(OWNER_DENY_PREFIX),
     EdgeExempt::Exact(AUTHORIZATION_SERVER_PATH),
+    // The OAuth token endpoints (REQ-OAU-008): a dashboard's
+    // backend is not a browser, so it can pass neither the `Origin`
+    // rule nor an Access login. Like the metadata path, they are
+    // the UI's own routes and fall through to `dispatch`.
+    EdgeExempt::Exact(oauth_token::TOKEN_PATH),
+    EdgeExempt::Exact(oauth_token::REVOKE_PATH),
 ];
 
 /// True when `path` is on [`EDGE_EXEMPT`].
@@ -167,8 +178,9 @@ pub fn edge_exempt(path: &str) -> bool {
 
 /// True when `path` is an ntfy redeem route: the [`EDGE_EXEMPT`]
 /// prefixes, which the approval redeemer answers rather than the
-/// UI's own dispatch. The list's one `Exact` entry (the RFC 8414
-/// metadata path) is the UI's own route and is not one.
+/// UI's own dispatch. The list's `Exact` entries (the RFC 8414
+/// metadata path, the OAuth token endpoints) are the UI's own
+/// routes and are not ones.
 pub fn redeem_exempt(path: &str) -> bool {
     EDGE_EXEMPT.iter().any(|e| match e {
         EdgeExempt::Prefix(p) => path.starts_with(p),
@@ -186,6 +198,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/"),
     ("GET", "/enroll"),
     ("GET", AUTHORIZATION_SERVER_PATH),
+    ("POST", oauth_token::TOKEN_PATH),
+    ("POST", oauth_token::REVOKE_PATH),
     ("GET", "/oauth/authorize"),
     ("POST", "/oauth/consent/view"),
     ("POST", "/oauth/consent/options"),
@@ -415,13 +429,20 @@ pub struct OwnerUi {
     /// well-known path and `/oauth/*` 404 like any other unknown route.
     oauth: Option<OauthAs>,
     /// Authorization codes (D4). Memory only; a panic clears them.
-    codes: oauth::CodeStore,
+    /// Behind an `Arc` because the token side's code redeemer
+    /// (#231) shares this one store.
+    codes: Arc<oauth::CodeStore>,
     /// Per-source budget for `GET /oauth/authorize` (REQ-OAU-008).
     authorize_budget: oauth::AuthorizeBudget,
     /// OAuth client admission (REQ-OAU-002; #229): the allow-list,
     /// CIMD fetch and cache `/oauth/authorize` admits through.
     /// `None` → no `[oauth]`, so no client is admissible.
     admission: Option<Arc<ClientAdmission>>,
+    /// The OAuth token side (REQ-OAU-004/-005; #231): the store
+    /// and code redeemer behind `POST /oauth/token` and
+    /// `POST /oauth/revoke`. `None` → the paths 404 like any other
+    /// unknown route.
+    oauth_tokens: Option<oauth_token::TokenSide>,
 }
 
 /// A ceremony as `options` hands it out: the sealed token (the
@@ -483,6 +504,10 @@ pub struct OwnerUiOptions {
     /// OAuth client admission, when `[oauth]` is set (REQ-OAU-002):
     /// the authorize endpoint admits clients through it.
     pub admission: Option<Arc<ClientAdmission>>,
+    /// The OAuth token side, when `[oauth]` is set (REQ-OAU-004):
+    /// the token store the daemon loaded at startup, plus the code
+    /// redeemer over the authorize side's code store (#230).
+    pub oauth_tokens: Option<oauth_token::TokenSide>,
 }
 
 impl OwnerUi {
@@ -508,6 +533,7 @@ impl OwnerUi {
                 access: None,
                 oauth: None,
                 admission: None,
+                oauth_tokens: None,
             },
             shell,
             audit,
@@ -530,6 +556,7 @@ impl OwnerUi {
             access,
             oauth,
             admission,
+            oauth_tokens,
         } = opts;
         // The Access gate exists only behind the edge. Config already
         // refuses `access` without `public_origin`; this is a second guard.
@@ -537,6 +564,18 @@ impl OwnerUi {
         let secure_cookie = origin.starts_with("https://");
         let (host, port) = crate::config::origin_authority(&origin, &rp_id, public);
         let passkeys = PasskeyStore::load(data_dir)?;
+        let codes = Arc::new(oauth::CodeStore::new());
+        // REQ-OAU-004 (#231): a token side built `unwired` gets the
+        // real code redeemer here, over the authorize side's own
+        // store — the store is born with the UI, so this is the
+        // first moment both halves exist. A side built with an
+        // explicit redeemer (tests) keeps it.
+        let oauth_tokens = oauth_tokens.map(|mut side| {
+            if side.bind_at_open {
+                side.codes = Arc::new(oauth_token::CodeStoreRedeemer::new(Arc::clone(&codes)));
+            }
+            side
+        });
         Ok(Arc::new(Self {
             rp_id,
             origin,
@@ -564,9 +603,10 @@ impl OwnerUi {
             unlocker: OnceLock::new(),
             unlock_attempts: Mutex::new(Vec::new()),
             oauth,
-            codes: oauth::CodeStore::new(),
+            codes,
             authorize_budget: oauth::AuthorizeBudget::new(),
             admission,
+            oauth_tokens,
         }))
     }
 
@@ -1007,6 +1047,17 @@ impl OwnerUi {
                 oauth.discovery.authorization_server_metadata().to_string(),
                 None,
             );
+        }
+        // The OAuth token endpoints (REQ-OAU-004/-005): on the
+        // exemption list, so no `Origin` and no Access stood in the
+        // way; the per-source throttle above has already refused a
+        // throttled source. Only with the token side configured;
+        // without it the paths fall through to the unknown-route
+        // 404 below.
+        if (req.path == oauth_token::TOKEN_PATH || req.path == oauth_token::REVOKE_PATH)
+            && let Some(side) = &self.oauth_tokens
+        {
+            return self.oauth_token_dispatch(&req, side);
         }
         if self.oauth.is_some() && req.path.starts_with("/oauth/consent") {
             return self.oauth_dispatch(&req);
@@ -2810,7 +2861,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_exempt_lists_the_redeem_routes_and_the_metadata_path() {
+    fn edge_exempt_lists_the_redeem_routes_and_the_oauth_paths() {
         for path in ["/owner/approve/abc", "/owner/deny/abc"] {
             assert!(edge_exempt(path), "{path}");
             assert!(redeem_exempt(path), "{path}");
@@ -2820,11 +2871,18 @@ mod tests {
         // the routing has to tell the two apart.
         assert!(edge_exempt(AUTHORIZATION_SERVER_PATH));
         assert!(!redeem_exempt(AUTHORIZATION_SERVER_PATH));
+        // The OAuth token endpoints are on the same list for the
+        // same reason (REQ-OAU-008), and route the same way.
+        for path in [oauth_token::TOKEN_PATH, oauth_token::REVOKE_PATH] {
+            assert!(edge_exempt(path), "{path}");
+            assert!(!redeem_exempt(path), "{path}");
+        }
         for path in [
             "/owner/approvals/approve",
             "/owner/login/finish",
             "/",
-            "/oauth/token",
+            "/oauth/authorize",
+            "/oauth/token/",
             "/.well-known/openid-configuration",
             "/.well-known/oauth-authorization-server/",
         ] {
@@ -2852,6 +2910,7 @@ mod tests {
                     access: None,
                     oauth,
                     admission: None,
+                    oauth_tokens: None,
                 },
                 shell.clone(),
                 Arc::new(NoAudit),
@@ -2890,6 +2949,630 @@ mod tests {
             call(&ui, Method::POST, Some("https://kharon-owner.example.com")).status(),
             StatusCode::METHOD_NOT_ALLOWED
         );
+    }
+
+    // ---- OAuth token endpoints (#231; REQ-OAU-004/-005/-008) ----
+
+    use crate::api::oauth_store::{ConnectLifecycle, OauthStore};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// The store's lifecycle seam, recorded.
+    #[derive(Default)]
+    struct RecLifecycle {
+        entries: StdMutex<Vec<crate::audit::Entry>>,
+        ended: StdMutex<Vec<String>>,
+    }
+
+    impl ConnectLifecycle for RecLifecycle {
+        fn append(&self, entry: crate::audit::Entry) -> bool {
+            self.entries.lock().unwrap().push(entry);
+            true
+        }
+        fn connect_ended(&self, agent_id: &str) {
+            self.ended.lock().unwrap().push(agent_id.to_owned());
+        }
+    }
+
+    /// The authorize side's code store (#230), faked at the seam.
+    #[derive(Default)]
+    struct FakeCodes(StdMutex<HashMap<String, oauth_token::RedeemedCode>>);
+
+    impl oauth_token::CodeRedeemer for FakeCodes {
+        fn redeem(&self, plaintext: &str) -> Option<oauth_token::RedeemedCode> {
+            self.0.lock().unwrap().remove(plaintext)
+        }
+    }
+
+    struct TokenFixture {
+        ui: Arc<OwnerUi>,
+        store: Arc<OauthStore>,
+        codes: Arc<FakeCodes>,
+        lifecycle: Arc<RecLifecycle>,
+    }
+
+    fn token_fixture(dir: &Path, with_side: bool) -> TokenFixture {
+        let store = Arc::new(OauthStore::load(dir).unwrap());
+        let lifecycle = Arc::new(RecLifecycle::default());
+        store.set_lifecycle(lifecycle.clone());
+        let codes = Arc::new(FakeCodes::default());
+        let oauth_tokens =
+            with_side.then(|| oauth_token::TokenSide::with_codes(store.clone(), codes.clone()));
+        let discovery = Discovery::new(
+            "https://kharon-owner.example.com".to_owned(),
+            "kharon.example.com",
+        );
+        let ui = OwnerUi::open_with(
+            dir,
+            OwnerUiOptions {
+                rp_id: "kharon-owner.example.com".into(),
+                origin: "https://kharon-owner.example.com".into(),
+                public: true,
+                access: None,
+                oauth: Some(metadata_oauth(discovery)),
+                admission: None,
+                oauth_tokens,
+            },
+            Arc::new(StaticShell(ShellView {
+                locked: false,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        TokenFixture {
+            ui,
+            store,
+            codes,
+            lifecycle,
+        }
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Insert a code on the fake authorize side, bound to
+    /// `verifier`'s PKCE challenge.
+    fn plant_code(fx: &TokenFixture, code: &str, verifier: &str) {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        let challenge = Base64UrlUnpadded::encode_string(&sha256(verifier.as_bytes()));
+        fx.codes.0.lock().unwrap().insert(
+            code.to_owned(),
+            oauth_token::RedeemedCode {
+                client_id: "https://dashboard.example/.well-known/kharon-client.json".to_owned(),
+                client_name: "Dashboard".to_owned(),
+                redirect_uri: "https://dashboard.example/cb".to_owned(),
+                code_challenge: challenge,
+                scopes: vec!["kharon:read".to_owned()],
+                consented_at: unix_now(),
+            },
+        );
+    }
+
+    fn form(pairs: &[(&str, &str)]) -> Vec<u8> {
+        fn enc(s: &str) -> String {
+            s.bytes()
+                .map(|b| match b {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect()
+        }
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes()
+    }
+
+    fn post_token(
+        ui: &OwnerUi,
+        path: &str,
+        body: Vec<u8>,
+        origin: Option<&str>,
+        throttle_key: Option<std::net::IpAddr>,
+    ) -> Response {
+        ui.dispatch(Incoming {
+            method: Method::POST,
+            path: path.into(),
+            cookie: None,
+            origin: origin.map(str::to_owned),
+            authorization: None,
+            content_type: Some("application/x-www-form-urlencoded".into()),
+            body,
+            client_ip: None,
+            throttle_key,
+            query: None,
+        })
+    }
+
+    fn code_form(code: &str, verifier: &str, resource: &str) -> Vec<u8> {
+        form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            (
+                "client_id",
+                "https://dashboard.example/.well-known/kharon-client.json",
+            ),
+            ("redirect_uri", "https://dashboard.example/cb"),
+            ("code_verifier", verifier),
+            ("resource", resource),
+        ])
+    }
+
+    #[test]
+    fn oauth_token_endpoints_404_without_the_token_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture(dir.path(), false);
+        for path in [oauth_token::TOKEN_PATH, oauth_token::REVOKE_PATH] {
+            let r = post_token(&fx.ui, path, form(&[("token", "x")]), None, None);
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[test]
+    fn oauth_token_redeems_rotates_and_revokes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture(dir.path(), true);
+        plant_code(&fx, "code-1", "verifier-1");
+        // The audience pin (D4): the `/connector` resource is
+        // refused, and the refusal does not spend the code.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-1",
+                "verifier-1",
+                "https://kharon.example.com/connector",
+            ),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&futures_body(r)).unwrap()["error"],
+            "invalid_target"
+        );
+        // Redemption issues the pair (D6 shape), `no-store` on it.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("code-1", "verifier-1", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+        let body: Value = serde_json::from_str(&futures_body(r)).unwrap();
+        let access = body["access_token"].as_str().unwrap().to_owned();
+        let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+        assert!(access.starts_with("kh_at_"), "{access}");
+        assert!(refresh.starts_with("kh_rt_"), "{refresh}");
+        assert_eq!(body["token_type"], "Bearer");
+        assert_eq!(body["expires_in"], 3600);
+        assert_eq!(body["scope"], "kharon:read");
+        let auth = fx.store.authenticate_access(&access, unix_now()).unwrap();
+        assert!(auth.agent_id.starts_with("c-"), "{}", auth.agent_id);
+        // Refresh rotates.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&futures_body(r)).unwrap();
+        let access2 = body["access_token"].as_str().unwrap().to_owned();
+        let refresh2 = body["refresh_token"].as_str().unwrap().to_owned();
+        assert_ne!(access2, access);
+        assert_ne!(refresh2, refresh);
+        // Revoking the access token ends only itself.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::REVOKE_PATH,
+            form(&[("token", &access2)]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(futures_body(r), "");
+        assert!(fx.store.authenticate_access(&access2, unix_now()).is_none());
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh2),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&futures_body(r)).unwrap();
+        let refresh3 = body["refresh_token"].as_str().unwrap().to_owned();
+        // Revoking the refresh token ends the whole Connect.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::REVOKE_PATH,
+            form(&[("token", &refresh3)]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh3),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            fx.lifecycle.ended.lock().unwrap().as_slice(),
+            [auth.agent_id]
+        );
+    }
+
+    #[test]
+    fn oauth_token_refresh_requires_the_issuing_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture(dir.path(), true);
+        plant_code(&fx, "code-7", "verifier-7");
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("code-7", "verifier-7", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&futures_body(r)).unwrap();
+        let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+        // No client_id at all: `invalid_request`.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&futures_body(r)).unwrap()["error"],
+            "invalid_request"
+        );
+        // The wrong client: `invalid_grant`, and nothing is spent —
+        // the issuing client still rotates with the same token.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                (
+                    "client_id",
+                    "https://other.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&futures_body(r)).unwrap()["error"],
+            "invalid_grant"
+        );
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn oauth_token_refusals_are_oauth_shaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture(dir.path(), true);
+        plant_code(&fx, "code-9", "right-verifier");
+        let err = |r: Response| {
+            serde_json::from_str::<Value>(&futures_body(r)).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        // Wrong PKCE verifier.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("code-9", "wrong-verifier", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err(r), "invalid_grant");
+        // Unknown code.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("nope", "v", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(err(r), "invalid_grant");
+        // Unknown grant type, and a missing parameter.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[("grant_type", "password")]),
+            None,
+            None,
+        );
+        assert_eq!(err(r), "unsupported_grant_type");
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[("grant_type", "refresh_token")]),
+            None,
+            None,
+        );
+        assert_eq!(err(r), "invalid_request");
+        // Wrong method on a wired endpoint.
+        let r = fx.ui.dispatch(Incoming {
+            method: Method::GET,
+            path: oauth_token::TOKEN_PATH.into(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            content_type: None,
+            body: Vec::new(),
+            client_ip: None,
+            throttle_key: None,
+            query: None,
+        });
+        assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// The production composition (#268 + #231): a token side
+    /// built `unwired` is bound at open to the UI's own code
+    /// store, so a code the authorize side issued redeems at the
+    /// token endpoint for real. A panic drops unredeemed codes
+    /// (REQ-OAU-005): both panic surfaces call
+    /// `OwnerUi::invalidate_sealed`, which clears the store.
+    #[test]
+    fn oauth_token_redeems_through_the_real_code_store() {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(OauthStore::load(dir.path()).unwrap());
+        store.set_lifecycle(Arc::new(RecLifecycle::default()));
+        let discovery = Discovery::new(
+            "https://kharon-owner.example.com".to_owned(),
+            "kharon.example.com",
+        );
+        let ui = OwnerUi::open_with(
+            dir.path(),
+            OwnerUiOptions {
+                rp_id: "kharon-owner.example.com".into(),
+                origin: "https://kharon-owner.example.com".into(),
+                public: true,
+                access: None,
+                oauth: Some(metadata_oauth(discovery)),
+                admission: None,
+                oauth_tokens: Some(oauth_token::TokenSide::unwired(Arc::clone(&store))),
+            },
+            Arc::new(StaticShell(ShellView {
+                locked: false,
+                pending: 0,
+            })),
+            Arc::new(NoAudit),
+            Arc::new(NoApprovals),
+        )
+        .unwrap();
+        // Issue from the UI's own code store, the way consent
+        // approval does: bound to the verifier's PKCE challenge,
+        // the dashboard's client and redirect, this deploy's
+        // resource.
+        let issue = |verifier: &str| {
+            let challenge = Base64UrlUnpadded::encode_string(&sha256(verifier.as_bytes()));
+            ui.codes
+                .issue(
+                    oauth::CodeBody {
+                        client_id: "https://dashboard.example/.well-known/kharon-client.json"
+                            .to_owned(),
+                        client_name: "Dashboard".to_owned(),
+                        redirect_uri: "https://dashboard.example/cb".to_owned(),
+                        code_challenge: challenge,
+                        resource: "https://kharon.example.com/mcp".to_owned(),
+                        scopes: vec![oauth::Scope::Read],
+                        consented_at: unix_now(),
+                    },
+                    Instant::now(),
+                )
+                .unwrap()
+        };
+        let code = issue("verifier-real");
+        let r = post_token(
+            &ui,
+            oauth_token::TOKEN_PATH,
+            code_form(&code, "verifier-real", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&futures_body(r)).unwrap();
+        let access = body["access_token"].as_str().unwrap();
+        assert!(store.authenticate_access(access, unix_now()).is_some());
+        // A second code, unredeemed when the panic lands, is
+        // gone: the redemption fails closed with `invalid_grant`.
+        let code = issue("verifier-lost");
+        ui.invalidate_sealed();
+        let r = post_token(
+            &ui,
+            oauth_token::TOKEN_PATH,
+            code_form(&code, "verifier-lost", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&futures_body(r)).unwrap()["error"],
+            "invalid_grant"
+        );
+    }
+
+    #[test]
+    fn oauth_token_second_redemption_revokes_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture(dir.path(), true);
+        plant_code(&fx, "code-2", "verifier-2");
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("code-2", "verifier-2", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&futures_body(r)).unwrap();
+        let access = body["access_token"].as_str().unwrap().to_owned();
+        let auth = fx.store.authenticate_access(&access, unix_now()).unwrap();
+        // The same code presented again (D4): refused, and
+        // everything it issued is revoked.
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("code-2", "verifier-2", "https://kharon.example.com/mcp"),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(fx.store.authenticate_access(&access, unix_now()).is_none());
+        assert_eq!(
+            fx.lifecycle.ended.lock().unwrap().as_slice(),
+            [auth.agent_id]
+        );
+        let events: Vec<(String, Option<String>)> = fx
+            .lifecycle
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.event.as_str().to_owned(), e.detail_code.clone()))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ("oauth_connect".to_owned(), None),
+                ("oauth_disconnect".to_owned(), Some("code_reuse".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn oauth_token_paths_are_origin_exempt_and_throttled_per_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture(dir.path(), true);
+        // Exempt (#208): a foreign `Origin` does not refuse the
+        // request — it is answered (here, an unknown code).
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form("nope", "v", "https://kharon.example.com/mcp"),
+            Some("https://unrelated.example"),
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        // Throttled per source (REQ-OAU-008): ten failures from one
+        // source close it; the eleventh request is refused before
+        // it is answered.
+        let ip: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        for _ in 0..10 {
+            let r = post_token(
+                &fx.ui,
+                oauth_token::TOKEN_PATH,
+                form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", "kh_rt_unknown"),
+                    (
+                        "client_id",
+                        "https://dashboard.example/.well-known/kharon-client.json",
+                    ),
+                ]),
+                None,
+                Some(ip),
+            );
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        }
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "kh_rt_unknown"),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            Some(ip),
+        );
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.headers().contains_key("retry-after"));
+        // A different source is its own bucket.
+        let other: std::net::IpAddr = "10.0.0.10".parse().unwrap();
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "kh_rt_unknown"),
+                (
+                    "client_id",
+                    "https://dashboard.example/.well-known/kharon-client.json",
+                ),
+            ]),
+            None,
+            Some(other),
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -3208,6 +3891,7 @@ mod tests {
                     access: None,
                     oauth: None,
                     admission: None,
+                    oauth_tokens: None,
                 },
                 Arc::new(StaticShell(ShellView {
                     locked: false,
@@ -4351,6 +5035,7 @@ mod tests {
                 access: None,
                 oauth: None,
                 admission: None,
+                oauth_tokens: None,
             },
             Arc::new(StaticShell(ShellView {
                 locked: false,
@@ -4564,6 +5249,7 @@ mod tests {
                 access: Some(verifier),
                 oauth: None,
                 admission: None,
+                oauth_tokens: None,
             },
             Arc::new(StaticShell(ShellView {
                 locked: false,
@@ -4612,6 +5298,7 @@ mod tests {
                     access: Some(verifier),
                     oauth,
                     admission: None,
+                    oauth_tokens: None,
                 },
                 Arc::new(StaticShell(ShellView {
                     locked: true,

@@ -39,6 +39,7 @@ pub mod mcp;
 pub mod meta;
 pub mod notify;
 pub mod oauth;
+pub mod oauth_store;
 pub mod public;
 pub mod rate;
 pub mod revocation;

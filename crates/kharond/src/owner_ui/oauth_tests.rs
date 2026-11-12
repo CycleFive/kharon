@@ -109,6 +109,7 @@ fn open_ui(
                 discovery: Arc::new(discovery()),
             }),
             admission: Some(clients),
+            oauth_tokens: None,
         },
         Arc::new(StaticShell(ShellView {
             locked: false,

@@ -667,6 +667,33 @@ where
         .unwrap_or(Err(ApiError::INVALID_TOKEN))
 }
 
+/// Authenticate a `POST /mcp` bearer token (REQ-OAU-004; #231):
+/// the one surface where `kh_at_` OAuth tokens are accepted. A
+/// `kh_at_` check costs a hash lookup, never an Argon2id permit
+/// (REQ-OAU-008), so it dispatches before the permit is taken;
+/// every other token takes the shared path above. The `/v1/*`
+/// handlers call [`authenticate`] only, so `kh_at_` is refused
+/// there.
+pub(super) async fn authenticate_mcp<S, C>(
+    state: &Arc<AppState<S, C>>,
+    token: Option<Zeroizing<String>>,
+) -> Result<AgentId, ApiError>
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    if let Some(t) = &token
+        && t.starts_with("kh_at_")
+    {
+        let token = token.ok_or(ApiError::MISSING_TOKEN)?;
+        let broker = Arc::clone(&state.broker);
+        return tokio::task::spawn_blocking(move || broker.authenticate_on_mcp(&token))
+            .await
+            .unwrap_or(Err(ApiError::INVALID_TOKEN));
+    }
+    authenticate(state, token).await
+}
+
 /// The credentials of `Bearer <token>` (scheme case-insensitive,
 /// RFC 9110 §11.1), copied into a zeroizing buffer.
 fn bearer(value: &HeaderValue) -> Option<Zeroizing<String>> {

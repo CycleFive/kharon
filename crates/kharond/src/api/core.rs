@@ -426,6 +426,11 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// it and `[public_ingress]` serves its protected-resource
     /// document. `None` keeps every pre-N3 response shape.
     oauth: Option<super::oauth::Discovery>,
+    /// The OAuth token store (REQ-OAU-004/-005; #231), when
+    /// `[oauth]` is configured: `kh_at_` tokens authenticate
+    /// against it on `/mcp` (never on `/v1/*`), and a panic ends
+    /// every Connect it holds.
+    oauth_store: Option<Arc<super::oauth_store::OauthStore>>,
 }
 
 /// Called with every resolved [`FillPlan`] after its values were
@@ -617,6 +622,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             transport: TransportLimits::new(),
             rollback: Mutex::new(RollbackGuard::new()),
             oauth: None,
+            oauth_store: None,
         }
     }
 
@@ -633,6 +639,20 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// configured.
     pub fn oauth_discovery(&self) -> Option<&super::oauth::Discovery> {
         self.oauth.as_ref()
+    }
+
+    /// Carry the OAuth token store (REQ-OAU-004/-005; #231): the
+    /// daemon loads it from `data_dir/oauth/state.json` before any
+    /// listener opens, and shares the one store with the owner UI's
+    /// token endpoints.
+    pub fn with_oauth_store(mut self, store: Arc<super::oauth_store::OauthStore>) -> Self {
+        self.oauth_store = Some(store);
+        self
+    }
+
+    /// The OAuth token store, when `[oauth]` is configured.
+    pub fn oauth_store(&self) -> Option<&Arc<super::oauth_store::OauthStore>> {
+        self.oauth_store.as_ref()
     }
 
     /// Use `clock` for grant TTLs and the request timeout instead of
@@ -856,6 +876,37 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             return Err(ApiError::INVALID_TOKEN);
         }
         Ok(AgentId(id))
+    }
+
+    /// Authenticate a bearer token presented on `POST /mcp`
+    /// (REQ-OAU-004; #231): the one surface that dispatches on
+    /// prefix. `kh_at_` goes to the OAuth token store — a SHA-256
+    /// lookup, never an Argon2id evaluation (REQ-OAU-008) — and
+    /// everything else takes the config-agent path above. The
+    /// `/v1/*` handlers keep calling [`Self::authenticate`], so a
+    /// `kh_at_` token there is refused like any unknown token.
+    pub fn authenticate_on_mcp(&self, token: &str) -> Result<AgentId, ApiError> {
+        if token.starts_with("kh_at_") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let conn = self
+                .oauth_store
+                .as_ref()
+                .and_then(|store| store.authenticate_access(token, now))
+                .ok_or(ApiError::INVALID_TOKEN)?;
+            if self
+                .rates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_revoked(&conn.agent_id)
+            {
+                return Err(ApiError::INVALID_TOKEN);
+            }
+            return Ok(AgentId(conn.agent_id));
+        }
+        self.authenticate(token)
     }
 
     /// Transport budget for one `/mcp` request from client `ip`,
@@ -1950,6 +2001,45 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         Ok(removed.grants.len())
     }
 
+    /// Drop a Connect identity's live grants and pending requests
+    /// (REQ-OAU-005, REQ-REV-001): the grant half of ending a
+    /// Connect, called by the OAuth store's lifecycle hook when a
+    /// Connect ends (revoke, reuse, re-redemption). Unlike
+    /// [`Self::revoke_agent`] there is no `token_revoke`: a Connect
+    /// has no configured token to bind a durable revocation to —
+    /// its own store has already ended the identity, and a future
+    /// Connect mints a fresh `c-…` id. Per-grant `grant_revoke`
+    /// entries match `revoke_agent`'s. Best effort throughout: the
+    /// Connect is already ended, and a failed append must not
+    /// resurrect it.
+    pub fn revoke_connect_grants(&self, agent_id: &str) {
+        let mut ctrl = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let removed = self
+            .grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revoke_agent(agent_id);
+        for grant in &removed.grants {
+            ctrl.release_idle_hold(&grant.id);
+        }
+        drop(ctrl);
+        for grant in &removed.grants {
+            let entry = Entry::new(Event::GrantRevoke)
+                .agent_id(grant.agent_id.clone())
+                .grant_id(grant.id.clone())
+                .result("revoked")
+                .detail_code("agent_revoked");
+            let entry = match grant_item_id(grant) {
+                Some(id) => entry.item_id(id),
+                None => entry,
+            };
+            let _ = self.append(entry);
+        }
+        for req in &removed.pending {
+            let _ = self.append(dropped_request_entry(req, "agent_revoked"));
+        }
+    }
+
     /// Clear an agent's suspension (REQ-RL-002 owner reset). Does
     /// not restore a revoked token; a revocation lasts until the
     /// token is rotated (mint, new `token_hash`, restart; #132).
@@ -1997,6 +2087,24 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
         for req in &removed.pending {
             let _ = self.append(dropped_request_entry(req, "panic"));
+        }
+        // A panic ends every Connect as well (REQ-OAU-005,
+        // REQ-REV-002): the OAuth store revokes the identities and
+        // their tokens (durable in its state file), and each ending
+        // is audited here. No channel: a panic arrives on several,
+        // and the `panic` entry itself carries that context.
+        if let Some(store) = &self.oauth_store {
+            for identity in store.revoke_all() {
+                let entry = Entry::new(Event::OauthDisconnect)
+                    .agent_id(identity.id.clone())
+                    .result("revoked")
+                    .detail_code("panic");
+                let entry = match identity.audit_origin() {
+                    Some(host) => entry.origin(host),
+                    None => entry,
+                };
+                let _ = self.append(entry);
+            }
         }
         self.rollback
             .lock()

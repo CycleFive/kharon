@@ -12,12 +12,20 @@
 
 mod api_support;
 
-use std::fmt::Write as _;
+use std::fmt::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use api_support::{Harness, TestBroker, mcp_call, raw_request};
+use api_support::{FakeAnswer, FakeFill, Harness, ITEM_A, TestBroker, mcp_call, raw_request};
+use kharond::api::fill::{FillBackend, FillFuture};
 use kharond::api::transport::{PER_AGENT_PER_MINUTE, PER_IP_PER_MINUTE};
+use kharond::cdp::fill::FillPlan;
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::subscriber::Interest;
+use tracing::{Event, Metadata, Subscriber};
 
 async fn serve_public(broker: Arc<TestBroker>) -> std::net::SocketAddr {
     serve_public_proxies(broker, Arc::from([])).await
@@ -180,92 +188,179 @@ async fn audit_entries_carry_the_effective_client_ip() {
     assert_eq!(list.client_ip.as_deref(), Some("127.0.0.1"));
 }
 
-/// Records every tracing event and span field emitted on this thread.
-struct TracingCapture(Arc<Mutex<String>>);
+/// Records every tracing span and event, on every thread, while armed.
+///
+/// The public surface's tasks run on the runtime's worker threads, so
+/// this subscriber is the process default and sees those tasks.
+/// `Interest::sometimes` keeps the enabled check live, including
+/// across the moment the probe arms.
+struct TracingCapture {
+    inner: Arc<CaptureInner>,
+}
 
-struct TracingRecorder<'a>(&'a mut String);
+struct CaptureInner {
+    next_id: AtomicU64,
+    capturing: AtomicBool,
+    buf: Mutex<String>,
+}
 
-impl tracing::field::Visit for TracingRecorder<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+struct FieldRecorder<'a>(&'a mut String);
+
+impl Visit for FieldRecorder<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         let _ = write!(self.0, " {}={value:?}", field.name());
     }
 }
 
-impl<S> tracing_subscriber::Layer<S> for TracingCapture
-where
-    S: tracing::Subscriber,
-{
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut line = format!("span {}", attrs.metadata().name());
-        attrs.record(&mut TracingRecorder(&mut line));
-        self.push(line);
-    }
-
-    fn on_record(
-        &self,
-        _id: &tracing::span::Id,
-        values: &tracing::span::Record<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut line = String::from("record");
-        values.record(&mut TracingRecorder(&mut line));
-        self.push(line);
-    }
-
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut line = format!(
-            "event {} {}",
-            event.metadata().target(),
-            event.metadata().name()
-        );
-        event.record(&mut TracingRecorder(&mut line));
-        self.push(line);
-    }
-}
-
 impl TracingCapture {
-    fn push(&self, line: String) {
-        let mut buf = self.0.lock().unwrap();
-        buf.push_str(&line);
-        buf.push('\n');
+    /// Install the process subscriber once and start recording.
+    fn arm() -> Self {
+        static INNER: OnceLock<Arc<CaptureInner>> = OnceLock::new();
+        let inner = INNER.get_or_init(|| {
+            let inner = Arc::new(CaptureInner {
+                next_id: AtomicU64::new(1),
+                capturing: AtomicBool::new(false),
+                buf: Mutex::new(String::new()),
+            });
+            tracing::subscriber::set_global_default(TracingCapture {
+                inner: Arc::clone(&inner),
+            })
+            .expect("tracing default subscriber is already set");
+            inner
+        });
+        inner.buf.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        inner.capturing.store(true, Ordering::SeqCst);
+        Self {
+            inner: Arc::clone(inner),
+        }
+    }
+
+    fn text(&self) -> String {
+        self.inner
+            .buf
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn push(&self, line: &str) {
+        if !self.inner.capturing.load(Ordering::Acquire) {
+            return;
+        }
+        let mut buf = self.inner.buf.lock().unwrap_or_else(|p| p.into_inner());
+        // Re-check under the lock: disarm can land between the first
+        // load and this write.
+        if self.inner.capturing.load(Ordering::Acquire) {
+            buf.push_str(line);
+            buf.push('\n');
+        }
     }
 }
 
-/// The redaction probe (#200, #239): canary-shaped secrets — the fixture
-/// vault's passwords and full usernames, the agent's own bearer
-/// token, and a canary used as a search query — must appear in no
-/// response body, no audit entry, and no tracing output the public
-/// surface produces, across success and error paths alike. One
-/// `kharon_fill` runs through it, and that fill really decrypts a
-/// vault password, so the scan is not of a path that never held one.
-///
-/// `current_thread` keeps the server task on this thread, where the
-/// capture subscriber is installed. kharond's own lines are
-/// `eprintln!`, not tracing events; the subscriber is what a later
-/// `tracing` event is checked against, and the sentinel proves it
-/// was recording.
-#[tokio::test(flavor = "current_thread")]
+impl Drop for TracingCapture {
+    fn drop(&mut self) {
+        self.inner.capturing.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Subscriber for TracingCapture {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        self.inner.capturing.load(Ordering::Acquire)
+    }
+
+    fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+
+    fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+        let n = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = Id::from_non_zero_u64(NonZeroU64::new(n).expect("span id overflow"));
+        let meta = attrs.metadata();
+        let mut line = format!("span {} {}", meta.target(), meta.name());
+        attrs.record(&mut FieldRecorder(&mut line));
+        self.push(&line);
+        id
+    }
+
+    fn record(&self, _span: &Id, values: &Record<'_>) {
+        let mut line = String::from("span-record");
+        values.record(&mut FieldRecorder(&mut line));
+        self.push(&line);
+    }
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let meta = event.metadata();
+        let mut line = format!("event {} {} {}", meta.level(), meta.target(), meta.name());
+        event.record(&mut FieldRecorder(&mut line));
+        self.push(&line);
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+/// Fill backend that emits one fixed tracing event once the broker has
+/// already decrypted the plan. The event carries no field value: it
+/// only proves the capture subscriber sees the fill task.
+struct TracingProbeFill(FakeFill);
+
+impl FillBackend for TracingProbeFill {
+    fn has_agent(&self, agent_id: &str) -> bool {
+        self.0.has_agent(agent_id)
+    }
+
+    fn fill<'a>(
+        &'a self,
+        agent_id: &'a str,
+        plan: &'a FillPlan,
+        allow_default: bool,
+    ) -> FillFuture<'a> {
+        tracing::debug!(
+            target: "kharon_redaction_probe",
+            "kharon_fill reached the backend"
+        );
+        self.0.fill(agent_id, plan, allow_default)
+    }
+}
+
+/// Panic when `needle` occurs in `logs`, with a short window of the
+/// surrounding tracing text so the emitting target is visible.
+fn assert_tracing_absent(logs: &str, needle: &str, what: &str) {
+    let Some(i) = logs.find(needle) else {
+        return;
+    };
+    let start = i.saturating_sub(120);
+    let end = (i + needle.len() + 120).min(logs.len());
+    let window = &logs[start..end];
+    panic!("{what} leaked into tracing output near: {window}");
+}
+
+/// The redaction probe (#200, extended by #239 N4): canary-shaped
+/// secrets — the fixture vault's passwords and full usernames, the
+/// agent's own bearer token, and a canary used as a search query —
+/// must appear in no response body, no audit entry, and no tracing
+/// output the public surface produces, across success and error
+/// paths alike. One `kharon_fill` runs inside the capture window so
+/// a log line on the fill path is scanned too (the acceptance
+/// wording is "logs or audit details").
+#[tokio::test]
 async fn public_surface_never_echoes_secrets() {
-    use api_support::{FakeAnswer, FakeFill, ITEM_A, assert_no_canary, canaries, mcp_request};
-    use tracing_subscriber::prelude::*;
-
-    let captured = Arc::new(Mutex::new(String::new()));
-    let subscriber = tracing_subscriber::registry().with(TracingCapture(Arc::clone(&captured)));
-    let _guard = tracing::subscriber::set_default(subscriber);
-    tracing::info!(target: "kharon_redaction_probe", "subscriber armed");
-
-    let fake = FakeFill::new(FakeAnswer::Filled).with_live_url("https://login.example.com/");
-    let recorded = fake.clone();
-    let h = Harness::with(false, move |b| b.with_fill_backend(Box::new(fake)));
+    use api_support::{assert_no_canary, canaries, mcp_request};
+    let capture = TracingCapture::arm();
+    let fake = FakeFill::new(FakeAnswer::Filled);
+    let backend = fake.clone();
+    let h = Harness::with(false, move |b| {
+        b.with_fill_backend(Box::new(TracingProbeFill(backend)))
+    });
+    // A fill that should reach the browser needs a matching live
+    // grant, or it stops at pending_approval before decrypt.
     h.grant_fixture_items();
     let addr = serve_public(h.broker.clone()).await;
     let token = h.alpha.clone();
@@ -286,27 +381,6 @@ async fn public_surface_never_echoes_secrets() {
     let params = format!(r#"{{"name":"kharon_search","arguments":{{"q":"{q}"}}}}"#);
     let r = mcp_request(addr, Some(&token), "tools/call", &params).await;
     bodies.push(r.body);
-    // One fill. The password is decrypted into the plan the backend
-    // sees; the reply is status only.
-    let fill = format!(
-        r#"{{"item_id":"{ITEM_A}","target":{{"cdp_target_id":"tab-1","expected_origin":"https://login.example.com"}},"fields":[{{"kind":"username"}},{{"kind":"password"}}]}}"#
-    );
-    let r = mcp_call(addr, Some(&token), "kharon_fill", &fill).await;
-    assert_eq!(r.status, 200, "{}", r.body);
-    let reply = r.json();
-    assert_eq!(reply["result"]["isError"], false, "{}", r.body);
-    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-    let filled: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(filled["status"], "filled", "{filled}");
-    assert!(
-        recorded.seen().iter().any(|plan| {
-            plan.fields.iter().any(|(kind, _, value)| {
-                *kind == "password" && canaries().iter().any(|c| c == value)
-            })
-        }),
-        "kharon_fill did not decrypt a vault password, so the scan would be vacuous"
-    );
-    bodies.push(r.body);
     // A near-miss token (the real one, corrupted) is refused; the
     // refusal must not echo what was presented.
     let bad = format!("{token}x");
@@ -325,11 +399,32 @@ async fn public_surface_never_echoes_secrets() {
     .await;
     assert_eq!(r.status, 413, "{}", r.body);
     bodies.push(r.body);
+    // One fill of the fixture item's username and password. The
+    // broker decrypts both before the backend runs; the probe event
+    // is emitted there, with no field value attached.
+    let fill = format!(
+        r#"{{"item_id":"{ITEM_A}","target":{{"cdp_target_id":"tab-1","expected_origin":"https://login.example.com"}},"fields":[{{"kind":"username"}},{{"kind":"password"}}]}}"#
+    );
+    let r = mcp_call(addr, Some(&token), "kharon_fill", &fill).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let reply = r.json();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    let inner: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(inner["status"], "filled", "{inner}");
+    bodies.push(r.body);
+
+    let manifest = api_support::manifest();
+    let password = manifest["items"][0]["password"].as_str().unwrap();
+    let username = manifest["items"][0]["username"].as_str().unwrap();
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 1, "kharon_fill did not reach the backend");
+    let got: Vec<(&str, &str)> = seen[0].fields.iter().map(|f| (f.0, f.2.as_str())).collect();
+    assert_eq!(got, [("username", username), ("password", password)]);
 
     for body in &bodies {
         assert_no_canary(body);
         assert!(!body.contains(&token), "response echoed the bearer token");
-        assert!(!body.contains(&q), "response echoed the search query");
     }
     let audit = serde_json::to_string(&*h.audit.entries.lock().unwrap()).unwrap();
     assert_no_canary(&audit);
@@ -337,18 +432,27 @@ async fn public_surface_never_echoes_secrets() {
         !audit.contains(&token),
         "audit entry holds the bearer token"
     );
-    assert!(!audit.contains(&q), "audit entry holds the search query");
-    let logs = captured.lock().unwrap().clone();
+
+    // The handler's events are synchronous, before the response is
+    // written. Yield so a task that logs as the connection closes
+    // still lands in the buffer.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let logs = capture.text();
     assert!(
-        logs.contains("subscriber armed"),
-        "the tracing subscriber recorded nothing, so the scan would be vacuous"
+        logs.contains("kharon_fill reached the backend"),
+        "the fill path emitted no tracing event, so this scan would not see a log line there"
     );
-    assert_no_canary(&logs);
-    assert!(
-        !logs.contains(&token),
-        "tracing output holds the bearer token"
-    );
-    assert!(!logs.contains(&q), "tracing output holds the search query");
+    for c in canaries() {
+        let what = if c == q {
+            "canary search query"
+        } else {
+            "canary"
+        };
+        assert_tracing_absent(&logs, &c, what);
+    }
+    assert_tracing_absent(&logs, &token, "bearer token");
 }
 
 /// `POST /mcp` as if the TCP peer were `peer`, through the real router.

@@ -49,9 +49,13 @@ the gateway's.
 
 ## 2. Broker host
 
-2. **Required. Provision the box** (operator): a Linux VM with Docker
-   and Compose, and a checkout of the release. *Not covered in the guide
-   yet: sizing, OS and the Docker install are tracked in #292.*
+2. **Required. Provision the box** (operator). The rest of this runbook
+   uses the Compose package: a Linux VM with Docker Engine and the
+   Compose plugin (`docker compose`), and a checkout of the release.
+   OS notes, what this repo does and doesn't say about VM size and the
+   Docker install, and the host-networked unit the pilot runs (the
+   user, `memlock`, `data_dir`) are in
+   [Host install](broker-lifecycle.md#host-install).
 3. **Required. Build the image** (operator): `docker compose build kharon`
    in `deploy/compose`. See the
    [compose README, Run it](../deploy/compose/README.md#run-it).
@@ -282,12 +286,13 @@ the gateway's.
     - What to do with a lost passkey or after being throttled. See
       [A lost passkey](deployment.md#a-lost-passkey) and
       [The throttle, and getting back in](deployment.md#the-throttle-and-getting-back-in).
-29. **Required. Set up alerts** (operator) on the connector outage line
-    (see [Connector config over WebSocket](deployment.md#connector-config-over-websocket))
-    and on the `CF-Connecting-IP` counter (see
-    [Watching it](deployment.md#watching-it)). *Backup and restore of
-    `/data`, upgrades, and a secrets inventory with rotation are tracked
-    in #292.*
+29. **Required. Set up alerts, backup and rotation** (operator). The
+    alerts are the connector outage line, the `CF-Connecting-IP`
+    counter and the checkpoint subscriber; the list is
+    [Alerts](broker-lifecycle.md#alerts). Backup and restore of `/data`,
+    upgrades, and the secrets inventory are in
+    [Data backup, restore and upgrade](broker-lifecycle.md#data-backup-restore-and-upgrade)
+    and [Secrets inventory](broker-lifecycle.md#secrets-inventory).
 
 To take the deploy off the internet again, see
 [Rollback](deployment.md#rollback).

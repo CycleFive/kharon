@@ -8,6 +8,7 @@ Deploying:
 
 - [`docs/managed-deploy-runbook.md`](docs/managed-deploy-runbook.md): the ordered steps for one managed customer deploy, end to end.
 - [`docs/deployment.md`](docs/deployment.md): the deployment guide, the reference each runbook step points into.
+- [`docs/broker-lifecycle.md`](docs/broker-lifecycle.md): host install of kharond, backup and restore of `/data`, upgrades, and the secrets inventory.
 - [`deploy/compose/README.md`](deploy/compose/README.md): running kharond with Docker Compose.
 
 ## License

@@ -11,7 +11,8 @@
 //! they bind a `c-…` id exactly like a config agent's. No scope
 //! approves: a `kh_at_` or `kh_rt_` presented to an owner-UI
 //! route, an ntfy redeem route, or the owner socket is refused
-//! (REQ-OAU-006).
+//! (REQ-OAU-006). A connector-audience token is the same refusal:
+//! the gate matches the prefix, and there is no exemption.
 
 mod api_support;
 
@@ -22,7 +23,7 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use kharond::api::grant::{Channel, GrantAction, GrantRequestArgs};
 use kharond::api::http::ApprovalRedeemer;
 use kharond::api::oauth::Discovery;
-use kharond::api::oauth_store::{CodeGrant, ConnectLifecycle, OauthStore};
+use kharond::api::oauth_store::{CodeGrant, ConnectLifecycle, OauthStore, TokenAudience};
 use kharond::api::rate::RatePolicy;
 use kharond::api::revocation::DurableState;
 use kharond::api::token::{TokenStore, generate_with};
@@ -596,6 +597,71 @@ async fn oauth_bearer_is_refused_on_every_owner_ui_route() {
     let r = owner_http(addr, "GET", "/", None).await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.body.contains("kharon"), "{}", r.body);
+}
+
+/// #279's owner-UI refusal, repeated with a connector-audience
+/// token (REQ-OAU-006). The gate matches the `kh_at_` / `kh_rt_`
+/// prefix, so the audience does not open an exemption. The
+/// assertions name no token value.
+#[tokio::test]
+async fn req_oau_006_connector_audience_token_is_refused_on_every_owner_ui_route() {
+    let store = empty_store();
+    let (_mcp_access, agent_id) = add_connect(&store, "connector-owner", &["kharon:read"]);
+    let connector = store
+        .insert_connector_audience(&agent_id, unix_now())
+        .unwrap();
+    assert_eq!(
+        store.token_audience(&connector.access_token),
+        Some(TokenAudience::Connector)
+    );
+    assert_eq!(
+        store.token_audience(&connector.refresh_token),
+        Some(TokenAudience::Connector)
+    );
+
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://localhost:{}", addr.port());
+    let ui = kharond::owner_ui::OwnerUi::open(
+        data.path(),
+        "localhost",
+        origin,
+        Arc::new(kharond::owner_ui::StaticShell(
+            kharond::owner_ui::ShellView {
+                locked: false,
+                pending: 0,
+            },
+        )),
+        Arc::new(kharond::owner_ui::NoAudit),
+        Arc::new(kharond::owner_ui::NoApprovals),
+    )
+    .unwrap();
+    tokio::spawn(kharond::owner_ui::serve(
+        listener,
+        Arc::clone(&ui),
+        Arc::new(ClosedRedeem),
+    ));
+
+    for (method, path) in kharond::owner_ui::ROUTES {
+        let r = owner_http(addr, method, path, Some(&connector.access_token)).await;
+        assert_connector_bearer_refused(&r, &connector.access_token);
+    }
+    let head = format!(
+        "GET /owner/session HTTP/1.1\r\nHost: localhost\r\nauthorization: bearer {}\r\nConnection: close\r\n\r\n",
+        connector.refresh_token
+    );
+    let r = raw_request(addr, head.as_bytes()).await;
+    assert_connector_bearer_refused(&r, &connector.refresh_token);
+}
+
+/// 403 `forbidden`, and the body does not carry the credential.
+/// Failure text names neither the token nor the body, so a leak
+/// cannot print the credential.
+fn assert_connector_bearer_refused(r: &RawResponse, token: &str) {
+    assert_eq!(r.status, 403);
+    assert!(r.body.contains("\"error\":\"forbidden\""));
+    assert!(!r.body.contains(token));
 }
 
 #[tokio::test]

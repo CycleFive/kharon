@@ -6,10 +6,13 @@
 //! authorization code is redeemed at `POST /oauth/token` — never at
 //! consent, so an unredeemed consent leaves nothing behind (A17).
 //! Tokens are opaque (`kh_at_<64 hex>`, `kh_rt_<64 hex>`); the file
-//! holds only their SHA-256 hashes, with the identities (D3). Codes
-//! are never written here: they live in the authorize side's memory
-//! (#230). The redeemed-code set that makes a second redemption
-//! revoke is memory-only too, expiring with the code. A pending
+//! holds only their SHA-256 hashes, with the identities (D3). Each
+//! record stores an audience (`mcp` or `connector`) in its own
+//! field, not in scope or resource (D4, #304). A phase-1 file omits
+//! the field and loads as `mcp`. Code redemption and refresh issue
+//! `mcp`. Codes are never written here: they live in the authorize
+//! side's memory (#230). The redeemed-code set that makes a second
+//! redemption revoke is memory-only too, expiring with the code. A pending
 //! marker is recorded in that set atomically with the code take
 //! ([`OauthStore::begin_redemption`]); [`OauthStore::connect`]
 //! resolves it under the store lock, so a second presentation that
@@ -58,6 +61,9 @@ pub const GRACE_SECS: u64 = 30;
 /// exactly that long past consent.
 pub const CODE_TTL_SECS: u64 = 60;
 
+/// On-disk schema. Stays at 1 when the audience field arrives: a
+/// phase-1 file has no `audience` key and deserializes as `mcp`
+/// (A6). Bumping this refuses those files at startup.
 const STATE_VERSION: u32 = 1;
 
 /// Where a Connect's audit entries go, and who drops its live
@@ -112,13 +118,33 @@ impl std::fmt::Debug for IssuedPair {
     }
 }
 
-/// What an access token authenticates as on `/mcp`.
+/// What a live access token resolves to. The audience is the
+/// record's own field. `/mcp` accepts only [`TokenAudience::Mcp`],
+/// and that refusal happens in the broker before the scope gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated {
     pub agent_id: String,
     /// The Connect's granted scopes (the store carries them from
     /// here; the broker enforces them via `AgentId`, #232).
     pub scopes: Vec<String>,
+    /// The audience stored on this access token.
+    pub audience: TokenAudience,
+}
+
+/// Which surface a token record is for (D4, #304).
+///
+/// Its own field on the access token and on the refresh token:
+/// not a scope, and not the `resource` parameter. A phase-1
+/// `oauth/state.json` has no audience key; that record loads as
+/// [`Self::Mcp`], an `/mcp` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenAudience {
+    /// `/mcp`. Code redemption and refresh issue this audience.
+    #[default]
+    Mcp,
+    /// The connector tunnel. Refused on `/mcp`.
+    Connector,
 }
 
 /// The checked contents of a redeemed authorization code (#230's
@@ -214,7 +240,13 @@ struct TokenRecord {
     kind: TokenKind,
     identity_id: String,
     /// The refresh family: one per Connect, named by the identity.
+    /// Not the audience — a Connect has one family today, and the
+    /// audience says which surface the token is for.
     family: String,
+    /// `mcp` or `connector`. Absent on a phase-1 record, which
+    /// deserializes as [`TokenAudience::Mcp`].
+    #[serde(default)]
+    audience: TokenAudience,
     /// The hash of the token this one descends from: a refresh
     /// token's parent is the refresh token it rotated from; an
     /// access token's parent is the refresh token issued in its
@@ -500,7 +532,7 @@ impl OauthStore {
             connected_via: "oauth".to_owned(),
             revoked: false,
         };
-        let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now);
+        let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now, TokenAudience::Mcp);
         enum Commit {
             Issued(IssuedPair),
             /// A second presentation landed before this commit.
@@ -664,8 +696,10 @@ impl OauthStore {
                 // failed write restores the snapshot, so the
                 // presented token stays as it was for a retry.
                 let backup = inner.file.clone();
+                // Refresh issues audience `mcp`, as code redemption
+                // does. A connector family's rotation is a later slice.
                 let (pair, access_rec, refresh_rec) =
-                    issue_pair(&identity, Some(hash.clone()), now);
+                    issue_pair(&identity, Some(hash.clone()), now, TokenAudience::Mcp);
                 if grace {
                     inner.file.tokens[pos].grace_used = true;
                     // The pair issued moments before is superseded,
@@ -829,10 +863,11 @@ impl OauthStore {
         ended
     }
 
-    /// Authenticate an access token on `/mcp`: a hash lookup, never
-    /// an Argon2id permit (REQ-OAU-008). `None` for unknown,
-    /// expired, revoked or wrong-kind tokens, and for tokens whose
-    /// Connect has ended.
+    /// A live access token, of whichever audience it stores: a hash
+    /// lookup, never an Argon2id permit (REQ-OAU-008). `None` for
+    /// unknown, expired, revoked or wrong-kind tokens, and for
+    /// tokens whose Connect has ended. A connector audience is
+    /// still `Some` here; `/mcp` refuses it before the scope gate.
     pub fn authenticate_access(&self, presented: &str, now: u64) -> Option<Authenticated> {
         let hash = hex(&sha256(presented.as_bytes()));
         let inner = self.lock();
@@ -848,7 +883,59 @@ impl OauthStore {
         Some(Authenticated {
             agent_id: identity.id.clone(),
             scopes: identity.scopes.clone(),
+            audience: rec.audience,
         })
+    }
+
+    /// The audience stored for `presented`, access or refresh,
+    /// whatever its status. `None` when the hash is not in the
+    /// store. Does not check expiry or revocation: a round-trip
+    /// reads what was written.
+    pub fn token_audience(&self, presented: &str) -> Option<TokenAudience> {
+        let hash = hex(&sha256(presented.as_bytes()));
+        let inner = self.lock();
+        inner
+            .file
+            .tokens
+            .iter()
+            .find(|t| t.hash == hash)
+            .map(|t| t.audience)
+    }
+
+    /// Plant a connector-audience access token and its refresh
+    /// sibling on a live Connect, and persist them.
+    ///
+    /// Tests use this constructor to hold a connector record and
+    /// round-trip it. Not an issuance path: code redemption and
+    /// refresh pass [`TokenAudience::Mcp`] and do not call this.
+    /// An unknown or revoked identity is [`TokenError::InvalidGrant`].
+    /// A failed write leaves the store unchanged and returns
+    /// [`TokenError::PersistFailed`]. The plaintext pair is returned
+    /// once and is not stored.
+    pub fn insert_connector_audience(
+        &self,
+        identity_id: &str,
+        now: u64,
+    ) -> Result<IssuedPair, TokenError> {
+        let mut inner = self.lock();
+        let Some(identity) = inner
+            .file
+            .identity(identity_id)
+            .filter(|identity| !identity.revoked)
+            .cloned()
+        else {
+            return Err(TokenError::InvalidGrant);
+        };
+        let backup = inner.file.clone();
+        let (pair, access_rec, refresh_rec) =
+            issue_pair(&identity, None, now, TokenAudience::Connector);
+        inner.file.tokens.push(access_rec);
+        inner.file.tokens.push(refresh_rec);
+        if self.persist(&inner.file).is_err() {
+            inner.file = backup;
+            return Err(TokenError::PersistFailed);
+        }
+        Ok(pair)
     }
 
     /// Whether the id is one of this store's Connect identities
@@ -943,11 +1030,14 @@ fn refresh_deadline(identity: &Identity, issued_at: u64) -> u64 {
 
 /// Mint a token pair for `identity`. `parent` is the hash of the
 /// refresh token being rotated from (`None` for a Connect's first
-/// pair).
+/// pair). `audience` is stored on both records. Code redemption
+/// and refresh pass [`TokenAudience::Mcp`]; they do not issue a
+/// connector audience.
 fn issue_pair(
     identity: &Identity,
     parent: Option<String>,
     now: u64,
+    audience: TokenAudience,
 ) -> (IssuedPair, TokenRecord, TokenRecord) {
     let access_token = format!("kh_at_{}", hex(&random_bytes::<32>()));
     let refresh_token = format!("kh_rt_{}", hex(&random_bytes::<32>()));
@@ -957,6 +1047,7 @@ fn issue_pair(
         kind: TokenKind::Access,
         identity_id: identity.id.clone(),
         family: identity.id.clone(),
+        audience,
         parent: Some(refresh_hash.clone()),
         issued_at: now,
         expires_at: now.saturating_add(ACCESS_TTL_SECS),
@@ -970,6 +1061,7 @@ fn issue_pair(
         kind: TokenKind::Refresh,
         identity_id: identity.id.clone(),
         family: identity.id.clone(),
+        audience,
         parent,
         issued_at: now,
         expires_at: refresh_deadline(identity, now),

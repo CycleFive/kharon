@@ -77,6 +77,7 @@ fn add_connect(store: &OauthStore, tag: &str, scopes: &[&str]) -> (String, Strin
         code_challenge: challenge,
         scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
         consented_at: unix_now(),
+        connector_grant_declared: false,
     };
     let code_hash: [u8; 32] = Sha256::digest(format!("code-{tag}").as_bytes()).into();
     let pair = store

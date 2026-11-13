@@ -3483,6 +3483,7 @@ mod tests {
             code_challenge: challenge,
             scopes: vec!["kharon:read".to_owned()],
             consented_at: unix_now(),
+            connector_grant_declared: false,
         }
     }
 
@@ -3889,6 +3890,7 @@ mod tests {
                         resource: "https://kharon.example.com/mcp".to_owned(),
                         scopes: vec![oauth::Scope::Read],
                         consented_at: unix_now(),
+                        connector_grant_declared: false,
                     },
                     Instant::now(),
                 )

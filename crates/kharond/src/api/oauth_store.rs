@@ -135,6 +135,9 @@ pub struct CodeGrant {
     /// Unix seconds of the consent; the refresh token's 90-day
     /// absolute lifetime counts from here (D4).
     pub consented_at: u64,
+    /// Whether the client's metadata document declared the connector
+    /// extension grant when the owner consented (#235 D3).
+    pub connector_grant_declared: bool,
 }
 
 /// How a Connect ended, for the `oauth_disconnect` `detail_code`
@@ -181,6 +184,14 @@ pub struct Identity {
     /// the Connections page can say how a Connect arrived.
     pub connected_via: String,
     pub revoked: bool,
+    /// Whether the client declared the connector extension grant
+    /// (`grant_types` lists `urn:kharon:oauth:grant-type:connector`)
+    /// at consent (#235 D3, A11). Fixed at consent: nothing after
+    /// redemption writes it, so a client that adds the grant to its
+    /// document later is still not declared on this Connect. A
+    /// phase 1 record has no field and loads as not declared.
+    #[serde(default)]
+    pub connector_grant_declared: bool,
 }
 
 impl Identity {
@@ -499,6 +510,7 @@ impl OauthStore {
             consented_at: grant.consented_at,
             connected_via: "oauth".to_owned(),
             revoked: false,
+            connector_grant_declared: grant.connector_grant_declared,
         };
         let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now);
         enum Commit {
@@ -866,6 +878,17 @@ impl OauthStore {
         self.lock().file.identities.clone()
     }
 
+    /// Whether a Connect's client declared the connector extension
+    /// grant at consent (#235 D3), for the spawn grant to check
+    /// (slice 4). `None` for an id this store never issued. An ended
+    /// Connect still answers; spawn checks liveness itself.
+    pub fn connector_grant_declared(&self, identity_id: &str) -> Option<bool> {
+        self.lock()
+            .file
+            .identity(identity_id)
+            .map(|i| i.connector_grant_declared)
+    }
+
     /// The `client_name` an identity was shown under at consent,
     /// for owner-facing display (D9, #233): approvals, grants and
     /// the audit view name a Connect by it. `None` for an id this
@@ -1145,6 +1168,7 @@ mod tests {
                 code_challenge: challenge,
                 scopes: vec!["kharon:read".to_owned(), "kharon:fill".to_owned()],
                 consented_at: NOW,
+                connector_grant_declared: false,
             },
             verifier.to_owned(),
         )
@@ -1467,6 +1491,64 @@ mod tests {
             recording.events().last().unwrap(),
             &("oauth_disconnect".to_owned(), Some("client".to_owned()))
         );
+    }
+
+    #[test]
+    fn a_phase_1_identity_without_the_declaration_loads_as_not_declared() {
+        // A state file written before #235: the identity has no
+        // `connector_grant_declared` field.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("oauth")).unwrap();
+        let phase1 = serde_json::json!({
+            "version": STATE_VERSION,
+            "identities": [{
+                "id": "c-abcdefghij",
+                "client_id": CLIENT,
+                "client_name": "Dashboard",
+                "scopes": ["kharon:read", "kharon:fill"],
+                "created_at": NOW,
+                "consented_at": NOW,
+                "connected_via": "oauth",
+                "revoked": false,
+            }],
+            "tokens": [],
+        });
+        std::fs::write(dir.path().join("oauth/state.json"), phase1.to_string()).unwrap();
+        let store = OauthStore::load(dir.path()).unwrap();
+        assert_eq!(store.connector_grant_declared("c-abcdefghij"), Some(false));
+        assert_eq!(store.connector_grant_declared("c-zzzzzzzzzz"), None);
+    }
+
+    #[test]
+    fn the_connector_grant_declaration_is_fixed_at_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        // Connect A: its document did not declare the grant at consent.
+        let (pair, undeclared) = connect_one(&store);
+        // The client's document adds the grant; only a new Connect
+        // (B, a fresh consent) records it.
+        let (mut g, verifier) = grant("second-verifier");
+        g.connector_grant_declared = true;
+        let pair_b = store
+            .connect(&g, &verifier, sha256(b"second-code"), NOW)
+            .unwrap();
+        let declared = store
+            .authenticate_access(&pair_b.access_token, NOW)
+            .unwrap()
+            .agent_id;
+        assert_ne!(undeclared, declared);
+        assert_eq!(store.connector_grant_declared(&undeclared), Some(false));
+        assert_eq!(store.connector_grant_declared(&declared), Some(true));
+        // A's refresh rotates without touching the flag, and both
+        // survive a reload as consented.
+        store
+            .refresh(&pair.refresh_token, CLIENT, NOW + 60)
+            .unwrap();
+        assert_eq!(store.connector_grant_declared(&undeclared), Some(false));
+        drop(store);
+        let reloaded = OauthStore::load(dir.path()).unwrap();
+        assert_eq!(reloaded.connector_grant_declared(&undeclared), Some(false));
+        assert_eq!(reloaded.connector_grant_declared(&declared), Some(true));
     }
 
     #[test]

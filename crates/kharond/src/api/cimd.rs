@@ -21,7 +21,10 @@
 //!    exactly; `client_name` must be present; `redirect_uris` must
 //!    be non-empty, all `https`, with no localhost; and
 //!    `token_endpoint_auth_method` must be absent or `none` (public
-//!    clients only, PKCE binds the code — A4).
+//!    clients only, PKCE binds the code — A4). `grant_types`, when
+//!    present, must be an array of strings; it is read for one fact
+//!    only, whether it lists the connector extension grant (#235 D3,
+//!    A11), and the list itself is not kept.
 //! 4. **Cache.** A validated document is cached per process for its
 //!    `Cache-Control` max-age clamped to 1 h–24 h, never persisted.
 //!    There is no stale-on-error (A16): a failed fetch with no fresh
@@ -42,6 +45,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use url::Url;
 
+use super::oauth::CONNECTOR_GRANT_TYPE;
 use crate::audit::{Entry, Event};
 
 /// The whole CIMD fetch — resolve, connect, TLS, body — gets 5 s
@@ -68,6 +72,10 @@ pub struct ClientMetadata {
     client_name: String,
     /// The document's `redirect_uris`, each validated `https`.
     redirect_uris: Vec<String>,
+    /// Whether the document's `grant_types` lists
+    /// [`CONNECTOR_GRANT_TYPE`]. Consent records this on the Connect
+    /// identity (#235 D3); it is the only use of `grant_types`.
+    declares_connector_grant: bool,
 }
 
 impl ClientMetadata {
@@ -84,6 +92,13 @@ impl ClientMetadata {
     /// The redirect URIs an authorize request may name.
     pub fn redirect_uris(&self) -> &[String] {
         &self.redirect_uris
+    }
+
+    /// Whether the client declares the connector extension grant
+    /// (`grant_types` lists [`CONNECTOR_GRANT_TYPE`]). Absent or
+    /// empty `grant_types` is `false`.
+    pub fn declares_connector_grant(&self) -> bool {
+        self.declares_connector_grant
     }
 }
 
@@ -696,10 +711,26 @@ fn validate_document(client_id: &str, body: &[u8]) -> Result<ClientMetadata, Ref
         Some(v) if v.as_str() == Some("none") => {}
         Some(_) => return Err(invalid),
     }
+    // `grant_types` (#235 D3): reduced at once to whether it lists
+    // the connector extension grant; nothing else reads it. Absent
+    // means not declared. A value that is not an array of strings is
+    // malformed, refused like the fields above.
+    let declares_connector_grant = match doc.get("grant_types") {
+        None => false,
+        Some(v) => {
+            let types = v.as_array().ok_or(invalid)?;
+            let mut declared = false;
+            for t in types {
+                declared |= t.as_str().ok_or(invalid)? == CONNECTOR_GRANT_TYPE;
+            }
+            declared
+        }
+    };
     Ok(ClientMetadata {
         client_id: client_id.to_owned(),
         client_name: client_name.to_owned(),
         redirect_uris,
+        declares_connector_grant,
     })
 }
 
@@ -753,6 +784,14 @@ mod tests {
             r#"{{"client_id": "{CLIENT}", "client_name": "Muse dashboard",
                  "redirect_uris": ["{REDIRECT}"],
                  "token_endpoint_auth_method": "none"}}"#
+        )
+    }
+
+    /// [`valid_doc`] with a raw `grant_types` JSON value added.
+    fn with_grant_types(raw: &str) -> String {
+        valid_doc().replace(
+            r#""token_endpoint_auth_method""#,
+            &format!(r#""grant_types": {raw}, "token_endpoint_auth_method""#),
         )
     }
 
@@ -907,6 +946,14 @@ mod tests {
                 "token_endpoint_auth_method is not none",
                 valid_doc().replace("\"none\"", "\"private_key_jwt\""),
             ),
+            (
+                "grant_types is not an array",
+                with_grant_types(r#""urn:kharon:oauth:grant-type:connector""#),
+            ),
+            (
+                "grant_types has a non-string entry",
+                with_grant_types(r#"["authorization_code", 7]"#),
+            ),
         ];
         for (name, body) in cases {
             let fake = FakeFetch::new(vec![ok(body, None)]);
@@ -921,6 +968,44 @@ mod tests {
                 Some("cimd_invalid"),
                 "case: {name}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_types_sets_the_connector_declaration_only_when_listed() {
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("grant_types absent", valid_doc(), false),
+            ("grant_types empty", with_grant_types("[]"), false),
+            (
+                "only the phase 1 grants",
+                with_grant_types(r#"["authorization_code", "refresh_token"]"#),
+                false,
+            ),
+            (
+                "a near miss is not the grant",
+                with_grant_types(r#"["urn:kharon:oauth:grant-type:connector2"]"#),
+                false,
+            ),
+            (
+                "lists the connector grant",
+                with_grant_types(
+                    r#"["authorization_code", "refresh_token",
+                        "urn:kharon:oauth:grant-type:connector"]"#,
+                ),
+                true,
+            ),
+        ];
+        for (name, body, declared) in cases {
+            let fake = FakeFetch::new(vec![ok(body, None)]);
+            let audit = Recorded::new();
+            let admission = admission(&[CLIENT], &fake, &audit);
+            let metadata = admission.admit(CLIENT).await.unwrap();
+            assert_eq!(
+                metadata.declares_connector_grant(),
+                declared,
+                "case: {name}"
+            );
+            assert!(audit.entries().is_empty(), "case: {name}");
         }
     }
 

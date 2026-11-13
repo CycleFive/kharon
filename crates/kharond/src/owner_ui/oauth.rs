@@ -146,6 +146,10 @@ pub(super) struct CodeBody {
     /// Unix seconds of the consent, for the refresh token's absolute
     /// lifetime (D4: counted from consent).
     pub consented_at: u64,
+    /// Whether the client's metadata document, as admitted for this
+    /// consent, declares the connector extension grant (#235 D3).
+    /// Fixed here: the identity redemption creates keeps this value.
+    pub connector_grant_declared: bool,
 }
 
 impl CodeBody {
@@ -287,6 +291,11 @@ struct Pending {
     state: Option<String>,
     resource: String,
     scopes: Vec<Scope>,
+    /// The admitted document's connector-grant declaration (#235 D3),
+    /// sealed with the `client_name` the consent screen shows, so
+    /// the identity records what the owner consented to.
+    #[serde(default)]
+    connector_grant_declared: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -627,6 +636,7 @@ impl OwnerUi {
             resource: pending.claims.resource.clone(),
             scopes: granted,
             consented_at: unix_now(),
+            connector_grant_declared: pending.claims.connector_grant_declared,
         };
         let state = pending.claims.state.clone();
         let redirect_uri = pending.claims.redirect_uri.clone();
@@ -920,6 +930,7 @@ async fn decide_authorize(query: &str, resource: &str, clients: &ClientAdmission
         state,
         resource: resource.to_owned(),
         scopes,
+        connector_grant_declared: admitted.declares_connector_grant(),
     })
 }
 

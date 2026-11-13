@@ -315,6 +315,12 @@ not something a person chose:
    and `--check` and startup refuse with `config error
    [api_key_file]: … not readable by kharond (euid 10001; …)`.
 
+Steps 2–4 on Bitwarden cloud — which organization plan, the
+collection, inviting and confirming the dedicated account, where
+`organization_id` and `collection_ids` are, moving the logins, URI
+match, and the API key JSON — are in
+[Customer vault onboarding](vault-onboarding.md).
+
 ### Agent tokens (REQ-API-003)
 
 Each agent has one bearer token, `kh_agent_<id>_<64 hex>`. kharond
@@ -1961,9 +1967,14 @@ When the failing leg is `upgrade`, the status is printed as received:
 | `websocket upgrade answered 400` / `403` | the request was malformed, or something added an `Origin` header |
 | `websocket upgrade answered 101 without the kharon-connector.v1 subprotocol` | the upgrade succeeded, but whatever answered is not kharond's `/connector` (or is an older build): check the route |
 
-Point the agent harness at `https://203.0.113.4:8787` with its agent
-API token, and trust the broker certificate there. The connector does
-not carry that token. The idle-lock contract in
+Point the agent harness at the gateway,
+`POST https://<public_host>/mcp`, with the agent token. The compose
+base leaves `[api]` commented out
+([`kharon.toml.example`](../deploy/compose/kharon.toml.example));
+`https://203.0.113.4:8787` is the raw path-(B) `[api] listen` in the
+example above, and that listener exists only when `[api]` is in the
+config. See [MCP client](#mcp-client). The connector does not carry
+the agent token. The idle-lock contract in
 [Running the agent](#running-the-agent) applies on this path too: the
 broker locks 30 minutes after the latest fill, unlock, or grant
 approval, and a re-unlock needs a new browser context. CI checks this
@@ -2033,3 +2044,83 @@ one. We recommend that the agent's tool harness:
   the model, only the page's text and structure;
 - masks password fields in screenshots, or takes none while a
   login form is on screen.
+
+## MCP client
+
+A managed deploy calls the broker at the public hostname
+(`[public_ingress] public_host`). The compose base serves that as
+`POST https://<gateway>/mcp` and has no `[api]` listener. The agent
+token from [Agent tokens](#agent-tokens-req-api-003) goes in one
+header:
+
+```text
+Authorization: Bearer kh_agent_<id>_<64 hex>
+```
+
+`<id>` is the agent id (`[a-z0-9-]{1,64}`, so it never contains `_`).
+`<64 hex>` is 32 random bytes, lowercase hex. `kharon token mint
+assistant` prints `kh_agent_assistant_` plus those 64 characters,
+once, on the terminal. The hash it writes to stdout is
+`[agents.assistant] token_hash`. The token itself stays in the
+client's secret store.
+
+```json
+{
+  "mcpServers": {
+    "kharon": {
+      "url": "https://kharon.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer kh_agent_assistant_…"
+      }
+    }
+  }
+}
+```
+
+`kh_agent_assistant_…` is a placeholder. Clients that take a map of
+HTTP MCP servers use this shape; the URL and the `Authorization`
+header are what kharond checks. The endpoint is streamable HTTP
+(SPEC §4, REQ-API-001). A config that spawns a local command is the
+wrong shape for this deploy.
+
+Use an `[api]` listen address (`10.66.0.1:8787` with
+`compose.vpn.yml`, or `203.0.113.4:8787` in the raw path-(B) example)
+only when that `[api]` table is actually in `kharon.toml`. Trust that
+listener's certificate. The gateway path uses the edge's certificate.
+
+The header is a single `Authorization: Bearer` value
+(`bearer_token`). The connector's `kh_tunnel_…` credential is a
+different secret and does not authenticate here. A dashboard Connect
+access token (`kh_at_…`) is accepted on `POST /mcp` and refused on
+`/v1/*`.
+
+No header, or more than one, or a value that is not `Bearer` plus a
+non-empty token: HTTP 401
+`{"error":"unauthorized","detail":"missing bearer token"}`. A token
+that does not verify: HTTP 401
+`{"error":"unauthorized","detail":"invalid agent token"}`. Both send
+`WWW-Authenticate: Bearer realm="kharon"`. With `[oauth]` configured,
+that challenge also carries the discovery parameters in
+[OAuth discovery and Connect endpoints](#oauth-discovery-and-connect-endpoints-n3).
+
+An `Origin` header is refused: HTTP 403
+`{"error":"forbidden","detail":"browser origins are not accepted"}`.
+`Content-Type` must be `application/json`, or the body is HTTP 400
+`{"error":"bad_request","detail":"content type must be application/json"}`.
+kharond answers a method other than POST with HTTP 405
+`{"error":"method_not_allowed","detail":"method not allowed"}` and
+`Allow: POST`. At the gateway, `GET /mcp` is 404
+(`deploy/checks/edge-checks.sh`, and the curl in
+[Verifying](#verifying)). While the broker is locked,
+`kharon_status` still answers and reports that. `kharon_list`,
+`kharon_search`, `kharon_fill`, `kharon_fill_totp`, `kharon_context`
+and `kharon_request_grant` are HTTP 423
+`{"error":"locked","detail":"broker is locked; owner unlock required"}`.
+
+The server accepts protocol versions `2026-07-28`, `2025-11-25` and
+`2025-06-18`, and issues no session id. Tool names and JSON Schemas
+are [`docs/api/mcp-tools.json`](api/mcp-tools.json) (seven tools:
+`kharon_status`, `kharon_list`, `kharon_search`, `kharon_fill`,
+`kharon_fill_totp`, `kharon_context`, `kharon_request_grant`). No
+tool returns a secret. Apply the
+[agent harness policy](#agent-harness-policy-spec-oq-3).

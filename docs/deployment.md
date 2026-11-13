@@ -54,6 +54,11 @@ binds to the WireGuard address only; under path (B) it binds to a
 TLS-capable listen address the agent reaches over outbound HTTPS
 (REQ-DEP-006).
 
+Host install of kharond (the binary or the image, the systemd unit,
+the user, `memlock` and `data_dir`), backup and restore of `/data`,
+upgrades, the secrets inventory and the alerts are in
+[Broker lifecycle](broker-lifecycle.md).
+
 ### Audit checkpoints off-host (REQ-AUD-002)
 
 By default kharond pushes a signed audit checkpoint to the
@@ -142,9 +147,11 @@ services:
 
 ```toml
 [approval]
-ntfy = { url = "https://ntfy.example.net", topic = "kharon-acme-q7x2" }
-token_file = "/run/secrets/ntfy_token"
+ntfy = { url = "https://ntfy.example.net", topic = "kharon-acme-q7x2", token_file = "/run/secrets/ntfy_token" }
 ```
+
+`token_file` is a field of the `ntfy` table. A `token_file` key beside
+`ntfy` is an unknown field, and kharond refuses the file.
 
 kharond reads the token once, at startup, and refuses to start if the
 file is missing, unreadable or empty. It sends it as
@@ -1481,6 +1488,10 @@ WantedBy=multi-user.target
 ```sh
 sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared-kharon.service
 ```
+
+kharond on this same host has its own unit, in
+[Host install](broker-lifecycle.md#host-install). The unit above is
+cloudflared only.
 
 `--no-autoupdate` keeps cloudflared from rewriting itself; update it
 by replacing the binary or the pinned image.

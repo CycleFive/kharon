@@ -6,7 +6,9 @@ no inbound port on the host (#207, REQ-DEP-001, REQ-DEP-002). It is an
 example to adapt, not a hardened deployment. The
 [deployment guide](../../docs/deployment.md) covers the rest: the
 kharon account's master password, agent tokens, the public gateway,
-the WireGuard link, and setting up the agent host.
+the WireGuard link, and setting up the agent host. Host install,
+backup and restore of `/data`, upgrades and the secrets inventory are
+in [Broker lifecycle](../../docs/broker-lifecycle.md).
 
 ## Run it
 

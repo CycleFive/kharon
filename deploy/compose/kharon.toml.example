@@ -69,10 +69,12 @@ public_host = "kharon.example.com"
 # Without this section the daemon refuses to start unless
 # [audit] checkpoint_local_only = true is set instead — local-only
 # checkpoints are a temporary pilot posture, not the release one.
+# token_file belongs inside this table. A token_file key beside ntfy is
+# an unknown field and is refused. With a published owner UI the topic
+# MUST be private (set token_file, use a reserved topic): the
+# Approve/Deny links in its messages work from anywhere.
 ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit" }
-# token_file = "/run/secrets/ntfy_token"
-# With a published owner UI the topic MUST be private (set token_file, use a
-# reserved topic): the Approve/Deny links in its messages work from anywhere.
+# ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit", token_file = "/run/secrets/ntfy_token" }
 
 # Owner web UI (REQ-APR-005, #208). The owner signs in with a passkey,
 # unlocks, approves and denies from a browser at its own hostname. The

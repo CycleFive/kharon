@@ -4,6 +4,12 @@ Vaultwarden fill broker: lets AI agents fill credentials without ever seeing the
 
 Design: [`SPEC.md`](SPEC.md). Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+Deploying:
+
+- [`docs/managed-deploy-runbook.md`](docs/managed-deploy-runbook.md): the ordered steps for one managed customer deploy, end to end.
+- [`docs/deployment.md`](docs/deployment.md): the deployment guide, the reference each runbook step points into.
+- [`deploy/compose/README.md`](deploy/compose/README.md): running kharond with Docker Compose.
+
 ## License
 
 Licensed under either of

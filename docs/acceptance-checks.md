@@ -18,7 +18,8 @@ from an internet host. Not from the tailnet, and not from an agent host.
 GATEWAY=kharon.example.com OWNER=kharon-owner.example.com OAUTH=1 ./deploy/checks/edge-checks.sh
 ```
 
-Every line must be `ok`. Read the script's header for what each switch
+Every scored line must be `ok`; `info` lines are reported, and fail
+only on a 5xx or no answer. Read the script's header for what each switch
 does and which checks write an audit entry. The checks are the ones in
 the deployment guide's
 [Verifying](deployment.md#verifying) and
@@ -62,12 +63,17 @@ The **customer** types the canary at a hidden prompt. It must never be
 pasted to the agent or to the person running the commands:
 
 ```sh
-( umask 077; IFS= read -rs C; printf '%s' "$C" > /tmp/.canary.pat; unset C )
-wc -c < /tmp/.canary.pat        # must equal the canary's known length
-sudo grep -rlF -f /tmp/.canary.pat / \
+PAT=$(mktemp)                   # a fresh 0600 file, not a fixed name in /tmp
+( IFS= read -rs C; printf '%s' "$C" > "$PAT"; unset C )
+wc -c < "$PAT"                  # must equal the canary's known length
+sudo grep -rlF -f "$PAT" / \
   --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev --exclude-dir=run \
-  2>/dev/null | grep -v '^/tmp/\.canary\.pat$' | wc -l      # must be 0
+  2>/dev/null | grep -vxF "$PAT" | wc -l      # must be 0
 ```
+
+While the pattern file exists, anything running as the same user can
+read it, the agent included. Stop the agent runtime for this check, or
+run it as a different user.
 
 - **The length check** catches a stray newline or a mistyped value; a
   wrong pattern makes a `0` meaningless.
@@ -77,24 +83,25 @@ sudo grep -rlF -f /tmp/.canary.pat / \
   fill browser's profile directory, copy it, and count rows with
   `sqlite3 <copy> 'select count(*) from logins'`. Expect 0, or no file.
   Don't open other browsers' `Login Data`; they aren't the fill profile.
-- **Clean up:** `shred -u /tmp/.canary.pat` when done.
+- **Clean up:** `shred -u "$PAT"` when done.
 
 Pass: 0 files, and the fill profile has no saved logins.
 
 ## 4. Canary sweep (broker and edge)
 
-With a pattern file made the same way on the broker host, count
+With a pattern file made the same way on the broker host (`mktemp`,
+kept in `$PAT`), count
 matches with `grep -cF -f` or `grep -rlF -f` only. Never print matching
 lines.
 
 | Surface | Command shape | Expect |
 |---|---|---|
-| kharond log | `docker compose logs kharon 2>&1 \| grep -cF -f /tmp/.canary.pat` | 0 |
-| cloudflared log | `docker compose logs cloudflared 2>&1 \| grep -cF -f /tmp/.canary.pat` | 0 |
-| journal since the fill | `sudo journalctl --since '<fill time>' \| grep -cF -f /tmp/.canary.pat` | 0 |
-| `/var/log` | `sudo grep -rlF -f /tmp/.canary.pat /var/log \| wc -l` | 0 |
-| kharond's data volume, audit log and keys included | `sudo grep -rlF -f /tmp/.canary.pat <volume path> \| wc -l` | 0 |
-| agent connector log (agent host) | `journalctl -u kharon-agent-connector \| grep -cF -f /tmp/.canary.pat` | 0 |
+| kharond log | `docker compose logs kharon 2>&1 \| grep -cF -f "$PAT"` | 0 |
+| cloudflared log | `docker compose logs cloudflared 2>&1 \| grep -cF -f "$PAT"` | 0 |
+| journal since the fill | `sudo journalctl --since '<fill time>' \| grep -cF -f "$PAT"` | 0 |
+| `/var/log` | `sudo grep -rlF -f "$PAT" /var/log \| wc -l` | 0 |
+| kharond's data volume, audit log and keys included | `sudo grep -rlF -f "$PAT" <volume path> \| wc -l` | 0 |
+| agent connector log (agent host) | `journalctl -u kharon-agent-connector \| grep -cF -f "$PAT"` | 0 |
 
 Two legs are covered by construction rather than by grep:
 - **`/mcp`:** its requests and responses have no credential field

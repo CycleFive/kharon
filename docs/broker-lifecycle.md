@@ -185,6 +185,8 @@ docker run -d --name kharond --restart unless-stopped \
   --user 10001:10001 \
   --ulimit memlock=-1 --ulimit core=0 \
   --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --security-opt seccomp=deploy/compose/kharon-seccomp.json \
   -v kharon-data:/data \
   -v /etc/kharon.toml:/etc/kharon.toml:ro \
   -v /etc/kharon/tls.crt:/etc/kharon/tls.crt:ro \
@@ -194,7 +196,10 @@ docker run -d --name kharond --restart unless-stopped \
   kharon:local
 ```
 
-Mount only the files this deploy uses. The API key, the TLS key and
+Run that from the repository root, so the seccomp path is the profile
+the compose file uses (`seccomp=./kharon-seccomp.json` there). Those
+two `security_opt` lines are the same SPEC §9 hardening as the compose
+service. Mount only the files this deploy uses. The API key, the TLS key and
 the ntfy token are mode `0400`, uid `10001`, as in the
 [secrets inventory](#secrets-inventory). `--restart unless-stopped`
 is the compose file's restart policy. A config the daemon refuses
@@ -268,10 +273,20 @@ too broad refuses startup (`scope_too_broad`, exit 78).
 
 Check, then start. `--check` does not create `data_dir`, bind a
 listener, or use the network. It does open the API key file and the
-TLS files, and it runs the memlock probe.
+TLS files, and it runs the memlock probe (`load_for_startup` with
+`ProcfsMlockProbe`).
+
+Run the check under the unit's memlock limit. A plain
+`sudo -u kharon kharond --check` does not get `LimitMEMLOCK=infinity`.
+On a stock Debian host the soft limit is 8 MiB, so with the default
+`require_mlock = true` that command exits 78:
+`RLIMIT_MEMLOCK soft limit is 8388608 bytes (needs unlimited)`. The
+unit is never started, and the check has not said the config is wrong.
 
 ```sh
-sudo -u kharon kharond --check --config /etc/kharon.toml
+sudo systemd-run --uid=kharon --gid=kharon \
+  -p LimitMEMLOCK=infinity --wait --pty \
+  /usr/local/bin/kharond --check --config /etc/kharon.toml
 sudo systemctl daemon-reload && sudo systemctl enable --now kharond.service
 ```
 
@@ -357,12 +372,14 @@ Host unit:
 
 ```sh
 sudo systemctl stop kharond
-sudo sh -c 'umask 077; tar -C / --exclude data/owner.sock -cpf /root/kharon-data.tar data'
+sudo sh -c 'umask 077; tar -C / --exclude data/owner.sock -cf /root/kharon-data.tar data'
 sudo systemctl start kharond
 ```
 
 Compose. This archives the volume, not the host's `/data`. Stop
-`kharon` only; leave the holder and cloudflared up.
+`kharon` only; leave the holder and cloudflared up. The helper image
+only has to provide `tar`. `alpine:3.22` is an example; this
+repository does not pin that tag.
 
 ```sh
 docker compose stop kharon
@@ -386,10 +403,16 @@ same pass, separately, with their modes. They are not in the tar of
 ### Restore
 
 Stop kharond. Keep the tree you are replacing until
-`kharon audit verify` has been run against the restored one. Restore
-the whole tree from one moment. A log from one backup and keys from
-another, or a newer `state.json` on an older log, is not a state the
-daemon repairs.
+`kharon audit verify` has been run against the restored one, and do
+that verify while kharond is still stopped. Restore the whole tree
+from one moment. A log from one backup and keys from another, or a
+newer `state.json` on an older log, is not a state the daemon repairs.
+
+Starting first appends entries past the restored head and publishes
+checkpoints for those sequence numbers. If the off-host stream already
+has a checkpoint there, `truncated after local seq L` becomes
+`checkpoint at seq N does not match the log`. Start only when verify
+prints `audit log OK, head seq N`.
 
 Host unit:
 
@@ -399,11 +422,13 @@ sudo mv /data /data.pre-restore
 sudo tar -C / -xpf /root/kharon-data.tar
 sudo chown -R kharon:kharon /data
 sudo find /data -printf '%m %u:%g %p\n'
-sudo systemctl start kharond
 sudo -u kharon kharon audit verify --data /data/audit --checkpoints /path/to/checkpoints.jsonl
 ```
 
-Compose, again without recreating the holder:
+Compose, again without recreating the holder. The restore helper needs
+`tar`, `find` and `chown`; `alpine:3.22` is an example, as in Backup.
+Verify with a one-off container on the volume, read-only, so nothing
+appends. The holder can stay up or not. This does not start kharond.
 
 ```sh
 docker compose stop kharon
@@ -413,9 +438,28 @@ sudo chmod 0600 /root/kharon-data-pre-restore.tar
 docker run --rm -v kharon-data:/data -v /root:/backup:ro alpine:3.22 \
   sh -c 'find /data -mindepth 1 -exec rm -rf {} + ; tar -C / -xpf /backup/kharon-data.tar && chown -R 10001:10001 /data'
 docker run --rm -v kharon-data:/data alpine:3.22 ls -lR /data
-docker compose start kharon
-docker compose exec kharon kharon audit verify --data /data/audit --checkpoints /path/to/checkpoints.jsonl
+docker run --rm --user 10001:10001 --entrypoint /usr/local/bin/kharon \
+  -v kharon-data:/data:ro \
+  -v /path/to/checkpoints.jsonl:/checkpoints.jsonl:ro \
+  kharon:local \
+  audit verify --data /data/audit --checkpoints /checkpoints.jsonl
 ```
+
+When that prints `audit log OK, head seq N`, start. Host:
+`sudo systemctl start kharond`. Compose: `docker compose start kharon`.
+
+From `deploy/compose`, with the holder still running, the same verify
+is:
+
+```sh
+docker compose run --rm --no-deps --entrypoint /usr/local/bin/kharon \
+  -v /path/to/checkpoints.jsonl:/checkpoints.jsonl:ro \
+  kharon audit verify --data /data/audit --checkpoints /checkpoints.jsonl
+```
+
+`--no-deps` does not start the holder, and this service joins the
+holder's network namespace, so that form needs the holder up. The
+`docker run` above does not.
 
 Check the modes against the table. A group- or world-writable
 `passkeys.json` refuses startup (`owner_ui_store`, exit 73,
@@ -442,10 +486,11 @@ of:
 | `checkpoint at seq N has an invalid signature` | The signing key is not the key that signed the stream. |
 | `checkpoint at seq N belongs to a different log` | The checkpoint's log id is another deployment's. |
 
-Once the restored broker appends past a restored head, the new entries
-are a different chain from the one the old checkpoints signed. Keep
-`/data.pre-restore` (or `/root/kharon-data-pre-restore.tar`) until you
-accept that.
+Anything other than `audit log OK, head seq N` means leave kharond
+stopped. Starting would append past the restored head, and the new
+entries are a different chain from the one the old checkpoints signed.
+Keep `/data.pre-restore` (or `/root/kharon-data-pre-restore.tar`) until
+you accept that.
 
 **Passkeys.** The file is the set that can sign in. A credential
 enrolled after the backup is gone. A credential removed after the

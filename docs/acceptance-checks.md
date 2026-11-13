@@ -87,6 +87,13 @@ run it as a different user.
 
 Pass: 0 files, and the fill profile has no saved logins.
 
+The `grep` only sees the canary's plaintext bytes. A `0` says nothing
+about compressed or encoded stores, which is why the `Login Data` row
+count is a separate check.
+
+After acceptance, delete or rotate the canary item in the vault: its
+value has been typed on two hosts.
+
 ## 4. Canary sweep (broker and edge)
 
 With a pattern file made the same way on the broker host (`mktemp`,

@@ -1172,8 +1172,8 @@ else is refused and audited as `oauth_client_refused`:
 - `redirect_uris` is a non-empty array. Every entry is an `https` URL
   with no fragment whose host is not `localhost`, a `.localhost`
   name or a loopback address. A Connect's `redirect_uri` must equal
-  one entry exactly, and must also carry no userinfo, whitespace or
-  backslash.
+  one entry exactly, must be at most 1024 bytes, and must also carry
+  no userinfo, whitespace or backslash.
 - `token_endpoint_auth_method` is absent or `"none"`. Other keys are
   ignored.
 - The URL answers `200` directly (no redirect is followed) within

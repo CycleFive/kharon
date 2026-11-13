@@ -18,7 +18,7 @@ docker run --rm -it --entrypoint kharon kharon:local init  # the account's maste
 # create the kharon account with it, then its org, collection and API key (see the guide)
 docker run --rm -it --entrypoint kharon kharon:local token mint assistant
 # token once on the terminal; paste the $argon2id$ token_hash line into kharon.toml
-cp kharon.toml.example kharon.toml        # then edit: org, collections, agents, CDP endpoint, token_hash
+cp kharon.toml.example kharon.toml        # then edit: public_host, org, collections, agents, CDP endpoint, token_hash
 cp /path/to/bw-api-key.json secrets/kharon_bw_api_key.json
 sudo chown 10001:10001 secrets/kharon_bw_api_key.json   # kharond's uid; see below
 sudo chmod 0400 secrets/kharon_bw_api_key.json
@@ -99,8 +99,10 @@ path B.
   still has `[api] listen = "127.0.0.1:8787"`. Delete that block: a
   dashboard mis-route could reach it. For liveness use
   `docker compose exec kharon kharon status`, or expect `401` from
-  `POST /mcp` on `127.0.0.1:8790` inside the namespace. Nothing
-  listens on 8787 now.
+  `POST /mcp` on `127.0.0.1:8790` inside the namespace when the request
+  carries your `public_host`
+  (`curl -H 'Host: kharon.example.com' -X POST http://127.0.0.1:8790/mcp`);
+  any other `Host` gets `404`. Nothing listens on 8787 now.
 - The owner UI is published on its own hostname, `kharon-owner.<domain>`.
   See "Owner web UI" below. Its loopback address is inside the holder's
   namespace, so an SSH forward does not reach it; the tunnel does.

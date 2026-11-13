@@ -127,6 +127,11 @@ sudo chown 10001:10001 secrets/ntfy_token
 sudo chmod 0400 secrets/ntfy_token
 ```
 
+Create the file before the first `docker compose up`. If
+`secrets/ntfy_token` is missing when the stack starts, Docker creates
+a directory at that path, and kharond then refuses to start with a
+confusing error about the token file.
+
 ```yaml
 # docker-compose.override.yml
 services:
@@ -158,6 +163,11 @@ ntfy token add checkpoints                  # for the checkpoint keeper (step 4)
 ntfy user add customer-phone                # the customer's phone (step 5)
 ntfy access customer-phone kharon-acme-q7x2 read-only
 ```
+
+`ntfy user add` prompts for the password. For `customer-phone`, let
+the customer type it at that prompt, or have them set their own
+afterwards with `ntfy user change-pass customer-phone`, so the
+operator never knows the customer's approval credential.
 
 A reader sees every message on the topic, including each approval
 prompt's Approve and Deny links. In public mode those links work from
@@ -195,12 +205,18 @@ while :; do
   curl -sfN -H @/etc/kharon-checkpoints/auth "$topic/json?since=$since" |
     jq --unbuffered -c 'select(.event == "message" and .title == "kharon audit checkpoint")' |
     while IFS= read -r m; do
-      printf '%s\n' "$m" | jq -c '.message | fromjson' >> "$dir/checkpoints.jsonl"
-      printf '%s\n' "$m" | jq -r .id > "$dir/since"
+      # Advance `since` only once the checkpoint is saved, so a failed
+      # append is retried on the next connection instead of skipped.
+      if printf '%s\n' "$m" | jq -c '.message | fromjson' >> "$dir/checkpoints.jsonl"; then
+        printf '%s\n' "$m" | jq -r .id > "$dir/since"
+      fi
     done
   sleep 5
 done
 ```
+
+`curl -H @file` needs curl 7.55 or later; on an older box, upgrade
+curl or run the subscriber elsewhere.
 
 If the subscriber is down longer than the server's `cache-duration`,
 the checkpoints from that gap are lost, so alert when it stops. The
@@ -229,8 +245,19 @@ application (step 5 of
 [Optional: Cloudflare Access in front](#optional-cloudflare-access-in-front)).
 
 **Rotating.** To replace kharond's token, add a new one with
-`ntfy token add kharond`, write it to `secrets/ntfy_token`, restart
-the stack (the broker comes back locked until the customer unlocks),
+`ntfy token add kharond`. The old file is owned by uid 10001 at mode
+`0400`, so you can't overwrite it; remove it instead (you own the
+`secrets/` directory) and repeat step 2's three commands with the new
+token:
+
+```sh
+rm -f secrets/ntfy_token
+( umask 077; read -rs T; printf '%s' "$T" > secrets/ntfy_token; unset T )
+sudo chown 10001:10001 secrets/ntfy_token
+sudo chmod 0400 secrets/ntfy_token
+```
+
+Then restart the stack (the broker comes back locked until the customer unlocks),
 then remove the old one with `ntfy token remove kharond <old token>`.
 To cut off a subscriber, run `ntfy user remove <user>`.
 

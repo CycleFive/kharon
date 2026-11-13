@@ -21,6 +21,11 @@ Work from a tagged release, not a branch.
   example `twkr.io`), and applies every Cloudflare-side change: the
   tunnel, its routes, DNS, WAF, rate-limit and Access rules. The guide
   says "the owner" for these too.
+- **Agent host.** Whoever runs the agent's runtime and its connector.
+  That may be the customer's own machine, or a third party's hosted
+  runtime that neither the operator nor the customer has a shell on.
+  The operator hands it the agent token, the tunnel credential and the
+  pin out of band.
 
 **Required** steps must be done before the deploy carries anyone but a
 short pilot. **Optional** steps depend on the deploy's shape.
@@ -90,9 +95,29 @@ the gateway's.
     [Path (B) broker](deployment.md#path-b-broker-agent-connector) and
     [Over WebSocket](deployment.md#over-websocket-through-the-public-gateway-199).
 
-## 5. kharond config
+## 5. ntfy and kharond config
 
-11. **Required. Write `kharon.toml`** from
+11. **Required. Set up the ntfy topic before the first start** (operator,
+    with the customer). The topic carries approval prompts and the
+    off-host audit checkpoints, and kharond starts pushing checkpoints
+    the moment it starts:
+    - Create the private topic's access tokens on the ntfy server: one
+      with write access for kharond's `token_file` (step 12), and one
+      with read access for each subscriber. Never reuse the write token
+      for a subscriber.
+    - Name who keeps the checkpoint stream. On a managed deploy that is
+      the operator, unless the customer chooses to keep it. Start saving
+      it off the broker host (a subscriber on another machine, or the ntfy
+      server's own retention) before step 19, so the stream step 27
+      verifies is complete from the first checkpoint.
+    - If approvals go through ntfy, the customer subscribes to the topic
+      on their phone with their read token.
+
+    Background: [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
+    and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
+    *Not covered in the guide yet: creating the tokens, saving the
+    stream and the phone subscription are tracked in #298.*
+12. **Required. Write `kharon.toml`** from
     [`kharon.toml.example`](../deploy/compose/kharon.toml.example)
     (operator). It needs:
     - **`[bitwarden]`:** server, email, API key file, org and collection IDs.
@@ -101,7 +126,7 @@ the gateway's.
     - **`[connector]`:** `websocket = true` and the TLS files, with no `listen`.
     - **`[public_ingress]`:** `listen = "127.0.0.1:8790"` and **`public_host`** (required when published). See
       [the `[public_ingress]` listener](deployment.md#kharond-the-public_ingress-listener).
-    - **`[approval].ntfy`:** with `token_file` for the private topic. See
+    - **`[approval].ntfy`:** with `token_file` holding the write token from step 11. See
       [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
       and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
     - **`[owner_ui]`:** `listen = "127.0.0.1:8788"` and
@@ -110,33 +135,33 @@ the gateway's.
     - **Optional, `[oauth] clients`:** for dashboard Connect. See
       [OAuth discovery and Connect endpoints](deployment.md#oauth-discovery-and-connect-endpoints-n3).
     - **Optional, `[owner_ui.access]`:** only after the Access application
-      exists (step 17).
-12. **Required. Check it**:
+      exists (step 18).
+13. **Required. Check it** (operator):
     `docker compose run --rm kharon --check --config /etc/kharon.toml`
     (the example's header). kharond refuses unsafe combinations by name.
 
 ## 6. Cloudflare (zone admin)
 
-13. **Required. Create the tunnel and the gateway routes**: `^/mcp$` and
+14. **Required. Create the tunnel and the gateway routes**: `^/mcp$` and
     `^/connector$` to `http://127.0.0.1:8790`, and a 404 catch-all. With
     `[oauth]`, also the two `.well-known/oauth-protected-resource` routes.
     The dashboard creates the proxied DNS record. See
     [Creating the tunnel (owner)](deployment.md#creating-the-tunnel-owner).
-14. **Required. Put the tunnel token in place** (zone admin to operator,
+15. **Required. Put the tunnel token in place** (zone admin to operator,
     never echoed or in argv): `secrets/cloudflared_tunnel_token`, owned
     by `65532:65532`, mode `0400`. See
     [Creating the tunnel](deployment.md#creating-the-tunnel-owner) and
     the [compose README](../deploy/compose/README.md#run-it).
-15. **Required. Add the owner hostname route** to `http://127.0.0.1:8788`,
+16. **Required. Add the owner hostname route** to `http://127.0.0.1:8788`,
     with an empty path, no HTTP Host Header and no HTTP/2 to origin. Then
     apply the Cloudflare settings that keep the throttle working. See
     [Publishing the owner UI](deployment.md#publishing-the-owner-ui),
     steps 3–4.
-16. **Required. Add the `/connector` rate-limit rule**, Free or Pro form.
+17. **Required. Add the `/connector` rate-limit rule**, Free or Pro form.
     See
     [Per-customer deploy checklist](deployment.md#per-customer-deploy-checklist-the-connector-rate-limit-required-223).
-    It's verified in step 21.
-17. **Optional.**
+    It's verified in step 22.
+18. **Optional.**
     - The WAF rules and the `/mcp` rate limit: see
       [Optional: WAF and the `/mcp` rate limit](deployment.md#optional-waf-and-the-mcp-rate-limit).
     - Cloudflare Access in front of the owner hostname, including the
@@ -147,21 +172,21 @@ the gateway's.
 
 ## 7. Start, enrol, unlock
 
-18. **Required. Start the stack** (operator): `COMPOSE_PROFILES=edge` in
+19. **Required. Start the stack** (operator): `COMPOSE_PROFILES=edge` in
     `.env`, then `docker compose up -d`. See
     [Running it](deployment.md#running-it) and
     [What the example sets](../deploy/compose/README.md#what-the-example-sets).
     The startup lines should say public mode for the owner UI and
     `POST /mcp and GET /connector` for public ingress. Restart the whole
     stack, never the `holder` alone.
-19. **Required. Enrol the customer's passkey** (customer and operator
+20. **Required. Enrol the customer's passkey** (customer and operator
     together). The customer opens `/enroll` first. The operator runs
     `kharon passkey-enroll` and sends the 43-character code as a
     message the customer can paste from. It works once, for 120 seconds.
     Then check the owner UI answers `200`. See
     [Publishing the owner UI](deployment.md#publishing-the-owner-ui),
     steps 5–6.
-20. **Required. Unlock** (customer, from a bookmark of the owner
+21. **Required. Unlock** (customer, from a bookmark of the owner
     hostname). See
     [Unlocking from the browser](deployment.md#unlocking-from-the-browser).
     After every restart and idle lock the broker is `locked`. That is
@@ -169,7 +194,8 @@ the gateway's.
 
 ## 8. Verify the edge
 
-21. **Required. Run the checks**:
+22. **Required. Run the checks** (operator, from outside the broker
+    host; the zone admin fixes anything Cloudflare-side that fails):
     - [Verifying](deployment.md#verifying): every other path is `404`
       at the edge, and `POST /mcp` without a token is `401`.
     - [Checks on the first live deploy](deployment.md#checks-on-the-first-live-deploy):
@@ -184,7 +210,8 @@ the gateway's.
 
 ## 9. Agent host
 
-22. **Required. Install the connector**: path B with
+23. **Required. Install the connector** (agent host, with what the
+    operator hands over): path B with
     `BROKER_URL=wss://kharon.example.com/connector`, the `BROKER_PIN`
     from step 10, the agent id, and the tunnel credential file from
     step 9, delivered out of band at mode `0400`. Run `--check` once with
@@ -196,9 +223,9 @@ the gateway's.
     *Hosted or root agent runtimes that can't run
     `provision-connector.sh`, and handing secrets to a runtime you have
     no shell on, are tracked in #291.*
-23. **Required. Point the agent's MCP client at the gateway**: `POST
-    https://kharon.example.com/mcp`, with the agent token from step 8 as
-    a bearer token. Apply the
+24. **Required. Point the agent's MCP client at the gateway** (agent
+    host): `POST https://kharon.example.com/mcp`, with the agent token
+    from step 8 as a bearer token. Apply the
     [agent harness policy](deployment.md#agent-harness-policy-spec-oq-3),
     and see [Running the agent](deployment.md#running-the-agent) for
     the idle lock and `kharon_context` after an unlock. *A worked client
@@ -206,9 +233,9 @@ the gateway's.
 
 ## 10. Dashboard Connect (optional, with `[oauth]`)
 
-24. **Optional.**
+25. **Optional.**
     - The dashboard's operator publishes its client metadata document,
-      and its URL is listed in `[oauth] clients` (step 11).
+      and its URL is listed in `[oauth] clients` (step 12).
     - The customer clicks Connect in the dashboard and approves on the
       owner hostname with the passkey.
     - The Connect then appears on the Connections page.
@@ -216,26 +243,29 @@ the gateway's.
     See [OAuth discovery and Connect endpoints](deployment.md#oauth-discovery-and-connect-endpoints-n3)
     and [Connections, Disconnect and panic](deployment.md#connections-disconnect-and-panic-n3-233).
     A Connect authorizes `/mcp` only. A hosted dashboard runtime that
-    fills still uses a hand-provisioned connector (steps 8–10 and 22)
+    fills still uses a hand-provisioned connector (steps 8–10 and 23)
     until #235.
 
 ## 11. Acceptance
 
-25. **Required. Do one real fill end to end**: the agent asks for a grant,
-    the customer approves on the owner UI (or through ntfy), and the fill
-    lands in the agent host's browser through the connector. Then run
-    the canary sweep and the filesystem check against REQ-GOAL-002
-    (SPEC §1). *The live procedure, as #201 ran it, isn't in the repo
+26. **Required. Do one real fill end to end** (agent host and customer):
+    the agent asks for a grant, the customer approves on the owner UI
+    (or through ntfy, step 11), and the fill lands in the agent host's
+    browser through the connector. Then run the canary sweep and the
+    filesystem check against REQ-GOAL-002 (SPEC §1) (agent host, with
+    the operator). *The live procedure, as #201 ran it, isn't in the repo
     yet; it's tracked in #290. Never paste a canary value into chat, a
     command line or an agent's context.*
-26. **Required. Verify the audit chain** against the saved ntfy checkpoint
-    stream: `kharon audit verify --data /data/audit --checkpoints <file>`.
+27. **Required. Verify the audit chain** against the saved ntfy
+    checkpoint stream (whoever keeps it, step 11, hands the saved file
+    to the operator, who runs this on the broker):
+    `kharon audit verify --data /data/audit --checkpoints <file>`.
     See [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
     and the [compose README](../deploy/compose/README.md#owner-web-ui).
 
 ## 12. Hand over
 
-27. **Required. Walk the customer through it**:
+28. **Required. Walk the customer through it** (operator, with the customer):
     - Bookmark the owner hostname, and save a Bitwarden login item for it
       with URI match **Host**. See
       [Unlocking from the browser](deployment.md#unlocking-from-the-browser).
@@ -244,7 +274,7 @@ the gateway's.
     - What to do with a lost passkey or after being throttled. See
       [A lost passkey](deployment.md#a-lost-passkey) and
       [The throttle, and getting back in](deployment.md#the-throttle-and-getting-back-in).
-28. **Required. Set up alerts** (operator) on the connector outage line
+29. **Required. Set up alerts** (operator) on the connector outage line
     (see [Connector config over WebSocket](deployment.md#connector-config-over-websocket))
     and on the `CF-Connecting-IP` counter (see
     [Watching it](deployment.md#watching-it)). *Backup and restore of

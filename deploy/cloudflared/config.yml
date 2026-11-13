@@ -11,7 +11,8 @@
 # limit rules) are applied by the owner, not by implementers.
 #
 # Only two paths reach kharond: POST /mcp (the MCP transport) and
-# GET /connector (the agent-connector WebSocket, #199). Every other
+# GET /connector (the agent-connector WebSocket, #199); see the note
+# on the N3 discovery routes below the ingress rules. Every other
 # request gets 404 from the edge. kharond's [public_ingress] listener
 # keeps the same allow-list itself, so a mistake in this file still
 # reaches nothing else.
@@ -51,6 +52,20 @@ ingress:
   - hostname: kharon.twkr.io
     path: ^/connector$
     service: https://<BROKER-TAILNET-IP>:8790
+  # Dashboard Connect (N3) needs these two routes too, but only on a
+  # deploy that can run it: [oauth] needs the owner UI published, and
+  # the owner UI listens on loopback, which a tunnel on a separate
+  # guest cannot reach unless a second cloudflared beside kharond
+  # publishes the owner hostname (docs/deployment.md, "Publishing the
+  # owner UI").
+  # With this file's shape, leave them out. They are listed so that
+  # this file matches the dashboard-managed routes table.
+  # - hostname: kharon.twkr.io
+  #   path: ^/\.well-known/oauth-protected-resource$
+  #   service: https://<BROKER-TAILNET-IP>:8790
+  # - hostname: kharon.twkr.io
+  #   path: ^/\.well-known/oauth-protected-resource/mcp$
+  #   service: https://<BROKER-TAILNET-IP>:8790
   # Everything else: the owner UI, /v1/*, /healthz, raw CDP, the
   # [connector] port, any other hostname.
   - service: http_status:404

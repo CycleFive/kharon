@@ -269,6 +269,10 @@ the gateway's.
     - Bookmark the owner hostname, and save a Bitwarden login item for it
       with URI match **Host**. See
       [Unlocking from the browser](deployment.md#unlocking-from-the-browser).
+    - Open the Passkeys page together and confirm it lists only the
+      customer's own passkey. On a managed deploy the operator can
+      enrol one with no audit entry (#249), and that page is the
+      customer's only view of it.
     - What panic does, including that it ends every Connect. See
       [Connections, Disconnect and panic](deployment.md#connections-disconnect-and-panic-n3-233).
     - What to do with a lost passkey or after being throttled. See

@@ -162,8 +162,8 @@ managed deploy that is the operator, who can approve, deny, revoke or
 panic on the owner's instruction. A throttled owner waits out the window
 the page shows, or signs in from another network. A CLI unlock means
 the owner giving the operator the master password: a last resort. A
-lost passkey is not fixed by the CLI: `passkey-enroll` adds a passkey
-but nothing removes one, so see "A lost passkey" in the
+lost passkey is removed with `kharon passkey list`, then
+`kharon passkey remove <id>`; see "A lost passkey" in the
 [deployment guide](../../docs/deployment.md#a-lost-passkey). The CLI
 talks to the owner socket inside the container:
 

@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::audit::{Entry, Event};
+use crate::connector::{ConnectAccess, ConnectTokens};
 
 /// Access tokens live one hour (D4).
 pub const ACCESS_TTL_SECS: u64 = 3_600;
@@ -851,6 +852,32 @@ impl OauthStore {
         })
     }
 
+    /// What a `kh_at_` value presented in a connector hello is (#235 D4):
+    /// the same hash lookup as [`Self::authenticate_access`], never an
+    /// Argon2id permit, plus the record's expiry. The audience comes from
+    /// #304's field on the record; until that lands every record is an
+    /// `/mcp` token, which the hello refuses with detail `audience`.
+    pub fn connector_access(&self, presented: &str, now: u64) -> ConnectAccess {
+        let hash = hex(&sha256(presented.as_bytes()));
+        let inner = self.lock();
+        let Some(rec) = inner.file.tokens.iter().find(|t| t.hash == hash) else {
+            return ConnectAccess::Unknown;
+        };
+        if rec.kind != TokenKind::Access || rec.status != TokenStatus::Live || now >= rec.expires_at
+        {
+            return ConnectAccess::Unknown;
+        }
+        match inner.file.identity(&rec.identity_id) {
+            Some(identity) if !identity.revoked => ConnectAccess::Live {
+                identity: identity.id.clone(),
+                connector_audience: false,
+                connector_scope: false,
+                expires_at: rec.expires_at,
+            },
+            _ => ConnectAccess::Unknown,
+        }
+    }
+
     /// Whether the id is one of this store's Connect identities
     /// (live or ended). The broker's grant cleanup for a `c-…` id
     /// goes through [`Self::disconnect`]; this only names the set.
@@ -895,6 +922,16 @@ impl OauthStore {
         };
         self.connect_ended(identity_id);
         Some(identity)
+    }
+}
+
+impl ConnectTokens for OauthStore {
+    fn access(&self, presented: &str, now: u64) -> ConnectAccess {
+        self.connector_access(presented, now)
+    }
+
+    fn is_connect(&self, agent_id: &str) -> bool {
+        OauthStore::is_connect(self, agent_id)
     }
 }
 
@@ -1186,6 +1223,75 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// #235 slice 5: the hello's lookup of a `kh_at_` value. A phase 1
+    /// access token is live with the `/mcp` audience, so the hub refuses
+    /// it with detail `audience`, before identity. Expired, refresh and
+    /// ended-Connect values are unknown.
+    #[test]
+    fn connector_access_sees_an_mcp_token_as_the_wrong_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _recording) = store(dir.path());
+        let (pair, id) = connect_one(&store);
+        assert_eq!(
+            store.connector_access(&pair.access_token, NOW),
+            ConnectAccess::Live {
+                identity: id.clone(),
+                connector_audience: false,
+                connector_scope: false,
+                expires_at: NOW + ACCESS_TTL_SECS,
+            }
+        );
+        assert_eq!(
+            store.connector_access(&pair.access_token, NOW + ACCESS_TTL_SECS),
+            ConnectAccess::Unknown
+        );
+        assert_eq!(
+            store.connector_access(&pair.refresh_token, NOW),
+            ConnectAccess::Unknown
+        );
+        assert_eq!(
+            store.connector_access("kh_at_00", NOW),
+            ConnectAccess::Unknown
+        );
+
+        let tokens = crate::api::token::TokenStore::with_floor_and_prefix(
+            std::iter::empty::<(&str, &str)>(),
+            &crate::api::token::ParamFloor {
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 1,
+            },
+            crate::api::token::TUNNEL_PREFIX,
+        )
+        .unwrap();
+        let hub = crate::connector::Hub::with_events(tokens, Arc::new(|_| {}));
+        hub.set_connect_tokens(store.clone() as Arc<dyn ConnectTokens>);
+        use crate::connector::AuthFailDetail;
+        assert_eq!(
+            hub.check_connect(&id, &pair.access_token, NOW),
+            Some(Err(AuthFailDetail::Audience))
+        );
+        assert_eq!(
+            hub.check_connect("c-aaaaaaaaaa", &pair.access_token, NOW),
+            Some(Err(AuthFailDetail::Audience))
+        );
+        assert_eq!(
+            hub.check_connect(&id, &pair.refresh_token, NOW),
+            Some(Err(AuthFailDetail::Unauthorized))
+        );
+        store
+            .disconnect(&id, DisconnectDetail::Owner, "web_ui", NOW)
+            .unwrap();
+        assert_eq!(
+            store.connector_access(&pair.access_token, NOW),
+            ConnectAccess::Unknown
+        );
+        assert!(
+            ConnectTokens::is_connect(&*store, &id),
+            "ended ids stay auditable"
+        );
     }
 
     #[test]

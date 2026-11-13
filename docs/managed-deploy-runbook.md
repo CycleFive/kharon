@@ -101,22 +101,24 @@ the gateway's.
     with the customer). The topic carries approval prompts and the
     off-host audit checkpoints, and kharond starts pushing checkpoints
     the moment it starts:
-    - Create the private topic's access tokens on the ntfy server: one
-      with write access for kharond's `token_file` (step 12), and one
-      with read access for each subscriber. Never reuse the write token
-      for a subscriber.
+    - Create the private topic's users on the ntfy server: a
+      write-only user whose token goes in kharond's `token_file`
+      (step 12), and a read-only user for each subscriber. The
+      checkpoint keeper uses its user's token; the phone signs in with
+      its user. Never reuse kharond's write token for a subscriber.
     - Name who keeps the checkpoint stream. On a managed deploy that is
       the operator, unless the customer chooses to keep it. Start saving
       it off the broker host (a subscriber on another machine, or the ntfy
       server's own retention) before step 19, so the stream step 27
       verifies is complete from the first checkpoint.
     - If approvals go through ntfy, the customer subscribes to the topic
-      on their phone with their read token.
+      in the ntfy app on their phone and signs in as their read-only
+      user (username and password).
 
-    Background: [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
+    See [Setting up the ntfy topic](deployment.md#setting-up-the-ntfy-topic)
+    for the tokens, the subscriber and the phone. Background:
+    [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
     and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
-    *Not covered in the guide yet: creating the tokens, saving the
-    stream and the phone subscription are tracked in #298.*
 12. **Required. Write `kharon.toml`** from
     [`kharon.toml.example`](../deploy/compose/kharon.toml.example)
     (operator). It needs:

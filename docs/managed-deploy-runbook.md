@@ -271,8 +271,9 @@ the gateway's.
       [Unlocking from the browser](deployment.md#unlocking-from-the-browser).
     - Open the Passkeys page together and confirm it lists only the
       customer's own passkey. On a managed deploy the operator can
-      enrol one with no audit entry (#249), and that page is the
-      customer's only view of it.
+      enrol a passkey too, and the audit log records it on `web_ui`
+      just like the customer's own (#249), so this page is the
+      customer's real check.
     - What panic does, including that it ends every Connect. See
       [Connections, Disconnect and panic](deployment.md#connections-disconnect-and-panic-n3-233).
     - What to do with a lost passkey or after being throttled. See

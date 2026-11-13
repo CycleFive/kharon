@@ -220,9 +220,10 @@ the gateway's.
     [Agent host](deployment.md#agent-host-req-dep-005),
     [Path (B) — agent-connector](deployment.md#path-b--agent-connector)
     and [Connector config over WebSocket](deployment.md#connector-config-over-websocket).
-    *Hosted or root agent runtimes that can't run
-    `provision-connector.sh`, and handing secrets to a runtime you have
-    no shell on, are tracked in #291.*
+    For hosted or root agent runtimes that can't run
+    `provision-connector.sh`, and for handing secrets to a runtime you
+    have no shell on, see
+    [Agent side: hosted and root runtimes](agent-runtime-setup.md).
 24. **Required. Point the agent's MCP client at the gateway** (agent
     host): `POST https://kharon.example.com/mcp`, with the agent token
     from step 8 as a bearer token. Apply the

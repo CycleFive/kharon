@@ -1812,6 +1812,12 @@ The #121 live pilot ran that way: a root agent, with Chromium on
 `--no-sandbox` under an AppArmor user-namespace restriction. It
 proves path (B)'s transport, auth and fill, not isolation.
 
+For that kind of runtime, where `provision-connector.sh` can't run and
+the operator has no shell, follow
+[Agent side: hosted and root runtimes](agent-runtime-setup.md). It also
+covers handing the tunnel credential, the agent token and `broker_pin`
+to the runtime out of band, and rotating them after a leak.
+
 For a visible browser instead of a headless one, change
 `browser.service`'s `ExecStart`: drop `--headless=new` and give it a
 display. Without `--headless`, Chromium binds CDP to loopback

@@ -113,10 +113,10 @@ the gateway's.
     - If approvals go through ntfy, the customer subscribes to the topic
       on their phone with their read token.
 
-    Background: [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
+    See [Setting up the ntfy topic](deployment.md#setting-up-the-ntfy-topic)
+    for the tokens, the subscriber and the phone. Background:
+    [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
     and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
-    *Not covered in the guide yet: creating the tokens, saving the
-    stream and the phone subscription are tracked in #298.*
 12. **Required. Write `kharon.toml`** from
     [`kharon.toml.example`](../deploy/compose/kharon.toml.example)
     (operator). It needs:

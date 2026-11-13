@@ -67,6 +67,8 @@ run if a configured token file cannot be read. The checkpoint
 stream is one JSON checkpoint per ntfy message — save it (ntfy
 server logs or a subscriber) and feed it to
 `kharon audit verify --data <data_dir>/audit --checkpoints <file>`.
+[Setting up the ntfy topic](#setting-up-the-ntfy-topic) covers the
+tokens, the subscriber that saves the stream, and the phone.
 `--data` takes the audit directory (it holds `audit.jsonl` and
 `keys/`), not `<data_dir>`.
 
@@ -75,6 +77,162 @@ checkpoints in `<data_dir>/audit/checkpoints.jsonl` and logs a
 startup warning. That is a temporary pilot posture, not the
 release one: nothing leaves the host, so a host compromise can
 rewrite both the log and its checkpoints.
+
+### Setting up the ntfy topic
+
+The topic carries approval prompts and the audit checkpoints, and
+kharond publishes its first checkpoint as soon as it starts, so set
+the topic up before the first start. These steps are for a
+self-hosted ntfy server, where you hold the `ntfy` CLI and the
+access-control list. On hosted ntfy.sh, a private topic means a
+reserved topic, which is a paid feature; check that its tokens give
+you the same split between writer and readers before relying on it.
+
+**1. Make the server private.** In the ntfy server's `server.yml`,
+turn on access control with nothing open by default, and keep the
+message cache on disk so a subscriber that was down can catch up:
+
+```yaml
+auth-file: /var/lib/ntfy/user.db
+auth-default-access: deny-all
+cache-file: /var/cache/ntfy/cache.db
+cache-duration: 72h        # longer than any subscriber outage you would accept
+# iOS only: a self-hosted server needs this for instant notifications.
+# upstream-base-url: https://ntfy.sh
+```
+
+With `deny-all`, a topic is readable and writable only by users the
+list names. Pick a topic name nobody would guess, in ntfy's charset
+`[A-Za-z0-9._-]` (kharond refuses anything else), for example
+`kharon-<customer>-<random>`.
+
+**2. One writer, for kharond.** Give it its own ntfy user with
+write-only access, and an access token. A write-only user can publish
+but cannot read the topic, so a copy of this token shows nobody the
+approve links:
+
+```sh
+ntfy user add kharond                       # prompts for a password nobody needs again
+ntfy access kharond kharon-acme-q7x2 write-only
+ntfy token add kharond                      # prints tk_…, once
+```
+
+On the broker host, put the token in a file owned by kharond's uid
+with mode `0400`, without echoing it or putting it in argv, and mount
+it read-only:
+
+```sh
+( umask 077; read -rs T; printf '%s' "$T" > secrets/ntfy_token; unset T )
+sudo chown 10001:10001 secrets/ntfy_token
+sudo chmod 0400 secrets/ntfy_token
+```
+
+```yaml
+# docker-compose.override.yml
+services:
+  kharon:
+    volumes:
+      - ./secrets/ntfy_token:/run/secrets/ntfy_token:ro
+```
+
+```toml
+[approval]
+ntfy = { url = "https://ntfy.example.net", topic = "kharon-acme-q7x2" }
+token_file = "/run/secrets/ntfy_token"
+```
+
+kharond reads the token once, at startup, and refuses to start if the
+file is missing, unreadable or empty. It sends it as
+`Authorization: Bearer`.
+
+**3. One reader per subscriber.** Each machine or person that
+subscribes gets its own ntfy user with read-only access, so one can be
+removed without touching the others. Never reuse kharond's write
+token for a subscriber.
+
+```sh
+ntfy user add checkpoints
+ntfy access checkpoints kharon-acme-q7x2 read-only
+ntfy token add checkpoints                  # for the checkpoint keeper (step 4)
+
+ntfy user add customer-phone                # the customer's phone (step 5)
+ntfy access customer-phone kharon-acme-q7x2 read-only
+```
+
+A reader sees every message on the topic, including each approval
+prompt's Approve and Deny links. In public mode those links work from
+anywhere for 120 seconds (see
+[ntfy approve and deny](#ntfy-approve-and-deny-req-apr-004-req-dep-006)),
+so every reader can approve. Give read access only to someone who
+may approve: the customer, and on a managed deploy the operator, who
+can already approve from the CLI.
+
+**4. Keep the checkpoint stream off the broker host.** Name who keeps
+it. On a managed deploy that is the operator, unless the customer
+chooses to keep it. Start the subscriber before kharond's first start,
+on a machine that is not the broker host, so the saved stream is
+complete from the first checkpoint.
+
+The topic carries other messages too, so the subscriber keeps only
+the checkpoints. kharond publishes each one with the title
+`kharon audit checkpoint` and the checkpoint JSON as the message body.
+Approval prompts are titled `kharon: approval requested` and panic
+notices `kharon: panic lock`. The file
+`kharon audit verify --checkpoints` reads is one checkpoint JSON
+object per line, which is the message body. A minimal subscriber
+with `curl` and `jq` resumes from the last message it saved:
+
+```sh
+#!/bin/sh
+# /usr/local/bin/kharon-checkpoints, run as a service (systemd, restart always)
+# /etc/kharon-checkpoints/auth holds one line, "Authorization: Bearer tk_…",
+# mode 0400, so the token is never in argv.
+set -u
+topic=https://ntfy.example.net/kharon-acme-q7x2
+dir=/var/lib/kharon-checkpoints
+while :; do
+  since=$(cat "$dir/since" 2>/dev/null || echo all)
+  curl -sfN -H @/etc/kharon-checkpoints/auth "$topic/json?since=$since" |
+    jq --unbuffered -c 'select(.event == "message" and .title == "kharon audit checkpoint")' |
+    while IFS= read -r m; do
+      printf '%s\n' "$m" | jq -c '.message | fromjson' >> "$dir/checkpoints.jsonl"
+      printf '%s\n' "$m" | jq -r .id > "$dir/since"
+    done
+  sleep 5
+done
+```
+
+If the subscriber is down longer than the server's `cache-duration`,
+the checkpoints from that gap are lost, so alert when it stops. The
+alternative is to let the ntfy server keep the stream (a `cache-file`
+and a `cache-duration` longer than the deploy's life) and extract it
+when you verify, with the same `jq` filter over
+`$topic/json?poll=1&since=all`. That puts the whole stream in the
+hands of whoever runs the ntfy server.
+
+To verify, the keeper hands `checkpoints.jsonl` to the operator, who
+runs on the broker:
+
+```sh
+kharon audit verify --data /data/audit --checkpoints checkpoints.jsonl
+```
+
+**5. The customer's phone** (when approvals go through ntfy). The
+customer installs the ntfy app, subscribes to the topic on the
+deploy's ntfy server (not the app's default server), and signs in as
+their read-only user (`customer-phone` above): the app asks for a
+username and password when the topic needs them. On iOS, instant
+notifications from a self-hosted server need `upstream-base-url`
+(step 1). Approve and Deny are posted by the app straight to the owner
+hostname, so with Cloudflare Access in front they need the ntfy bypass
+application (step 5 of
+[Optional: Cloudflare Access in front](#optional-cloudflare-access-in-front)).
+
+**Rotating.** To replace kharond's token, add a new one with
+`ntfy token add kharond`, write it to `secrets/ntfy_token`, restart
+the stack (the broker comes back locked until the customer unlocks),
+then remove the old one with `ntfy token remove kharond <old token>`.
+To cut off a subscriber, run `ntfy user remove <user>`.
 
 ### The kharon account and its master password (REQ-DEP-007)
 

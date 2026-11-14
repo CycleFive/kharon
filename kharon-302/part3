@@ -1,0 +1,283 @@
+diff --git a/crates/kharond/tests/req_dep_003_config.rs b/crates/kharond/tests/req_dep_003_config.rs
+index a2ea59b..9bb6926 100644
+--- a/crates/kharond/tests/req_dep_003_config.rs
++++ b/crates/kharond/tests/req_dep_003_config.rs
+@@ -244,6 +244,24 @@ fn bad_configs() -> Vec<Row> {
+             p.approval.clear();
+             p.audit.clear()
+         }),
++        // #302: the separate checkpoint topic.
++        row("checkpoint topic charset", "invalid_ntfy_topic", |p| {
++            p.audit = "[audit]\ncheckpoint_ntfy = { url = \"https://ntfy.example.net\", topic = \"kharon cp\" }\n".into()
++        }),
++        row("checkpoint topic url", "invalid_url", |p| {
++            p.audit =
++                "[audit]\ncheckpoint_ntfy = { url = \"ntfy.example.net\", topic = \"kharon-cp\" }\n"
++                    .into()
++        }),
++        row(
++            "checkpoint topic with local-only",
++            "audit_checkpoint_ntfy_with_local_only",
++            |p| {
++                p.audit.push_str(
++                    "checkpoint_ntfy = { url = \"https://ntfy.example.net\", topic = \"kharon-cp\" }\n",
++                )
++            },
++        ),
+         // REQ-API-003: hashes below the Argon2id floor are refused at load.
+         row("weak token hash memory", "token_hash_weak_params", |p| {
+             p.agents = p.agents.replace("m=65536,t=3,p=4", "m=4096,t=3,p=1")
+diff --git a/deploy/compose/README.md b/deploy/compose/README.md
+index 6086dde..8725d01 100644
+--- a/deploy/compose/README.md
++++ b/deploy/compose/README.md
+@@ -120,7 +120,10 @@ path B.
+   Fill in a real ntfy server/topic before starting — with no
+   `[approval].ntfy` section kharond refuses to start unless
+   `[audit] checkpoint_local_only = true` is set instead (a temporary
+-  pilot posture; see the deployment guide).
++  pilot posture; see the deployment guide). `[audit] checkpoint_ntfy`
++  moves the checkpoints to a topic of their own, so the checkpoint
++  keeper does not read approval prompts (#302; see
++  [A separate checkpoint topic](../../docs/deployment.md#a-separate-checkpoint-topic-302)).
+ - All capabilities are dropped and `no-new-privileges` is set.
+   `security_opt` also points at [`kharon-seccomp.json`](./kharon-seccomp.json)
+   (SPEC §9). That file is the Docker/moby **default** seccomp profile
+diff --git a/deploy/compose/kharon.toml.example b/deploy/compose/kharon.toml.example
+index 8aa35a5..e95a2bc 100644
+--- a/deploy/compose/kharon.toml.example
++++ b/deploy/compose/kharon.toml.example
+@@ -76,6 +76,14 @@ public_host = "kharon.example.com"
+ ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit" }
+ # ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit", token_file = "/run/secrets/ntfy_token" }
+ 
++# Optional (#302): a separate topic, with its own write token, for the
++# audit checkpoints only, so whoever keeps the checkpoint stream never
++# reads approval prompts (and cannot approve). Approval prompts and
++# panic notices stay on [approval].ntfy. See docs/deployment.md,
++# "A separate checkpoint topic".
++# [audit]
++# checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit-cp", token_file = "/run/secrets/ntfy_checkpoint_token" }
++
+ # Owner web UI (REQ-APR-005, #208). The owner signs in with a passkey,
+ # unlocks, approves and denies from a browser at its own hostname. The
+ # listener stays on loopback inside the holder's namespace; the tunnel
+diff --git a/docs/broker-lifecycle.md b/docs/broker-lifecycle.md
+index 34f7869..06e34d4 100644
+--- a/docs/broker-lifecycle.md
++++ b/docs/broker-lifecycle.md
+@@ -586,6 +586,7 @@ mint commands need a terminal; they refuse without `/dev/tty`.
+ | Tunnel token | cloudflared's `--token-file`. Compose: `secrets/cloudflared_tunnel_token`, uid `65532`, mode `0400`, mounted at `/run/secrets/cloudflared_tunnel_token`. Host: `/etc/cloudflared/kharon.token`, owner the `cloudflared` user, mode `0400`. That user's numeric uid is whichever `useradd --system` assigned; the unit does not pin one. Compose pins `65532` because that is the image's uid. | As in the location column. | The zone admin creates it. The operator installs the file. cloudflared reads it. kharond does not. | A new token from the dashboard, written with `umask 077` and never in argv, then restart cloudflared only (`docker compose restart cloudflared`, or `systemctl restart cloudflared-kharon`). Revoke the old token in the dashboard. This repo has no command for that. |
+ | TLS key, and the pin | `tls_cert_file` and `tls_key_file`. The guide uses `/etc/kharon/tls.crt` and `/etc/kharon/tls.key`, bind-mounted read-only. The pin is the SHA-256 of the certificate's DER (`openssl x509 -in /etc/kharon/tls.crt -outform DER \| sha256sum`). It is `broker_pin` on every connector. The pin is not a secret. It has to arrive unchanged. | The key: uid `10001`, mode `0400`. The code requires the uid to be able to read the cert and the key. A key it cannot read fails with `make it owned by that uid, mode 0400`. A looser mode that is still readable is not refused. A cert and key that are not a matching PEM pair fail with `tls_material` / `not a PEM certificate and private key`, exit 78. | The operator generates the key. kharond reads it. Every connector has the pin. The agent host does not have the key. | A new key and a new certificate together. Install them, restart kharond, recompute the pin, and set `broker_pin` on every connector, then restart each connector. The old pin fails before a credential is sent. The raw listener and the WebSocket path share this certificate, so rotating it re-pins every connector. |
+ | ntfy write token | `token_file` inside the `[approval].ntfy` table. A `token_file` key beside `ntfy` is an unknown field and the config is refused. Compose: `secrets/ntfy_token`, uid `10001`, mode `0400`, mounted at `/run/secrets/ntfy_token`. Host: `/etc/kharon/ntfy_token`, same owner and mode. | The code reads the file once at startup, trims it, and refuses if it is missing, unreadable or empty. It does not check the mode. It is sent as `Authorization: Bearer`. | The operator, from `ntfy token add kharond` on the write-only user. kharond's uid can read the file. That token cannot read the topic. Subscribers do not use it. | [Setting up the ntfy topic](deployment.md#setting-up-the-ntfy-topic): `ntfy token add kharond`, remove the `0400` file, recreate it, `chown`, `chmod`, restart kharond, then `ntfy token remove`. The section restarts the whole stack, which also restarts cloudflared. cloudflared does not read this token. kharond comes back locked. |
++| ntfy checkpoint write token (two topics only) | `token_file` inside `[audit] checkpoint_ntfy`. Compose: `secrets/ntfy_checkpoint_token`, uid `10001`, mode `0400`, mounted at `/run/secrets/ntfy_checkpoint_token`. Host: `/etc/kharon/ntfy_checkpoint_token`, same owner and mode. | Read like the ntfy write token: once at startup, refused if missing, unreadable or empty, with no fallback to the approval topic. | The operator, from `ntfy token add kharond-checkpoints` on the checkpoint topic's write-only user. It cannot read either topic or publish on the approval topic. | [A separate checkpoint topic](deployment.md#a-separate-checkpoint-topic-302): the same steps as the ntfy write token, with that user and file. |
+ | ntfy checkpoint token | On the keeper's machine, not the broker: `/etc/kharon-checkpoints/auth`, mode `0400`, one line `Authorization: Bearer tk_…`. The `checkpoints` user's token. The phone uses a username and password, not this token. | Mode `0400`, as that section writes it. kharond never reads this file. | Whoever keeps the checkpoint stream. The customer's phone password is the customer's; the operator does not need to know it. | `ntfy token add checkpoints`, replace the file, restart the subscriber. `ntfy user remove <user>` cuts a subscriber off. |
+ | Audit signing key | `/data/audit/keys/audit_sign_key`, mode `0600`, owner the kharond uid. Generated on first start if the file is absent. `audit_sign.pub` beside it is the verifying key. | `0600` on the seed. The pub key requests `0644`, masked by the umask. | The file. Whoever can read `/data` can read the seed. `kharon audit verify` needs the pub key, not the seed. | Don't. There is no command. A new seed makes the next start rewrite the pub key to match, and checkpoints signed by the old key fail with `checkpoint at seq N has an invalid signature`. Restore the file from backup. |
+ | Audit name key | `/data/audit/keys/audit_name_key`, mode `0600`, owner the kharond uid. HMAC-SHA256 of item names. | `0600`. | The file. Someone who has it can test guesses of item names (REQ-AUD-004). | Don't. SPEC says it is not rotated: a new key breaks correlation of names across the log. The chain still verifies, because the hash is stored on the entry and not recomputed. Restore the file from backup. |
+@@ -615,6 +616,7 @@ are the misconfiguration lines for the install and the secrets above,
+ not a fifth page to add:
+ 
+ - `audit.checkpoint_local_only = true: checkpoints are not pushed off-host`. The guide's temporary pilot posture.
++- `audit.checkpoint_ntfy is the [approval].ntfy topic: the checkpoint keeper still sees approval prompts`. `checkpoint_ntfy` names the same `url` and `topic` as `[approval].ntfy`, so the separate topic separates nothing. Give it its own topic ([A separate checkpoint topic](deployment.md#a-separate-checkpoint-topic-302)).
+ - `public_ingress.listen is not loopback and trusted_proxies is empty: CF-Connecting-IP is ignored, so every client shares the peer's throttle key and audit client_ip`. Loopback, which the pilot and the compose holder use, does not print this.
+ - `memory.require_mlock = false: key material may be swapped to disk`.
+ - `bitwarden.api_key_file is group- or world-readable; use mode 0400 or 0600 unless it is a container-private secret`, and `bitwarden.api_key_file is not owned by kharond's effective uid`.
+diff --git a/docs/deployment.md b/docs/deployment.md
+index be668e0..3606ce6 100644
+--- a/docs/deployment.md
++++ b/docs/deployment.md
+@@ -64,11 +64,15 @@ upgrades, the secrets inventory and the alerts are in
+ By default kharond pushes a signed audit checkpoint to the
+ `[approval].ntfy` topic every 100 entries or 10 minutes (and once
+ more at shutdown), so truncating the local audit log is detectable
+-against a stream the broker host does not control. Point
+-`[approval].ntfy` at an ntfy server you trust (self-hosted is fine)
+-and keep the topic access-controlled; `token_file` supplies the
+-bearer token when the topic requires one, and startup refuses to
+-run if a configured token file cannot be read. The checkpoint
++against a stream the broker host does not control. With
++`[audit] checkpoint_ntfy` set, the checkpoints go to that topic
++instead, and only there; approval prompts and panic notices stay on
++`[approval].ntfy` (see
++[A separate checkpoint topic](#a-separate-checkpoint-topic-302)).
++Point the topic at an ntfy server you trust (self-hosted is fine)
++and keep it access-controlled; `token_file` supplies the bearer
++token when the topic requires one, and startup refuses to run if a
++configured token file cannot be read. The checkpoint
+ stream is one JSON checkpoint per ntfy message — save it (ntfy
+ server logs or a subscriber) and feed it to
+ `kharon audit verify --data <data_dir>/audit --checkpoints <file>`.
+@@ -87,7 +91,10 @@ rewrite both the log and its checkpoints.
+ 
+ The topic carries approval prompts and the audit checkpoints, and
+ kharond publishes its first checkpoint as soon as it starts, so set
+-the topic up before the first start. These steps are for a
++the topic up before the first start. When the checkpoint keeper is
++not someone who may approve, give the checkpoints a topic of their
++own: [A separate checkpoint topic](#a-separate-checkpoint-topic-302)
++changes steps 2 to 4 for that. These steps are for a
+ self-hosted ntfy server, where you hold the `ntfy` CLI and the
+ access-control list. On hosted ntfy.sh, a private topic means a
+ reserved topic, which is a paid feature; check that its tokens give
+@@ -182,7 +189,9 @@ anywhere for 120 seconds (see
+ [ntfy approve and deny](#ntfy-approve-and-deny-req-apr-004-req-dep-006)),
+ so every reader can approve. Give read access only to someone who
+ may approve: the customer, and on a managed deploy the operator, who
+-can already approve from the CLI.
++can already approve from the CLI. With
++[a separate checkpoint topic](#a-separate-checkpoint-topic-302), the
++checkpoint keeper reads that topic instead and never sees a prompt.
+ 
+ **4. Keep the checkpoint stream off the broker host.** Name who keeps
+ it. On a managed deploy that is the operator, unless the customer
+@@ -268,6 +277,94 @@ Then restart the stack (the broker comes back locked until the customer unlocks)
+ then remove the old one with `ntfy token remove kharond <old token>`.
+ To cut off a subscriber, run `ntfy user remove <user>`.
+ 
++#### A separate checkpoint topic (#302)
++
++With one topic, whoever keeps the checkpoint stream reads every
++approval prompt too, and so can approve. `[audit] checkpoint_ntfy`
++gives the checkpoints a topic of their own, with its own writer
++token. kharond then publishes every checkpoint to that topic and
++nothing else to it, and approval prompts and panic notices stay on
++`[approval].ntfy`. The keeper subscribes read-only to the checkpoint
++topic only and holds no approval power. Left unset, checkpoints share
++the approval topic as above.
++
++The steps above change like this. Topic names follow step 1's rule
++(the same charset, which kharond checks at `--check`), for example
++`kharon-acme-q7x2` for approvals and `kharon-acme-cp-m4k9` for
++checkpoints.
++
++**Step 2, two writers.** Give each topic its own write-only user and
++token, so neither token can publish on the other topic, and put the
++second token in its own file, with the same owner, mode and mount as
++the first:
++
++```sh
++ntfy user add kharond-checkpoints
++ntfy access kharond-checkpoints kharon-acme-cp-m4k9 write-only
++ntfy token add kharond-checkpoints          # prints tk_…, once
++
++( umask 077; read -rs T; printf '%s' "$T" > secrets/ntfy_checkpoint_token; unset T )
++sudo chown 10001:10001 secrets/ntfy_checkpoint_token
++sudo chmod 0400 secrets/ntfy_checkpoint_token
++```
++
++```yaml
++# docker-compose.override.yml, beside the approval token
++      - ./secrets/ntfy_checkpoint_token:/run/secrets/ntfy_checkpoint_token:ro
++```
++
++```toml
++[approval]
++ntfy = { url = "https://ntfy.example.net", topic = "kharon-acme-q7x2", token_file = "/run/secrets/ntfy_token" }
++
++[audit]
++checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon-acme-cp-m4k9", token_file = "/run/secrets/ntfy_checkpoint_token" }
++```
++
++The checkpoint token file is read once at startup like the approval
++one: missing, unreadable or empty refuses startup, and kharond never
++falls back to the approval topic for checkpoints. The checkpoint topic
++can live on another ntfy server; `url` is per topic. kharond refuses
++`checkpoint_ntfy` together with `checkpoint_local_only = true`, and
++warns at startup when `checkpoint_ntfy` names the approval topic
++itself (same `url` and `topic`), since the keeper would still see
++the prompts. `[approval].ntfy` may be left out when approvals do not
++go through ntfy; the checkpoint topic alone is then the off-host
++sink.
++
++**Step 3, readers.** The checkpoint keeper's user reads the
++checkpoint topic and has no access to the approval topic; the phone's
++user reads the approval topic only:
++
++```sh
++ntfy user add checkpoints
++ntfy access checkpoints kharon-acme-cp-m4k9 read-only
++
++ntfy user add customer-phone
++ntfy access customer-phone kharon-acme-q7x2 read-only
++```
++
++With `deny-all` (step 1), `checkpoints` cannot read the approval
++topic, so the keeper can no longer approve. Readers of the approval
++topic still can, as step 3 says.
++
++**Step 4, the subscriber.** Point `topic=` at the checkpoint topic
++(`https://ntfy.example.net/kharon-acme-cp-m4k9`). Every message
++there is a checkpoint; the `jq` title filter still holds and can stay.
++Verify as before.
++
++**Rotating.** The same as kharond's approval token, with
++`ntfy token add kharond-checkpoints` and
++`secrets/ntfy_checkpoint_token`.
++
++**Moving an existing deploy to two topics.** Start the new topic's
++subscriber first, then set `checkpoint_ntfy` and restart. The
++checkpoints before the restart are on the old topic and those after
++it on the new one, so the keeper saves both and concatenates them,
++oldest first, before verifying. Then take the keeper's read access to
++the approval topic away with `ntfy access --reset checkpoints
++kharon-acme-q7x2`.
++
+ ### The kharon account and its master password (REQ-DEP-007)
+ 
+ On a managed deploy the customer runs the `init` step below on their own
+diff --git a/docs/managed-deploy-runbook.md b/docs/managed-deploy-runbook.md
+index bbf15fd..96dc1d7 100644
+--- a/docs/managed-deploy-runbook.md
++++ b/docs/managed-deploy-runbook.md
+@@ -106,23 +106,34 @@ the gateway's.
+ 11. **Required. Set up the ntfy topic before the first start** (operator,
+     with the customer). The topic carries approval prompts and the
+     off-host audit checkpoints, and kharond starts pushing checkpoints
+-    the moment it starts:
++    the moment it starts. If the checkpoint keeper is not someone who
++    may approve, use two topics: an approval topic and a checkpoint
++    topic (`[audit] checkpoint_ntfy`, step 12), so the keeper never
++    reads a prompt:
+     - Create the private topic's users on the ntfy server: a
+       write-only user whose token goes in kharond's `token_file`
+       (step 12), and a read-only user for each subscriber. The
+       checkpoint keeper uses its user's token; the phone signs in with
+       its user. Never reuse kharond's write token for a subscriber.
++      With two topics, each topic gets its own write-only user and
++      token file, the keeper's user reads only the checkpoint topic,
++      and the phone's user reads only the approval topic.
+     - Name who keeps the checkpoint stream. On a managed deploy that is
+       the operator, unless the customer chooses to keep it. Start saving
+       it off the broker host (a subscriber on another machine, or the ntfy
+       server's own retention) before step 19, so the stream step 27
+-      verifies is complete from the first checkpoint.
++      verifies is complete from the first checkpoint. On one topic the
++      keeper can approve, since every reader of the approval topic can;
++      on a managed deploy the operator can approve from the CLI anyway.
++      With two topics the keeper reads checkpoints only and cannot.
+     - If approvals go through ntfy, the customer subscribes to the topic
+       in the ntfy app on their phone and signs in as their read-only
+       user (username and password).
+ 
+     See [Setting up the ntfy topic](deployment.md#setting-up-the-ntfy-topic)
+-    for the tokens, the subscriber and the phone. Background:
++    for the tokens, the subscriber and the phone, and
++    [A separate checkpoint topic](deployment.md#a-separate-checkpoint-topic-302)
++    for the two-topic setup. Background:
+     [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
+     and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
+ 12. **Required. Write `kharon.toml`** from
+@@ -134,7 +145,9 @@ the gateway's.
+     - **`[connector]`:** `websocket = true` and the TLS files, with no `listen`.
+     - **`[public_ingress]`:** `listen = "127.0.0.1:8790"` and **`public_host`** (required when published). See
+       [the `[public_ingress]` listener](deployment.md#kharond-the-public_ingress-listener).
+-    - **`[approval].ntfy`:** with `token_file` holding the write token from step 11. See
++    - **`[approval].ntfy`:** with `token_file` holding the write token from step 11.
++      With two topics, also **`[audit] checkpoint_ntfy`** with the
++      checkpoint topic and its own `token_file`. See
+       [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
+       and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
+     - **`[owner_ui]`:** `listen = "127.0.0.1:8788"` and
+-- 
+2.43.0
+

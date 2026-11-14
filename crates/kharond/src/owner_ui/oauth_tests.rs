@@ -894,6 +894,42 @@ fn authorize_is_throttled_per_source_and_not_globally() {
 }
 
 #[test]
+fn consent_records_whether_the_document_declares_the_connector_grant() {
+    // #235 D3: the declaration the owner consented under rides the
+    // sealed pending authorization into the code, and from there onto
+    // the identity redemption creates.
+    let declaring = cimd_document("Muse", &[REDIRECT]).replace(
+        r#""token_endpoint_auth_method""#,
+        r#""grant_types":["authorization_code","refresh_token","urn:kharon:oauth:grant-type:connector"],"token_endpoint_auth_method""#,
+    );
+    for (doc, declared) in [
+        (cimd_document("Muse", &[REDIRECT]), false),
+        (declaring, true),
+    ] {
+        let clients = admission(
+            vec![Ok((doc, Some("max-age=86400".into())))],
+            Arc::new(SilentAudit),
+        );
+        let (ui, _dir) = open_ui(clients, Arc::new(NoAudit), false);
+        let mut auth = enroll(&ui);
+        let cookie = sign_in(&ui, &mut auth);
+        let token = start(&ui, "kharon:fill");
+        let code = approve_all(
+            &ui,
+            &mut auth,
+            &cookie,
+            &token,
+            &["kharon:read", "kharon:fill"],
+        );
+        let body = ui
+            .codes
+            .redeem(&code, std::time::Instant::now())
+            .expect("code");
+        assert_eq!(body.connector_grant_declared, declared);
+    }
+}
+
+#[test]
 fn code_store_is_single_use_and_expires() {
     let store = CodeStore::new();
     let now = std::time::Instant::now();
@@ -905,6 +941,7 @@ fn code_store_is_single_use_and_expires() {
         resource: RESOURCE.into(),
         scopes: vec![Scope::Read, Scope::Fill],
         consented_at: 1,
+        connector_grant_declared: false,
     };
     let code = store.issue(body.clone(), now).unwrap();
     assert_eq!(b64_decode(&code).len(), 32);

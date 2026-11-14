@@ -41,6 +41,8 @@ pub struct RedeemedCode {
     pub scopes: Vec<String>,
     /// Unix seconds of the consent.
     pub consented_at: u64,
+    /// The connector-grant declaration recorded at consent (#235 D3).
+    pub connector_grant_declared: bool,
 }
 
 /// The authorize side's code store, as the token endpoint needs
@@ -97,6 +99,7 @@ impl CodeRedeemer for CodeStoreRedeemer {
                 code_challenge: body.code_challenge,
                 scopes: body.scopes.iter().map(|s| s.as_str().to_owned()).collect(),
                 consented_at: body.consented_at,
+                connector_grant_declared: body.connector_grant_declared,
             })
     }
 }
@@ -273,6 +276,7 @@ impl OwnerUi {
             code_challenge: body.code_challenge,
             scopes: body.scopes,
             consented_at: body.consented_at,
+            connector_grant_declared: body.connector_grant_declared,
         };
         match side.store.connect(&grant, verifier, code_hash, now) {
             Ok(pair) => token_answer(pair),

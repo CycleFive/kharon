@@ -62,11 +62,6 @@ pub const SCOPES_SUPPORTED: [&str; 3] = ["kharon:read", "kharon:fill", "kharon:r
 /// Connect identity at consent (A11, [`super::cimd`]).
 pub const CONNECTOR_GRANT_TYPE: &str = "urn:kharon:oauth:grant-type:connector";
 
-/// The only scope a connector-audience access token carries (D4, A5).
-/// Not a consent scope: it is absent from [`SCOPES_SUPPORTED`], and
-/// it is not stored on the Connect identity.
-pub const CONNECTOR_SCOPE: &str = "kharon:connector";
-
 /// `grant_types_supported` in the AS metadata: the two phase 1
 /// grants and the connector extension grant (A1 keeps the first two).
 pub const GRANT_TYPES_SUPPORTED: [&str; 3] =
@@ -202,15 +197,6 @@ impl Discovery {
     /// [`Self::connector_resource`] instead.
     pub fn resource(&self) -> &str {
         &self.resource
-    }
-
-    /// This deploy's public `/connector` URL. Spawn and a
-    /// connector-family refresh require `resource` to equal it (D3).
-    pub fn connector_resource(&self) -> String {
-        match self.resource.strip_suffix("/mcp") {
-            Some(prefix) => format!("{prefix}/connector"),
-            None => format!("{}/connector", self.resource),
-        }
     }
 
     /// RFC 9728 protected-resource metadata, served on

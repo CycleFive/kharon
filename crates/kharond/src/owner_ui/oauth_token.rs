@@ -196,11 +196,10 @@ impl OwnerUi {
                 // `resource` is optional. Omitted, an MCP-family
                 // token still rotates (phase 1). A connector-family
                 // token needs this deploy's `/connector` URL (D3).
-                let connector = oauth.discovery.connector_resource();
                 let resource = RefreshResource {
                     presented: form.get("resource"),
                     mcp: oauth.discovery.resource(),
-                    connector: &connector,
+                    connector: oauth.discovery.connector_resource(),
                 };
                 map_token_result(
                     side.store
@@ -306,13 +305,12 @@ impl OwnerUi {
         let Some(oauth) = &self.oauth else {
             return oauth_error(StatusCode::NOT_FOUND, "not_found");
         };
-        let connector = oauth.discovery.connector_resource();
         map_token_result(side.store.spawn(
             SpawnRequest {
                 refresh_token: presented,
                 client_id,
                 resource,
-                connector_resource: &connector,
+                connector_resource: oauth.discovery.connector_resource(),
                 connector_configured: oauth.connector_configured,
             },
             now,

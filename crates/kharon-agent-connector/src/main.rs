@@ -1,12 +1,14 @@
 //! Agent-host connector (path B, REQ-ARCH-001 / REQ-ARCH-002).
 //!
-//! Dials kharond's connector listener over outbound TLS, proves the tunnel
-//! credential, and relays the broker's CDP traffic to loopback Chromium.
-//! It holds that tunnel credential and, when configured, the egress
-//! proxy's password. It does not hold an agent API token, a vault key,
-//! or the account password. A token that does not start
-//! with `kh_tunnel_` is refused before any dial, so an agent API token
-//! left in the file by mistake is not sent to the broker.
+//! Dials kharond's connector listener over outbound TLS, proves its
+//! connector credential, and relays the broker's CDP traffic to loopback
+//! Chromium. It holds that credential — a tunnel credential
+//! (`kh_tunnel_`) or a broker-issued connector access token (`kh_at_`,
+//! REQ-ARCH-002) — and, when configured, the egress proxy's password.
+//! It does not hold a vault key or the account password. Token material
+//! with any other prefix is refused before any dial; the broker enforces
+//! the token's audience at authenticate time, so an MCP-audience token
+//! is refused there before any CDP traffic.
 //!
 //! Two transports: `transport = "tls"` (default) dials `broker` over raw
 //! pinned TLS; `transport = "ws"` dials `broker_url` (`wss://host[:port]/path`)
@@ -377,12 +379,16 @@ fn read_token(path: &Path) -> Result<Zeroizing<String>, String> {
     let text = std::fs::read_to_string(path).map_err(|_| "cannot read token file".to_owned())?;
     let token = text.trim().to_owned();
     if token.is_empty() || token.chars().any(char::is_whitespace) {
-        return Err("token file must hold one tunnel credential".to_owned());
+        return Err("token file must hold one connector credential".to_owned());
     }
-    // An agent API token must never be sent on this socket (REQ-ARCH-001).
-    if !token.starts_with("kh_tunnel_") {
+    // The credential is a tunnel credential (`kh_tunnel_`) or a
+    // broker-issued connector access token (`kh_at_`, REQ-ARCH-002);
+    // anything else in the file is refused before any dial. The token's
+    // audience is the broker's check at authenticate time: an
+    // MCP-audience `kh_at_` is refused there, before any CDP traffic.
+    if !token.starts_with("kh_tunnel_") && !token.starts_with("kh_at_") {
         return Err(
-            "token file must hold a tunnel credential (kh_tunnel_...), not an agent API token"
+            "token file must hold a tunnel credential (kh_tunnel_...) or a connector access token (kh_at_...)"
                 .to_owned(),
         );
     }
@@ -628,6 +634,7 @@ async fn sleep_or_shutdown(delay: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::read_token;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -724,6 +731,31 @@ mod tests {
             parse_proxy("http://127.0.0.1:3128").unwrap(),
             ("127.0.0.1".to_owned(), 3128)
         );
+    }
+
+    #[test]
+    fn token_file_accepts_tunnel_and_connector_access_tokens() {
+        // REQ-ARCH-002: a Connect access token (kh_at_) of connector
+        // audience is a tunnel credential on wire v1, so the spawn flow's
+        // token file must load exactly like a kh_tunnel_ file.
+        let scratch = Scratch::new();
+        for body in [b"kh_tunnel_x\n".as_slice(), b"kh_at_x\n".as_slice()] {
+            let path = scratch.file("token", body, 0o600);
+            assert!(read_token(&path).is_ok());
+        }
+    }
+
+    #[test]
+    fn token_file_refuses_other_material() {
+        let scratch = Scratch::new();
+        for body in [
+            b"kh_api_x\n".as_slice(),
+            b"hunter2\n".as_slice(),
+            b"\n".as_slice(),
+        ] {
+            let path = scratch.file("token", body, 0o600);
+            assert!(read_token(&path).is_err());
+        }
     }
 
     #[test]

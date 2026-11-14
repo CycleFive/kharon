@@ -50,6 +50,7 @@ fn connect_read(store: &OauthStore) -> (IssuedPair, String) {
         code_challenge: challenge,
         scopes: vec!["kharon:read".to_owned()],
         consented_at: now,
+        connector_grant_declared: false,
     };
     let pair = store
         .connect(

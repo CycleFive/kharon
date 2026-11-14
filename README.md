@@ -9,6 +9,7 @@ Vaultwarden fill broker: lets AI agents fill credentials without ever seeing the
 - [`SPEC.md`](SPEC.md): the spec and source of truth. Every requirement has a `REQ-<AREA>-NNN` ID and one acceptance criterion.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): who builds kharon, the claim protocol, PR and review rules, and secrets policy.
 - [`COMPAT.md`](COMPAT.md): official Bitwarden cloud compatibility (REQ-DEP-004), how the nightly job runs, and recorded results.
+- [`docs/roadmap.md`](docs/roadmap.md): the agent platform roadmap, from v0.4.0 through v0.6.0 and after.
 
 ### Design and security
 

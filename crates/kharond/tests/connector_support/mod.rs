@@ -277,11 +277,16 @@ pub async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
 }
 
 pub async fn fill_once(hub: &Arc<Hub>) -> kharond::cdp::FillOutcome {
+    fill_once_as(hub, "assistant").await
+}
+
+/// [`fill_once`] over `agent_id`'s session.
+pub async fn fill_once_as(hub: &Arc<Hub>, agent_id: &str) -> kharond::cdp::FillOutcome {
     let endpoint =
         CdpEndpoint::validate("ws://127.0.0.1:9222", Tunnel::AgentConnector, None).unwrap();
     let dial = CdpDial::Connector {
         hub: Arc::clone(hub),
-        agent_id: "assistant".into(),
+        agent_id: agent_id.into(),
     };
     let client = tokio::time::timeout(
         Duration::from_secs(5),

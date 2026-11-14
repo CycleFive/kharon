@@ -451,6 +451,96 @@ async fn relay_sees_neither_canary_nor_credential() {
     ));
 }
 
+/// #235 slice 5: a Connect's connector access token answers the same
+/// lookup a dashboard runtime's broker would, for the relay test below.
+struct OneConnect {
+    token: String,
+}
+
+impl kharond::connector::ConnectTokens for OneConnect {
+    fn access(&self, presented: &str, now: u64) -> kharond::connector::ConnectAccess {
+        if presented == self.token {
+            kharond::connector::ConnectAccess::Live {
+                identity: CONNECT_ID.into(),
+                connector_audience: true,
+                connector_scope: true,
+                expires_at: now + 3600,
+            }
+        } else {
+            kharond::connector::ConnectAccess::Unknown
+        }
+    }
+    fn is_connect(&self, agent_id: &str) -> bool {
+        agent_id == CONNECT_ID
+    }
+}
+
+const CONNECT_ID: &str = "c-relaytest0";
+
+/// #235 "Relay, in process": a Connect access token in the hello is inner
+/// TLS plaintext like the tunnel credential. The edge's recording of an
+/// attach and a fill holds neither the access token, its prefix, the
+/// Connect id, nor the canary.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_sees_no_connect_access_token() {
+    let rig = rig().await;
+    let token = format!("kh_at_{}", "7e".repeat(32));
+    rig.hub.set_connect_tokens(Arc::new(OneConnect {
+        token: token.clone(),
+    }));
+    let relay = Relay::start(Mode::Forward {
+        upstream: rig.public,
+        tamper: false,
+    })
+    .await;
+    let params = AgentParams {
+        agent_id: CONNECT_ID.into(),
+        token: zeroize::Zeroizing::new(token.clone()),
+        ..relay.dial(&rig)
+    };
+    let agent = tokio::spawn(async move { run_agent_once(&params).await });
+    eventually("Connect attach through the relay", || {
+        rig.hub.is_connected(CONNECT_ID)
+    })
+    .await;
+    let outcome = fill_once_as(&rig.hub, CONNECT_ID).await;
+    assert_eq!(outcome.status(), "filled", "{outcome:?}");
+    rig.hub.disconnect(CONNECT_ID);
+    let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
+
+    let c2s = relay.rec.c2s.lock().unwrap().clone();
+    let s2c = relay.rec.s2c.lock().unwrap().clone();
+    let (_, c2s_msgs) = parse_stream(&c2s);
+    let (_, s2c_msgs) = parse_stream(&s2c);
+    assert!(
+        c2s_msgs.len() >= 3 && s2c_msgs.len() >= 3,
+        "too little recorded"
+    );
+    let bare = token.strip_prefix("kh_at_").unwrap();
+    let needles: [(&str, &[u8]); 5] = [
+        ("canary / password", CANARY.as_bytes()),
+        ("access token", token.as_bytes()),
+        ("access token without prefix", bare.as_bytes()),
+        ("access token prefix", b"kh_at_"),
+        ("Connect id", CONNECT_ID.as_bytes()),
+    ];
+    let decoded_up: Vec<u8> = c2s_msgs.concat();
+    let decoded_down: Vec<u8> = s2c_msgs.concat();
+    for (what, needle) in needles {
+        for (where_, hay) in [
+            ("outer plaintext up", &c2s),
+            ("outer plaintext down", &s2c),
+            ("decoded messages up", &decoded_up),
+            ("decoded messages down", &decoded_down),
+        ] {
+            assert!(
+                !find(hay, needle),
+                "the edge saw the {what} in the {where_}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_with_own_inner_key_gets_bad_cert_and_no_auth() {
     let rig = rig().await;

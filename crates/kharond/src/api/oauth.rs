@@ -6,6 +6,7 @@
 //! | Document | Served on | Route |
 //! |---|---|---|
 //! | RFC 9728 protected-resource metadata | `[public_ingress]` (the agent hostname) | `GET /.well-known/oauth-protected-resource/mcp` and `GET /.well-known/oauth-protected-resource` |
+//! | RFC 9728 connector protected-resource metadata (#235 D1, REQ-OAU-009) | `[public_ingress]` (the agent hostname) | `GET /.well-known/oauth-protected-resource/connector`, only when a `[connector]` certificate is configured |
 //! | RFC 8414 authorization-server metadata | the owner hostname (`[owner_ui]`) | `GET /.well-known/oauth-authorization-server` |
 //!
 //! The issuer is the `[owner_ui]` origin, no path. The protected
@@ -35,6 +36,17 @@ pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource
 /// metadata with the resource path inserted, the URL the `/mcp` 401
 /// names as `resource_metadata`.
 pub const PROTECTED_RESOURCE_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
+/// `GET /.well-known/oauth-protected-resource/connector`: RFC 9728
+/// metadata with the `/connector` resource path inserted (#235 D1,
+/// Option B). This document — and only this document — carries the
+/// `kharon_connector_pin` extension member. It is a publication for
+/// comparison, never a root of trust: a dashboard runtime must
+/// already hold the pin from operator provisioning (D1, Option C)
+/// and must never adopt the value served here.
+pub const PROTECTED_RESOURCE_CONNECTOR_PATH: &str =
+    "/.well-known/oauth-protected-resource/connector";
+/// The one scope the `/connector` resource supports (#235 D1).
+pub const CONNECTOR_SCOPE: &str = "kharon:connector";
 /// `GET /.well-known/oauth-authorization-server`: RFC 8414 metadata
 /// on the owner hostname, the well-known URL the issuer derives.
 pub const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-server";
@@ -121,6 +133,13 @@ pub struct Discovery {
     resource: String,
     /// The RFC 9728 document URL the `/mcp` 401 challenge names.
     resource_metadata: String,
+    /// The connector resource: the deploy's public `/connector` URL.
+    connector_resource: String,
+    /// SHA-256 of the `[connector]` certificate's DER, lowercase hex
+    /// (#235 D1). `None` when no connector certificate is
+    /// configured (or it cannot be read/parsed): the connector
+    /// protected-resource document is then not served at all.
+    connector_pin: Option<String>,
 }
 
 impl Discovery {
@@ -132,7 +151,11 @@ impl Discovery {
         cfg.oauth.as_ref()?;
         let issuer = cfg.owner_ui.as_ref()?.origin.clone();
         let public_host = cfg.public_ingress.as_ref()?.public_host.as_ref()?;
-        Some(Self::new(issuer, public_host))
+        let mut discovery = Self::new(issuer, public_host);
+        if let Some(pin) = connector_pin_from_config(cfg) {
+            discovery = discovery.with_connector_pin(pin);
+        }
+        Some(discovery)
     }
 
     /// Build from an issuer and the public (agent) hostname.
@@ -140,8 +163,31 @@ impl Discovery {
         Self {
             resource: format!("https://{public_host}/mcp"),
             resource_metadata: format!("https://{public_host}{PROTECTED_RESOURCE_MCP_PATH}"),
+            connector_resource: format!("https://{public_host}/connector"),
+            connector_pin: None,
             issuer,
         }
+    }
+
+    /// Carry the connector certificate pin (#235 D1): the lowercase
+    /// hex SHA-256 of the `[connector]` end-entity certificate DER,
+    /// the same value a `connector.toml` holds as `broker_pin`.
+    /// With a pin set, [`Self::connector_protected_resource_metadata`]
+    /// serves the connector document; without one it serves nothing.
+    pub fn with_connector_pin(mut self, pin_hex: String) -> Self {
+        self.connector_pin = Some(pin_hex);
+        self
+    }
+
+    /// The connector resource: this deploy's public `/connector` URL.
+    pub fn connector_resource(&self) -> &str {
+        &self.connector_resource
+    }
+
+    /// The published connector pin, when a connector certificate is
+    /// configured.
+    pub fn connector_pin(&self) -> Option<&str> {
+        self.connector_pin.as_deref()
     }
 
     /// The issuer (the `[owner_ui]` origin).
@@ -180,6 +226,32 @@ impl Discovery {
             "bearer_methods_supported": ["header"],
             "resource_name": "kharon",
         })
+    }
+
+    /// RFC 9728 protected-resource metadata for `/connector`,
+    /// served on `[public_ingress]` at
+    /// [`PROTECTED_RESOURCE_CONNECTOR_PATH`] (#235 D1, Option B;
+    /// REQ-OAU-009). `None` when no connector certificate is
+    /// configured — the caller answers 404, so a phase 1 deploy does
+    /// not advertise a connector it has not configured.
+    ///
+    /// The document deliberately omits `bearer_methods_supported`:
+    /// RFC 9728's methods are `header`, `body` and `query`, but this
+    /// resource takes its credential in the wire-v1 hello after the
+    /// inner TLS, and naming `header` would be a metadata lie.
+    /// `kharon_connector_pin` is an extension member (clients that
+    /// do not know it ignore it, as RFC 9728 requires). The `/mcp`
+    /// and root documents never carry the pin or the connector
+    /// scope. Publication is not trust: see the path constant.
+    pub fn connector_protected_resource_metadata(&self) -> Option<Value> {
+        let pin = self.connector_pin.as_ref()?;
+        Some(json!({
+            "resource": self.connector_resource,
+            "authorization_servers": [self.issuer],
+            "scopes_supported": [CONNECTOR_SCOPE],
+            "resource_name": "kharon",
+            "kharon_connector_pin": pin,
+        }))
     }
 
     /// RFC 8414 authorization-server metadata, served on the owner
@@ -237,6 +309,24 @@ impl Discovery {
     }
 }
 
+/// The pin of the configured `[connector]` certificate: SHA-256 of
+/// the first (end-entity) certificate's DER in its PEM file,
+/// lowercase hex — exactly `kharon_connector::pin_of_der`, the value
+/// relay clients pin (#235 D1). `None` when there is no `[connector]`
+/// section, the file cannot be read, or it holds no PEM certificate.
+/// Startup validation (`Config::check_startup`) has already loaded
+/// this material as TLS, so a `None` here from a configured section
+/// fails closed: no connector document is published.
+fn connector_pin_from_config(cfg: &Config) -> Option<String> {
+    use rustls_pki_types::pem::PemObject;
+    let connector = cfg.connector.as_ref()?;
+    let pem = std::fs::read(&connector.tls.cert_file).ok()?;
+    let first = rustls_pki_types::CertificateDer::pem_slice_iter(&pem)
+        .next()?
+        .ok()?;
+    Some(hex::encode(crate::connector::pin_of_der(first.as_ref())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +355,87 @@ mod tests {
                 "resource_name": "kharon",
             })
         );
+    }
+
+    #[test]
+    fn req_oau_009_connector_metadata_is_the_golden_document_with_the_pin() {
+        // #235 D1 Option B / spec test plan "Metadata": the exact
+        // document, with the pin, and no bearer_methods_supported.
+        let pin = "ab".repeat(32);
+        let d = discovery().with_connector_pin(pin.clone());
+        assert_eq!(
+            d.connector_protected_resource_metadata(),
+            Some(json!({
+                "resource": "https://kharon.twkr.io/connector",
+                "authorization_servers": ["https://kharon-owner.twkr.io"],
+                "scopes_supported": ["kharon:connector"],
+                "resource_name": "kharon",
+                "kharon_connector_pin": pin,
+            }))
+        );
+        let doc = d.connector_protected_resource_metadata().unwrap();
+        assert!(doc.get("bearer_methods_supported").is_none());
+        // The /mcp and root documents stay the phase 1 documents:
+        // no pin, no connector scope (asserted byte-for-byte by
+        // protected_resource_metadata_is_the_golden_document).
+        let mcp = d.protected_resource_metadata().to_string();
+        assert!(!mcp.contains("kharon_connector_pin"), "{mcp}");
+        assert!(!mcp.contains("kharon:connector"), "{mcp}");
+    }
+
+    #[test]
+    fn req_oau_009_from_config_publishes_the_configured_connector_certs_pin() {
+        // The daemon path: Discovery::from_config reads the
+        // [connector] certificate file and publishes pin_of_der of
+        // its DER — the same pin a relay-test client pins
+        // (req_arch_002_ws_relay). The pin may appear here: it is
+        // public (spec test plan).
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("connector.crt");
+        let key_path = dir.path().join("connector.key");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+        let text = format!(
+            r#"mode = "export"
+data_dir = "/data"
+[export]
+file = "/run/secrets/export.json"
+[audit]
+checkpoint_local_only = true
+[agents.assistant]
+token_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo"
+connector_token_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo"
+cdp = {{ endpoint = "ws://127.0.0.1:9222", via = "agent_connector" }}
+[public_ingress]
+listen = "127.0.0.1:8790"
+public_host = "kharon.example.com"
+[owner_ui]
+listen = "127.0.0.1:8788"
+public_origin = "https://kharon-owner.example.com"
+[oauth]
+[connector]
+websocket = true
+tls_cert_file = "{}"
+tls_key_file = "{}"
+"#,
+            cert_path.display(),
+            key_path.display()
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        let discovery = Discovery::from_config(&cfg).expect("oauth is set");
+        let expected = hex::encode(crate::connector::pin_of_der(certified.cert.der()));
+        assert_eq!(discovery.connector_pin(), Some(expected.as_str()));
+        let doc = discovery.connector_protected_resource_metadata().unwrap();
+        assert_eq!(doc["kharon_connector_pin"], expected);
+        assert_eq!(doc["resource"], "https://kharon.example.com/connector");
+    }
+
+    #[test]
+    fn req_oau_009_connector_metadata_is_absent_without_a_connector_certificate() {
+        // No pin configured → no document (the handler 404s).
+        assert_eq!(discovery().connector_protected_resource_metadata(), None);
+        assert_eq!(discovery().connector_pin(), None);
     }
 
     #[test]

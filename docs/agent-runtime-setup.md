@@ -122,12 +122,17 @@ the runtime by one of these routes, in order of preference:
    the public key. The operator encrypts the credential to it on the
    minting machine and sends the ciphertext any way they like; the
    runtime decrypts it straight into the token file
-   (`age -d -i /root/handover.key -o /etc/kharon-connector/token`,
-   then `chmod 0400`) and deletes the key.
+   (`age -d -i /root/handover.key | install -m 0400 /dev/stdin
+   /etc/kharon-connector/token`) and deletes the key. `install` creates
+   the file at mode `0400`, the same way route 1 does.
 3. **The customer types it.** When the customer has a terminal in
    the runtime and the operator doesn't, the operator reads the value
-   to them over a call, and the customer types it into an editor that
-   writes the file. Slow, but nothing stores it in transit.
+   to them over a call. The customer types it at a hidden prompt
+   straight into the token file, the way the canary is typed (#121):
+   `( IFS= read -rs T; printf '%s' "$T" | install -m 0400 /dev/stdin
+   /etc/kharon-connector/token; unset T )`. That writes mode `0400`
+   and skips an editor's swap and backup files. Slow, but nothing
+   stores it in transit.
 
 Never:
 

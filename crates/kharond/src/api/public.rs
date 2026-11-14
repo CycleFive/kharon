@@ -54,6 +54,10 @@ use crate::lock::Clock;
 /// `GET /connector`: the agent-connector WebSocket upgrade (#199).
 pub const CONNECTOR_PATH: &str = "/connector";
 
+/// HTTPS port the public edge publishes. The `[public_ingress]` Host
+/// check accepts the configured host bare or with this port.
+pub const EDGE_HTTPS_PORT: u16 = 443;
+
 /// The header Cloudflare sets for the client address of a request it
 /// proxied (`CF-Connecting-IP`).
 pub const CF_CONNECTING_IP: &str = "cf-connecting-ip";
@@ -207,7 +211,8 @@ impl Connected<IncomingStream<'_, TlsListener>> for Peer {
 
 /// The public-ingress router over `broker`. `ws` mounts `GET /connector`;
 /// without it the route answers 404. With `public_host` set, a request
-/// whose `Host` is not that host (bare or `:443`) gets the same 404.
+/// whose `Host` is not that host (bare or with [`EDGE_HTTPS_PORT`])
+/// gets the same 404.
 pub fn router<S, C>(
     broker: Arc<Broker<S, C>>,
     ws: Option<Arc<WsEntry>>,
@@ -335,7 +340,7 @@ where
     // Before routing, auth, audit or the body: a foreign Host is an
     // unknown route.
     if let Some(host) = &public_host
-        && !host_matches(req.headers(), host, 443)
+        && !host_matches(req.headers(), host, EDGE_HTTPS_PORT)
     {
         return not_found();
     }
@@ -405,7 +410,7 @@ mod tests {
             }
             h
         };
-        let m = |h: &HeaderMap| host_matches(h, "kharon.example.com", 443);
+        let m = |h: &HeaderMap| host_matches(h, "kharon.example.com", EDGE_HTTPS_PORT);
         assert!(!m(&HeaderMap::new()), "no header");
         assert!(!m(&with(&["kharon.example.com", "kharon.example.com"])));
         assert!(m(&with(&["kharon.example.com"])));

@@ -4,8 +4,11 @@ Status: design, 2026-11-12, for #235. Follow-up 9 of the N3 design
 ([`2026-11-10-n3-mcp-oauth-connect-design.md`](2026-11-10-n3-mcp-oauth-connect-design.md),
 #213, #226), section D7. Builder: Nyx. Reviewers: Muse and Duet.
 Q1 (pin provisioning) and Q3 (the malicious-edge residual) were
-accepted by Lothrop on 2026-11-12. Q2, the consent-screen words, stays
-open. The recommendation is to change nothing the customer reads.
+accepted by Lothrop on 2026-11-12. Q2, the consent-screen words, was
+ruled by Lothrop on 2026-11-14 (#324): when the client declares the
+connector grant, the consent screen names the dashboard's browser in
+one added sentence (the sentence and its condition are in the Q2
+section below).
 After Duet's review at `311a2eb`: spawn is open only to a client whose
 metadata document declares the extension grant (D3, "Who may spawn"),
 and a retired MCP refresh token presented at spawn is specified (D3
@@ -1002,9 +1005,8 @@ recording assertion is the one above.
 
 ## Open questions for Lothrop
 
-Q2 is not decided. Reviewers should not treat the recommendation as
-his answer. It does not change the token endpoint, which keeps refusing
-`/connector` until the implementation.
+Q2 was ruled by Lothrop on 2026-11-14; see the ruling under Q2
+below. (Q1 and Q3 were decided on 2026-11-12.)
 
 **Q2. Consent-screen words.** The recommendation is to change nothing
 the customer reads. `kharon:fill` already says the dashboard may ask to
@@ -1013,6 +1015,14 @@ is not a checkbox and not a fourth bundle. Unticking fill is what
 refuses the browser. If the screen should name the dashboard's browser
 in its own sentence, that sentence is his to supply. This note does
 not draft it.
+
+**Ruled (Lothrop, 2026-11-14; #324).** The screen does name the
+browser, in the owner's sentence: "This dashboard has its own browser.
+kharon types your password into it, and the dashboard stays signed in
+afterward." It shows only when the client's metadata document declares
+the connector grant, as one more sentence under the Fill bundle;
+clients that do not declare it see the screen as it was. Implemented
+in `owner_ui/oauth.rs` with present/absent tests.
 
 Linked, not answered: because spawn is limited to clients that declare
 the extension grant (D3), consent knows whether this Connect can attach

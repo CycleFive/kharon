@@ -106,23 +106,34 @@ the gateway's.
 11. **Required. Set up the ntfy topic before the first start** (operator,
     with the customer). The topic carries approval prompts and the
     off-host audit checkpoints, and kharond starts pushing checkpoints
-    the moment it starts:
+    the moment it starts. If the checkpoint keeper is not someone who
+    may approve, use two topics: an approval topic and a checkpoint
+    topic (`[audit] checkpoint_ntfy`, step 12), so the keeper never
+    reads a prompt:
     - Create the private topic's users on the ntfy server: a
       write-only user whose token goes in kharond's `token_file`
       (step 12), and a read-only user for each subscriber. The
       checkpoint keeper uses its user's token; the phone signs in with
       its user. Never reuse kharond's write token for a subscriber.
+      With two topics, each topic gets its own write-only user and
+      token file, the keeper's user reads only the checkpoint topic,
+      and the phone's user reads only the approval topic.
     - Name who keeps the checkpoint stream. On a managed deploy that is
       the operator, unless the customer chooses to keep it. Start saving
       it off the broker host (a subscriber on another machine, or the ntfy
       server's own retention) before step 19, so the stream step 27
-      verifies is complete from the first checkpoint.
+      verifies is complete from the first checkpoint. On one topic the
+      keeper can approve, since every reader of the approval topic can;
+      on a managed deploy the operator can approve from the CLI anyway.
+      With two topics the keeper reads checkpoints only and cannot.
     - If approvals go through ntfy, the customer subscribes to the topic
       in the ntfy app on their phone and signs in as their read-only
       user (username and password).
 
     See [Setting up the ntfy topic](deployment.md#setting-up-the-ntfy-topic)
-    for the tokens, the subscriber and the phone. Background:
+    for the tokens, the subscriber and the phone, and
+    [A separate checkpoint topic](deployment.md#a-separate-checkpoint-topic-302)
+    for the two-topic setup. Background:
     [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
     and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
 12. **Required. Write `kharon.toml`** from
@@ -134,7 +145,9 @@ the gateway's.
     - **`[connector]`:** `websocket = true` and the TLS files, with no `listen`.
     - **`[public_ingress]`:** `listen = "127.0.0.1:8790"` and **`public_host`** (required when published). See
       [the `[public_ingress]` listener](deployment.md#kharond-the-public_ingress-listener).
-    - **`[approval].ntfy`:** with `token_file` holding the write token from step 11. See
+    - **`[approval].ntfy`:** with `token_file` holding the write token from step 11.
+      With two topics, also **`[audit] checkpoint_ntfy`** with the
+      checkpoint topic and its own `token_file`. See
       [Audit checkpoints off-host](deployment.md#audit-checkpoints-off-host-req-aud-002)
       and [ntfy approve and deny](deployment.md#ntfy-approve-and-deny-req-apr-004-req-dep-006).
     - **`[owner_ui]`:** `listen = "127.0.0.1:8788"` and

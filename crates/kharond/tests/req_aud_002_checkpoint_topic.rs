@@ -1,0 +1,346 @@
+//! REQ-AUD-002 with a separate checkpoint topic (#302): with
+//! `[audit].checkpoint_ntfy` set, the running daemon publishes its
+//! signed checkpoints only there, with that topic's own token, while
+//! the `[approval].ntfy` channel keeps the panic notices (and approval
+//! prompts, published by the same notifier) and receives no checkpoint.
+//!
+//! - Routing: two stub ntfy servers, one per topic. An unlock, a panic
+//!   and a shutdown put every checkpoint on the checkpoint stub (path
+//!   `/<checkpoint topic>`, its bearer token) and the panic notice on
+//!   the approval stub, which sees no checkpoint.
+//! - `--check` accepts a checkpoint topic with no `[approval].ntfy`.
+//! - Fail closed: an unreadable checkpoint `token_file` refuses
+//!   `daemon::start` with `audit_checkpoint_sink_setup`, even when the
+//!   approval topic's own token is fine.
+//!
+//! Unset `checkpoint_ntfy` keeps the single-topic behavior; that path
+//! is `req_aud_002_offhost.rs`.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use kharond::api::token::generate;
+use kharond::audit::{AuditKeys, Checkpoint};
+use kharond::config::Config;
+use kharond::daemon;
+use kharond::lock::StaticHardening;
+use serde_json::{Value, json};
+
+const PASSWORD: &str = "kharon export fixture password 9";
+const APPROVAL_TOPIC: &str = "kharon-approve";
+const CHECKPOINT_TOPIC: &str = "kharon-checkpoints";
+
+/// One request a stub saw: request line, headers, body.
+#[derive(Clone, Debug)]
+struct Seen {
+    request_line: String,
+    headers: String,
+    body: String,
+}
+
+/// Stub ntfy server: records every request and answers 200.
+struct StubNtfy {
+    port: u16,
+    seen: Arc<Mutex<Vec<Seen>>>,
+}
+
+impl StubNtfy {
+    fn snapshot(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// Wait until `pred` holds over what the stub has seen.
+    fn wait_until(&self, what: &str, pred: impl Fn(&[Seen]) -> bool) -> Vec<Seen> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = self.snapshot();
+            if pred(&seen) {
+                return seen;
+            }
+            assert!(Instant::now() < deadline, "{what}: stub saw {seen:?}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+fn stub_ntfy() -> StubNtfy {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let seen3 = Arc::clone(&seen2);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let mut headers = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line.to_ascii_lowercase().starts_with("content-length:") {
+                        content_length =
+                            line.split(':').nth(1).unwrap().trim().parse().unwrap_or(0);
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+                let mut body = vec![0u8; content_length];
+                if reader.read_exact(&mut body).is_ok() {
+                    seen3.lock().unwrap().push(Seen {
+                        request_line: request_line.trim_end().to_owned(),
+                        headers,
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                    });
+                }
+                let mut stream = reader.into_inner();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            });
+        }
+    });
+    StubNtfy { port, seen }
+}
+
+fn is_checkpoint(s: &Seen) -> bool {
+    s.headers.contains("X-Title: kharon audit checkpoint")
+        || serde_json::from_str::<Checkpoint>(&s.body).is_ok()
+}
+
+fn token_file(dir: &Path, name: &str, token: &str) -> std::path::PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, format!("{token}\n")).unwrap();
+    p
+}
+
+/// Export-mode config in SPEC-default audit posture with a separate
+/// checkpoint topic. `approval` is the whole `[approval]` table (or
+/// empty); the owner UI is in public mode so the approval notifier is
+/// installed (its redeem base is the public origin).
+fn config(hash: &str, data_dir: &Path, approval: &str, checkpoint_ntfy: &str) -> String {
+    format!(
+        r#"mode = "export"
+data_dir = "{}"
+
+[export]
+file = "{}"
+
+[agents.assistant]
+token_hash = "{hash}"
+cdp = {{ endpoint = "ws://127.0.0.1:9222" }}
+
+{approval}
+
+[audit]
+checkpoint_ntfy = {checkpoint_ntfy}
+
+[memory]
+require_mlock = false
+
+[api]
+listen = "127.0.0.1:0"
+
+[owner_ui]
+listen = "127.0.0.1:0"
+rp_id = "kharon-owner.example.com"
+public_origin = "https://kharon-owner.example.com"
+"#,
+        data_dir.display(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/export/password_protected.json"
+        )
+    )
+}
+
+fn approval_table(port: u16, token: &Path) -> String {
+    format!(
+        "[approval]\nntfy = {{ url = \"http://127.0.0.1:{port}\", topic = \"{APPROVAL_TOPIC}\", token_file = \"{}\" }}",
+        token.display()
+    )
+}
+
+fn checkpoint_table(port: u16, token: &Path) -> String {
+    format!(
+        "{{ url = \"http://127.0.0.1:{port}\", topic = \"{CHECKPOINT_TOPIC}\", token_file = \"{}\" }}",
+        token.display()
+    )
+}
+
+fn owner_op(socket: &Path, request: &Value) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stream = loop {
+        match UnixStream::connect(socket) {
+            Ok(s) => break s,
+            Err(e) => {
+                assert!(Instant::now() < deadline, "owner socket never came up: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream.write_all(request.to_string().as_bytes()).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    serde_json::from_str(reply.trim()).unwrap_or_else(|_| panic!("bad owner reply: {reply}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_aud_002_checkpoints_go_only_to_the_checkpoint_topic() {
+    let approval_stub = stub_ntfy();
+    let checkpoint_stub = stub_ntfy();
+    let data = tempfile::tempdir().unwrap();
+    let secrets = tempfile::tempdir().unwrap();
+    let approval_token = token_file(secrets.path(), "ntfy_token", "tk_approval_writer");
+    let checkpoint_token = token_file(secrets.path(), "ntfy_cp", "tk_checkpoint_writer");
+    let (_token, hash) = generate("assistant");
+    let cfg = Config::from_toml_str(&config(
+        &hash,
+        data.path(),
+        &approval_table(approval_stub.port, &approval_token),
+        &checkpoint_table(checkpoint_stub.port, &checkpoint_token),
+    ))
+    .unwrap();
+    assert!(
+        !cfg.warnings()
+            .contains(&kharond::config::ConfigWarning::CheckpointTopicIsApprovalTopic),
+        "{:?}",
+        cfg.warnings()
+    );
+    daemon::check(&cfg).unwrap();
+
+    let daemon = daemon::start(&cfg, Box::new(StaticHardening::all_ok()))
+        .await
+        .expect("daemon must start with a separate checkpoint topic");
+    let socket = daemon.owner_socket().to_path_buf();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(daemon.run(async move {
+        let _ = rx.await;
+    }));
+
+    let reply = owner_op(&socket, &json!({"op": "unlock", "password": PASSWORD}));
+    assert_eq!(reply["ok"], json!(true), "unlock reply: {reply}");
+    // REQ-REV-002: the panic notice goes to the approval channel.
+    let reply = owner_op(&socket, &json!({"op": "panic"}));
+    assert_eq!(reply["ok"], json!(true), "panic reply: {reply}");
+    let approvals = approval_stub.wait_until("panic notice on the approval topic", |seen| {
+        seen.iter().any(|s| s.body.contains("kharon: panic lock"))
+    });
+
+    tx.send(()).unwrap();
+    run.await.unwrap().unwrap();
+
+    // Checkpoint topic: only checkpoints, at /<topic>, with its token.
+    let checkpoints = checkpoint_stub.snapshot();
+    assert!(
+        !checkpoints.is_empty(),
+        "the shutdown checkpoint must reach the checkpoint topic"
+    );
+    let keys = AuditKeys::load_or_generate(&data.path().join("audit").join("keys")).unwrap();
+    for s in &checkpoints {
+        assert_eq!(
+            s.request_line,
+            format!("POST /{CHECKPOINT_TOPIC} HTTP/1.1"),
+            "{s:?}"
+        );
+        assert!(
+            s.headers
+                .contains("Authorization: Bearer tk_checkpoint_writer"),
+            "{s:?}"
+        );
+        assert!(
+            s.headers.contains("X-Title: kharon audit checkpoint"),
+            "{s:?}"
+        );
+        let cp: Checkpoint = serde_json::from_str(&s.body)
+            .unwrap_or_else(|e| panic!("non-checkpoint on the checkpoint topic ({e}): {s:?}"));
+        assert!(cp.verify_signature(&keys.verifying_key()), "{cp:?}");
+        assert_eq!(cp.log_id, keys.log_id());
+    }
+    let last: Checkpoint = serde_json::from_str(&checkpoints.last().unwrap().body).unwrap();
+    assert!(last.seq >= 2, "anchors the unlock and the panic: {last:?}");
+
+    // Approval topic: the panic notice, with the approval token, and
+    // never a checkpoint.
+    let approvals_after = approval_stub.snapshot();
+    assert!(approvals_after.len() >= approvals.len());
+    for s in &approvals_after {
+        assert!(!is_checkpoint(s), "checkpoint leaked to approvals: {s:?}");
+        assert!(
+            s.headers
+                .contains("Authorization: Bearer tk_approval_writer"),
+            "{s:?}"
+        );
+        let body: Value = serde_json::from_str(&s.body).unwrap();
+        assert_eq!(body["topic"], APPROVAL_TOPIC, "{s:?}");
+    }
+}
+
+#[test]
+fn req_aud_002_check_accepts_checkpoint_topic_without_approval_ntfy() {
+    let checkpoint_stub = stub_ntfy();
+    let data = tempfile::tempdir().unwrap();
+    let secrets = tempfile::tempdir().unwrap();
+    let checkpoint_token = token_file(secrets.path(), "ntfy_cp", "tk_checkpoint_writer");
+    let (_token, hash) = generate("assistant");
+    let cfg = Config::from_toml_str(&config(
+        &hash,
+        data.path(),
+        "",
+        &checkpoint_table(checkpoint_stub.port, &checkpoint_token),
+    ))
+    .unwrap();
+    assert_eq!(cfg.approval.ntfy, None);
+    daemon::check(&cfg).expect("the checkpoint topic is an off-host sink by itself");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn req_aud_002_start_fails_closed_on_unreadable_checkpoint_token_file() {
+    let approval_stub = stub_ntfy();
+    let checkpoint_stub = stub_ntfy();
+    let data = tempfile::tempdir().unwrap();
+    let secrets = tempfile::tempdir().unwrap();
+    let approval_token = token_file(secrets.path(), "ntfy_token", "tk_approval_writer");
+    let missing = secrets.path().join("no-such-checkpoint-token");
+    let (_token, hash) = generate("assistant");
+    let cfg = Config::from_toml_str(&config(
+        &hash,
+        data.path(),
+        &approval_table(approval_stub.port, &approval_token),
+        &checkpoint_table(checkpoint_stub.port, &missing),
+    ))
+    .unwrap();
+    // --check does not touch the token file; start must fail closed
+    // rather than fall back to the approval topic.
+    daemon::check(&cfg).unwrap();
+    let err = match daemon::start(&cfg, Box::new(StaticHardening::all_ok())).await {
+        Ok(_) => panic!("unreadable checkpoint token file must refuse startup"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "audit_checkpoint_sink_setup", "{err}");
+    assert!(checkpoint_stub.snapshot().is_empty());
+    assert!(approval_stub.snapshot().is_empty());
+
+    // An empty token file is refused the same way.
+    std::fs::write(&missing, "\n").unwrap();
+    let err = match daemon::start(&cfg, Box::new(StaticHardening::all_ok())).await {
+        Ok(_) => panic!("empty checkpoint token file must refuse startup"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "audit_checkpoint_sink_setup", "{err}");
+}

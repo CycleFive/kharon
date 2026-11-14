@@ -76,6 +76,14 @@ public_host = "kharon.example.com"
 ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit" }
 # ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit", token_file = "/run/secrets/ntfy_token" }
 
+# Optional (#302): a separate topic, with its own write token, for the
+# audit checkpoints only, so whoever keeps the checkpoint stream never
+# reads approval prompts (and cannot approve). Approval prompts and
+# panic notices stay on [approval].ntfy. See docs/deployment.md,
+# "A separate checkpoint topic".
+# [audit]
+# checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon-audit-cp", token_file = "/run/secrets/ntfy_checkpoint_token" }
+
 # Owner web UI (REQ-APR-005, #208). The owner signs in with a passkey,
 # unlocks, approves and denies from a browser at its own hostname. The
 # listener stays on loopback inside the holder's namespace; the tunnel

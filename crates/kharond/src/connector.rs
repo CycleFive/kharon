@@ -5,6 +5,12 @@
 //! CDP streams on that session. A failed credential never reaches the
 //! mux. A new session for the same agent replaces the previous one.
 //!
+//! A Connect (#235) presents its connector access token (`kh_at_`)
+//! instead, under its `c-…` id. The hello is dispatched on the token's
+//! prefix before any Argon2id permit: `kh_at_` is a hash lookup through
+//! [`ConnectTokens`], `kh_rt_` is refused outright. Such a session ends
+//! when its token expires.
+//!
 //! At most [`ARGON2_CONCURRENCY`] Argon2id evaluations run at once, counted
 //! across both transports, and each socket has one absolute pre-auth
 //! deadline (#219): [`WS_PREAUTH_DEADLINE`] from its slot on the WebSocket
@@ -128,6 +134,74 @@ fn stderr_sink() -> EventSink {
 /// append. Best effort: an `Err` is logged and changes nothing else.
 pub type ConnectorAudit = Arc<dyn Fn(Entry) -> Result<(), ()> + Send + Sync>;
 
+/// The hello prefix of a Connect access token (#235 D2).
+pub const ACCESS_PREFIX: &str = "kh_at_";
+/// The hello prefix of a Connect refresh token, refused with no lookup.
+pub const REFRESH_PREFIX: &str = "kh_rt_";
+
+/// What the OAuth store says about a `kh_at_` value presented in a hello
+/// (#235 D4). Facts only; the hub applies D4's check order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectAccess {
+    /// No live access token for the value: unknown, not an access token,
+    /// expired, revoked, or its Connect has ended.
+    Unknown,
+    /// A live access token.
+    Live {
+        /// The Connect identity (`c-…`) the token belongs to.
+        identity: String,
+        /// The token's audience is `connector` (not `/mcp`).
+        connector_audience: bool,
+        /// The token carries `kharon:connector`.
+        connector_scope: bool,
+        /// The record's expiry, Unix seconds. The session ends then.
+        expires_at: u64,
+    },
+}
+
+/// The Connect side of the hello (#235 slice 5): looks up `kh_at_`
+/// values by hash. Never an Argon2id permit. The OAuth store implements
+/// it; tests can inject their own.
+pub trait ConnectTokens: Send + Sync {
+    /// Check `presented` at `now` (Unix seconds).
+    fn access(&self, presented: &str, now: u64) -> ConnectAccess;
+    /// Whether `agent_id` is a Connect identity the store knows, ended
+    /// ones included (the audit's "auditable id" rule).
+    fn is_connect(&self, agent_id: &str) -> bool;
+}
+
+/// Why a hello was refused: the `detail_code` of its
+/// `connector_auth_fail` entry, in D4's check order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailDetail {
+    /// No live credential for the presented value. Every tunnel refusal.
+    Unauthorized,
+    /// A live access token whose audience is not `connector`.
+    Audience,
+    /// A connector token presented under another agent id.
+    Identity,
+    /// A connector token without `kharon:connector`.
+    Scope,
+}
+
+impl AuthFailDetail {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Audience => "audience",
+            Self::Identity => "identity",
+            Self::Scope => "scope",
+        }
+    }
+}
+
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Argon2id evaluations allowed at once, across both transports (#219).
 pub const ARGON2_CONCURRENCY: usize = 2;
 /// Pre-auth time of a WebSocket socket, from its slot to the start of the
@@ -168,6 +242,9 @@ pub struct Hub {
     events: EventSink,
     /// Audit sink; unset means the connector writes no audit entries.
     audit: OnceLock<ConnectorAudit>,
+    /// The Connect token lookup (`[oauth]`); unset means every `kh_at_`
+    /// hello is refused, still without an Argon2id permit.
+    connect: OnceLock<Arc<dyn ConnectTokens>>,
     /// Per-agent rate-limit windows for the two audit events.
     limits: std::sync::Mutex<Limits>,
 }
@@ -248,6 +325,17 @@ struct Live {
     replaced: Arc<AtomicBool>,
     /// When this session was registered.
     since: Instant,
+    /// Unix seconds the authenticating token expires (#235 D5); `None`
+    /// for a tunnel credential, which does not expire.
+    expires_at: Option<u64>,
+}
+
+impl Live {
+    /// Live at `now` (Unix seconds): a session past its token's expiry is
+    /// absent even before its timer runs. No grace.
+    fn current(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|exp| now < exp)
+    }
 }
 
 impl Hub {
@@ -271,8 +359,22 @@ impl Hub {
             next: AtomicU64::new(1),
             events,
             audit: OnceLock::new(),
+            connect: OnceLock::new(),
             limits: std::sync::Mutex::new(Limits::default()),
         }
+    }
+
+    /// Accept Connect access tokens in the hello, checked by `tokens`
+    /// (#235 slice 5). Set once; a later call is ignored.
+    pub fn set_connect_tokens(&self, tokens: Arc<dyn ConnectTokens>) {
+        let _ = self.connect.set(tokens);
+    }
+
+    /// Whether `agent_id` may hold a session: a configured agent, or a
+    /// Connect identity the store knows.
+    fn is_known_agent(&self, agent_id: &str) -> bool {
+        self.tokens.agents().any(|id| id == agent_id)
+            || self.connect.get().is_some_and(|c| c.is_connect(agent_id))
     }
 
     /// Send the connector's audit entries to `sink` (the broker's audit
@@ -294,13 +396,25 @@ impl Hub {
         }
     }
 
-    /// Audit a refused hello that claimed `claimed` (#199). Written only
-    /// when `claimed` is a configured agent, at most one entry per agent
-    /// per 60 s; unknown ids and junk are not audited. `detail_code` is
-    /// always `unauthorized`: a malformed hello carries no attributable
-    /// agent id.
+    /// Audit a refused hello that claimed `claimed` (#199), with detail
+    /// `unauthorized`. See [`Hub::audit_auth_fail_with`].
     pub fn audit_auth_fail(&self, claimed: &str, transport: SessionTransport) {
-        if !self.tokens.agents().any(|id| id == claimed) {
+        self.audit_auth_fail_with(claimed, transport, AuthFailDetail::Unauthorized);
+    }
+
+    /// Audit a refused hello that claimed `claimed` (#199, #235). Written
+    /// only when `claimed` is a configured agent or a Connect identity in
+    /// the store (ended ones included), at most one entry per id per 60 s
+    /// whatever the detail; unknown ids and junk are not audited. A
+    /// malformed hello carries no attributable agent id and never gets
+    /// here. The token is never part of the entry.
+    pub fn audit_auth_fail_with(
+        &self,
+        claimed: &str,
+        transport: SessionTransport,
+        detail: AuthFailDetail,
+    ) {
+        if !self.is_known_agent(claimed) {
             return;
         }
         let due = {
@@ -312,7 +426,7 @@ impl Hub {
                 Entry::new(Event::ConnectorAuthFail)
                     .agent_id(claimed)
                     .transport(transport)
-                    .detail_code("unauthorized")
+                    .detail_code(detail.as_str())
                     .suppressed(suppressed),
             );
         }
@@ -367,12 +481,15 @@ impl Hub {
         (self.events)(&event);
     }
 
-    /// Whether `agent_id` has a live authenticated session.
+    /// Whether `agent_id` has a live authenticated session. A session past
+    /// its token's expiry is not one, even before its timer runs.
     pub fn is_connected(&self, agent_id: &str) -> bool {
+        let now = unix_now();
         self.sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .contains_key(agent_id)
+            .get(agent_id)
+            .is_some_and(|live| live.current(now))
     }
 
     /// Drop `agent_id`'s session, if any. The agent is expected to redial.
@@ -392,7 +509,7 @@ impl Hub {
     /// Dial failures are returned; a missing session waits (the caller's
     /// connect budget is the timeout).
     pub async fn open_stream(&self, agent_id: &str) -> Result<MuxIo, kharon_connector::OpenError> {
-        if !self.tokens.agents().any(|id| id == agent_id) {
+        if !self.is_known_agent(agent_id) {
             return Err(kharon_connector::OpenError::Closed);
         }
         loop {
@@ -410,10 +527,12 @@ impl Hub {
     }
 
     fn session(&self, agent_id: &str) -> Option<BrokerSession> {
+        let now = unix_now();
         self.sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(agent_id)
+            .filter(|live| live.current(now))
             .map(|live| live.session.clone())
     }
 
@@ -426,6 +545,7 @@ impl Hub {
         agent: String,
         session: BrokerSession,
         transport: SessionTransport,
+        expires_at: Option<u64>,
     ) -> (u64, Arc<AtomicBool>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let replaced = Arc::new(AtomicBool::new(false));
@@ -435,6 +555,7 @@ impl Hub {
             session,
             replaced: Arc::clone(&replaced),
             since: now,
+            expires_at,
         };
         let mut map = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         let old_age = map.insert(agent.clone(), live).map(|old| {
@@ -460,6 +581,43 @@ impl Hub {
             }
         }
         (id, replaced)
+    }
+
+    /// The Connect half of the hello's prefix dispatch (#235 D2, D4).
+    /// `None`: not a Connect token, so the tunnel path (Argon2id) decides.
+    /// Otherwise the token's expiry on success, or why it was refused, in
+    /// D4's order. Never touches the sessions map, so a refusal evicts
+    /// nobody.
+    pub(crate) fn check_connect(
+        &self,
+        claimed: &str,
+        token: &str,
+        now: u64,
+    ) -> Option<Result<u64, AuthFailDetail>> {
+        if token.starts_with(REFRESH_PREFIX) {
+            return Some(Err(AuthFailDetail::Unauthorized));
+        }
+        if !token.starts_with(ACCESS_PREFIX) {
+            return None;
+        }
+        let Some(connect) = self.connect.get() else {
+            return Some(Err(AuthFailDetail::Unauthorized));
+        };
+        Some(match connect.access(token, now) {
+            ConnectAccess::Unknown => Err(AuthFailDetail::Unauthorized),
+            ConnectAccess::Live {
+                connector_audience: false,
+                ..
+            } => Err(AuthFailDetail::Audience),
+            ConnectAccess::Live { identity, .. } if identity != claimed => {
+                Err(AuthFailDetail::Identity)
+            }
+            ConnectAccess::Live {
+                connector_scope: false,
+                ..
+            } => Err(AuthFailDetail::Scope),
+            ConnectAccess::Live { expires_at, .. } => Ok(expires_at),
+        })
     }
 
     fn remove_if(&self, agent: &str, id: u64) {
@@ -528,7 +686,7 @@ async fn authenticate<S>(
     hub: &Arc<Hub>,
     deadline: Instant,
     permit: OwnedSemaphorePermit,
-) -> Option<(tokio_rustls::server::TlsStream<S>, String)>
+) -> Option<(tokio_rustls::server::TlsStream<S>, String, Option<u64>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -555,6 +713,24 @@ where
             return None;
         }
     };
+    // #235 D2: dispatch on the token's prefix after the hello parses and
+    // before any Argon2id permit. A Connect access token is a hash lookup;
+    // a refresh token is refused outright. Neither may spend a permit.
+    if let Some(verdict) = hub.check_connect(&hello.agent_id, hello.token.as_str(), unix_now()) {
+        drop(permit);
+        return match verdict {
+            Ok(expires_at) => {
+                if write_server_hello(&mut tls, AUTH_OK).await.is_err() {
+                    return None;
+                }
+                Some((tls, hello.agent_id, Some(expires_at)))
+            }
+            Err(detail) => {
+                refuse(&mut tls, peer, transport, hub, &hello.agent_id, detail).await;
+                None
+            }
+        };
+    }
     // At most `ARGON2_CONCURRENCY` evaluations run at once, across both
     // transports. The wait is bounded by the socket's deadline; running out
     // of time here writes no server hello, so a legitimate client sees a
@@ -585,23 +761,47 @@ where
         if write_server_hello(&mut tls, AUTH_OK).await.is_err() {
             return None;
         }
-        Some((tls, hello.agent_id))
+        Some((tls, hello.agent_id, None))
     } else {
-        // The raw listener logs each refusal (#150). On the public path any
-        // stranger can reach this, so a refusal is only counted.
-        if transport == SessionTransport::Ws {
-            hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            hub.report(ConnectorEvent::Refused { peer });
-        }
-        hub.audit_auth_fail(&hello.agent_id, transport);
-        let _ = timeout(
-            TRAILING_HELLO_WRITE,
-            write_server_hello(&mut tls, AUTH_UNAUTHORIZED),
+        refuse(
+            &mut tls,
+            peer,
+            transport,
+            hub,
+            &hello.agent_id,
+            AuthFailDetail::Unauthorized,
         )
         .await;
         None
     }
+}
+
+/// The refusal tail shared by both credential paths: count or log it,
+/// audit it for an auditable id, and answer `AUTH_UNAUTHORIZED` within
+/// [`TRAILING_HELLO_WRITE`]. The pre-auth slot is already released.
+async fn refuse<S>(
+    tls: &mut tokio_rustls::server::TlsStream<S>,
+    peer: SocketAddr,
+    transport: SessionTransport,
+    hub: &Hub,
+    claimed: &str,
+    detail: AuthFailDetail,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // The raw listener logs each refusal (#150). On the public path any
+    // stranger can reach this, so a refusal is only counted.
+    if transport == SessionTransport::Ws {
+        hub.ws_refused_auth.fetch_add(1, Ordering::Relaxed);
+    } else {
+        hub.report(ConnectorEvent::Refused { peer });
+    }
+    hub.audit_auth_fail_with(claimed, transport, detail);
+    let _ = timeout(
+        TRAILING_HELLO_WRITE,
+        write_server_hello(tls, AUTH_UNAUTHORIZED),
+    )
+    .await;
 }
 
 /// Run one connector socket from inner TLS to detach. `stop` ends the
@@ -624,7 +824,7 @@ async fn authenticate_and_serve<S>(
         a = authenticate(stream, peer, transport, acceptor, &hub, deadline, permit) => a,
         () = stopped(&mut stop) => return,
     };
-    let Some((tls, agent_id)) = authed else {
+    let Some((tls, agent_id, expires_at)) = authed else {
         return;
     };
     let session = spawn_broker(tls);
@@ -636,10 +836,22 @@ async fn authenticate_and_serve<S>(
         transport,
         peer,
     });
-    let (id, replaced) = hub.insert(agent_id.clone(), session.clone(), transport);
+    let (id, replaced) = hub.insert(agent_id.clone(), session.clone(), transport, expires_at);
+    // #235 D5: a Connect session ends when its access token expires, with
+    // no grace. The drop is the ordinary detach line, not an audit entry.
+    let expiry = async {
+        match expires_at {
+            Some(exp) => {
+                let left = exp.saturating_sub(unix_now());
+                tokio::time::sleep(Duration::from_secs(left)).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
         () = session.closed() => {}
         () = stopped(&mut stop) => session.shutdown(),
+        () = expiry => session.shutdown(),
     }
     hub.remove_if(&agent_id, id);
     hub.report(ConnectorEvent::Detached {
@@ -684,6 +896,139 @@ mod tests {
             Ok(())
         }));
         (hub, entries)
+    }
+
+    const CID: &str = "c-abcdefghij";
+
+    /// A Connect token lookup with fixed answers per token.
+    struct FakeConnect(HashMap<&'static str, ConnectAccess>);
+
+    impl ConnectTokens for FakeConnect {
+        fn access(&self, presented: &str, _now: u64) -> ConnectAccess {
+            self.0
+                .get(presented)
+                .cloned()
+                .unwrap_or(ConnectAccess::Unknown)
+        }
+        fn is_connect(&self, agent_id: &str) -> bool {
+            agent_id == CID
+        }
+    }
+
+    fn live(identity: &str, audience: bool, scope: bool) -> ConnectAccess {
+        ConnectAccess::Live {
+            identity: identity.into(),
+            connector_audience: audience,
+            connector_scope: scope,
+            expires_at: 4_000_000_000,
+        }
+    }
+
+    fn connect_hub() -> (Hub, Arc<Mutex<Vec<Entry>>>) {
+        let (hub, entries) = hub();
+        hub.set_connect_tokens(Arc::new(FakeConnect(HashMap::from([
+            ("kh_at_good", live(CID, true, true)),
+            ("kh_at_mcp", live(CID, false, true)),
+            ("kh_at_other", live("c-otherother", true, true)),
+            ("kh_at_noscope", live(CID, true, false)),
+        ]))));
+        (hub, entries)
+    }
+
+    /// D2/D4: prefix dispatch and the check order. A tunnel token is not a
+    /// Connect token; a refresh token never reaches the lookup.
+    #[test]
+    fn connect_checks_run_in_d4_order() {
+        let (hub, _) = connect_hub();
+        let check = |claimed: &str, token: &str| hub.check_connect(claimed, token, 0);
+        assert_eq!(check(CID, "kh_at_good"), Some(Ok(4_000_000_000)));
+        assert_eq!(check(CID, "kh_at_mcp"), Some(Err(AuthFailDetail::Audience)));
+        // Audience is checked before identity.
+        assert_eq!(
+            check("c-otherother", "kh_at_mcp"),
+            Some(Err(AuthFailDetail::Audience))
+        );
+        assert_eq!(
+            check(CID, "kh_at_other"),
+            Some(Err(AuthFailDetail::Identity))
+        );
+        assert_eq!(
+            check(CID, "kh_at_noscope"),
+            Some(Err(AuthFailDetail::Scope))
+        );
+        assert_eq!(
+            check(CID, "kh_at_unknown"),
+            Some(Err(AuthFailDetail::Unauthorized))
+        );
+        assert_eq!(
+            check(CID, "kh_rt_good"),
+            Some(Err(AuthFailDetail::Unauthorized))
+        );
+        assert_eq!(check("assistant", "kh_tunnel_assistant_00"), None);
+        assert_eq!(check("assistant", "junk"), None);
+        // Without `[oauth]` a Connect token is refused, still with no permit.
+        let (bare, _) = super::tests::hub();
+        assert_eq!(
+            bare.check_connect(CID, "kh_at_good", 0),
+            Some(Err(AuthFailDetail::Unauthorized))
+        );
+    }
+
+    /// The `connector_auth_fail` detail codes share one window per id; a
+    /// known Connect id is auditable, an unknown `c-…` id writes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn connect_auth_fail_details_share_one_window() {
+        let (hub, entries) = connect_hub();
+        hub.audit_auth_fail_with(CID, SessionTransport::Ws, AuthFailDetail::Audience);
+        hub.audit_auth_fail_with(CID, SessionTransport::Ws, AuthFailDetail::Identity);
+        hub.audit_auth_fail_with(CID, SessionTransport::Tls, AuthFailDetail::Unauthorized);
+        hub.audit_auth_fail_with(
+            "c-zzzzzzzzzz",
+            SessionTransport::Ws,
+            AuthFailDetail::Audience,
+        );
+        {
+            let all = entries.lock().unwrap();
+            assert_eq!(all.len(), 1, "one entry per id per minute: {all:?}");
+            assert_eq!(all[0].event, Event::ConnectorAuthFail);
+            assert_eq!(all[0].agent_id.as_deref(), Some(CID));
+            assert_eq!(all[0].detail_code.as_deref(), Some("audience"));
+            assert_eq!(all[0].suppressed, Some(0));
+        }
+        tokio::time::advance(AUDIT_WINDOW).await;
+        hub.audit_auth_fail_with(CID, SessionTransport::Ws, AuthFailDetail::Identity);
+        let all = entries.lock().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].detail_code.as_deref(), Some("identity"));
+        assert_eq!(all[1].suppressed, Some(2));
+    }
+
+    /// A4: a session past its token's `expires_at` is absent before any
+    /// timer runs: not connected, and no stream lookup finds it.
+    #[tokio::test]
+    async fn expired_session_is_absent_before_its_timer() {
+        let (hub, _) = connect_hub();
+        let (a, _b) = tokio::io::duplex(1024);
+        let session = spawn_broker(a);
+        let now = unix_now();
+        hub.insert(
+            CID.into(),
+            session.clone(),
+            SessionTransport::Ws,
+            Some(now + 3600),
+        );
+        assert!(hub.is_connected(CID));
+        assert!(hub.session(CID).is_some());
+        // Same session, expiry already passed: still in the map, not live.
+        hub.insert(
+            CID.into(),
+            session,
+            SessionTransport::Ws,
+            Some(now.saturating_sub(1)),
+        );
+        assert!(hub.sessions.lock().unwrap().contains_key(CID));
+        assert!(!hub.is_connected(CID));
+        assert!(hub.session(CID).is_none());
     }
 
     /// Count one `replaced` event for `agent` the way `insert` does.

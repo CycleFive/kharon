@@ -1119,6 +1119,13 @@ pub async fn start(
         rt.hub.set_audit(Arc::new(move |entry| {
             audit_broker.append_audit(entry).map_err(|_| ())
         }));
+        // #235 slice 5: with `[oauth]` set, a Connect access token in the
+        // hello is checked against the OAuth store (hash lookup, no
+        // Argon2id permit). Without it every `kh_at_` hello is refused.
+        if let Some(store) = broker.oauth_store() {
+            rt.hub
+                .set_connect_tokens(Arc::clone(store) as Arc<dyn crate::connector::ConnectTokens>);
+        }
     }
     // REQ-API-007: the server whose `Date` the clock is checked
     // against. Building the client does no I/O; config validation has

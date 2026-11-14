@@ -6,10 +6,13 @@
 //! authorization code is redeemed at `POST /oauth/token` — never at
 //! consent, so an unredeemed consent leaves nothing behind (A17).
 //! Tokens are opaque (`kh_at_<64 hex>`, `kh_rt_<64 hex>`); the file
-//! holds only their SHA-256 hashes, with the identities (D3). Codes
-//! are never written here: they live in the authorize side's memory
-//! (#230). The redeemed-code set that makes a second redemption
-//! revoke is memory-only too, expiring with the code. A pending
+//! holds only their SHA-256 hashes, with the identities (D3). Each
+//! record stores an audience (`mcp` or `connector`) in its own
+//! field, not in scope or resource (D4, #304). A phase-1 file omits
+//! the field and loads as `mcp`. Code redemption and refresh issue
+//! `mcp`. Codes are never written here: they live in the authorize
+//! side's memory (#230). The redeemed-code set that makes a second
+//! redemption revoke is memory-only too, expiring with the code. A pending
 //! marker is recorded in that set atomically with the code take
 //! ([`OauthStore::begin_redemption`]); [`OauthStore::connect`]
 //! resolves it under the store lock, so a second presentation that
@@ -59,6 +62,9 @@ pub const GRACE_SECS: u64 = 30;
 /// exactly that long past consent.
 pub const CODE_TTL_SECS: u64 = 60;
 
+/// On-disk schema. Stays at 1 when the audience field arrives: a
+/// phase-1 file has no `audience` key and deserializes as `mcp`
+/// (A6). Bumping this refuses those files at startup.
 const STATE_VERSION: u32 = 1;
 
 /// Where a Connect's audit entries go, and who drops its live
@@ -113,13 +119,33 @@ impl std::fmt::Debug for IssuedPair {
     }
 }
 
-/// What an access token authenticates as on `/mcp`.
+/// What a live access token resolves to. The audience is the
+/// record's own field. `/mcp` accepts only [`TokenAudience::Mcp`],
+/// and that refusal happens in the broker before the scope gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated {
     pub agent_id: String,
     /// The Connect's granted scopes (the store carries them from
     /// here; the broker enforces them via `AgentId`, #232).
     pub scopes: Vec<String>,
+    /// The audience stored on this access token.
+    pub audience: TokenAudience,
+}
+
+/// Which surface a token record is for (D4, #304).
+///
+/// Its own field on the access token and on the refresh token:
+/// not a scope, and not the `resource` parameter. A phase-1
+/// `oauth/state.json` has no audience key; that record loads as
+/// [`Self::Mcp`], an `/mcp` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenAudience {
+    /// `/mcp`. Code redemption and refresh issue this audience.
+    #[default]
+    Mcp,
+    /// The connector tunnel. Refused on `/mcp`.
+    Connector,
 }
 
 /// The checked contents of a redeemed authorization code (#230's
@@ -136,6 +162,9 @@ pub struct CodeGrant {
     /// Unix seconds of the consent; the refresh token's 90-day
     /// absolute lifetime counts from here (D4).
     pub consented_at: u64,
+    /// Whether the client's metadata document declared the connector
+    /// extension grant when the owner consented (#235 D3).
+    pub connector_grant_declared: bool,
 }
 
 /// How a Connect ended, for the `oauth_disconnect` `detail_code`
@@ -182,6 +211,14 @@ pub struct Identity {
     /// the Connections page can say how a Connect arrived.
     pub connected_via: String,
     pub revoked: bool,
+    /// Whether the client declared the connector extension grant
+    /// (`grant_types` lists `urn:kharon:oauth:grant-type:connector`)
+    /// at consent (#235 D3, A11). Fixed at consent: nothing after
+    /// redemption writes it, so a client that adds the grant to its
+    /// document later is still not declared on this Connect. A
+    /// phase 1 record has no field and loads as not declared.
+    #[serde(default)]
+    pub connector_grant_declared: bool,
 }
 
 impl Identity {
@@ -215,7 +252,13 @@ struct TokenRecord {
     kind: TokenKind,
     identity_id: String,
     /// The refresh family: one per Connect, named by the identity.
+    /// Not the audience — a Connect has one family today, and the
+    /// audience says which surface the token is for.
     family: String,
+    /// `mcp` or `connector`. Absent on a phase-1 record, which
+    /// deserializes as [`TokenAudience::Mcp`].
+    #[serde(default)]
+    audience: TokenAudience,
     /// The hash of the token this one descends from: a refresh
     /// token's parent is the refresh token it rotated from; an
     /// access token's parent is the refresh token issued in its
@@ -500,8 +543,9 @@ impl OauthStore {
             consented_at: grant.consented_at,
             connected_via: "oauth".to_owned(),
             revoked: false,
+            connector_grant_declared: grant.connector_grant_declared,
         };
-        let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now);
+        let (pair, access_rec, refresh_rec) = issue_pair(&identity, None, now, TokenAudience::Mcp);
         enum Commit {
             Issued(IssuedPair),
             /// A second presentation landed before this commit.
@@ -665,8 +709,10 @@ impl OauthStore {
                 // failed write restores the snapshot, so the
                 // presented token stays as it was for a retry.
                 let backup = inner.file.clone();
+                // Refresh issues audience `mcp`, as code redemption
+                // does. A connector family's rotation is a later slice.
                 let (pair, access_rec, refresh_rec) =
-                    issue_pair(&identity, Some(hash.clone()), now);
+                    issue_pair(&identity, Some(hash.clone()), now, TokenAudience::Mcp);
                 if grace {
                     inner.file.tokens[pos].grace_used = true;
                     // The pair issued moments before is superseded,
@@ -830,10 +876,11 @@ impl OauthStore {
         ended
     }
 
-    /// Authenticate an access token on `/mcp`: a hash lookup, never
-    /// an Argon2id permit (REQ-OAU-008). `None` for unknown,
-    /// expired, revoked or wrong-kind tokens, and for tokens whose
-    /// Connect has ended.
+    /// A live access token, of whichever audience it stores: a hash
+    /// lookup, never an Argon2id permit (REQ-OAU-008). `None` for
+    /// unknown, expired, revoked or wrong-kind tokens, and for
+    /// tokens whose Connect has ended. A connector audience is
+    /// still `Some` here; `/mcp` refuses it before the scope gate.
     pub fn authenticate_access(&self, presented: &str, now: u64) -> Option<Authenticated> {
         let hash = hex(&sha256(presented.as_bytes()));
         let inner = self.lock();
@@ -849,14 +896,16 @@ impl OauthStore {
         Some(Authenticated {
             agent_id: identity.id.clone(),
             scopes: identity.scopes.clone(),
+            audience: rec.audience,
         })
     }
 
     /// What a `kh_at_` value presented in a connector hello is (#235 D4):
     /// the same hash lookup as [`Self::authenticate_access`], never an
-    /// Argon2id permit, plus the record's expiry. The audience comes from
-    /// #304's field on the record; until that lands every record is an
-    /// `/mcp` token, which the hello refuses with detail `audience`.
+    /// Argon2id permit, plus the record's audience and expiry. A record
+    /// holds no scope of its own: `kharon:connector` is the only scope a
+    /// connector-audience token carries, and an `/mcp` token never
+    /// carries it, so the scope follows the stored audience.
     pub fn connector_access(&self, presented: &str, now: u64) -> ConnectAccess {
         let hash = hex(&sha256(presented.as_bytes()));
         let inner = self.lock();
@@ -868,14 +917,68 @@ impl OauthStore {
             return ConnectAccess::Unknown;
         }
         match inner.file.identity(&rec.identity_id) {
-            Some(identity) if !identity.revoked => ConnectAccess::Live {
-                identity: identity.id.clone(),
-                connector_audience: false,
-                connector_scope: false,
-                expires_at: rec.expires_at,
-            },
+            Some(identity) if !identity.revoked => {
+                let connector = rec.audience == TokenAudience::Connector;
+                ConnectAccess::Live {
+                    identity: identity.id.clone(),
+                    connector_audience: connector,
+                    connector_scope: connector,
+                    expires_at: rec.expires_at,
+                }
+            }
             _ => ConnectAccess::Unknown,
         }
+    }
+
+    /// The audience stored for `presented`, access or refresh,
+    /// whatever its status. `None` when the hash is not in the
+    /// store. Does not check expiry or revocation: a round-trip
+    /// reads what was written.
+    pub fn token_audience(&self, presented: &str) -> Option<TokenAudience> {
+        let hash = hex(&sha256(presented.as_bytes()));
+        let inner = self.lock();
+        inner
+            .file
+            .tokens
+            .iter()
+            .find(|t| t.hash == hash)
+            .map(|t| t.audience)
+    }
+
+    /// Plant a connector-audience access token and its refresh
+    /// sibling on a live Connect, and persist them.
+    ///
+    /// Tests use this constructor to hold a connector record and
+    /// round-trip it. Not an issuance path: code redemption and
+    /// refresh pass [`TokenAudience::Mcp`] and do not call this.
+    /// An unknown or revoked identity is [`TokenError::InvalidGrant`].
+    /// A failed write leaves the store unchanged and returns
+    /// [`TokenError::PersistFailed`]. The plaintext pair is returned
+    /// once and is not stored.
+    pub fn insert_connector_audience(
+        &self,
+        identity_id: &str,
+        now: u64,
+    ) -> Result<IssuedPair, TokenError> {
+        let mut inner = self.lock();
+        let Some(identity) = inner
+            .file
+            .identity(identity_id)
+            .filter(|identity| !identity.revoked)
+            .cloned()
+        else {
+            return Err(TokenError::InvalidGrant);
+        };
+        let backup = inner.file.clone();
+        let (pair, access_rec, refresh_rec) =
+            issue_pair(&identity, None, now, TokenAudience::Connector);
+        inner.file.tokens.push(access_rec);
+        inner.file.tokens.push(refresh_rec);
+        if self.persist(&inner.file).is_err() {
+            inner.file = backup;
+            return Err(TokenError::PersistFailed);
+        }
+        Ok(pair)
     }
 
     /// Whether the id is one of this store's Connect identities
@@ -891,6 +994,17 @@ impl OauthStore {
     /// name a Connect that has since been disconnected.
     pub fn identities(&self) -> Vec<Identity> {
         self.lock().file.identities.clone()
+    }
+
+    /// Whether a Connect's client declared the connector extension
+    /// grant at consent (#235 D3), for the spawn grant to check
+    /// (slice 4). `None` for an id this store never issued. An ended
+    /// Connect still answers; spawn checks liveness itself.
+    pub fn connector_grant_declared(&self, identity_id: &str) -> Option<bool> {
+        self.lock()
+            .file
+            .identity(identity_id)
+            .map(|i| i.connector_grant_declared)
     }
 
     /// The `client_name` an identity was shown under at consent,
@@ -980,11 +1094,14 @@ fn refresh_deadline(identity: &Identity, issued_at: u64) -> u64 {
 
 /// Mint a token pair for `identity`. `parent` is the hash of the
 /// refresh token being rotated from (`None` for a Connect's first
-/// pair).
+/// pair). `audience` is stored on both records. Code redemption
+/// and refresh pass [`TokenAudience::Mcp`]; they do not issue a
+/// connector audience.
 fn issue_pair(
     identity: &Identity,
     parent: Option<String>,
     now: u64,
+    audience: TokenAudience,
 ) -> (IssuedPair, TokenRecord, TokenRecord) {
     let access_token = format!("kh_at_{}", hex(&random_bytes::<32>()));
     let refresh_token = format!("kh_rt_{}", hex(&random_bytes::<32>()));
@@ -994,6 +1111,7 @@ fn issue_pair(
         kind: TokenKind::Access,
         identity_id: identity.id.clone(),
         family: identity.id.clone(),
+        audience,
         parent: Some(refresh_hash.clone()),
         issued_at: now,
         expires_at: now.saturating_add(ACCESS_TTL_SECS),
@@ -1007,6 +1125,7 @@ fn issue_pair(
         kind: TokenKind::Refresh,
         identity_id: identity.id.clone(),
         family: identity.id.clone(),
+        audience,
         parent,
         issued_at: now,
         expires_at: refresh_deadline(identity, now),
@@ -1182,6 +1301,7 @@ mod tests {
                 code_challenge: challenge,
                 scopes: vec!["kharon:read".to_owned(), "kharon:fill".to_owned()],
                 consented_at: NOW,
+                connector_grant_declared: false,
             },
             verifier.to_owned(),
         )
@@ -1291,6 +1411,53 @@ mod tests {
         assert!(
             ConnectTokens::is_connect(&*store, &id),
             "ended ids stay auditable"
+        );
+    }
+
+    #[test]
+    fn connector_access_reads_the_connector_audience_from_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _recording) = store(dir.path());
+        let (_mcp, id) = connect_one(&store);
+        let pair = store.insert_connector_audience(&id, NOW).unwrap();
+        assert_eq!(
+            store.connector_access(&pair.access_token, NOW),
+            ConnectAccess::Live {
+                identity: id.clone(),
+                connector_audience: true,
+                connector_scope: true,
+                expires_at: NOW + ACCESS_TTL_SECS,
+            }
+        );
+        assert_eq!(
+            store.connector_access(&pair.refresh_token, NOW),
+            ConnectAccess::Unknown
+        );
+
+        let tokens = crate::api::token::TokenStore::with_floor_and_prefix(
+            std::iter::empty::<(&str, &str)>(),
+            &crate::api::token::ParamFloor {
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 1,
+            },
+            crate::api::token::TUNNEL_PREFIX,
+        )
+        .unwrap();
+        let hub = crate::connector::Hub::with_events(tokens, Arc::new(|_| {}));
+        hub.set_connect_tokens(store.clone() as Arc<dyn ConnectTokens>);
+        use crate::connector::AuthFailDetail;
+        assert_eq!(
+            hub.check_connect(&id, &pair.access_token, NOW),
+            Some(Ok(NOW + ACCESS_TTL_SECS))
+        );
+        assert_eq!(
+            hub.check_connect("c-aaaaaaaaaa", &pair.access_token, NOW),
+            Some(Err(AuthFailDetail::Identity))
+        );
+        assert_eq!(
+            hub.check_connect(&id, &pair.access_token, NOW + ACCESS_TTL_SECS),
+            Some(Err(AuthFailDetail::Unauthorized))
         );
     }
 
@@ -1573,6 +1740,64 @@ mod tests {
             recording.events().last().unwrap(),
             &("oauth_disconnect".to_owned(), Some("client".to_owned()))
         );
+    }
+
+    #[test]
+    fn a_phase_1_identity_without_the_declaration_loads_as_not_declared() {
+        // A state file written before #235: the identity has no
+        // `connector_grant_declared` field.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("oauth")).unwrap();
+        let phase1 = serde_json::json!({
+            "version": STATE_VERSION,
+            "identities": [{
+                "id": "c-abcdefghij",
+                "client_id": CLIENT,
+                "client_name": "Dashboard",
+                "scopes": ["kharon:read", "kharon:fill"],
+                "created_at": NOW,
+                "consented_at": NOW,
+                "connected_via": "oauth",
+                "revoked": false,
+            }],
+            "tokens": [],
+        });
+        std::fs::write(dir.path().join("oauth/state.json"), phase1.to_string()).unwrap();
+        let store = OauthStore::load(dir.path()).unwrap();
+        assert_eq!(store.connector_grant_declared("c-abcdefghij"), Some(false));
+        assert_eq!(store.connector_grant_declared("c-zzzzzzzzzz"), None);
+    }
+
+    #[test]
+    fn the_connector_grant_declaration_is_fixed_at_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _rec) = store(dir.path());
+        // Connect A: its document did not declare the grant at consent.
+        let (pair, undeclared) = connect_one(&store);
+        // The client's document adds the grant; only a new Connect
+        // (B, a fresh consent) records it.
+        let (mut g, verifier) = grant("second-verifier");
+        g.connector_grant_declared = true;
+        let pair_b = store
+            .connect(&g, &verifier, sha256(b"second-code"), NOW)
+            .unwrap();
+        let declared = store
+            .authenticate_access(&pair_b.access_token, NOW)
+            .unwrap()
+            .agent_id;
+        assert_ne!(undeclared, declared);
+        assert_eq!(store.connector_grant_declared(&undeclared), Some(false));
+        assert_eq!(store.connector_grant_declared(&declared), Some(true));
+        // A's refresh rotates without touching the flag, and both
+        // survive a reload as consented.
+        store
+            .refresh(&pair.refresh_token, CLIENT, NOW + 60)
+            .unwrap();
+        assert_eq!(store.connector_grant_declared(&undeclared), Some(false));
+        drop(store);
+        let reloaded = OauthStore::load(dir.path()).unwrap();
+        assert_eq!(reloaded.connector_grant_declared(&undeclared), Some(false));
+        assert_eq!(reloaded.connector_grant_declared(&declared), Some(true));
     }
 
     #[test]

@@ -126,6 +126,7 @@ impl Rig {
             code_challenge: challenge,
             scopes: ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
             consented_at: unix_now(),
+            connector_grant_declared: false,
         };
         let code_hash: [u8; 32] = Sha256::digest(format!("code for {client_id}").as_bytes()).into();
         let pair = self

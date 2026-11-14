@@ -969,9 +969,13 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// (REQ-OAU-004; #231): the one surface that dispatches on
     /// prefix. `kh_at_` goes to the OAuth token store — a SHA-256
     /// lookup, never an Argon2id evaluation (REQ-OAU-008) — and
-    /// everything else takes the config-agent path above. The
-    /// `/v1/*` handlers keep calling [`Self::authenticate`], so a
-    /// `kh_at_` token there is refused like any unknown token.
+    /// everything else takes the config-agent path above. A
+    /// connector-audience access token is [`ApiError::INVALID_TOKEN`]
+    /// here, before the scope gate (N3 phase 2, D4): the client is
+    /// not invited to step up, and the call never becomes a tool
+    /// result. The `/v1/*` handlers keep calling
+    /// [`Self::authenticate`], so a `kh_at_` token there is refused
+    /// like any unknown token.
     pub fn authenticate_on_mcp(&self, token: &str) -> Result<AgentId, ApiError> {
         if token.starts_with("kh_at_") {
             let now = std::time::SystemTime::now()
@@ -983,6 +987,12 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                 .as_ref()
                 .and_then(|store| store.authenticate_access(token, now))
                 .ok_or(ApiError::INVALID_TOKEN)?;
+            // Before scopes. A connector audience is not a missing
+            // scope: 401 invalid_token, the same shape as any other
+            // auth failure, never 403 insufficient_scope.
+            if conn.audience != super::oauth_store::TokenAudience::Mcp {
+                return Err(ApiError::INVALID_TOKEN);
+            }
             if self
                 .rates
                 .lock()

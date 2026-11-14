@@ -76,8 +76,11 @@ needs a secret except step 5.
    and no other arguments. Expect `agent connector attached: …
    transport=ws` in kharond's log.
 8. **The MCP client.** Point it at `https://<host>/mcp` with the agent
-   token as `Authorization: Bearer …`, stored in the client's or the
-   runtime's secret setting, not in a prompt or a file the model reads.
+   token as `Authorization: Bearer kh_agent_<id>_…`, stored in the
+   client's or the runtime's secret setting, never in a prompt or a
+   file the model reads. A worked config is in
+   [MCP client](deployment.md#mcp-client). Tool names and schemas are
+   [`docs/api/mcp-tools.json`](api/mcp-tools.json).
    Apply the [agent harness policy](deployment.md#agent-harness-policy-spec-oq-3).
 
 ### What a root agent costs (G1)

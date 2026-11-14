@@ -43,6 +43,18 @@ pub const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-se
 /// bundle membership is #232, the names are discovery's from here).
 pub const SCOPES_SUPPORTED: [&str; 3] = ["kharon:read", "kharon:fill", "kharon:request"];
 
+/// The extension grant a dashboard runtime uses to spawn its
+/// connector token family (#235 design D3, A1). RFC 6749 §4.5 wants
+/// an extension grant type to be a URI. A client may spawn only if
+/// its metadata document lists this in `grant_types`, recorded on the
+/// Connect identity at consent (A11, [`super::cimd`]).
+pub const CONNECTOR_GRANT_TYPE: &str = "urn:kharon:oauth:grant-type:connector";
+
+/// `grant_types_supported` in the AS metadata: the two phase 1
+/// grants and the connector extension grant (A1 keeps the first two).
+pub const GRANT_TYPES_SUPPORTED: [&str; 3] =
+    ["authorization_code", "refresh_token", CONNECTOR_GRANT_TYPE];
+
 /// The scope bundles (REQ-OAU-006, design D5): each scope names a
 /// fixed set of MCP tools. This table is the one place the mapping
 /// lives — enforcement ([`scope_for_tool`]), `tools/list`
@@ -167,7 +179,7 @@ impl Discovery {
             "token_endpoint": format!("{}/oauth/token", self.issuer),
             "revocation_endpoint": format!("{}/oauth/revoke", self.issuer),
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "grant_types_supported": GRANT_TYPES_SUPPORTED,
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
             "client_id_metadata_document_supported": true,
@@ -242,7 +254,11 @@ mod tests {
                 "token_endpoint": "https://kharon-owner.twkr.io/oauth/token",
                 "revocation_endpoint": "https://kharon-owner.twkr.io/oauth/revoke",
                 "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "grant_types_supported": [
+                    "authorization_code",
+                    "refresh_token",
+                    "urn:kharon:oauth:grant-type:connector",
+                ],
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
                 "client_id_metadata_document_supported": true,

@@ -54,6 +54,7 @@ fn live_connect() -> (Arc<OauthStore>, String, String) {
         code_challenge: challenge,
         scopes: vec!["kharon:read".to_owned()],
         consented_at: unix_now(),
+        connector_grant_declared: false,
     };
     let code_hash = Sha256::digest(b"integration-code").into();
     let pair = store

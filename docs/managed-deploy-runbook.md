@@ -68,10 +68,12 @@ the gateway's.
    [The kharon account and its master password](deployment.md#the-kharon-account-and-its-master-password-req-dep-007),
    step 1.
 5. **Required. Create the account, organization, collection and API key**
-   (customer). See steps 2–4 of the same section. The customer then
-   moves the logins kharon may fill into that collection. *Detail on the
-   Bitwarden side (org setup, moving items, where the IDs and the API
-   key are) is tracked in #293.*
+   (customer). See steps 2–4 of the same section, and
+   [Customer vault onboarding](vault-onboarding.md) for the Bitwarden
+   web-app steps: the organization plan, the collection, inviting and
+   confirming the dedicated account, where `organization_id` and
+   `collection_ids` are, the API key JSON, moving the logins kharon
+   may fill into that collection, and URI match.
 6. **Required. Hand over the API key file, the account email, and the
    organization and collection IDs** (customer to operator), out of band:
    never in a shared channel. The master password is never handed over.
@@ -235,8 +237,9 @@ the gateway's.
     from step 8 as a bearer token. Apply the
     [agent harness policy](deployment.md#agent-harness-policy-spec-oq-3),
     and see [Running the agent](deployment.md#running-the-agent) for
-    the idle lock and `kharon_context` after an unlock. *A worked client
-    config example is tracked in #293.*
+    the idle lock and `kharon_context` after an unlock. A worked client
+    config is in [MCP client](deployment.md#mcp-client). The tool
+    schemas are [`docs/api/mcp-tools.json`](api/mcp-tools.json).
 
 ## 10. Dashboard Connect (optional, with `[oauth]`)
 

@@ -4,9 +4,9 @@
 //! before any Argon2id permit; the session carries the token's expiry and
 //! drops at it; refusals carry D4's audit detail codes.
 //!
-//! The Connect lookup is injected here: #304 adds the audience field to
-//! the OAuth store, and the store side of the lookup has its own unit test
-//! (`connector_access_sees_an_mcp_token_as_the_wrong_audience`).
+//! Most tests inject the Connect lookup to script its answers.
+//! `real_store_connector_token_attaches_and_fills` wires the OAuth store
+//! itself, with a connector-audience token from #304's record field.
 
 mod api_support;
 mod connector_support;
@@ -16,12 +16,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64ct::{Base64UrlUnpadded, Encoding};
 use connector_support::*;
 use kharon_connector::{ClientError, connect_and_auth, run_agent_once};
+use kharond::api::oauth_store::{CodeGrant, ConnectLifecycle, OauthStore};
 use kharond::audit::{Entry, Event};
 use kharond::connector::{
     AgentParams, ConnectAccess, ConnectTokens, ConnectorEvent, connect_pinned,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use zeroize::Zeroizing;
@@ -153,6 +156,113 @@ async fn connect_token_attaches_and_fills_over_ws_and_raw_tls() {
     .await;
     rig.hub.disconnect("assistant");
     let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
+}
+
+/// The store's lifecycle seam, permissive: the hub's own audit sink
+/// records what this test checks.
+struct AllowAll;
+
+impl ConnectLifecycle for AllowAll {
+    fn append(&self, _entry: Entry) -> bool {
+        true
+    }
+    fn connect_ended(&self, _agent_id: &str) {}
+}
+
+/// #304 landed: the OAuth store itself answers the hello. A Connect's
+/// connector-audience access token attaches under its own id over the
+/// WebSocket and raw TLS, and a fill over each session reaches the CDP
+/// stub. The same Connect's `/mcp` access token is refused with detail
+/// `audience`, and its connector refresh token with `unauthorized`.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_store_connector_token_attaches_and_fills() {
+    let rig = rig().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = OauthStore::load(dir.path()).unwrap();
+    store.set_lifecycle(Arc::new(AllowAll));
+    let store = Arc::new(store);
+    let verifier = "slice5-verifier";
+    let grant = CodeGrant {
+        client_id: "https://dashboard.example/.well-known/kharon-client.json".to_owned(),
+        client_name: "Dashboard".to_owned(),
+        code_challenge: Base64UrlUnpadded::encode_string(&Sha256::digest(verifier.as_bytes())),
+        scopes: vec!["kharon:read".to_owned()],
+        consented_at: now(),
+        connector_grant_declared: true,
+    };
+    let mcp = store
+        .connect(
+            &grant,
+            verifier,
+            Sha256::digest(b"slice5-code").into(),
+            now(),
+        )
+        .unwrap();
+    let id = store
+        .authenticate_access(&mcp.access_token, now())
+        .unwrap()
+        .agent_id;
+    let connector = store.insert_connector_audience(&id, now()).unwrap();
+    rig.hub
+        .set_connect_tokens(Arc::clone(&store) as Arc<dyn ConnectTokens>);
+    let entries = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&entries);
+    rig.hub.set_audit(Arc::new(move |e| {
+        sink.lock().unwrap().push(e);
+        Ok(())
+    }));
+
+    for params in [
+        ws_as(&rig, &id, &connector.access_token),
+        raw_as(&rig, &id, &connector.access_token),
+    ] {
+        let agent = tokio::spawn(async move { run_agent_once(&params).await });
+        eventually("store-backed Connect session attached", || {
+            rig.hub.is_connected(&id)
+        })
+        .await;
+        assert_eq!(rig.hub.argon_in_flight(), 0);
+        rig.received.lock().unwrap().clear();
+        let outcome = fill_once_as(&rig.hub, &id).await;
+        assert_eq!(outcome.status(), "filled", "{outcome:?}");
+        assert!(
+            rig.received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.to_string().contains(CANARY)),
+            "the fill never reached the CDP stub"
+        );
+        rig.hub.disconnect(&id);
+        let _ = tokio::time::timeout(Duration::from_secs(5), agent).await;
+    }
+    assert!(auth_fails(&entries).is_empty());
+
+    // The `/mcp` token is refused with detail `audience`; the connector
+    // refresh token is refused too, inside the same 60 s window for the
+    // id, so it writes no second entry.
+    for token in [&mcp.access_token, &connector.refresh_token] {
+        let params = ws_as(&rig, &id, token);
+        let result = tokio::time::timeout(Duration::from_secs(10), run_agent_once(&params))
+            .await
+            .expect("the refused hello hung");
+        assert!(result.is_err(), "a refused token attached");
+        assert!(!rig.hub.is_connected(&id));
+    }
+    let fails = auth_fails(&entries);
+    assert_eq!(fails.len(), 1, "one entry per id per window");
+    assert_eq!(fails[0].detail_code.as_deref(), Some("audience"));
+    let written = format!("{:?}", fails[0]);
+    for token in [
+        &mcp.access_token,
+        &connector.access_token,
+        &connector.refresh_token,
+    ] {
+        assert!(
+            !written.contains(token.as_str()),
+            "a token reached the audit log"
+        );
+    }
 }
 
 /// A raw hello whose answer the caller waits for.

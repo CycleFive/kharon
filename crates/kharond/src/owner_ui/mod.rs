@@ -3224,6 +3224,7 @@ mod tests {
     fn metadata_oauth(discovery: Discovery) -> OauthAs {
         OauthAs {
             discovery: Arc::new(discovery),
+            connector_configured: false,
         }
     }
 
@@ -3420,11 +3421,22 @@ mod tests {
         store: Arc<OauthStore>,
         codes: Option<Arc<dyn oauth_token::CodeRedeemer>>,
     ) -> Arc<OwnerUi> {
+        open_token_ui_at(dir, store, codes, false)
+    }
+
+    fn open_token_ui_at(
+        dir: &Path,
+        store: Arc<OauthStore>,
+        codes: Option<Arc<dyn oauth_token::CodeRedeemer>>,
+        connector_configured: bool,
+    ) -> Arc<OwnerUi> {
         let oauth_tokens = codes.map(|codes| oauth_token::TokenSide::with_codes(store, codes));
         let discovery = Discovery::new(
             "https://kharon-owner.example.com".to_owned(),
             "kharon.example.com",
         );
+        let mut oauth = metadata_oauth(discovery);
+        oauth.connector_configured = connector_configured;
         OwnerUi::open_with(
             dir,
             OwnerUiOptions {
@@ -3432,7 +3444,7 @@ mod tests {
                 origin: "https://kharon-owner.example.com".into(),
                 public: true,
                 access: None,
-                oauth: Some(metadata_oauth(discovery)),
+                oauth: Some(oauth),
                 admission: None,
                 oauth_tokens,
             },
@@ -3444,6 +3456,25 @@ mod tests {
             Arc::new(NoApprovals),
         )
         .unwrap()
+    }
+
+    fn token_fixture_with(dir: &Path, connector_configured: bool) -> TokenFixture {
+        let store = Arc::new(OauthStore::load(dir).unwrap());
+        let lifecycle = Arc::new(RecLifecycle::default());
+        store.set_lifecycle(lifecycle.clone());
+        let codes = Arc::new(FakeCodes::default());
+        let ui = open_token_ui_at(
+            dir,
+            store.clone(),
+            Some(codes.clone() as Arc<dyn oauth_token::CodeRedeemer>),
+            connector_configured,
+        );
+        TokenFixture {
+            ui,
+            store,
+            codes,
+            lifecycle,
+        }
     }
 
     fn token_fixture(dir: &Path, with_side: bool) -> TokenFixture {
@@ -3706,6 +3737,343 @@ mod tests {
             fx.lifecycle.ended.lock().unwrap().as_slice(),
             [auth.agent_id]
         );
+    }
+
+    fn plant_spawn_code(fx: &TokenFixture, code: &str, verifier: &str, fill: bool, declared: bool) {
+        let mut body = redeemed_code(verifier);
+        body.scopes = if fill {
+            vec!["kharon:read".to_owned(), "kharon:fill".to_owned()]
+        } else {
+            vec!["kharon:read".to_owned()]
+        };
+        body.connector_grant_declared = declared;
+        fx.codes.0.lock().unwrap().insert(code.to_owned(), body);
+    }
+
+    const DASH_CLIENT: &str = "https://dashboard.example/.well-known/kharon-client.json";
+
+    fn token_json(response: Response) -> Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&futures_body(response)).unwrap()
+    }
+
+    /// Code grant, unchanged (D3): `resource` equal to the `/connector`
+    /// URL is `invalid_target`, and the code is still redeemed by the
+    /// `/mcp` URL afterwards.
+    #[test]
+    fn code_grant_with_the_connector_resource_does_not_spend_the_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture_with(dir.path(), true);
+        plant_code(&fx, "code-connector", "verifier-connector");
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-connector",
+                "verifier-connector",
+                "https://kharon.example.com/connector",
+            ),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(r), "invalid_target");
+        let body = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-connector",
+                "verifier-connector",
+                "https://kharon.example.com/mcp",
+            ),
+            None,
+            None,
+        ));
+        assert!(body["access_token"].as_str().unwrap().starts_with("kh_at_"));
+        assert_eq!(body["scope"], "kharon:read");
+    }
+
+    /// Spawn through the token endpoint: the extension grant, the
+    /// lost-response retry, and a refresh that stays inside its family.
+    #[test]
+    fn connector_grant_spawns_and_each_family_refreshes_on_its_own_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture_with(dir.path(), true);
+        plant_spawn_code(&fx, "code-spawn", "verifier-spawn", true, true);
+        let body = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-spawn",
+                "verifier-spawn",
+                "https://kharon.example.com/mcp",
+            ),
+            None,
+            None,
+        ));
+        let mcp_refresh = body["refresh_token"].as_str().unwrap().to_owned();
+        let spawned = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "urn:kharon:oauth:grant-type:connector"),
+                ("refresh_token", &mcp_refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/connector"),
+            ]),
+            None,
+            None,
+        ));
+        assert_eq!(spawned["scope"], "kharon:connector");
+        assert_eq!(spawned["expires_in"], 3600);
+        assert_eq!(spawned["token_type"], "Bearer");
+        let first_access = spawned["access_token"].as_str().unwrap().to_owned();
+        let connector_refresh = spawned["refresh_token"].as_str().unwrap().to_owned();
+        assert_eq!(
+            fx.store.token_audience(&first_access),
+            Some(crate::api::oauth_store::TokenAudience::Connector)
+        );
+        // Lost-response retry: a new pair, and the first access dies.
+        let retried = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "urn:kharon:oauth:grant-type:connector"),
+                ("refresh_token", &mcp_refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/connector"),
+            ]),
+            None,
+            None,
+        ));
+        let second_access = retried["access_token"].as_str().unwrap().to_owned();
+        let second_refresh = retried["refresh_token"].as_str().unwrap().to_owned();
+        assert_ne!(second_access, first_access);
+        assert!(
+            fx.store
+                .authenticate_access(&first_access, unix_now())
+                .is_none()
+        );
+        assert!(
+            fx.store
+                .authenticate_access(&second_access, unix_now())
+                .is_some()
+        );
+        let third = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "urn:kharon:oauth:grant-type:connector"),
+                ("refresh_token", &mcp_refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/connector"),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(third.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(third), "invalid_grant");
+        assert!(
+            fx.store
+                .authenticate_access(&second_access, unix_now())
+                .is_some()
+        );
+        // The MCP refresh, resource omitted, still rotates. The
+        // connector refresh does not, and the wrong resource leaves
+        // it live for the right one.
+        let mcp_body = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &mcp_refresh),
+                ("client_id", DASH_CLIENT),
+            ]),
+            None,
+            None,
+        ));
+        assert_ne!(mcp_body["refresh_token"], mcp_refresh);
+        let wrong = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &second_refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/mcp"),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(wrong), "invalid_target");
+        let rotated = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &second_refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/connector"),
+            ]),
+            None,
+            None,
+        ));
+        assert_eq!(rotated["scope"], "kharon:connector");
+        assert_eq!(
+            fx.store
+                .token_audience(rotated["access_token"].as_str().unwrap()),
+            Some(crate::api::oauth_store::TokenAudience::Connector)
+        );
+        assert_eq!(
+            fx.store
+                .token_audience(rotated["refresh_token"].as_str().unwrap()),
+            Some(crate::api::oauth_store::TokenAudience::Connector)
+        );
+        // One spawn audit, no token material.
+        let entries = fx.lifecycle.entries.lock().unwrap();
+        let grants: Vec<_> = entries
+            .iter()
+            .filter(|e| e.event.as_str() == "oauth_connector_grant")
+            .collect();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].result.as_deref(), Some("issued"));
+        assert!(grants[0].channel.is_none());
+        let json = serde_json::to_string(&entries[..]).unwrap();
+        for secret in [
+            &first_access,
+            &connector_refresh,
+            &second_access,
+            &second_refresh,
+            &mcp_refresh,
+        ] {
+            assert!(!json.contains(secret.as_str()));
+        }
+    }
+
+    #[test]
+    fn spawn_refuses_a_missing_certificate_an_undeclared_client_and_a_read_only_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `[connector]` certificate: the right URL is still
+        // `invalid_target`, and the MCP refresh stays live.
+        let fx = token_fixture_with(dir.path(), false);
+        plant_spawn_code(&fx, "code-nocert", "verifier-nocert", true, true);
+        let body = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-nocert",
+                "verifier-nocert",
+                "https://kharon.example.com/mcp",
+            ),
+            None,
+            None,
+        ));
+        let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "urn:kharon:oauth:grant-type:connector"),
+                ("refresh_token", &refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/connector"),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(r), "invalid_target");
+        let still = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", DASH_CLIENT),
+            ]),
+            None,
+            None,
+        ));
+        assert!(still["refresh_token"].is_string());
+
+        // Declared flag absent: `unauthorized_client`, refresh lives.
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture_with(dir.path(), true);
+        plant_spawn_code(&fx, "code-undeclared", "verifier-undeclared", true, false);
+        let body = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-undeclared",
+                "verifier-undeclared",
+                "https://kharon.example.com/mcp",
+            ),
+            None,
+            None,
+        ));
+        let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "urn:kharon:oauth:grant-type:connector"),
+                ("refresh_token", &refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/connector"),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(r), "unauthorized_client");
+        assert_eq!(
+            token_json(post_token(
+                &fx.ui,
+                oauth_token::TOKEN_PATH,
+                form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", &refresh),
+                    ("client_id", DASH_CLIENT),
+                ]),
+                None,
+                None,
+            ))["token_type"],
+            "Bearer"
+        );
+
+        // Declared, but the owner unticked fill.
+        let dir = tempfile::tempdir().unwrap();
+        let fx = token_fixture_with(dir.path(), true);
+        plant_spawn_code(&fx, "code-nofill", "verifier-nofill", false, true);
+        let body = token_json(post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            code_form(
+                "code-nofill",
+                "verifier-nofill",
+                "https://kharon.example.com/mcp",
+            ),
+            None,
+            None,
+        ));
+        let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+        let r = post_token(
+            &fx.ui,
+            oauth_token::TOKEN_PATH,
+            form(&[
+                ("grant_type", "urn:kharon:oauth:grant-type:connector"),
+                ("refresh_token", &refresh),
+                ("client_id", DASH_CLIENT),
+                ("resource", "https://kharon.example.com/connector"),
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_err(r), "invalid_grant");
+        let text = std::fs::read_to_string(dir.path().join("oauth/state.json")).unwrap();
+        assert!(!text.contains("\"audience\":\"connector\""));
     }
 
     #[test]

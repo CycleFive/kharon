@@ -69,6 +69,10 @@ const MAX_NAME: usize = 128;
 /// [`super::OwnerUi::client_admission`], the CIMD fetch from #229.
 pub struct OauthAs {
     pub discovery: Arc<Discovery>,
+    /// `[connector]` is configured, so the broker has a certificate
+    /// to pin. Spawn answers `invalid_target` without one (D3): a
+    /// missing connector config is not a connector resource.
+    pub connector_configured: bool,
 }
 
 const PENDING_PURPOSE: &str = "pending";

@@ -191,8 +191,10 @@ impl Discovery {
     }
 
     /// The protected resource: this deploy's public `/mcp` URL.
-    /// Authorize (REQ-OAU-003) and the token endpoint
-    /// (REQ-OAU-004) both require `resource` to equal it.
+    /// Authorize (REQ-OAU-003) and code redemption (REQ-OAU-004)
+    /// require `resource` to equal it. An MCP-family refresh may
+    /// name it or omit `resource`. The connector family names
+    /// [`Self::connector_resource`] instead.
     pub fn resource(&self) -> &str {
         &self.resource
     }
@@ -317,6 +319,14 @@ mod tests {
 
     fn discovery() -> Discovery {
         Discovery::new("https://kharon-owner.twkr.io".to_owned(), "kharon.twkr.io")
+    }
+
+    #[test]
+    fn connector_resource_is_the_deploy_connector_url() {
+        assert_eq!(
+            discovery().connector_resource(),
+            "https://kharon.twkr.io/connector"
+        );
     }
 
     #[test]

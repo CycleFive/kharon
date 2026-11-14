@@ -107,6 +107,7 @@ fn open_ui(
             access: None,
             oauth: Some(OauthAs {
                 discovery: Arc::new(discovery()),
+                connector_configured: false,
             }),
             admission: Some(clients),
             oauth_tokens: None,

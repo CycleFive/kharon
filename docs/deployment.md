@@ -1292,15 +1292,21 @@ guide.
 | Hostname | Path | Served by | Who calls it |
 |---|---|---|---|
 | `kharon.twkr.io` | `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource/mcp` | `[public_ingress]` (RFC 9728 protected-resource metadata, unauthenticated) | the MCP client |
+| `kharon.twkr.io` | `GET /.well-known/oauth-protected-resource/connector` | `[public_ingress]` (RFC 9728 connector metadata with `kharon_connector_pin`, unauthenticated; only with `[oauth]` and a `[connector]` certificate, 404 otherwise) | the dashboard runtime, to compare against its provisioned `broker_pin` — never to adopt it |
 | `kharon-owner.twkr.io` | `GET /.well-known/oauth-authorization-server` | owner UI listener (RFC 8414 metadata, unauthenticated) | the MCP client |
 | `kharon-owner.twkr.io` | `GET /oauth/authorize`, `GET /oauth/consent/<token>`, `POST /oauth/consent/*` | owner UI listener; consent needs a fresh passkey assertion | the owner's browser |
 | `kharon-owner.twkr.io` | `POST /oauth/token`, `POST /oauth/revoke` | owner UI listener; no session, no `Origin` | the dashboard's backend |
 
-**Tunnel routes.** The gateway hostname needs two more routes beside
-`^/mcp$` and `^/connector$`, both to `http://127.0.0.1:8790`:
-`^/\.well-known/oauth-protected-resource$` and
-`^/\.well-known/oauth-protected-resource/mcp$` (see the table in
-[Creating the tunnel](#creating-the-tunnel-owner)). The owner hostname
+**Tunnel routes.** The gateway hostname needs three more routes beside
+`^/mcp$` and `^/connector$`, all to `http://127.0.0.1:8790`:
+`^/\.well-known/oauth-protected-resource$`,
+`^/\.well-known/oauth-protected-resource/mcp$` and
+`^/\.well-known/oauth-protected-resource/connector$` (see the table in
+[Creating the tunnel](#creating-the-tunnel-owner)). The connector
+route publishes the inner pin for comparison only (#235 D1): a
+dashboard runtime must already hold `broker_pin` from operator
+provisioning, must hard-stop on a mismatch, and must never adopt the
+published value. The owner hostname
 needs nothing new: its route from
 [Publishing the owner UI](#publishing-the-owner-ui) step 3 has an
 empty path, so it already covers every path above. Without `[oauth]`,
@@ -1433,9 +1439,10 @@ dashboard-managed tunnel. Add public-hostname routes for
 | `^/connector$` | `http://127.0.0.1:8790` |
 | `^/\.well-known/oauth-protected-resource$` (with `[oauth]`) | `http://127.0.0.1:8790` |
 | `^/\.well-known/oauth-protected-resource/mcp$` (with `[oauth]`) | `http://127.0.0.1:8790` |
+| `^/\.well-known/oauth-protected-resource/connector$` (with `[oauth]` and a `[connector]` certificate) | `http://127.0.0.1:8790` |
 | (catch-all) | `HTTP Status: 404` |
 
-The two `.well-known` routes are needed only when the deploy has
+The three `.well-known` routes are needed only when the deploy has
 `[oauth]` for dashboard Connect (see
 [OAuth discovery and Connect endpoints](#oauth-discovery-and-connect-endpoints-n3)).
 Without them a dashboard cannot discover the authorization server.

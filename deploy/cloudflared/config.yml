@@ -66,6 +66,9 @@ ingress:
   # - hostname: kharon.twkr.io
   #   path: ^/\.well-known/oauth-protected-resource/mcp$
   #   service: https://<BROKER-TAILNET-IP>:8790
+  # - hostname: kharon.twkr.io
+  #   path: ^/\.well-known/oauth-protected-resource/connector$
+  #   service: https://<BROKER-TAILNET-IP>:8790
   # Everything else: the owner UI, /v1/*, /healthz, raw CDP, the
   # [connector] port, any other hostname.
   - service: http_status:404

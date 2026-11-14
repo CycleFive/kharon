@@ -535,12 +535,111 @@ async fn oauth_discovery_is_served_when_oauth_is_configured() {
 }
 
 #[tokio::test]
+async fn req_oau_009_connector_metadata_publishes_the_pin_and_nothing_else_changes() {
+    // Spec test plan "Metadata" (#235 D1): with [oauth] and a
+    // connector certificate, the connector document is the D1
+    // document, Cache-Control: no-store, and its pin equals the
+    // SHA-256 of that certificate's DER — pin_of_der, the exact
+    // function a successful relay-test client pins with
+    // (req_arch_002_ws_relay). The pin may appear in assertions:
+    // it is public.
+    let CertifiedKey { cert, .. } = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let pin: String = kharond::connector::pin_of_der(cert.der())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let discovery = kharond::api::oauth::Discovery::new(
+        "https://kharon-owner.twkr.io".to_owned(),
+        "kharon.twkr.io",
+    )
+    .with_connector_pin(pin.clone());
+    let h = Harness::with(false, |b| b.with_oauth(discovery.clone()));
+    let addr = serve_public(h.broker.clone()).await;
+
+    let r = raw_request(
+        addr,
+        request(
+            "GET",
+            "/.well-known/oauth-protected-resource/connector",
+            None,
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        r.json(),
+        json!({
+            "resource": "https://kharon.twkr.io/connector",
+            "authorization_servers": ["https://kharon-owner.twkr.io"],
+            "scopes_supported": ["kharon:connector"],
+            "resource_name": "kharon",
+            "kharon_connector_pin": pin,
+        })
+    );
+
+    // The /mcp and root documents are byte-for-byte the phase 1
+    // documents: no pin, no connector scope.
+    for target in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ] {
+        let r = raw_request(addr, request("GET", target, None).as_bytes()).await;
+        assert_eq!(r.status, 200, "{target}: {}", r.body);
+        assert_eq!(
+            r.json(),
+            discovery.protected_resource_metadata(),
+            "{target}"
+        );
+        assert!(!r.body.contains("kharon_connector_pin"), "{target}");
+        assert!(!r.body.contains("kharon:connector"), "{target}");
+    }
+
+    // GET /connector stays the WebSocket upgrade route, not this
+    // document: with no WsEntry mounted it is the uniform 404.
+    let r = raw_request(addr, request("GET", "/connector", None).as_bytes()).await;
+    assert_not_found(r.status, &r.body, "GET /connector");
+}
+
+#[tokio::test]
+async fn req_oau_009_connector_metadata_is_404_without_a_connector_certificate() {
+    // [oauth] set but no connector certificate configured: the
+    // connector document does not exist, while the /mcp document
+    // still serves.
+    let discovery = kharond::api::oauth::Discovery::new(
+        "https://kharon-owner.twkr.io".to_owned(),
+        "kharon.twkr.io",
+    );
+    let h = Harness::with(false, |b| b.with_oauth(discovery.clone()));
+    let addr = serve_public(h.broker.clone()).await;
+    let r = raw_request(
+        addr,
+        request(
+            "GET",
+            "/.well-known/oauth-protected-resource/connector",
+            None,
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_not_found(r.status, &r.body, "connector metadata without a pin");
+    let r = raw_request(
+        addr,
+        request("GET", "/.well-known/oauth-protected-resource/mcp", None).as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+#[tokio::test]
 async fn without_oauth_discovery_is_the_uniform_404_and_the_challenge_is_bare() {
     let h = Harness::new(false);
     let addr = serve_public(h.broker.clone()).await;
     for target in [
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource/connector",
     ] {
         let r = raw_request(addr, request("GET", target, None).as_bytes()).await;
         assert_not_found(r.status, &r.body, target);

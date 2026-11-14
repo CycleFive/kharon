@@ -131,6 +131,12 @@ pub enum Event {
     /// revoked for reuse. `agent_id` is the Connect's `c-…` id,
     /// `origin` the client's CIMD hostname, channel `web_ui`.
     OauthRefreshReuse,
+    /// REQ-OAU-004 (#307, D4): the connector family was spawned, or
+    /// that spawn's persist failed. `agent_id` is the `c-…` id,
+    /// `origin` the CIMD hostname. No channel: the client's own
+    /// request. `result` is `issued` or `persist_failed`. No token
+    /// and no pin. A lost-response retry of the spawn writes nothing.
+    OauthConnectorGrant,
 }
 
 impl Event {
@@ -174,6 +180,7 @@ impl Event {
             Event::OauthConnect => "oauth_connect",
             Event::OauthDisconnect => "oauth_disconnect",
             Event::OauthRefreshReuse => "oauth_refresh_reuse",
+            Event::OauthConnectorGrant => "oauth_connector_grant",
         }
     }
 }
@@ -224,6 +231,7 @@ impl<'de> Deserialize<'de> for Event {
             "oauth_connect" => Event::OauthConnect,
             "oauth_disconnect" => Event::OauthDisconnect,
             "oauth_refresh_reuse" => Event::OauthRefreshReuse,
+            "oauth_connector_grant" => Event::OauthConnectorGrant,
             "oauth_client_refused" => Event::OauthClientRefused,
             other => {
                 return Err(serde::de::Error::custom(format!(

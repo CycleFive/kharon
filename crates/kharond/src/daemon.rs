@@ -1107,6 +1107,9 @@ pub async fn start(
     if let Some(store) = broker.oauth_store() {
         store.set_lifecycle(Arc::new(DaemonOauthLifecycle {
             broker: Arc::clone(&broker),
+            // Reuse of either refresh family ends the live connector
+            // session (A3). No hub when `[connector]` is unset.
+            hub: connector.as_ref().map(|rt| Arc::clone(&rt.hub)),
         }));
     }
     // #199: the connector's two audit events go through the broker's
@@ -1311,6 +1314,9 @@ async fn bind_owner_ui(
     ) {
         (Some(_), Some(host)) => Some(crate::owner_ui::OauthAs {
             discovery: Arc::new(crate::api::oauth::Discovery::new(origin.clone(), host)),
+            // `[connector]` carries the certificate spawn requires
+            // (D3). Absent, the extension grant is `invalid_target`.
+            connector_configured: cfg.connector.is_some(),
         }),
         _ => None,
     };
@@ -1518,6 +1524,9 @@ impl crate::api::cimd::RefusalAudit for DaemonCimdAudit {
 /// Connect that ends drops its live grants on the broker.
 struct DaemonOauthLifecycle {
     broker: Arc<DaemonBroker>,
+    /// The connector hub, when `[connector]` is configured. Ending a
+    /// Connect drops that identity's live session (A3).
+    hub: Option<Arc<crate::connector::Hub>>,
 }
 
 impl crate::api::oauth_store::ConnectLifecycle for DaemonOauthLifecycle {
@@ -1526,6 +1535,9 @@ impl crate::api::oauth_store::ConnectLifecycle for DaemonOauthLifecycle {
     }
 
     fn connect_ended(&self, agent_id: &str) {
+        if let Some(hub) = &self.hub {
+            hub.disconnect(agent_id);
+        }
         self.broker.revoke_connect_grants(agent_id);
     }
 }

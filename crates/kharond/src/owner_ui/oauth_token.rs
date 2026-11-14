@@ -27,7 +27,10 @@ use axum::http::{Method, StatusCode};
 use serde_json::json;
 
 use super::{Incoming, OwnerUi, Response, json_body, method_not_allowed, sha256};
-use crate::api::oauth_store::{CodeClaim, CodeGrant, DisconnectDetail, OauthStore, TokenError};
+use crate::api::oauth::CONNECTOR_GRANT_TYPE;
+use crate::api::oauth_store::{
+    CodeClaim, CodeGrant, DisconnectDetail, OauthStore, RefreshResource, SpawnRequest, TokenError,
+};
 
 /// A redeemed authorization code, carried from the authorize side
 /// to the token store: #230's `CodeBody` across the seam.
@@ -187,16 +190,24 @@ impl OwnerUi {
                 let Some(client_id) = form.get("client_id") else {
                     return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
                 };
-                match side.store.refresh(presented, client_id, now) {
-                    Ok(pair) => token_answer(pair),
-                    Err(TokenError::InvalidGrant) => {
-                        oauth_error(StatusCode::BAD_REQUEST, "invalid_grant")
-                    }
-                    Err(TokenError::AuditFailed | TokenError::PersistFailed) => {
-                        oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
-                    }
-                }
+                let Some(oauth) = &self.oauth else {
+                    return oauth_error(StatusCode::NOT_FOUND, "not_found");
+                };
+                // `resource` is optional. Omitted, an MCP-family
+                // token still rotates (phase 1). A connector-family
+                // token needs this deploy's `/connector` URL (D3).
+                let connector = oauth.discovery.connector_resource();
+                let resource = RefreshResource {
+                    presented: form.get("resource"),
+                    mcp: oauth.discovery.resource(),
+                    connector: &connector,
+                };
+                map_token_result(
+                    side.store
+                        .refresh_for(presented, client_id, Some(resource), now),
+                )
             }
+            Some(CONNECTOR_GRANT_TYPE) => self.oauth_token_spawn(&form, side, now),
             Some(_) => oauth_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
             None => oauth_error(StatusCode::BAD_REQUEST, "invalid_request"),
         }
@@ -278,13 +289,34 @@ impl OwnerUi {
             consented_at: body.consented_at,
             connector_grant_declared: body.connector_grant_declared,
         };
-        match side.store.connect(&grant, verifier, code_hash, now) {
-            Ok(pair) => token_answer(pair),
-            Err(TokenError::InvalidGrant) => oauth_error(StatusCode::BAD_REQUEST, "invalid_grant"),
-            Err(TokenError::AuditFailed | TokenError::PersistFailed) => {
-                oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
-            }
-        }
+        map_token_result(side.store.connect(&grant, verifier, code_hash, now))
+    }
+
+    /// The connector extension grant (D3). `resource` is required:
+    /// omitting it is `invalid_request`, not a spawn at the `/mcp`
+    /// URL. The store checks `client_id` before the resource.
+    fn oauth_token_spawn(&self, form: &Form, side: &TokenSide, now: u64) -> Response {
+        let (Some(presented), Some(client_id), Some(resource)) = (
+            form.get("refresh_token"),
+            form.get("client_id"),
+            form.get("resource"),
+        ) else {
+            return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+        };
+        let Some(oauth) = &self.oauth else {
+            return oauth_error(StatusCode::NOT_FOUND, "not_found");
+        };
+        let connector = oauth.discovery.connector_resource();
+        map_token_result(side.store.spawn(
+            SpawnRequest {
+                refresh_token: presented,
+                client_id,
+                resource,
+                connector_resource: &connector,
+                connector_configured: oauth.connector_configured,
+            },
+            now,
+        ))
     }
 
     fn oauth_revoke(&self, req: &Incoming, side: &TokenSide) -> Response {
@@ -300,6 +332,23 @@ impl OwnerUi {
         match side.store.revoke(token, unix_now()) {
             Ok(()) => json_body(StatusCode::OK, String::new(), None),
             Err(_) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+        }
+    }
+}
+
+/// Map a store result onto the token-endpoint status. Every OAuth
+/// error here is 400; a failed audit or persist is 500 and carries
+/// no token.
+fn map_token_result(result: Result<crate::api::oauth_store::IssuedPair, TokenError>) -> Response {
+    match result {
+        Ok(pair) => token_answer(pair),
+        Err(TokenError::InvalidGrant) => oauth_error(StatusCode::BAD_REQUEST, "invalid_grant"),
+        Err(TokenError::InvalidTarget) => oauth_error(StatusCode::BAD_REQUEST, "invalid_target"),
+        Err(TokenError::UnauthorizedClient) => {
+            oauth_error(StatusCode::BAD_REQUEST, "unauthorized_client")
+        }
+        Err(TokenError::AuditFailed | TokenError::PersistFailed) => {
+            oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
         }
     }
 }

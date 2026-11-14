@@ -9,8 +9,10 @@
 //! holds only their SHA-256 hashes, with the identities (D3). Each
 //! record stores an audience (`mcp` or `connector`) in its own
 //! field, not in scope or resource (D4, #304). A phase-1 file omits
-//! the field and loads as `mcp`. Code redemption and refresh issue
-//! `mcp`. Codes are never written here: they live in the authorize
+//! the field and loads as `mcp`. Code redemption issues `mcp`.
+//! Refresh rotates inside the presented token's family (#307). The
+//! connector family is born from the extension grant, not from a
+//! code. Codes are never written here: they live in the authorize
 //! side's memory (#230). The redeemed-code set that makes a second
 //! redemption revoke is memory-only too, expiring with the code. A pending
 //! marker is recorded in that set atomically with the code take
@@ -20,8 +22,9 @@
 //!
 //! Ordering follows I5 / REQ-AUD-003, and the two directions fail
 //! closed opposite ways, on purpose:
-//! - **Issuance** (connect, refresh): audit first where an entry is
-//!   owed (`oauth_connect`), then persist, then answer. Re-check,
+//! - **Issuance** (connect, spawn, refresh): audit first where an
+//!   entry is owed (`oauth_connect`, `oauth_connector_grant`), then
+//!   persist, then answer. Re-check,
 //!   mutation, persist and commit all happen under the one store
 //!   lock, so concurrent writers cannot overwrite each other (or
 //!   resurrect a Connect an ending path just revoked); a failed
@@ -89,10 +92,48 @@ pub enum TokenError {
     /// The presented code or token is unknown, expired, spent or
     /// otherwise not usable.
     InvalidGrant,
-    /// The `oauth_connect` append failed: nothing was created.
+    /// The `oauth_connect` or `oauth_connector_grant` append failed:
+    /// nothing was created.
     AuditFailed,
     /// The state write failed: no tokens are answered.
     PersistFailed,
+    /// `resource` is not the one this family mints (D3). The
+    /// presented token is left as it was.
+    InvalidTarget,
+    /// The client did not declare the connector extension grant at
+    /// consent (D3, A11).
+    UnauthorizedClient,
+}
+
+/// The `resource` a refresh named, plus the two URLs this deploy
+/// mints (D3). Absent on [`OauthStore::refresh`], which is the
+/// phase-1 call: an MCP-family token rotates, and a
+/// connector-family token is [`TokenError::InvalidTarget`].
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshResource<'a> {
+    /// The request's `resource`, when it sent one.
+    pub presented: Option<&'a str>,
+    /// This deploy's `/mcp` URL.
+    pub mcp: &'a str,
+    /// This deploy's `/connector` URL.
+    pub connector: &'a str,
+}
+
+/// `POST /oauth/token` with the connector extension grant (D3).
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnRequest<'a> {
+    /// The presented refresh token.
+    pub refresh_token: &'a str,
+    /// Must be the client the token was issued to. A mismatch is
+    /// [`TokenError::InvalidGrant`] and is not reuse.
+    pub client_id: &'a str,
+    /// The request's `resource`.
+    pub resource: &'a str,
+    /// This deploy's `/connector` URL.
+    pub connector_resource: &'a str,
+    /// `[connector]` has a certificate. Without it the resource is
+    /// not a connector target.
+    pub connector_configured: bool,
 }
 
 /// A freshly issued token pair, plaintext, for the one response
@@ -250,9 +291,9 @@ struct TokenRecord {
     hash: String,
     kind: TokenKind,
     identity_id: String,
-    /// The refresh family: one per Connect, named by the identity.
-    /// Not the audience — a Connect has one family today, and the
-    /// audience says which surface the token is for.
+    /// The Connect id this token descends from. Not the audience:
+    /// a Connect has two refresh lines, and [`TokenAudience`] says
+    /// which one a record belongs to (D3, D4).
     family: String,
     /// `mcp` or `connector`. Absent on a phase-1 record, which
     /// deserializes as [`TokenAudience::Mcp`].
@@ -638,14 +679,30 @@ impl OauthStore {
         }
     }
 
-    /// `grant_type=refresh_token`: rotate, applying the idle and
-    /// absolute limits, the 30 s grace and reuse detection (D4, I5).
-    /// `client_id` must name the client the token was issued to
-    /// (OAuth 2.1 §4.3); it is compared under the store lock.
+    /// `grant_type=refresh_token` with no `resource` (phase 1). An
+    /// MCP-family token rotates. A connector-family token is
+    /// [`TokenError::InvalidTarget`] and stays live: refresh does
+    /// not turn it into an `/mcp` pair.
     pub fn refresh(
         &self,
         presented: &str,
         client_id: &str,
+        now: u64,
+    ) -> Result<IssuedPair, TokenError> {
+        self.refresh_for(presented, client_id, None, now)
+    }
+
+    /// `grant_type=refresh_token` for one family (D3). The new pair
+    /// keeps the presented token's audience. The other family's
+    /// tokens are not retired. A `resource` from the wrong cell of
+    /// D3's table is [`TokenError::InvalidTarget`], and the
+    /// presented token stays as it was — including a retired token,
+    /// which does not trip reuse on the wrong resource.
+    pub fn refresh_for(
+        &self,
+        presented: &str,
+        client_id: &str,
+        resource: Option<RefreshResource<'_>>,
         now: u64,
     ) -> Result<IssuedPair, TokenError> {
         let hash = hex(&sha256(presented.as_bytes()));
@@ -683,18 +740,12 @@ impl OauthStore {
             if identity.revoked || rec.status == TokenStatus::Revoked {
                 return Err(TokenError::InvalidGrant);
             }
-            let grace = rec.status == TokenStatus::Retired
-                && !rec.grace_used
-                && rec
-                    .retired_at
-                    .is_some_and(|t| now.saturating_sub(t) <= GRACE_SECS)
-                && rec.successor.as_ref().is_some_and(|succ| {
-                    inner.file.tokens.iter().any(|t| {
-                        t.hash == *succ
-                            && t.status == TokenStatus::Live
-                            && t.identity_id == rec.identity_id
-                    })
-                });
+            // Before grace and reuse, so the wrong cell does not
+            // retire a live token and does not end the Connect.
+            if !family_resource_ok(rec.audience, resource) {
+                return Err(TokenError::InvalidTarget);
+            }
+            let grace = refresh_grace(&rec, &inner.file.tokens, now);
             if rec.status == TokenStatus::Retired && !grace {
                 Outcome::Reuse(rec.identity_id.clone())
             } else {
@@ -708,10 +759,11 @@ impl OauthStore {
                 // failed write restores the snapshot, so the
                 // presented token stays as it was for a retry.
                 let backup = inner.file.clone();
-                // Refresh issues audience `mcp`, as code redemption
-                // does. A connector family's rotation is a later slice.
+                // Rotate inside the presented family. A connector
+                // refresh stays audience `connector`; it does not
+                // become an `/mcp` pair.
                 let (pair, access_rec, refresh_rec) =
-                    issue_pair(&identity, Some(hash.clone()), now, TokenAudience::Mcp);
+                    issue_pair(&identity, Some(hash.clone()), now, rec.audience);
                 if grace {
                     inner.file.tokens[pos].grace_used = true;
                     // The pair issued moments before is superseded,
@@ -759,24 +811,158 @@ impl OauthStore {
         match outcome {
             Outcome::Pair(pair) => Ok(pair),
             Outcome::PersistFailed => Err(TokenError::PersistFailed),
-            Outcome::Reuse(identity_id) => {
-                // Reuse (I5): revoke first — memory and the state
-                // file — then audit `oauth_refresh_reuse`. The
-                // answer is `invalid_grant` whatever the write did.
-                let ended = self.end_connect(&identity_id);
-                if let Some(identity) = ended {
-                    let entry = Entry::new(Event::OauthRefreshReuse)
-                        .agent_id(identity.id.clone())
-                        .channel("web_ui")
-                        .result("revoked");
-                    let entry = match cimd_host(&identity.client_id) {
-                        Some(host) => entry.origin(host),
-                        None => entry,
-                    };
-                    self.append(entry);
-                }
-                Err(TokenError::InvalidGrant)
+            Outcome::Reuse(identity_id) => Err(self.reuse_ended(&identity_id)),
+        }
+    }
+
+    /// `grant_type=urn:kharon:oauth:grant-type:connector` (D3).
+    ///
+    /// Checked in the spec's order, with `client_id` first so a
+    /// mismatch is [`TokenError::InvalidGrant`] and is not reuse.
+    /// Then the connector resource (and a configured certificate),
+    /// then whether the token is a live MCP-family refresh, then
+    /// the declaration recorded at consent, then `kharon:fill`.
+    /// The declaration is read off the live identity: a revoked
+    /// identity still answers [`Self::connector_grant_declared`],
+    /// and that answer is not a spawn.
+    ///
+    /// The first spawn appends `oauth_connector_grant` before the
+    /// persist (D4). A failed append stores nothing. A failed
+    /// persist rolls the family back, leaves the MCP refresh token
+    /// live, and appends the compensating `persist_failed` result.
+    /// One retry within [`GRACE_SECS`] replaces the pair and writes
+    /// no second entry. A further spawn is [`TokenError::InvalidGrant`]
+    /// and does not end the Connect.
+    pub fn spawn(&self, req: SpawnRequest<'_>, now: u64) -> Result<IssuedPair, TokenError> {
+        let hash = hex(&sha256(req.refresh_token.as_bytes()));
+        enum Outcome {
+            Issued(IssuedPair),
+            /// `Some` when `issued` was already appended and the
+            /// compensating entry is owed. `None` on a grace retry,
+            /// which wrote no entry.
+            PersistFailed(Option<(String, Option<String>)>),
+            Reuse(String),
+        }
+        let outcome = {
+            let mut inner = self.lock();
+            let Some(pos) = inner.file.tokens.iter().position(|t| t.hash == hash) else {
+                return Err(TokenError::InvalidGrant);
+            };
+            let rec = inner.file.tokens[pos].clone();
+            if rec.kind != TokenKind::Refresh {
+                return Err(TokenError::InvalidGrant);
             }
+            let Some(identity) = inner.file.identity(&rec.identity_id).cloned() else {
+                return Err(TokenError::InvalidGrant);
+            };
+            // 0. client_id, before resource and before reuse.
+            if identity.client_id != req.client_id {
+                return Err(TokenError::InvalidGrant);
+            }
+            // 1. The connector resource, and a certificate. A miss
+            // does not retire the token and does not trip reuse.
+            if !req.connector_configured || req.resource != req.connector_resource {
+                return Err(TokenError::InvalidTarget);
+            }
+            if identity.revoked || rec.status == TokenStatus::Revoked {
+                return Err(TokenError::InvalidGrant);
+            }
+            // 2. A live MCP-family refresh, or a retired one under
+            // the same grace rule as refresh — except the inside-
+            // grace answer issues nothing and does not spend it.
+            if rec.audience != TokenAudience::Mcp {
+                return Err(TokenError::InvalidGrant);
+            }
+            if rec.status == TokenStatus::Retired {
+                if refresh_grace(&rec, &inner.file.tokens, now) {
+                    return Err(TokenError::InvalidGrant);
+                }
+                Outcome::Reuse(rec.identity_id)
+            } else if now >= rec.expires_at || refresh_deadline(&identity, now) <= now {
+                return Err(TokenError::InvalidGrant);
+            } else if !identity.connector_grant_declared {
+                // 3. The flag recorded at consent. A phase-1 record
+                // loads as not declared. Liveness was checked above,
+                // so a revoked identity never reaches this arm.
+                return Err(TokenError::UnauthorizedClient);
+            } else if !identity.scopes.iter().any(|s| s == "kharon:fill") {
+                // 4. Nothing for a browser to do.
+                return Err(TokenError::InvalidGrant);
+            } else {
+                match connector_family(&inner.file.tokens, &identity.id, now) {
+                    ConnectorFamily::Grace(family_pos) => {
+                        let backup = inner.file.clone();
+                        let old_hash = inner.file.tokens[family_pos].hash.clone();
+                        let (pair, access_rec, refresh_rec) = issue_pair(
+                            &identity,
+                            Some(old_hash.clone()),
+                            now,
+                            TokenAudience::Connector,
+                        );
+                        {
+                            let old = &mut inner.file.tokens[family_pos];
+                            old.status = TokenStatus::Retired;
+                            old.retired_at = Some(now);
+                            old.grace_used = true;
+                            old.successor = Some(refresh_rec.hash.clone());
+                        }
+                        for token in inner.file.tokens.iter_mut() {
+                            if token.kind == TokenKind::Access
+                                && token.parent.as_deref() == Some(old_hash.as_str())
+                                && token.status == TokenStatus::Live
+                            {
+                                token.status = TokenStatus::Revoked;
+                            }
+                        }
+                        inner.file.tokens.push(access_rec);
+                        inner.file.tokens.push(refresh_rec);
+                        match self.persist(&inner.file) {
+                            Ok(()) => Outcome::Issued(pair),
+                            Err(_) => {
+                                inner.file = backup;
+                                // No `issued` entry was written, so
+                                // there is nothing to compensate.
+                                Outcome::PersistFailed(None)
+                            }
+                        }
+                    }
+                    ConnectorFamily::Exists => return Err(TokenError::InvalidGrant),
+                    ConnectorFamily::None => {
+                        let origin = identity.audit_origin();
+                        let entry = connector_grant_entry(&identity.id, &origin, "issued", None);
+                        if !self.append(entry) {
+                            return Err(TokenError::AuditFailed);
+                        }
+                        let backup = inner.file.clone();
+                        let (pair, access_rec, refresh_rec) =
+                            issue_pair(&identity, None, now, TokenAudience::Connector);
+                        inner.file.tokens.push(access_rec);
+                        inner.file.tokens.push(refresh_rec);
+                        match self.persist(&inner.file) {
+                            Ok(()) => Outcome::Issued(pair),
+                            Err(_) => {
+                                inner.file = backup;
+                                Outcome::PersistFailed(Some((identity.id.clone(), origin)))
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        match outcome {
+            Outcome::Issued(pair) => Ok(pair),
+            Outcome::PersistFailed(compensate) => {
+                if let Some((id, origin)) = compensate {
+                    self.append(connector_grant_entry(
+                        &id,
+                        &origin,
+                        "persist_failed",
+                        Some("persist_failed"),
+                    ));
+                }
+                Err(TokenError::PersistFailed)
+            }
+            Outcome::Reuse(identity_id) => Err(self.reuse_ended(&identity_id)),
         }
     }
 
@@ -987,6 +1173,27 @@ impl OauthStore {
             .map(|i| i.client_name.clone())
     }
 
+    /// Reuse of either family (I5, A3): revoke first — memory and
+    /// the state file, which also drops the live connector session
+    /// through [`ConnectLifecycle::connect_ended`] — then audit
+    /// `oauth_refresh_reuse`. The answer is `invalid_grant`
+    /// whatever the write did.
+    fn reuse_ended(&self, identity_id: &str) -> TokenError {
+        let ended = self.end_connect(identity_id);
+        if let Some(identity) = ended {
+            let entry = Entry::new(Event::OauthRefreshReuse)
+                .agent_id(identity.id.clone())
+                .channel("web_ui")
+                .result("revoked");
+            let entry = match cimd_host(&identity.client_id) {
+                Some(host) => entry.origin(host),
+                None => entry,
+            };
+            self.append(entry);
+        }
+        TokenError::InvalidGrant
+    }
+
     /// The shared tail of every Connect-ending path: mutate memory
     /// first (fail closed in-process), then persist, then the
     /// grants hook. Returns the identity as it stood, when a live
@@ -1051,11 +1258,97 @@ fn refresh_deadline(identity: &Identity, issued_at: u64) -> u64 {
         .min(identity.consented_at.saturating_add(REFRESH_ABSOLUTE_SECS))
 }
 
+/// Whether `rec` is inside I5's one retry: retired, grace unused,
+/// within [`GRACE_SECS`], and its successor still live.
+fn refresh_grace(rec: &TokenRecord, tokens: &[TokenRecord], now: u64) -> bool {
+    rec.status == TokenStatus::Retired
+        && !rec.grace_used
+        && rec
+            .retired_at
+            .is_some_and(|t| now.saturating_sub(t) <= GRACE_SECS)
+        && rec.successor.as_ref().is_some_and(|succ| {
+            tokens.iter().any(|t| {
+                t.hash == *succ && t.status == TokenStatus::Live && t.identity_id == rec.identity_id
+            })
+        })
+}
+
+/// D3's resource cell. `None` is a phase-1 refresh: the MCP family
+/// rotates, the connector family does not.
+fn family_resource_ok(audience: TokenAudience, resource: Option<RefreshResource<'_>>) -> bool {
+    match audience {
+        TokenAudience::Mcp => match resource {
+            None => true,
+            Some(r) => r.presented.is_none_or(|presented| presented == r.mcp),
+        },
+        TokenAudience::Connector => resource.is_some_and(|r| r.presented == Some(r.connector)),
+    }
+}
+
+/// Where the connector refresh line stands for one identity.
+enum ConnectorFamily {
+    /// No connector refresh has been issued.
+    None,
+    /// The one pair from the spawn, still inside the lost-response
+    /// window, grace not yet spent.
+    Grace(usize),
+    /// A family exists and the lost-response retry is not available.
+    Exists,
+}
+
+fn connector_family(tokens: &[TokenRecord], identity_id: &str, now: u64) -> ConnectorFamily {
+    let positions: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| {
+            token.identity_id == identity_id
+                && token.kind == TokenKind::Refresh
+                && token.audience == TokenAudience::Connector
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match positions.as_slice() {
+        [] => ConnectorFamily::None,
+        [pos] => {
+            let rec = &tokens[*pos];
+            if rec.status == TokenStatus::Live
+                && !rec.grace_used
+                && now.saturating_sub(rec.issued_at) <= GRACE_SECS
+            {
+                ConnectorFamily::Grace(*pos)
+            } else {
+                ConnectorFamily::Exists
+            }
+        }
+        _ => ConnectorFamily::Exists,
+    }
+}
+
+/// `oauth_connector_grant`. No channel, no token (D4).
+fn connector_grant_entry(
+    agent_id: &str,
+    origin: &Option<String>,
+    result: &str,
+    detail: Option<&str>,
+) -> Entry {
+    let entry = Entry::new(Event::OauthConnectorGrant)
+        .agent_id(agent_id)
+        .result(result);
+    let entry = match origin {
+        Some(host) => entry.origin(host.clone()),
+        None => entry,
+    };
+    match detail {
+        Some(detail) => entry.detail_code(detail),
+        None => entry,
+    }
+}
+
 /// Mint a token pair for `identity`. `parent` is the hash of the
-/// refresh token being rotated from (`None` for a Connect's first
-/// pair). `audience` is stored on both records. Code redemption
-/// and refresh pass [`TokenAudience::Mcp`]; they do not issue a
-/// connector audience.
+/// refresh token being rotated from (`None` for a family's first
+/// pair). `audience` is stored on both records and selects the
+/// token response's `scope`: the identity's granted scopes for
+/// `mcp`, exactly `kharon:connector` for `connector`.
 fn issue_pair(
     identity: &Identity,
     parent: Option<String>,
@@ -1093,10 +1386,14 @@ fn issue_pair(
         successor: None,
         grace_used: false,
     };
+    let scope = match audience {
+        TokenAudience::Mcp => identity.scopes.join(" "),
+        TokenAudience::Connector => super::oauth::CONNECTOR_SCOPE.to_owned(),
+    };
     let pair = IssuedPair {
         access_token,
         refresh_token,
-        scope: identity.scopes.join(" "),
+        scope,
     };
     (pair, access_rec, refresh_rec)
 }
@@ -1249,6 +1546,12 @@ mod tests {
         let recording = Arc::new(Recording::default());
         store.set_lifecycle(recording.clone() as Arc<dyn ConnectLifecycle>);
         (Arc::new(store), recording)
+    }
+
+    /// Same as [`store`]. The new tests call this so a local
+    /// `store` binding does not shadow the helper.
+    fn fresh(dir: &Path) -> (Arc<OauthStore>, Arc<Recording>) {
+        store(dir)
     }
 
     fn grant(verifier: &str) -> (CodeGrant, String) {
@@ -1868,5 +2171,704 @@ mod tests {
         });
         assert!(matches!(again, CodeClaim::Reuse { identity_id: None }));
         assert!(recording.ended.lock().unwrap().is_empty());
+    }
+
+    const MCP_URL: &str = "https://kharon.example.com/mcp";
+    const CONNECTOR_URL: &str = "https://kharon.example.com/connector";
+
+    fn declared(verifier: &str) -> (CodeGrant, String) {
+        let (mut grant, verifier) = grant(verifier);
+        grant.connector_grant_declared = true;
+        (grant, verifier)
+    }
+
+    fn connect_declared(store: &OauthStore, code: &[u8]) -> (IssuedPair, String) {
+        let (grant, verifier) = declared("declared-verifier");
+        let pair = store.connect(&grant, &verifier, sha256(code), NOW).unwrap();
+        let id = store
+            .authenticate_access(&pair.access_token, NOW)
+            .unwrap()
+            .agent_id;
+        (pair, id)
+    }
+
+    fn spawn_with(
+        store: &OauthStore,
+        refresh: &str,
+        client_id: &str,
+        resource: &str,
+        configured: bool,
+        now: u64,
+    ) -> Result<IssuedPair, TokenError> {
+        store.spawn(
+            SpawnRequest {
+                refresh_token: refresh,
+                client_id,
+                resource,
+                connector_resource: CONNECTOR_URL,
+                connector_configured: configured,
+            },
+            now,
+        )
+    }
+
+    fn spawn_at(store: &OauthStore, refresh: &str, now: u64) -> Result<IssuedPair, TokenError> {
+        spawn_with(store, refresh, CLIENT, CONNECTOR_URL, true, now)
+    }
+
+    fn refresh_resource(
+        store: &OauthStore,
+        token: &str,
+        resource: Option<&str>,
+        now: u64,
+    ) -> Result<IssuedPair, TokenError> {
+        store.refresh_for(
+            token,
+            CLIENT,
+            Some(RefreshResource {
+                presented: resource,
+                mcp: MCP_URL,
+                connector: CONNECTOR_URL,
+            }),
+            now,
+        )
+    }
+
+    fn connector_grants(recording: &Recording) -> Vec<(String, Option<String>, Option<String>)> {
+        recording
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.event == Event::OauthConnectorGrant)
+            .map(|entry| {
+                (
+                    entry.result.clone().unwrap_or_default(),
+                    entry.detail_code.clone(),
+                    entry.origin.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_grant_entries_carry_no_token(recording: &Recording, tokens: &[&str]) {
+        for entry in recording.entries.lock().unwrap().iter() {
+            if entry.event != Event::OauthConnectorGrant {
+                continue;
+            }
+            assert!(entry.channel.is_none());
+            let json = serde_json::to_string(entry).unwrap();
+            for token in tokens {
+                assert!(!json.contains(token), "{json}");
+            }
+        }
+    }
+
+    fn audiences(dir: &Path) -> Vec<String> {
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("oauth/state.json")).unwrap())
+                .unwrap();
+        value["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|token| token["audience"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Spawn. A live MCP refresh, fill, the declaration and the
+    /// connector resource issue scope `kharon:connector`. The MCP
+    /// refresh still rotates. The audit is one entry and no token.
+    #[test]
+    fn spawn_issues_a_connector_family_and_leaves_the_mcp_refresh_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (mcp, id) = connect_declared(&store, b"spawn-code");
+        let connector = spawn_at(&store, &mcp.refresh_token, NOW + 1).unwrap();
+        assert_eq!(connector.scope, "kharon:connector");
+        assert!(connector.access_token.starts_with("kh_at_"));
+        assert!(connector.refresh_token.starts_with("kh_rt_"));
+        assert_eq!(
+            store.token_audience(&connector.access_token),
+            Some(TokenAudience::Connector)
+        );
+        assert_eq!(
+            store.token_audience(&connector.refresh_token),
+            Some(TokenAudience::Connector)
+        );
+        let auth = store
+            .authenticate_access(&connector.access_token, NOW + 1)
+            .unwrap();
+        assert_eq!(auth.agent_id, id);
+        assert_eq!(auth.audience, TokenAudience::Connector);
+        let mcp2 = store.refresh(&mcp.refresh_token, CLIENT, NOW + 2).unwrap();
+        assert_eq!(
+            store.token_audience(&mcp2.access_token),
+            Some(TokenAudience::Mcp)
+        );
+        assert_eq!(mcp2.scope, "kharon:read kharon:fill");
+        assert!(
+            store
+                .authenticate_access(&connector.access_token, NOW + 2)
+                .is_some()
+        );
+        assert_eq!(
+            connector_grants(&recording),
+            vec![(
+                "issued".to_owned(),
+                None,
+                Some("dashboard.example".to_owned())
+            )]
+        );
+        assert_grant_entries_carry_no_token(
+            &recording,
+            &[
+                &connector.access_token,
+                &connector.refresh_token,
+                &mcp.access_token,
+                &mcp.refresh_token,
+                &mcp2.access_token,
+                &mcp2.refresh_token,
+            ],
+        );
+        let text = std::fs::read_to_string(dir.path().join("oauth/state.json")).unwrap();
+        assert!(!text.contains(&connector.access_token));
+        assert!(!text.contains(&connector.refresh_token));
+    }
+
+    /// Spawn's lost-response grace is one retry. A third spawn is
+    /// `invalid_grant` and the second pair still works. A spawn
+    /// after the window, with no retry taken, is the same and does
+    /// not end the Connect.
+    #[test]
+    fn spawn_grace_is_one_retry_and_a_further_spawn_does_not_end_the_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (mcp, _) = connect_declared(&store, b"grace-code");
+        let first = spawn_at(&store, &mcp.refresh_token, NOW + 10).unwrap();
+        let second = spawn_at(&store, &mcp.refresh_token, NOW + 10 + GRACE_SECS).unwrap();
+        assert_ne!(second.access_token, first.access_token);
+        assert_eq!(second.scope, "kharon:connector");
+        assert!(
+            store
+                .authenticate_access(&first.access_token, NOW + 10 + GRACE_SECS)
+                .is_none()
+        );
+        assert!(
+            store
+                .authenticate_access(&second.access_token, NOW + 10 + GRACE_SECS)
+                .is_some()
+        );
+        assert_eq!(connector_grants(&recording).len(), 1);
+        assert_eq!(
+            spawn_at(&store, &mcp.refresh_token, NOW + 10 + GRACE_SECS),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(
+            store
+                .authenticate_access(&second.access_token, NOW + 10 + GRACE_SECS)
+                .is_some()
+        );
+        assert!(store.refresh(&mcp.refresh_token, CLIENT, NOW + 11).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (mcp, _) = connect_declared(&store, b"late-code");
+        let first = spawn_at(&store, &mcp.refresh_token, NOW).unwrap();
+        assert_eq!(
+            spawn_at(&store, &mcp.refresh_token, NOW + GRACE_SECS + 1),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(
+            store
+                .authenticate_access(&first.access_token, NOW)
+                .is_some()
+        );
+        assert!(store.refresh(&mcp.refresh_token, CLIENT, NOW + 1).is_ok());
+        assert!(recording.ended.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spawn_without_fill_or_with_the_connector_refresh_issues_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (mut grant, verifier) = declared("read-only");
+        grant.scopes = vec!["kharon:read".to_owned()];
+        let pair = store
+            .connect(&grant, &verifier, sha256(b"read-only-code"), NOW)
+            .unwrap();
+        assert_eq!(
+            spawn_at(&store, &pair.refresh_token, NOW + 1),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(audiences(dir.path()).iter().all(|a| a == "mcp"));
+        assert!(store.refresh(&pair.refresh_token, CLIENT, NOW + 1).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (mcp, _) = connect_declared(&store, b"present-connector");
+        let connector = spawn_at(&store, &mcp.refresh_token, NOW + 1).unwrap();
+        assert_eq!(
+            spawn_at(&store, &connector.refresh_token, NOW + 2),
+            Err(TokenError::InvalidGrant)
+        );
+        let rotated = refresh_resource(
+            &store,
+            &connector.refresh_token,
+            Some(CONNECTOR_URL),
+            NOW + 3,
+        )
+        .unwrap();
+        assert_eq!(
+            store.token_audience(&rotated.access_token),
+            Some(TokenAudience::Connector)
+        );
+        assert_eq!(
+            store.token_audience(&rotated.refresh_token),
+            Some(TokenAudience::Connector)
+        );
+    }
+
+    /// A retired MCP refresh at spawn. Outside the grace it is
+    /// reuse. Inside it, nothing changes: the successor still
+    /// rotates, a spawn with that successor succeeds, and the
+    /// grace flag is still unused.
+    #[test]
+    fn a_retired_mcp_refresh_at_spawn_is_reuse_outside_the_grace_and_inert_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (mcp, id) = connect_declared(&store, b"retired-out");
+        let successor = store.refresh(&mcp.refresh_token, CLIENT, NOW + 60).unwrap();
+        assert_eq!(
+            spawn_at(&store, &mcp.refresh_token, NOW + 60 + GRACE_SECS + 1),
+            Err(TokenError::InvalidGrant)
+        );
+        assert_eq!(
+            store.refresh(&successor.refresh_token, CLIENT, NOW + 60 + GRACE_SECS + 2),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(
+            recording
+                .events()
+                .iter()
+                .any(|(event, _)| event == "oauth_refresh_reuse")
+        );
+        assert_eq!(recording.ended.lock().unwrap().as_slice(), [id.as_str()]);
+        assert!(connector_grants(&recording).is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (mcp, _) = connect_declared(&store, b"retired-in");
+        let successor = store
+            .refresh(&mcp.refresh_token, CLIENT, NOW + 100)
+            .unwrap();
+        let at = NOW + 100 + GRACE_SECS;
+        assert_eq!(
+            spawn_at(&store, &mcp.refresh_token, at),
+            Err(TokenError::InvalidGrant)
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("oauth/state.json")).unwrap(),
+        )
+        .unwrap();
+        let retired: Vec<bool> = value["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|token| token["kind"] == "refresh" && token["status"] == "retired")
+            .map(|token| token["grace_used"].as_bool().unwrap())
+            .collect();
+        assert_eq!(retired, vec![false]);
+        let rotated = store.refresh(&successor.refresh_token, CLIENT, at).unwrap();
+        let connector = spawn_at(&store, &rotated.refresh_token, at).unwrap();
+        assert_eq!(connector.scope, "kharon:connector");
+        assert!(recording.ended.lock().unwrap().is_empty());
+        // A wrong client presenting the retired token is not reuse.
+        assert_eq!(
+            spawn_with(
+                &store,
+                &mcp.refresh_token,
+                "https://other.example/client",
+                CONNECTOR_URL,
+                true,
+                at,
+            ),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(recording.ended.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spawn_requires_the_declaration_recorded_at_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        // Fill is granted. The document did not declare the grant,
+        // and adding it later does not change this Connect.
+        let (pair, id) = connect_one(&store);
+        assert_eq!(store.connector_grant_declared(&id), Some(false));
+        assert_eq!(
+            spawn_at(&store, &pair.refresh_token, NOW + 1),
+            Err(TokenError::UnauthorizedClient)
+        );
+        assert!(store.refresh(&pair.refresh_token, CLIENT, NOW + 1).is_ok());
+        assert!(connector_grants(&recording).is_empty());
+
+        // A phase-1 identity has no flag and loads as not declared.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (pair, id) = connect_declared(&store, b"phase1-flag");
+        drop(store);
+        let path = dir.path().join("oauth/state.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for identity in value["identities"].as_array_mut().unwrap() {
+            identity
+                .as_object_mut()
+                .unwrap()
+                .remove("connector_grant_declared");
+        }
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        let store = OauthStore::load(dir.path()).unwrap();
+        assert_eq!(store.connector_grant_declared(&id), Some(false));
+        assert_eq!(
+            spawn_at(&store, &pair.refresh_token, NOW + 1),
+            Err(TokenError::UnauthorizedClient)
+        );
+        assert!(store.refresh(&pair.refresh_token, CLIENT, NOW + 2).is_ok());
+
+        // The flag still answers after revocation. Spawn pairs it
+        // with liveness, so the answer is `invalid_grant`.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (pair, id) = connect_declared(&store, b"revoked-flag");
+        store
+            .disconnect(&id, DisconnectDetail::Owner, "web_ui", NOW)
+            .unwrap();
+        assert_eq!(store.connector_grant_declared(&id), Some(true));
+        assert_eq!(
+            spawn_at(&store, &pair.refresh_token, NOW + 1),
+            Err(TokenError::InvalidGrant)
+        );
+
+        // Declaration is checked before fill (spec rules 3 then 4).
+        // Missing both is `unauthorized_client`.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (mut grant, verifier) = grant("neither");
+        grant.scopes = vec!["kharon:read".to_owned()];
+        let pair = store
+            .connect(&grant, &verifier, sha256(b"neither-code"), NOW)
+            .unwrap();
+        assert_eq!(
+            spawn_at(&store, &pair.refresh_token, NOW + 1),
+            Err(TokenError::UnauthorizedClient)
+        );
+    }
+
+    #[test]
+    fn spawn_resource_and_certificate_are_invalid_target_and_do_not_retire() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (pair, _) = connect_declared(&store, b"resource");
+        for (resource, configured) in [
+            (MCP_URL, true),
+            ("https://kharon.example.com/elsewhere", true),
+            (CONNECTOR_URL, false),
+        ] {
+            assert_eq!(
+                spawn_with(
+                    &store,
+                    &pair.refresh_token,
+                    CLIENT,
+                    resource,
+                    configured,
+                    NOW + 1
+                ),
+                Err(TokenError::InvalidTarget),
+                "{resource} configured={configured}"
+            );
+        }
+        assert!(store.refresh(&pair.refresh_token, CLIENT, NOW + 1).is_ok());
+    }
+
+    /// Audit. One `oauth_connector_grant` per spawn. A failed append
+    /// stores nothing. A failed persist writes `persist_failed` and
+    /// leaves the MCP refresh token live.
+    #[test]
+    fn spawn_audit_precedes_the_persist_and_a_failed_persist_compensates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (pair, _) = connect_declared(&store, b"audit-fail");
+        *recording.fail_append.lock().unwrap() = true;
+        assert_eq!(
+            spawn_at(&store, &pair.refresh_token, NOW + 1),
+            Err(TokenError::AuditFailed)
+        );
+        *recording.fail_append.lock().unwrap() = false;
+        assert!(connector_grants(&recording).is_empty());
+        // The failed append stored nothing, so this refresh token
+        // is still the live MCP one. Rotating it, then spawning
+        // with the successor, is a first grant.
+        let rotated = store.refresh(&pair.refresh_token, CLIENT, NOW + 1).unwrap();
+        let connector = spawn_at(&store, &rotated.refresh_token, NOW + 2).unwrap();
+        assert_eq!(connector.scope, "kharon:connector");
+        assert_eq!(connector_grants(&recording).len(), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (pair, _) = connect_declared(&store, b"persist-fail");
+        std::fs::remove_dir_all(dir.path().join("oauth")).unwrap();
+        std::fs::write(dir.path().join("oauth"), b"not a directory").unwrap();
+        assert_eq!(
+            spawn_at(&store, &pair.refresh_token, NOW + 1),
+            Err(TokenError::PersistFailed)
+        );
+        assert_eq!(
+            connector_grants(&recording),
+            vec![
+                (
+                    "issued".to_owned(),
+                    None,
+                    Some("dashboard.example".to_owned())
+                ),
+                (
+                    "persist_failed".to_owned(),
+                    Some("persist_failed".to_owned()),
+                    Some("dashboard.example".to_owned())
+                ),
+            ]
+        );
+        assert_grant_entries_carry_no_token(&recording, &[&pair.access_token, &pair.refresh_token]);
+        std::fs::remove_file(dir.path().join("oauth")).unwrap();
+        std::fs::create_dir(dir.path().join("oauth")).unwrap();
+        // The MCP refresh was not retired, so it still rotates,
+        // and the spawn that then lands is a first grant.
+        let rotated = store.refresh(&pair.refresh_token, CLIENT, NOW + 2).unwrap();
+        let connector = spawn_at(&store, &rotated.refresh_token, NOW + 2).unwrap();
+        assert_eq!(connector.scope, "kharon:connector");
+        assert_eq!(connector_grants(&recording).len(), 3);
+    }
+
+    /// Family isolation, including the #310 gap: refreshing a
+    /// connector-audience `kh_rt_` stays in that family.
+    #[test]
+    fn each_family_rotates_only_within_itself_and_the_wrong_resource_stays_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (mcp, _) = connect_declared(&store, b"families");
+        let connector = spawn_at(&store, &mcp.refresh_token, NOW + 1).unwrap();
+        assert_eq!(
+            store.refresh(&connector.refresh_token, CLIENT, NOW + 2),
+            Err(TokenError::InvalidTarget)
+        );
+        for resource in [None, Some(MCP_URL), Some("https://other.example/mcp")] {
+            assert_eq!(
+                refresh_resource(&store, &connector.refresh_token, resource, NOW + 2),
+                Err(TokenError::InvalidTarget),
+                "{resource:?}"
+            );
+        }
+        let connector2 = refresh_resource(
+            &store,
+            &connector.refresh_token,
+            Some(CONNECTOR_URL),
+            NOW + 2,
+        )
+        .unwrap();
+        assert_eq!(
+            store.token_audience(&connector2.access_token),
+            Some(TokenAudience::Connector)
+        );
+        assert_eq!(
+            store.token_audience(&connector2.refresh_token),
+            Some(TokenAudience::Connector)
+        );
+        assert_eq!(connector2.scope, "kharon:connector");
+        // The MCP refresh was not retired by the connector rotation.
+        assert_eq!(
+            store.token_audience(&mcp.refresh_token),
+            Some(TokenAudience::Mcp)
+        );
+        let mcp2 = refresh_resource(&store, &mcp.refresh_token, None, NOW + 3).unwrap();
+        assert_eq!(
+            store.token_audience(&mcp2.access_token),
+            Some(TokenAudience::Mcp)
+        );
+        assert_eq!(mcp2.scope, "kharon:read kharon:fill");
+        // And the connector refresh was not retired by that.
+        assert_eq!(
+            store.token_audience(&connector2.refresh_token),
+            Some(TokenAudience::Connector)
+        );
+        let connector3 = refresh_resource(
+            &store,
+            &connector2.refresh_token,
+            Some(CONNECTOR_URL),
+            NOW + 4,
+        )
+        .unwrap();
+        assert_eq!(
+            store.token_audience(&connector3.access_token),
+            Some(TokenAudience::Connector)
+        );
+        assert_eq!(
+            refresh_resource(&store, &mcp2.refresh_token, Some(CONNECTOR_URL), NOW + 5),
+            Err(TokenError::InvalidTarget)
+        );
+        assert_eq!(
+            refresh_resource(
+                &store,
+                &mcp2.refresh_token,
+                Some("https://other.example/x"),
+                NOW + 5
+            ),
+            Err(TokenError::InvalidTarget)
+        );
+        let mcp3 = refresh_resource(&store, &mcp2.refresh_token, Some(MCP_URL), NOW + 5).unwrap();
+        assert_eq!(
+            store.token_audience(&mcp3.access_token),
+            Some(TokenAudience::Mcp)
+        );
+        // A retired connector token presented at the wrong resource
+        // is not reuse: its successor still rotates.
+        assert_eq!(
+            refresh_resource(&store, &connector2.refresh_token, Some(MCP_URL), NOW + 6),
+            Err(TokenError::InvalidTarget)
+        );
+        assert!(
+            refresh_resource(
+                &store,
+                &connector3.refresh_token,
+                Some(CONNECTOR_URL),
+                NOW + 6
+            )
+            .is_ok()
+        );
+
+        // A phase-1 record with no audience field refreshes as mcp.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = fresh(dir.path());
+        let (pair, _) = connect_one(&store);
+        drop(store);
+        let path = dir.path().join("oauth/state.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for token in value["tokens"].as_array_mut().unwrap() {
+            token.as_object_mut().unwrap().remove("audience");
+        }
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        let loaded = OauthStore::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.token_audience(&pair.refresh_token),
+            Some(TokenAudience::Mcp)
+        );
+        let next = loaded
+            .refresh(&pair.refresh_token, CLIENT, NOW + 1)
+            .unwrap();
+        assert_eq!(
+            loaded.token_audience(&next.access_token),
+            Some(TokenAudience::Mcp)
+        );
+        assert_eq!(
+            loaded.token_audience(&next.refresh_token),
+            Some(TokenAudience::Mcp)
+        );
+    }
+
+    /// Reuse of the connector family ends the whole Connect. Inside
+    /// the grace, one retry revokes the superseded access token,
+    /// and a second presentation is reuse.
+    #[test]
+    fn reuse_of_the_connector_refresh_ends_the_connect_including_the_mcp_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (mcp, id) = connect_declared(&store, b"reuse-out");
+        let connector = spawn_at(&store, &mcp.refresh_token, NOW + 1).unwrap();
+        let successor = refresh_resource(
+            &store,
+            &connector.refresh_token,
+            Some(CONNECTOR_URL),
+            NOW + 50,
+        )
+        .unwrap();
+        assert_eq!(
+            refresh_resource(
+                &store,
+                &connector.refresh_token,
+                Some(CONNECTOR_URL),
+                NOW + 50 + GRACE_SECS + 1
+            ),
+            Err(TokenError::InvalidGrant)
+        );
+        assert_eq!(
+            store.refresh(&mcp.refresh_token, CLIENT, NOW + 50 + GRACE_SECS + 2),
+            Err(TokenError::InvalidGrant)
+        );
+        assert!(
+            store
+                .authenticate_access(&successor.access_token, NOW + 50)
+                .is_none()
+        );
+        assert!(
+            recording
+                .events()
+                .iter()
+                .any(|(event, _)| event == "oauth_refresh_reuse")
+        );
+        assert_eq!(recording.ended.lock().unwrap().as_slice(), [id]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, recording) = fresh(dir.path());
+        let (mcp, id) = connect_declared(&store, b"reuse-in");
+        let connector = spawn_at(&store, &mcp.refresh_token, NOW + 1).unwrap();
+        let superseded = refresh_resource(
+            &store,
+            &connector.refresh_token,
+            Some(CONNECTOR_URL),
+            NOW + 80,
+        )
+        .unwrap();
+        let retried = refresh_resource(
+            &store,
+            &connector.refresh_token,
+            Some(CONNECTOR_URL),
+            NOW + 80 + GRACE_SECS,
+        )
+        .unwrap();
+        assert_eq!(
+            store.token_audience(&retried.access_token),
+            Some(TokenAudience::Connector)
+        );
+        assert!(
+            store
+                .authenticate_access(&superseded.access_token, NOW + 80)
+                .is_none()
+        );
+        assert!(
+            store
+                .authenticate_access(&retried.access_token, NOW + 80)
+                .is_some()
+        );
+        let mcp2 = store.refresh(&mcp.refresh_token, CLIENT, NOW + 81).unwrap();
+        assert_eq!(
+            refresh_resource(
+                &store,
+                &connector.refresh_token,
+                Some(CONNECTOR_URL),
+                NOW + 80 + GRACE_SECS
+            ),
+            Err(TokenError::InvalidGrant)
+        );
+        assert_eq!(
+            store.refresh(&mcp2.refresh_token, CLIENT, NOW + 82),
+            Err(TokenError::InvalidGrant)
+        );
+        assert_eq!(recording.ended.lock().unwrap().as_slice(), [id]);
+        assert!(
+            recording
+                .events()
+                .iter()
+                .any(|(event, _)| event == "oauth_refresh_reuse")
+        );
     }
 }

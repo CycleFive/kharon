@@ -10,10 +10,11 @@
 //!    load) or `[public_ingress]` (#210: with no `[api]` the daemon
 //!    runs with the agent API off and agents reach `POST /mcp` there).
 //! 2. The audit checkpoint sink must be resolvable: local-only, or
-//!    the off-host ntfy sink when `[approval].ntfy` is configured
-//!    (REQ-AUD-002, #127; the loader already refuses off-host mode
-//!    with no ntfy channel, and [`start`] fails closed if the sink
-//!    cannot be built, e.g. an unreadable ntfy token file).
+//!    the off-host ntfy sink on `[audit].checkpoint_ntfy` when set,
+//!    else on `[approval].ntfy` (REQ-AUD-002, #127, #302; the loader
+//!    already refuses off-host mode with no ntfy channel, and
+//!    [`start`] fails closed if the sink cannot be built, e.g. an
+//!    unreadable ntfy token file).
 //! 3. Process hardening: `harden_process()` (REQ-MEM-001), then
 //!    `lock_memory()` when `require_mlock` is set (REQ-MEM-002; the
 //!    lock module asks for this at startup so the master password is
@@ -585,13 +586,14 @@ pub enum StartupError {
         "no agent listener configured; set `[api] listen` (a VPN address) or `[public_ingress] listen` (the edge's loopback)"
     )]
     NoAgentListener,
-    /// `audit.checkpoint_local_only = false` but no `[approval].ntfy`
-    /// channel is configured. The config loader refuses this first
-    /// (`audit_no_off_host_sink`); this is defence in depth so the
-    /// daemon never silently downgrades to local-only checkpoints.
+    /// `audit.checkpoint_local_only = false` but neither
+    /// `[audit].checkpoint_ntfy` nor `[approval].ntfy` is configured.
+    /// The config loader refuses this first (`audit_no_off_host_sink`);
+    /// this is defence in depth so the daemon never silently
+    /// downgrades to local-only checkpoints.
     #[error(
-        "audit checkpoints need an off-host sink ([approval].ntfy) \
-         or audit.checkpoint_local_only = true"
+        "audit checkpoints need an off-host sink ([approval].ntfy or \
+         audit.checkpoint_ntfy) or audit.checkpoint_local_only = true"
     )]
     OffHostCheckpointNotConfigured,
     /// The off-host checkpoint sink could not be built at startup
@@ -828,7 +830,7 @@ pub fn check(cfg: &Config) -> Result<Option<SocketAddr>, StartupError> {
     // mode, and `--check` must not read the token file or touch the
     // network, so presence is all that is verified here. Sink
     // construction (fail-closed) happens in `start`.
-    if !cfg.audit.checkpoint_local_only && cfg.approval.ntfy.is_none() {
+    if !cfg.audit.checkpoint_local_only && cfg.checkpoint_ntfy().is_none() {
         return Err(StartupError::OffHostCheckpointNotConfigured);
     }
     Ok(cfg.api.as_ref().map(|a| a.listen))
@@ -951,9 +953,11 @@ pub async fn start(
     })?;
     // REQ-AUD-002 (#127): local-only runs keep the file checkpoint
     // stream; SPEC-default runs publish checkpoints to the configured
-    // ntfy topic (the off-host stream). Building the ntfy sink reads
-    // its token file eagerly — an unreadable token refuses startup
-    // here instead of silently downgrading.
+    // ntfy topic (the off-host stream): `[audit].checkpoint_ntfy`
+    // when set, so its keeper never sees approval prompts (#302),
+    // else `[approval].ntfy`. Building the ntfy sink reads its token
+    // file eagerly — an unreadable token refuses startup here instead
+    // of silently downgrading.
     let sink: Box<dyn CheckpointSink> = if cfg.audit.checkpoint_local_only {
         Box::new(
             FileCheckpointSink::create(&audit_dir.join("checkpoints.jsonl"))
@@ -961,9 +965,7 @@ pub async fn start(
         )
     } else {
         let ntfy = cfg
-            .approval
-            .ntfy
-            .as_ref()
+            .checkpoint_ntfy()
             .ok_or(StartupError::OffHostCheckpointNotConfigured)?;
         Box::new(
             NtfyCheckpointSink::new(&ntfy.url, &ntfy.topic, ntfy.token_file.as_deref()).map_err(

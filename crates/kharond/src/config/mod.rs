@@ -50,6 +50,15 @@
 //! ntfy = { url = "https://ntfy.example.net", topic = "kharon", token_file = "/run/secrets/ntfy" }
 //! ```
 //!
+//! Audit checkpoints go to that ntfy topic too, unless the optional
+//! `[audit] checkpoint_ntfy` (same table shape) names a topic of their
+//! own (#302), so the checkpoint keeper never reads approval prompts:
+//!
+//! ```toml
+//! [audit]
+//! checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon-checkpoints", token_file = "/run/secrets/ntfy_checkpoints" }
+//! ```
+//!
 //! plus two keys the SPEC §9 example does not show yet (#14):
 //!
 //! ```toml
@@ -258,9 +267,22 @@ pub enum ConfigError {
     /// off-host sink is configured and `audit.checkpoint_local_only` is
     /// not set.
     #[error(
-        "audit checkpoints need an off-host sink ([approval].ntfy) or audit.checkpoint_local_only = true"
+        "audit checkpoints need an off-host sink ([approval].ntfy or audit.checkpoint_ntfy) or audit.checkpoint_local_only = true"
     )]
     AuditNoOffHostSink,
+    /// `audit.checkpoint_ntfy` is set together with
+    /// `audit.checkpoint_local_only = true`: the two name different
+    /// checkpoint streams, and kharond will not guess which one is
+    /// meant (#302).
+    #[error("audit.checkpoint_ntfy is set but audit.checkpoint_local_only = true; keep one")]
+    AuditCheckpointNtfyWithLocalOnly,
+    /// An ntfy topic has characters outside ntfy's charset
+    /// `[A-Za-z0-9._-]`, or is empty.
+    #[error("`{key}` must be a non-empty ntfy topic in [A-Za-z0-9._-]")]
+    InvalidNtfyTopic {
+        /// Dotted key path.
+        key: String,
+    },
     /// `bitwarden.api_key_file` is unreadable or not a personal API key
     /// (`{"client_id": "user.<uuid>", "client_secret": ...}`). The
     /// reason is fixed text; file content is never echoed.
@@ -549,6 +571,8 @@ impl ConfigError {
             Self::StandingGrantsDisabled => "standing_grants_disabled",
             Self::DefaultContextMultiAgent => "default_context_multi_agent",
             Self::AuditNoOffHostSink => "audit_no_off_host_sink",
+            Self::AuditCheckpointNtfyWithLocalOnly => "audit_checkpoint_ntfy_with_local_only",
+            Self::InvalidNtfyTopic { .. } => "invalid_ntfy_topic",
             Self::ApiKeyFile { .. } | Self::ApiKeyFileNotReadable { .. } => "api_key_file",
             Self::CaFile { .. } => "ca_file",
             Self::MlockUnavailable { .. } => "mlock_unavailable",
@@ -630,6 +654,10 @@ pub enum ConfigWarning {
     /// so `CF-Connecting-IP` is ignored and every client shares the
     /// peer's throttle key (REQ-API-010).
     PublicIngressNoTrustedProxy,
+    /// `audit.checkpoint_ntfy` names the same server and topic as
+    /// `[approval].ntfy`, so the checkpoint keeper still reads every
+    /// approval prompt (#302).
+    CheckpointTopicIsApprovalTopic,
 }
 
 impl fmt::Display for ConfigWarning {
@@ -654,6 +682,9 @@ impl fmt::Display for ConfigWarning {
             }
             Self::PublicIngressNoTrustedProxy => {
                 "public_ingress.listen is not loopback and trusted_proxies is empty: CF-Connecting-IP is ignored, so every client shares the peer's throttle key and audit client_ip"
+            }
+            Self::CheckpointTopicIsApprovalTopic => {
+                "audit.checkpoint_ntfy is the [approval].ntfy topic: the checkpoint keeper still sees approval prompts"
             }
         })
     }
@@ -901,7 +932,9 @@ pub struct NtfyConfig {
 /// `[approval]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApprovalConfig {
-    /// ntfy channel (also the off-host audit checkpoint sink).
+    /// ntfy channel for approval prompts and panic notices; also the
+    /// off-host audit checkpoint sink unless `[audit].checkpoint_ntfy`
+    /// is set (see [`Config::checkpoint_ntfy`]).
     pub ntfy: Option<NtfyConfig>,
 }
 
@@ -910,6 +943,10 @@ pub struct ApprovalConfig {
 pub struct AuditConfig {
     /// SPEC §7 `audit_checkpoint_local_only`. Default false.
     pub checkpoint_local_only: bool,
+    /// `checkpoint_ntfy` (#302): a separate ntfy topic, with its own
+    /// token, that receives the audit checkpoints and nothing else.
+    /// `None` = checkpoints share the `[approval].ntfy` topic.
+    pub checkpoint_ntfy: Option<NtfyConfig>,
     /// REQ-AUD-004 `audit_item_names`. Default false.
     pub item_names: bool,
 }
@@ -1180,6 +1217,22 @@ impl Config {
         Ok(warnings)
     }
 
+    /// The ntfy topic the off-host audit checkpoints go to
+    /// (REQ-AUD-002, #302): `[audit].checkpoint_ntfy` when set,
+    /// otherwise the `[approval].ntfy` topic. `None` in local-only
+    /// mode, or when neither is configured (the loader refuses that
+    /// outside local-only mode). Approval prompts and panic notices
+    /// always use `[approval].ntfy`, whatever this returns.
+    pub fn checkpoint_ntfy(&self) -> Option<&NtfyConfig> {
+        if self.audit.checkpoint_local_only {
+            return None;
+        }
+        self.audit
+            .checkpoint_ntfy
+            .as_ref()
+            .or(self.approval.ntfy.as_ref())
+    }
+
     /// Startup warnings to print (never fatal).
     pub fn warnings(&self) -> Vec<ConfigWarning> {
         let mut w = Vec::new();
@@ -1205,6 +1258,12 @@ impl Config {
             && public.trusted_proxies.is_empty()
         {
             w.push(ConfigWarning::PublicIngressNoTrustedProxy);
+        }
+        if let (Some(cp), Some(ap)) = (&self.audit.checkpoint_ntfy, &self.approval.ntfy)
+            && cp.url == ap.url
+            && cp.topic == ap.topic
+        {
+            w.push(ConfigWarning::CheckpointTopicIsApprovalTopic);
         }
         w
     }

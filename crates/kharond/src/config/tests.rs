@@ -702,3 +702,136 @@ fn oauth_clients_must_be_https_urls() {
         assert_eq!(err.code(), "oauth_client_not_https");
     }
 }
+
+/// The SPEC §9 example plus an `[audit]` table (#302).
+fn with_audit(audit: &str) -> String {
+    format!("{}\n[audit]\n{audit}\n", spec_example())
+}
+
+const CHECKPOINT_NTFY: &str = r#"checkpoint_ntfy = { url = "https://ntfy-audit.example.net/base", topic = "kharon-checkpoints", token_file = "/run/secrets/ntfy_checkpoints" }"#;
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_routes_checkpoints_to_its_own_topic() {
+    let cfg = Config::from_toml_str(&with_audit(CHECKPOINT_NTFY)).unwrap();
+    let cp = cfg
+        .audit
+        .checkpoint_ntfy
+        .as_ref()
+        .expect("checkpoint_ntfy parsed");
+    assert_eq!(cp.url.as_str(), "https://ntfy-audit.example.net/base");
+    assert_eq!(cp.topic, "kharon-checkpoints");
+    assert_eq!(
+        cp.token_file.as_deref(),
+        Some(Path::new("/run/secrets/ntfy_checkpoints"))
+    );
+    // Checkpoints go to the checkpoint topic; the approval channel
+    // (prompts and panic notices) is unchanged.
+    assert_eq!(cfg.checkpoint_ntfy(), Some(cp));
+    let approval = cfg.approval.ntfy.as_ref().unwrap();
+    assert_eq!(approval.topic, "kharon");
+    assert_eq!(
+        approval.token_file.as_deref(),
+        Some(Path::new("/run/secrets/ntfy"))
+    );
+    assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+}
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_unset_falls_back_to_approval_topic() {
+    let cfg = Config::from_toml_str(&spec_example()).unwrap();
+    assert_eq!(cfg.audit.checkpoint_ntfy, None);
+    assert_eq!(cfg.checkpoint_ntfy(), cfg.approval.ntfy.as_ref());
+    assert_eq!(cfg.checkpoint_ntfy().unwrap().topic, "kharon");
+
+    let local = Config::from_toml_str(&with_audit("checkpoint_local_only = true")).unwrap();
+    assert_eq!(local.checkpoint_ntfy(), None, "local-only pushes nowhere");
+}
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_alone_is_an_off_host_sink() {
+    // No [approval].ntfy at all: the checkpoint topic satisfies the
+    // off-host rule by itself, and no approval channel appears.
+    let text = with_audit(CHECKPOINT_NTFY).replace(
+        "[approval]\nntfy = { url = \"https://ntfy.example.net\", topic = \"kharon\", token_file = \"/run/secrets/ntfy\" }\n",
+        "",
+    );
+    let cfg = Config::from_toml_str(&text).unwrap();
+    assert_eq!(cfg.approval.ntfy, None);
+    assert_eq!(cfg.checkpoint_ntfy().unwrap().topic, "kharon-checkpoints");
+}
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_topic_charset_is_validated() {
+    for bad in [
+        "",
+        "kharon checkpoints",
+        "kharon/checkpoints",
+        "kharon?x",
+        "kharón",
+    ] {
+        let audit =
+            format!(r#"checkpoint_ntfy = {{ url = "https://ntfy.example.net", topic = "{bad}" }}"#);
+        let err = Config::from_toml_str(&with_audit(&audit)).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNtfyTopic {
+                key: "audit.checkpoint_ntfy.topic".to_owned()
+            },
+            "{bad:?}"
+        );
+        assert_eq!(err.code(), "invalid_ntfy_topic");
+    }
+    // The charset itself is accepted.
+    let ok = r#"checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "Kharon_cp-1.a" }"#;
+    Config::from_toml_str(&with_audit(ok)).unwrap();
+}
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_url_must_be_http() {
+    for bad in ["ftp://ntfy.example.net", "ntfy.example.net", "https://"] {
+        let audit = format!(r#"checkpoint_ntfy = {{ url = "{bad}", topic = "kharon-cp" }}"#);
+        let err = Config::from_toml_str(&with_audit(&audit)).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidUrl {
+                key: "audit.checkpoint_ntfy.url".to_owned()
+            },
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_refuses_unknown_and_secret_keys() {
+    let unknown =
+        r#"checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon-cp", bogus = 1 }"#;
+    let err = Config::from_toml_str(&with_audit(unknown)).unwrap_err();
+    assert_eq!(err.code(), "parse", "{err:?}");
+    // The token lives in token_file, never inline.
+    let inline = r#"checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon-cp", token = "tk_x" }"#;
+    let err = Config::from_toml_str(&with_audit(inline)).unwrap_err();
+    assert_eq!(err.code(), "secret_in_config", "{err:?}");
+    assert!(!err.to_string().contains("tk_x"), "{err}");
+}
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_with_local_only_is_refused() {
+    let audit = format!("checkpoint_local_only = true\n{CHECKPOINT_NTFY}");
+    let err = Config::from_toml_str(&with_audit(&audit)).unwrap_err();
+    assert_eq!(err, ConfigError::AuditCheckpointNtfyWithLocalOnly);
+    assert_eq!(err.code(), "audit_checkpoint_ntfy_with_local_only");
+}
+
+#[test]
+fn req_aud_002_checkpoint_ntfy_same_as_approval_topic_warns() {
+    let same = r#"checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon", token_file = "/run/secrets/ntfy_cp" }"#;
+    let cfg = Config::from_toml_str(&with_audit(same)).unwrap();
+    assert_eq!(
+        cfg.warnings(),
+        vec![ConfigWarning::CheckpointTopicIsApprovalTopic]
+    );
+    // Same topic name on another server is a different topic.
+    let other = r#"checkpoint_ntfy = { url = "https://ntfy-audit.example.net", topic = "kharon" }"#;
+    let cfg = Config::from_toml_str(&with_audit(other)).unwrap();
+    assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+}

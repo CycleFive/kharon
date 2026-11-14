@@ -120,7 +120,10 @@ path B.
   Fill in a real ntfy server/topic before starting — with no
   `[approval].ntfy` section kharond refuses to start unless
   `[audit] checkpoint_local_only = true` is set instead (a temporary
-  pilot posture; see the deployment guide).
+  pilot posture; see the deployment guide). `[audit] checkpoint_ntfy`
+  moves the checkpoints to a topic of their own, so the checkpoint
+  keeper does not read approval prompts (#302; see
+  [A separate checkpoint topic](../../docs/deployment.md#a-separate-checkpoint-topic-302)).
 - All capabilities are dropped and `no-new-privileges` is set.
   `security_opt` also points at [`kharon-seccomp.json`](./kharon-seccomp.json)
   (SPEC §9). That file is the Docker/moby **default** seccomp profile

@@ -244,6 +244,24 @@ fn bad_configs() -> Vec<Row> {
             p.approval.clear();
             p.audit.clear()
         }),
+        // #302: the separate checkpoint topic.
+        row("checkpoint topic charset", "invalid_ntfy_topic", |p| {
+            p.audit = "[audit]\ncheckpoint_ntfy = { url = \"https://ntfy.example.net\", topic = \"kharon cp\" }\n".into()
+        }),
+        row("checkpoint topic url", "invalid_url", |p| {
+            p.audit =
+                "[audit]\ncheckpoint_ntfy = { url = \"ntfy.example.net\", topic = \"kharon-cp\" }\n"
+                    .into()
+        }),
+        row(
+            "checkpoint topic with local-only",
+            "audit_checkpoint_ntfy_with_local_only",
+            |p| {
+                p.audit.push_str(
+                    "checkpoint_ntfy = { url = \"https://ntfy.example.net\", topic = \"kharon-cp\" }\n",
+                )
+            },
+        ),
         // REQ-API-003: hashes below the Argon2id floor are refused at load.
         row("weak token hash memory", "token_hash_weak_params", |p| {
             p.agents = p.agents.replace("m=65536,t=3,p=4", "m=4096,t=3,p=1")

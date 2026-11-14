@@ -215,6 +215,7 @@ struct RawNtfy {
 struct RawAudit {
     #[serde(default)]
     checkpoint_local_only: bool,
+    checkpoint_ntfy: Option<RawNtfy>,
     #[serde(default)]
     item_names: bool,
 }
@@ -352,13 +353,25 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     }
 
     let approval = ApprovalConfig {
-        ntfy: raw.approval.ntfy.map(validate_ntfy).transpose()?,
+        ntfy: raw
+            .approval
+            .ntfy
+            .map(|n| validate_ntfy("approval.ntfy", n))
+            .transpose()?,
     };
     let audit = AuditConfig {
         checkpoint_local_only: raw.audit.checkpoint_local_only,
+        checkpoint_ntfy: raw
+            .audit
+            .checkpoint_ntfy
+            .map(validate_checkpoint_ntfy)
+            .transpose()?,
         item_names: raw.audit.item_names,
     };
-    if !audit.checkpoint_local_only && approval.ntfy.is_none() {
+    if audit.checkpoint_local_only && audit.checkpoint_ntfy.is_some() {
+        return Err(ConfigError::AuditCheckpointNtfyWithLocalOnly);
+    }
+    if !audit.checkpoint_local_only && approval.ntfy.is_none() && audit.checkpoint_ntfy.is_none() {
         return Err(ConfigError::AuditNoOffHostSink);
     }
 
@@ -962,12 +975,26 @@ fn validate_policy(p: RawPolicy) -> Result<PolicyConfig, ConfigError> {
     Ok(policy)
 }
 
-fn validate_ntfy(n: RawNtfy) -> Result<NtfyConfig, ConfigError> {
+fn validate_ntfy(key: &str, n: RawNtfy) -> Result<NtfyConfig, ConfigError> {
     Ok(NtfyConfig {
-        url: http_url("approval.ntfy.url", &n.url)?,
+        url: http_url(&format!("{key}.url"), &n.url)?,
         topic: n.topic,
         token_file: n.token_file,
     })
+}
+
+/// `[audit].checkpoint_ntfy` (#302). The topic is checked here, with
+/// the charset every ntfy publisher enforces, so `kharond --check`
+/// catches a bad one; the token file is read (fail closed) only when
+/// the daemon builds the sink, like `[approval].ntfy`'s.
+fn validate_checkpoint_ntfy(n: RawNtfy) -> Result<NtfyConfig, ConfigError> {
+    const KEY: &str = "audit.checkpoint_ntfy";
+    crate::audit::checkpoint::validate_ntfy_topic(&n.topic).map_err(|_| {
+        ConfigError::InvalidNtfyTopic {
+            key: format!("{KEY}.topic"),
+        }
+    })?;
+    validate_ntfy(KEY, n)
 }
 
 #[cfg(test)]

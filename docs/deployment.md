@@ -64,11 +64,15 @@ upgrades, the secrets inventory and the alerts are in
 By default kharond pushes a signed audit checkpoint to the
 `[approval].ntfy` topic every 100 entries or 10 minutes (and once
 more at shutdown), so truncating the local audit log is detectable
-against a stream the broker host does not control. Point
-`[approval].ntfy` at an ntfy server you trust (self-hosted is fine)
-and keep the topic access-controlled; `token_file` supplies the
-bearer token when the topic requires one, and startup refuses to
-run if a configured token file cannot be read. The checkpoint
+against a stream the broker host does not control. With
+`[audit] checkpoint_ntfy` set, the checkpoints go to that topic
+instead, and only there; approval prompts and panic notices stay on
+`[approval].ntfy` (see
+[A separate checkpoint topic](#a-separate-checkpoint-topic-302)).
+Point the topic at an ntfy server you trust (self-hosted is fine)
+and keep it access-controlled; `token_file` supplies the bearer
+token when the topic requires one, and startup refuses to run if a
+configured token file cannot be read. The checkpoint
 stream is one JSON checkpoint per ntfy message — save it (ntfy
 server logs or a subscriber) and feed it to
 `kharon audit verify --data <data_dir>/audit --checkpoints <file>`.
@@ -87,7 +91,10 @@ rewrite both the log and its checkpoints.
 
 The topic carries approval prompts and the audit checkpoints, and
 kharond publishes its first checkpoint as soon as it starts, so set
-the topic up before the first start. These steps are for a
+the topic up before the first start. When the checkpoint keeper is
+not someone who may approve, give the checkpoints a topic of their
+own: [A separate checkpoint topic](#a-separate-checkpoint-topic-302)
+changes steps 2 to 4 for that. These steps are for a
 self-hosted ntfy server, where you hold the `ntfy` CLI and the
 access-control list. On hosted ntfy.sh, a private topic means a
 reserved topic, which is a paid feature; check that its tokens give
@@ -182,7 +189,9 @@ anywhere for 120 seconds (see
 [ntfy approve and deny](#ntfy-approve-and-deny-req-apr-004-req-dep-006)),
 so every reader can approve. Give read access only to someone who
 may approve: the customer, and on a managed deploy the operator, who
-can already approve from the CLI.
+can already approve from the CLI. With
+[a separate checkpoint topic](#a-separate-checkpoint-topic-302), the
+checkpoint keeper reads that topic instead and never sees a prompt.
 
 **4. Keep the checkpoint stream off the broker host.** Name who keeps
 it. On a managed deploy that is the operator, unless the customer
@@ -267,6 +276,94 @@ sudo chmod 0400 secrets/ntfy_token
 Then restart the stack (the broker comes back locked until the customer unlocks),
 then remove the old one with `ntfy token remove kharond <old token>`.
 To cut off a subscriber, run `ntfy user remove <user>`.
+
+#### A separate checkpoint topic (#302)
+
+With one topic, whoever keeps the checkpoint stream reads every
+approval prompt too, and so can approve. `[audit] checkpoint_ntfy`
+gives the checkpoints a topic of their own, with its own writer
+token. kharond then publishes every checkpoint to that topic and
+nothing else to it, and approval prompts and panic notices stay on
+`[approval].ntfy`. The keeper subscribes read-only to the checkpoint
+topic only and holds no approval power. Left unset, checkpoints share
+the approval topic as above.
+
+The steps above change like this. Topic names follow step 1's rule
+(the same charset, which kharond checks at `--check`), for example
+`kharon-acme-q7x2` for approvals and `kharon-acme-cp-m4k9` for
+checkpoints.
+
+**Step 2, two writers.** Give each topic its own write-only user and
+token, so neither token can publish on the other topic, and put the
+second token in its own file, with the same owner, mode and mount as
+the first:
+
+```sh
+ntfy user add kharond-checkpoints
+ntfy access kharond-checkpoints kharon-acme-cp-m4k9 write-only
+ntfy token add kharond-checkpoints          # prints tk_…, once
+
+( umask 077; read -rs T; printf '%s' "$T" > secrets/ntfy_checkpoint_token; unset T )
+sudo chown 10001:10001 secrets/ntfy_checkpoint_token
+sudo chmod 0400 secrets/ntfy_checkpoint_token
+```
+
+```yaml
+# docker-compose.override.yml, beside the approval token
+      - ./secrets/ntfy_checkpoint_token:/run/secrets/ntfy_checkpoint_token:ro
+```
+
+```toml
+[approval]
+ntfy = { url = "https://ntfy.example.net", topic = "kharon-acme-q7x2", token_file = "/run/secrets/ntfy_token" }
+
+[audit]
+checkpoint_ntfy = { url = "https://ntfy.example.net", topic = "kharon-acme-cp-m4k9", token_file = "/run/secrets/ntfy_checkpoint_token" }
+```
+
+The checkpoint token file is read once at startup like the approval
+one: missing, unreadable or empty refuses startup, and kharond never
+falls back to the approval topic for checkpoints. The checkpoint topic
+can live on another ntfy server; `url` is per topic. kharond refuses
+`checkpoint_ntfy` together with `checkpoint_local_only = true`, and
+warns at startup when `checkpoint_ntfy` names the approval topic
+itself (same `url` and `topic`), since the keeper would still see
+the prompts. `[approval].ntfy` may be left out when approvals do not
+go through ntfy; the checkpoint topic alone is then the off-host
+sink.
+
+**Step 3, readers.** The checkpoint keeper's user reads the
+checkpoint topic and has no access to the approval topic; the phone's
+user reads the approval topic only:
+
+```sh
+ntfy user add checkpoints
+ntfy access checkpoints kharon-acme-cp-m4k9 read-only
+
+ntfy user add customer-phone
+ntfy access customer-phone kharon-acme-q7x2 read-only
+```
+
+With `deny-all` (step 1), `checkpoints` cannot read the approval
+topic, so the keeper can no longer approve. Readers of the approval
+topic still can, as step 3 says.
+
+**Step 4, the subscriber.** Point `topic=` at the checkpoint topic
+(`https://ntfy.example.net/kharon-acme-cp-m4k9`). Every message
+there is a checkpoint; the `jq` title filter still holds and can stay.
+Verify as before.
+
+**Rotating.** The same as kharond's approval token, with
+`ntfy token add kharond-checkpoints` and
+`secrets/ntfy_checkpoint_token`.
+
+**Moving an existing deploy to two topics.** Start the new topic's
+subscriber first, then set `checkpoint_ntfy` and restart. The
+checkpoints before the restart are on the old topic and those after
+it on the new one, so the keeper saves both and concatenates them,
+oldest first, before verifying. Then take the keeper's read access to
+the approval topic away with `ntfy access --reset checkpoints
+kharon-acme-q7x2`.
 
 ### The kharon account and its master password (REQ-DEP-007)
 

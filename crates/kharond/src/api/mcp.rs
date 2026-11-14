@@ -392,8 +392,8 @@ pub fn tool_definitions() -> Value {
 
 /// Every tool name, in [`Tool::ALL`] order — the registry the other
 /// layers validate against (per-agent allow-lists, #200).
-pub const TOOL_NAMES: [&str; 7] = {
-    let mut names = [""; 7];
+pub const TOOL_NAMES: [&str; Tool::ALL.len()] = {
+    let mut names = [""; Tool::ALL.len()];
     let mut i = 0;
     while i < Tool::ALL.len() {
         names[i] = Tool::ALL[i].name();

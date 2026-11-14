@@ -107,6 +107,9 @@ fn agent_post(cf_ip: &str, token: &str) -> Vec<u8> {
 /// the budget that ran out is the agent's, not the address's.
 #[tokio::test]
 async fn public_ingress_agent_window_refuses_the_241st_request() {
+    // The five-address spread stays under the per-IP window only while
+    // the agent budget fits in five IP budgets.
+    const _: () = assert!(PER_AGENT_PER_MINUTE <= 5 * PER_IP_PER_MINUTE);
     let h = Harness::new(false);
     let addr = serve_public(h.broker.clone()).await;
     let ips = [
@@ -116,6 +119,7 @@ async fn public_ingress_agent_window_refuses_the_241st_request() {
         "198.51.100.14",
         "198.51.100.15",
     ];
+    assert_eq!(ips.len(), 5, "the const assert above assumes this spread");
     for i in 0..PER_AGENT_PER_MINUTE {
         let r = raw_request(addr, &agent_post(ips[(i as usize) % ips.len()], &h.alpha)).await;
         assert_eq!(r.status, 200, "request {i} must be admitted: {}", r.body);

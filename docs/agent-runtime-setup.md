@@ -62,7 +62,8 @@ needs a secret except step 5.
    `/etc/kharon-connector/token`, mode `0400`, owned by the uid that
    runs the connector. See [Handing over the secrets](#handing-over-the-secrets)
    for how it gets there. The connector refuses a file readable by
-   group or others.
+   group or others. The connector reads the file only when it starts:
+   after replacing the credential, restart the connector.
 6. **`connector.toml`.** Write `/etc/kharon-connector/connector.toml`
    as in [Connector config over WebSocket](deployment.md#connector-config-over-websocket):
    `transport = "ws"`, `broker_url = "wss://<host>/connector"`,
@@ -97,11 +98,34 @@ customer which one they are getting.
 
 ### Dashboard runtimes and `/connector`
 
-A dashboard Connect (OAuth, `[oauth]`) authorizes `/mcp` only. Until
-v0.3.0 ships #235, a dashboard runtime that fills still needs its
-`/connector` access provisioned by hand, exactly as above: a minted
-tunnel credential, a `connector_token_hash` in `[agents.<id>]`, and
-the file handed over out of band.
+Since v0.3.0 (#235 phase 2), a dashboard Connect can also spawn the
+connector. The dashboard's client metadata document must declare the
+connector grant type; at consent the broker records that, and the
+client redeems the extension grant for a connector token pair scoped
+`kharon:connector`. The spawned connector's `token_file` then holds
+the connector access token (`kh_at_…`) instead of a minted tunnel
+credential — REQ-ARCH-002 makes a connector-audience `kh_at_` a
+tunnel credential on wire v1, and the broker enforces the audience at
+authenticate time. The connector binary must be built from v0.3.0 or
+later to accept that token file (#320). A connector token is refused
+on `/mcp` (401): the two legs stay separate (#304).
+
+A standalone agent host — one that does not arrive through a
+dashboard — still uses the hand-provisioned path on this page: a
+minted tunnel credential, a `connector_token_hash` in
+`[agents.<id>]`, and the file handed over out of band.
+
+### Verify the install
+
+The install is done when the identity has a live session:
+
+- The owner's Connections page shows the identity with a live
+  browser session (and since when).
+- From the agent side, an MCP `kharon_context` call with the agent
+  token returns the browser context id with status `ok`. Fills
+  refuse until a session is live (REQ-OAU-007), so a refused fill
+  with a "no browser attached" detail means the connector is not
+  attached, whatever the MCP leg is doing.
 
 ## Handing over the secrets
 

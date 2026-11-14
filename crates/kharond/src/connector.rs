@@ -156,6 +156,10 @@ pub enum ConnectAccess {
         connector_scope: bool,
         /// The record's expiry, Unix seconds. The session ends then.
         expires_at: u64,
+        /// SHA-256 hex of the presented value: the record's key at
+        /// rest. A session the hello admits is bound to this record
+        /// (#235 D5) — it is live only while the record is.
+        token_hash: String,
     },
 }
 
@@ -165,9 +169,29 @@ pub enum ConnectAccess {
 pub trait ConnectTokens: Send + Sync {
     /// Check `presented` at `now` (Unix seconds).
     fn access(&self, presented: &str, now: u64) -> ConnectAccess;
+    /// Whether the record `token_hash` names (SHA-256 hex of the
+    /// presented value) is still a live connector access token at
+    /// `now`: not revoked, not expired, its Connect not ended. A
+    /// session bound to that record is live only while this holds
+    /// (#235 D5: a grace retry revoking the superseded access token,
+    /// or an `/oauth/revoke` of it, ends the session at once, not at
+    /// the record's `expires_at`).
+    fn access_live(&self, token_hash: &str, now: u64) -> bool;
     /// Whether `agent_id` is a Connect identity the store knows, ended
     /// ones included (the audit's "auditable id" rule).
     fn is_connect(&self, agent_id: &str) -> bool;
+}
+
+/// Live connector sessions, read by the broker (#235 slice 6): the
+/// `require_browser` check (REQ-OAU-007) and the Connections page.
+/// The hub implements it; without a hub the broker is built without
+/// one and every Connect answers `no_browser`, as in phase 1.
+pub trait ConnectorSessions: Send + Sync {
+    /// When `agent_id`'s live, unexpired connector session attached
+    /// (Unix seconds), or `None` when there is none. A session past
+    /// its token's expiry, or bound to a token record that has since
+    /// been revoked, is not live.
+    fn session_since(&self, agent_id: &str) -> Option<u64>;
 }
 
 /// Why a hello was refused: the `detail_code` of its
@@ -325,14 +349,20 @@ struct Live {
     replaced: Arc<AtomicBool>,
     /// When this session was registered.
     since: Instant,
+    /// [`Self::since`] as Unix seconds, for the Connections page.
+    since_unix: u64,
     /// Unix seconds the authenticating token expires (#235 D5); `None`
     /// for a tunnel credential, which does not expire.
     expires_at: Option<u64>,
+    /// The record a Connect session is bound to (#235 D5): SHA-256
+    /// hex of the access token that authenticated the hello. `None`
+    /// for a tunnel credential, which no record revocation can end.
+    token_hash: Option<String>,
 }
 
 impl Live {
-    /// Live at `now` (Unix seconds): a session past its token's expiry is
-    /// absent even before its timer runs. No grace.
+    /// Unexpired at `now` (Unix seconds): a session past its token's
+    /// expiry is absent even before its timer runs. No grace.
     fn current(&self, now: u64) -> bool {
         self.expires_at.is_none_or(|exp| now < exp)
     }
@@ -481,6 +511,25 @@ impl Hub {
         (self.events)(&event);
     }
 
+    /// Whether `live` is a live session at `now` (Unix seconds):
+    /// unexpired, and — for a Connect session — its token record is
+    /// still live in the store (#235 D5). The record half is what
+    /// ends a session whose access token was revoked out from under
+    /// it (a refresh grace retry, `/oauth/revoke`) while its socket
+    /// is still open.
+    fn live_now(&self, live: &Live, now: u64) -> bool {
+        if !live.current(now) {
+            return false;
+        }
+        match &live.token_hash {
+            None => true,
+            Some(hash) => self
+                .connect
+                .get()
+                .is_some_and(|connect| connect.access_live(hash, now)),
+        }
+    }
+
     /// Whether `agent_id` has a live authenticated session. A session past
     /// its token's expiry is not one, even before its timer runs.
     pub fn is_connected(&self, agent_id: &str) -> bool {
@@ -489,7 +538,20 @@ impl Hub {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(agent_id)
-            .is_some_and(|live| live.current(now))
+            .is_some_and(|live| self.live_now(live, now))
+    }
+
+    /// When `agent_id`'s live session attached (Unix seconds), or
+    /// `None` when it has none. The Connections page's "since when"
+    /// (#235 slice 6); the same liveness as [`Self::is_connected`].
+    pub fn session_since(&self, agent_id: &str) -> Option<u64> {
+        let now = unix_now();
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .filter(|live| self.live_now(live, now))
+            .map(|live| live.since_unix)
     }
 
     /// Drop `agent_id`'s session, if any. The agent is expected to redial.
@@ -532,7 +594,7 @@ impl Hub {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(agent_id)
-            .filter(|live| live.current(now))
+            .filter(|live| self.live_now(live, now))
             .map(|live| live.session.clone())
     }
 
@@ -546,6 +608,7 @@ impl Hub {
         session: BrokerSession,
         transport: SessionTransport,
         expires_at: Option<u64>,
+        token_hash: Option<String>,
     ) -> (u64, Arc<AtomicBool>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let replaced = Arc::new(AtomicBool::new(false));
@@ -555,7 +618,9 @@ impl Hub {
             session,
             replaced: Arc::clone(&replaced),
             since: now,
+            since_unix: unix_now(),
             expires_at,
+            token_hash,
         };
         let mut map = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         let old_age = map.insert(agent.clone(), live).map(|old| {
@@ -585,15 +650,15 @@ impl Hub {
 
     /// The Connect half of the hello's prefix dispatch (#235 D2, D4).
     /// `None`: not a Connect token, so the tunnel path (Argon2id) decides.
-    /// Otherwise the token's expiry on success, or why it was refused, in
-    /// D4's order. Never touches the sessions map, so a refusal evicts
-    /// nobody.
+    /// Otherwise the token's expiry and record hash on success, or why
+    /// it was refused, in D4's order. Never touches the sessions map,
+    /// so a refusal evicts nobody.
     pub(crate) fn check_connect(
         &self,
         claimed: &str,
         token: &str,
         now: u64,
-    ) -> Option<Result<u64, AuthFailDetail>> {
+    ) -> Option<Result<(u64, String), AuthFailDetail>> {
         if token.starts_with(REFRESH_PREFIX) {
             return Some(Err(AuthFailDetail::Unauthorized));
         }
@@ -616,7 +681,11 @@ impl Hub {
                 connector_scope: false,
                 ..
             } => Err(AuthFailDetail::Scope),
-            ConnectAccess::Live { expires_at, .. } => Ok(expires_at),
+            ConnectAccess::Live {
+                expires_at,
+                token_hash,
+                ..
+            } => Ok((expires_at, token_hash)),
         })
     }
 
@@ -627,6 +696,12 @@ impl Hub {
             drop(map);
             self.changed.notify_waiters();
         }
+    }
+}
+
+impl ConnectorSessions for Hub {
+    fn session_since(&self, agent_id: &str) -> Option<u64> {
+        self.session_since(agent_id)
     }
 }
 
@@ -686,7 +761,12 @@ async fn authenticate<S>(
     hub: &Arc<Hub>,
     deadline: Instant,
     permit: OwnedSemaphorePermit,
-) -> Option<(tokio_rustls::server::TlsStream<S>, String, Option<u64>)>
+) -> Option<(
+    tokio_rustls::server::TlsStream<S>,
+    String,
+    Option<u64>,
+    Option<String>,
+)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -719,11 +799,11 @@ where
     if let Some(verdict) = hub.check_connect(&hello.agent_id, hello.token.as_str(), unix_now()) {
         drop(permit);
         return match verdict {
-            Ok(expires_at) => {
+            Ok((expires_at, token_hash)) => {
                 if write_server_hello(&mut tls, AUTH_OK).await.is_err() {
                     return None;
                 }
-                Some((tls, hello.agent_id, Some(expires_at)))
+                Some((tls, hello.agent_id, Some(expires_at), Some(token_hash)))
             }
             Err(detail) => {
                 refuse(&mut tls, peer, transport, hub, &hello.agent_id, detail).await;
@@ -761,7 +841,7 @@ where
         if write_server_hello(&mut tls, AUTH_OK).await.is_err() {
             return None;
         }
-        Some((tls, hello.agent_id, None))
+        Some((tls, hello.agent_id, None, None))
     } else {
         refuse(
             &mut tls,
@@ -824,7 +904,7 @@ async fn authenticate_and_serve<S>(
         a = authenticate(stream, peer, transport, acceptor, &hub, deadline, permit) => a,
         () = stopped(&mut stop) => return,
     };
-    let Some((tls, agent_id, expires_at)) = authed else {
+    let Some((tls, agent_id, expires_at, token_hash)) = authed else {
         return;
     };
     let session = spawn_broker(tls);
@@ -836,7 +916,13 @@ async fn authenticate_and_serve<S>(
         transport,
         peer,
     });
-    let (id, replaced) = hub.insert(agent_id.clone(), session.clone(), transport, expires_at);
+    let (id, replaced) = hub.insert(
+        agent_id.clone(),
+        session.clone(),
+        transport,
+        expires_at,
+        token_hash,
+    );
     // #235 D5: a Connect session ends when its access token expires, with
     // no grace. The drop is the ordinary detach line, not an audit entry.
     let expiry = async {
@@ -905,10 +991,30 @@ mod tests {
 
     impl ConnectTokens for FakeConnect {
         fn access(&self, presented: &str, _now: u64) -> ConnectAccess {
-            self.0
-                .get(presented)
-                .cloned()
-                .unwrap_or(ConnectAccess::Unknown)
+            // The fake's record hash is the token itself; the hub
+            // only ever hands it back to `access_live`.
+            match self.0.get(presented).cloned() {
+                Some(ConnectAccess::Live {
+                    identity,
+                    connector_audience,
+                    connector_scope,
+                    expires_at,
+                    ..
+                }) => ConnectAccess::Live {
+                    identity,
+                    connector_audience,
+                    connector_scope,
+                    expires_at,
+                    token_hash: presented.to_owned(),
+                },
+                _ => ConnectAccess::Unknown,
+            }
+        }
+        fn access_live(&self, token_hash: &str, now: u64) -> bool {
+            matches!(
+                self.0.get(token_hash),
+                Some(ConnectAccess::Live { expires_at, .. }) if now < *expires_at
+            )
         }
         fn is_connect(&self, agent_id: &str) -> bool {
             agent_id == CID
@@ -921,6 +1027,7 @@ mod tests {
             connector_audience: audience,
             connector_scope: scope,
             expires_at: 4_000_000_000,
+            token_hash: String::new(),
         }
     }
 
@@ -941,7 +1048,10 @@ mod tests {
     fn connect_checks_run_in_d4_order() {
         let (hub, _) = connect_hub();
         let check = |claimed: &str, token: &str| hub.check_connect(claimed, token, 0);
-        assert_eq!(check(CID, "kh_at_good"), Some(Ok(4_000_000_000)));
+        assert_eq!(
+            check(CID, "kh_at_good"),
+            Some(Ok((4_000_000_000, "kh_at_good".to_owned())))
+        );
         assert_eq!(check(CID, "kh_at_mcp"), Some(Err(AuthFailDetail::Audience)));
         // Audience is checked before identity.
         assert_eq!(
@@ -1016,6 +1126,7 @@ mod tests {
             session.clone(),
             SessionTransport::Ws,
             Some(now + 3600),
+            None,
         );
         assert!(hub.is_connected(CID));
         assert!(hub.session(CID).is_some());
@@ -1025,6 +1136,7 @@ mod tests {
             session,
             SessionTransport::Ws,
             Some(now.saturating_sub(1)),
+            None,
         );
         assert!(hub.sessions.lock().unwrap().contains_key(CID));
         assert!(!hub.is_connected(CID));

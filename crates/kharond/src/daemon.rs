@@ -1069,6 +1069,17 @@ pub async fn start(
         }
         None => broker,
     };
+    // REQ-OAU-007 (#235 slice 6): with `[connector]` set, the
+    // broker reads live Connect sessions off the same hub the fill
+    // backend rides: `require_browser` admits a Connect whose
+    // browser is attached, and the Connections page shows it.
+    let broker = match &connector {
+        Some(rt) => {
+            let sessions: Arc<dyn crate::connector::ConnectorSessions> = rt.hub.clone();
+            broker.with_connector_sessions(sessions)
+        }
+        None => broker,
+    };
     // REQ-APR-004 send half (#128): publish approval prompts to the
     // configured ntfy topic, with action URLs on the owner listener.
     // Needs both halves: no `[approval].ntfy` → no channel; no

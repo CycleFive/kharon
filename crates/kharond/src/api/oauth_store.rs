@@ -1110,10 +1110,34 @@ impl OauthStore {
                     connector_audience: connector,
                     connector_scope: connector,
                     expires_at: rec.expires_at,
+                    token_hash: hash,
                 }
             }
             _ => ConnectAccess::Unknown,
         }
+    }
+
+    /// Whether the record `token_hash` names is a live
+    /// connector-audience access token whose Connect has not ended:
+    /// the session-binding half of [`ConnectTokens::access_live`]
+    /// (#235 D5). An `/mcp` record never keeps a connector session
+    /// live.
+    pub fn connector_access_live(&self, token_hash: &str, now: u64) -> bool {
+        let inner = self.lock();
+        let Some(rec) = inner.file.tokens.iter().find(|t| t.hash == token_hash) else {
+            return false;
+        };
+        if rec.kind != TokenKind::Access
+            || rec.status != TokenStatus::Live
+            || rec.audience != TokenAudience::Connector
+            || now >= rec.expires_at
+        {
+            return false;
+        }
+        inner
+            .file
+            .identity(&rec.identity_id)
+            .is_some_and(|identity| !identity.revoked)
     }
 
     /// The audience stored for `presented`, access or refresh,
@@ -1249,6 +1273,10 @@ impl OauthStore {
 impl ConnectTokens for OauthStore {
     fn access(&self, presented: &str, now: u64) -> ConnectAccess {
         self.connector_access(presented, now)
+    }
+
+    fn access_live(&self, token_hash: &str, now: u64) -> bool {
+        self.connector_access_live(token_hash, now)
     }
 
     fn is_connect(&self, agent_id: &str) -> bool {
@@ -1664,6 +1692,7 @@ mod tests {
                 connector_audience: false,
                 connector_scope: false,
                 expires_at: NOW + ACCESS_TTL_SECS,
+                token_hash: hex(&sha256(pair.access_token.as_bytes())),
             }
         );
         assert_eq!(
@@ -1730,6 +1759,7 @@ mod tests {
                 connector_audience: true,
                 connector_scope: true,
                 expires_at: NOW + ACCESS_TTL_SECS,
+                token_hash: hex(&sha256(pair.access_token.as_bytes())),
             }
         );
         assert_eq!(
@@ -1752,7 +1782,10 @@ mod tests {
         use crate::connector::AuthFailDetail;
         assert_eq!(
             hub.check_connect(&id, &pair.access_token, NOW),
-            Some(Ok(NOW + ACCESS_TTL_SECS))
+            Some(Ok((
+                NOW + ACCESS_TTL_SECS,
+                hex(&sha256(pair.access_token.as_bytes()))
+            )))
         );
         assert_eq!(
             hub.check_connect("c-aaaaaaaaaa", &pair.access_token, NOW),

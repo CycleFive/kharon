@@ -137,6 +137,14 @@ pub struct ConnectionRow {
     pub channel: String,
     /// REQ-RL-002 suspension in force: the page offers Unsuspend.
     pub suspended: bool,
+    /// A live connector session is attached (#235 slice 6,
+    /// REQ-OAU-007): the Connect has a browser right now. No pin
+    /// and no token ever reach the page.
+    pub browser: bool,
+    /// RFC 3339, when that session attached. Absent when
+    /// `browser` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_since: Option<String>,
 }
 
 /// One row of the grants list: the grant's status view, plus the
@@ -367,14 +375,19 @@ where
     fn connections(&self) -> Vec<ConnectionRow> {
         self.connect_identities()
             .into_iter()
-            .map(|identity| ConnectionRow {
-                suspended: self.agent_suspended(&identity.id),
-                host: identity.audit_origin(),
-                connected_at: rfc3339_unix(identity.created_at),
-                channel: identity.connected_via.clone(),
-                agent_id: identity.id,
-                client_name: identity.client_name,
-                scopes: identity.scopes,
+            .map(|identity| {
+                let session = self.connector_session_since(&identity.id);
+                ConnectionRow {
+                    suspended: self.agent_suspended(&identity.id),
+                    host: identity.audit_origin(),
+                    connected_at: rfc3339_unix(identity.created_at),
+                    channel: identity.connected_via.clone(),
+                    agent_id: identity.id,
+                    client_name: identity.client_name,
+                    scopes: identity.scopes,
+                    browser: session.is_some(),
+                    browser_since: session.map(rfc3339_unix),
+                }
             })
             .collect()
     }

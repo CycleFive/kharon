@@ -465,10 +465,16 @@ impl kharond::connector::ConnectTokens for OneConnect {
                 connector_audience: true,
                 connector_scope: true,
                 expires_at: now + 3600,
+                // The fake's record hash is the token itself; the
+                // hub only ever hands it back to `access_live`.
+                token_hash: presented.to_owned(),
             }
         } else {
             kharond::connector::ConnectAccess::Unknown
         }
+    }
+    fn access_live(&self, token_hash: &str, _now: u64) -> bool {
+        token_hash == self.token
     }
     fn is_connect(&self, agent_id: &str) -> bool {
         agent_id == CONNECT_ID

@@ -5,8 +5,9 @@
 //! set; the broker checks every call against the bundles
 //! (REQ-OAU-006) on top of #200's allow-list, `tools/list` shows
 //! only what the scopes allow, and a Connect — which has no CDP
-//! endpoint in phase 1 — gets `forbidden` / `no_browser` for
-//! context and fills, before any fill backend is consulted
+//! endpoint in phase 1 — gets `Forbidden` / `NoBrowser` for
+//! context and fills, reported on MCP as `no_browser`, before
+//! any fill backend is consulted
 //! (REQ-OAU-007). The `[policy]` limits are keyed by agent id, so
 //! they bind a `c-…` id exactly like a config agent's. No scope
 //! approves: a `kh_at_` or `kh_rt_` presented to an owner-UI
@@ -349,15 +350,17 @@ async fn connect_context_and_fills_answer_no_browser_without_a_backend() {
     assert!(probe.context_calls.lock().unwrap().is_empty());
 
     // On the wire the refusal keeps the plain tool-result shape —
-    // HTTP 200, `forbidden` / `no_browser`, no step-up challenge:
-    // the step-up answers scope refusals only, and this token
-    // holds every scope.
+    // HTTP 200, `error` `no_browser` (#323) with the fixed detail,
+    // no step-up challenge: the step-up answers scope refusals
+    // only, and this token holds every scope. The typed error
+    // stays `Forbidden` / `NoBrowser`; the tool result reports
+    // the typed name rather than the `forbidden` class.
     let addr = serve_http(h.broker.clone()).await;
     let r = mcp_call(addr, Some(&access), "kharon_context", "{}").await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.header("www-authenticate"), None);
     let err = tool_error(&r.json());
-    assert_eq!(err["error"], "forbidden", "{err}");
+    assert_eq!(err["error"], "no_browser", "{err}");
     assert_eq!(err["detail"], "this connection has no browser attached yet");
     assert!(probe.context_calls.lock().unwrap().is_empty());
 

@@ -2318,7 +2318,7 @@ fn req_oau_007_compose_a_connect_has_no_browser() {
     ] {
         assert_eq!(o.status, 200, "{tool}: HTTP status");
         assert!(o.is_error, "{tool}: isError");
-        assert_eq!(o.error.as_deref(), Some("forbidden"), "{tool}: error");
+        assert_eq!(o.error.as_deref(), Some("no_browser"), "{tool}: error");
         assert_eq!(
             o.detail.as_deref(),
             Some("this connection has no browser attached yet"),

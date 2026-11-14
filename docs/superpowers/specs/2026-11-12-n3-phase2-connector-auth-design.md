@@ -976,7 +976,9 @@ the owner socket still fails as REQ-OAU-006 states (#279's tests keep
 passing, and one of them is repeated with a connector-audience token).
 
 **`no_browser` order.** A Connect with `kharon:fill` and no session:
-context, fill, and fill-totp are `forbidden` / `no_browser`, backend
+context, fill, and fill-totp are `no_browser` on the MCP tool result
+(detail "this connection has no browser attached yet"; the typed
+error stays `Forbidden` / `NoBrowser`), backend
 untouched. A read-only Connect calling `kharon_fill` is still
 `insufficient_scope`, and that still precedes `no_browser`.
 

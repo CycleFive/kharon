@@ -248,6 +248,41 @@ async fn context(lr: &LiveRig) -> Result<Outcome, ApiError> {
         .await
 }
 
+fn mcp_fill_args(kind: &str) -> String {
+    format!(
+        r#"{{"item_id":"{ITEM_A}","target":{{"cdp_target_id":"t1","expected_origin":"https://example.com"}},"fields":[{{"kind":"{kind}"}}]}}"#
+    )
+}
+
+/// The `{"error","detail"}` object inside a failed `tools/call`.
+fn mcp_tool_error(call_reply: &serde_json::Value) -> serde_json::Value {
+    assert_eq!(call_reply["result"]["isError"], true, "{call_reply}");
+    let text = call_reply["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool error text");
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+/// REQ-OAU-007 / #323: the MCP tool result names this refusal
+/// `no_browser` and keeps the fixed detail. HTTP stays 200 with no
+/// step-up challenge.
+async fn assert_mcp_no_browser(
+    addr: std::net::SocketAddr,
+    token: &str,
+    tool: &str,
+    arguments: &str,
+) {
+    let r = mcp_call(addr, Some(token), tool, arguments).await;
+    assert_eq!(r.status, 200, "{tool}: {}", r.body);
+    assert_eq!(r.header("www-authenticate"), None, "{tool}");
+    let err = mcp_tool_error(&r.json());
+    assert_eq!(err["error"], "no_browser", "{tool}: {err}");
+    assert_eq!(
+        err["detail"], "this connection has no browser attached yet",
+        "{tool}: {err}"
+    );
+}
+
 /// The slice's core: no session is `no_browser` with the backend
 /// untouched; a live session carries the context call and a
 /// granted fill to the CDP stub; the Connections row tracks the
@@ -255,6 +290,7 @@ async fn context(lr: &LiveRig) -> Result<Outcome, ApiError> {
 #[tokio::test(flavor = "multi_thread")]
 async fn fills_ride_the_live_session_and_disconnect_ends_it() {
     let lr = live_rig().await;
+    let addr = serve_http(Arc::clone(&lr.h.broker)).await;
 
     // No session yet: all three browser tools refuse, and nothing
     // reached the stub (no configured endpoint is a fallback).
@@ -271,6 +307,22 @@ async fn fills_ride_the_live_session_and_disconnect_ends_it() {
             .await,
         Err(ApiError::NO_BROWSER)
     );
+    // The same refusal on `/mcp`, under the typed name (#323).
+    assert_mcp_no_browser(addr, &lr.mcp_access, "kharon_context", "{}").await;
+    assert_mcp_no_browser(
+        addr,
+        &lr.mcp_access,
+        "kharon_fill",
+        &mcp_fill_args("password"),
+    )
+    .await;
+    assert_mcp_no_browser(
+        addr,
+        &lr.mcp_access,
+        "kharon_fill_totp",
+        &mcp_fill_args("totp"),
+    )
+    .await;
     assert!(lr.rig.received.lock().unwrap().is_empty());
     let rows = lr.h.broker.connections();
     assert_eq!(rows.len(), 1);
@@ -312,7 +364,17 @@ async fn fills_ride_the_live_session_and_disconnect_ends_it() {
     // the Connect and shuts its session in the same call.
     assert!(lr.h.broker.disconnect_connect(&lr.id).unwrap());
     assert!(!lr.rig.hub.is_connected(&lr.id));
-    assert_eq!(fill(&lr).await, Err(ApiError::NO_BROWSER));
+    // Disconnect revokes the Connect, so a fresh `/mcp` call is 401
+    // rather than a tool result. The refusal the already-authenticated
+    // agent still gets is the same `no_browser`, and MCP renders it
+    // under that name (#323).
+    let err = fill(&lr).await.unwrap_err();
+    assert_eq!(err, ApiError::NO_BROWSER);
+    assert_eq!(err.tool_body()["error"], "no_browser");
+    assert_eq!(
+        err.tool_body()["detail"],
+        "this connection has no browser attached yet"
+    );
     let rows = lr.h.broker.connections();
     assert!(rows.is_empty(), "an ended Connect leaves the page");
     detach(&lr, handle).await;
@@ -334,6 +396,16 @@ async fn a_revoked_access_token_ends_its_session_at_once() {
         "the session outlived its token record"
     );
     assert_eq!(fill(&lr).await, Err(ApiError::NO_BROWSER));
+    // The Connect's `/mcp` token is a different record, so the tool
+    // result is reachable and still named `no_browser` (#323).
+    let addr = serve_http(Arc::clone(&lr.h.broker)).await;
+    assert_mcp_no_browser(
+        addr,
+        &lr.mcp_access,
+        "kharon_fill",
+        &mcp_fill_args("password"),
+    )
+    .await;
 
     // The Connect lives: its /mcp token still authenticates, the
     // family rotates, and the new token's session fills.

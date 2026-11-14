@@ -268,7 +268,9 @@ impl ApiError {
         Self::new(ErrorCode::InsufficientScope, Detail::InsufficientScope);
     /// 403, a Connect identity has no browser attached yet
     /// (REQ-OAU-007 phase 1; #232). The detail variant is the typed
-    /// error `no_browser`.
+    /// error `no_browser`. MCP tool results report that name
+    /// ([`Self::tool_error`]); [`Self::body`] keeps the `forbidden`
+    /// class, which this error shares with other 403s.
     pub const NO_BROWSER: Self = Self::new(ErrorCode::Forbidden, Detail::NoBrowser);
     /// 423.
     pub const LOCKED: Self = Self::new(ErrorCode::Locked, Detail::Locked);
@@ -291,6 +293,30 @@ impl ApiError {
     pub fn body(&self) -> Value {
         serde_json::to_value(ErrorBody {
             error: self.code.as_str(),
+            detail: self.detail.as_str(),
+        })
+        .expect("invariant: error bodies serialize")
+    }
+
+    /// The `error` name an MCP tool result reports (#323).
+    ///
+    /// [`ErrorCode::as_str`] is the class, and it is what [`Self::body`]
+    /// sends. `NoBrowser` shares [`ErrorCode::Forbidden`] with other
+    /// 403s, so that class name folds the typed refusal into
+    /// `forbidden`. A dashboard matches `no_browser` (REQ-OAU-007).
+    /// Every other error keeps its class name.
+    pub const fn tool_error(self) -> &'static str {
+        match (self.code, self.detail) {
+            (ErrorCode::Forbidden, Detail::NoBrowser) => "no_browser",
+            _ => self.code.as_str(),
+        }
+    }
+
+    /// The MCP tool-result body: [`Self::body`] with [`Self::tool_error`]
+    /// as `error`. The detail text is unchanged.
+    pub fn tool_body(&self) -> Value {
+        serde_json::to_value(ErrorBody {
+            error: self.tool_error(),
             detail: self.detail.as_str(),
         })
         .expect("invariant: error bodies serialize")

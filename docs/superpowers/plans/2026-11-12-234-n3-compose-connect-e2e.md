@@ -260,7 +260,7 @@ async fn dashboard_serves_its_metadata_document_and_counts_fetches() {
    - Tokens: `at0`, `rt0`.
    - Connect A's id: the one row of `GET /owner/connections` now.
 2. **An `/mcp` call.** `kharon_status` with `at0`: 200, not an error.
-3. **`no_browser`.** `kharon_context` with `{}` and `at0`: HTTP 200, `isError`, `error == "forbidden"`, `detail == "this connection has no browser attached yet"`, no `WWW-Authenticate` (as `req_oau_006_007_scopes.rs:349–353` asserts in-process). Then `kharon_fill` with well-formed arguments (the shape the ws E2E's fill uses, any item id): the same error.
+3. **`no_browser`.** `kharon_context` with `{}` and `at0`: HTTP 200, `isError`, `error == "no_browser"`, `detail == "this connection has no browser attached yet"`, no `WWW-Authenticate` (as `req_oau_006_007_scopes.rs` asserts in-process). Then `kharon_fill` with well-formed arguments (the shape the ws E2E's fill uses, any item id): the same error.
 4. **Rotation.** Refresh `rt0`: 200 with `at1`, `rt1`, both different from the first pair. `kharon_status` with `at1`: 200. Record `Instant` `rotated_at`.
 5. **The single retry.** Refresh `rt0` again at once: 200 with `at2`, `rt2`. Then `kharon_status` with `at1`: 401 (the pair the retry superseded is dead), and with `at2`: 200. Record the time since `rotated_at`.
 6. **Reuse kills the Connect.** Refresh `rt0` a third time: `400 invalid_grant`. Then `kharon_status` with `at2`: 401, and refresh `rt2`: `400 invalid_grant`. (Intended 4xx answers so far: two.)

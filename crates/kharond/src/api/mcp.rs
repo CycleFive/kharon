@@ -50,9 +50,11 @@
 //! (400; 413 past the caps), then JSON-RPC. Everything before JSON-RPC answers with the `/v1/*` error
 //! body. JSON-RPC protocol errors use fixed messages ([`RpcError`]);
 //! tool errors are results with `isError: true` whose text is the
-//! [`ApiError`] body. One exception (REQ-OAU-001): a `tools/call`
-//! refused for scope answers HTTP 403 with the RFC 6750 step-up
-//! challenge, so an OAuth client can re-authorize and retry. No
+//! [`ApiError`] body. `no_browser` is named `no_browser` there, not
+//! the `forbidden` class it shares (#323). One exception
+//! (REQ-OAU-001): a `tools/call` refused for scope answers HTTP 403
+//! with the RFC 6750 step-up challenge, so an OAuth client can
+//! re-authorize and retry. No
 //! response here interpolates request data,
 //! except the requested protocol version in an unsupported-version
 //! error, which is echoed only when it has the `YYYY-MM-DD` shape
@@ -857,17 +859,20 @@ where
                     // call again. The body stays the tool-error
                     // result. Every other error — `no_browser`
                     // included — keeps the tool-result shape.
+                    // `tool_body` is `body` except that `no_browser`
+                    // reports its typed name (#323), not `forbidden`.
                     let challenge = (e == ApiError::INSUFFICIENT_SCOPE)
                         .then(|| step_up_challenge(broker, agent, tool))
                         .flatten();
                     match challenge {
                         Some(challenge) => {
-                            let Reply::Json(_, v) = tool_result(id, era, e.body(), true) else {
+                            let Reply::Json(_, v) = tool_result(id, era, e.tool_body(), true)
+                            else {
                                 unreachable!("tool results are JSON replies")
                             };
                             Reply::Challenged(StatusCode::FORBIDDEN, v, challenge)
                         }
-                        None => tool_result(id, era, e.body(), true),
+                        None => tool_result(id, era, e.tool_body(), true),
                     }
                 }
             }

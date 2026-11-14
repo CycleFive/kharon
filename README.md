@@ -13,6 +13,8 @@ Deploying:
 - [`docs/agent-runtime-setup.md`](docs/agent-runtime-setup.md): the agent side on a hosted or root runtime, and handing over credentials.
 - [`deploy/compose/README.md`](deploy/compose/README.md): running kharond with Docker Compose.
 
+Planning: [`docs/roadmap.md`](docs/roadmap.md), agent platforms from v0.4.0 through v0.6.0 and after.
+
 ## License
 
 Licensed under either of

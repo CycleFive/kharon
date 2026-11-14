@@ -478,6 +478,11 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// against it on `/mcp` (never on `/v1/*`), and a panic ends
     /// every Connect it holds.
     oauth_store: Option<Arc<super::oauth_store::OauthStore>>,
+    /// Live connector sessions (REQ-OAU-007; #235 slice 6), when
+    /// `[connector]` is configured: the connector hub. A Connect
+    /// with a live, unexpired session has a browser; without this
+    /// every Connect answers `no_browser`, as in phase 1.
+    connector_sessions: Option<Arc<dyn crate::connector::ConnectorSessions>>,
     /// Panic hooks (#252): run on every [`Self::panic_lock`],
     /// whatever its outcome. Registered after construction (the
     /// owner UI is built from the broker, so it cannot be a builder
@@ -680,6 +685,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             rollback: Mutex::new(RollbackGuard::new()),
             oauth: None,
             oauth_store: None,
+            connector_sessions: None,
             panic_hooks: Mutex::new(Vec::new()),
         }
     }
@@ -740,6 +746,28 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// The OAuth token store, when `[oauth]` is configured.
     pub fn oauth_store(&self) -> Option<&Arc<super::oauth_store::OauthStore>> {
         self.oauth_store.as_ref()
+    }
+
+    /// Carry the connector hub's live sessions (REQ-OAU-007;
+    /// #235 slice 6): the daemon shares the one hub with the fill
+    /// backend, so the session `require_browser` admits is the
+    /// session a fill then rides.
+    pub fn with_connector_sessions(
+        mut self,
+        sessions: Arc<dyn crate::connector::ConnectorSessions>,
+    ) -> Self {
+        self.connector_sessions = Some(sessions);
+        self
+    }
+
+    /// When `agent_id`'s live, unexpired connector session attached
+    /// (Unix seconds), or `None` when it has none — no hub wired,
+    /// no session, or a session whose token record has ended. The
+    /// Connections page's "browser attached" half (#235 slice 6).
+    pub fn connector_session_since(&self, agent_id: &str) -> Option<u64> {
+        self.connector_sessions
+            .as_ref()
+            .and_then(|sessions| sessions.session_since(agent_id))
     }
 
     /// Use `clock` for grant TTLs and the request timeout instead of
@@ -1049,14 +1077,18 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
     }
 
-    /// Phase 1 (REQ-OAU-007; #232): a Connect identity has no CDP
-    /// endpoint and no browser attached, so context and fill calls
-    /// refuse `no_browser` here — before the lock gate, any rate
-    /// bucket, any grant work and above all before the fill backend
-    /// is consulted, so a Connect can never fall back to a
-    /// configured endpoint. Config agents pass.
+    /// REQ-OAU-007 (#232, #235 slice 6): a Connect identity has a
+    /// browser only while its connector session is live — the
+    /// session its connector-audience token attached (REQ-OAU-009),
+    /// live only while that token's record is. Without one, context
+    /// and fill calls refuse `no_browser` here — after the scope
+    /// gate, before the lock gate, any rate bucket, any grant work
+    /// and above all before the fill backend is consulted, so a
+    /// Connect can never fall back to a configured endpoint. Config
+    /// agents pass: their CDP lookup never consults a Connect
+    /// session, and a Connect session never satisfies theirs.
     fn require_browser(&self, agent: &AgentId) -> Result<(), ApiError> {
-        if agent.is_connect() {
+        if agent.is_connect() && self.connector_session_since(agent.as_str()).is_none() {
             Err(ApiError::NO_BROWSER)
         } else {
             Ok(())

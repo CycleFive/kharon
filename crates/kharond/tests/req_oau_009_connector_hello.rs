@@ -53,10 +53,30 @@ struct FakeConnect {
 impl ConnectTokens for FakeConnect {
     fn access(&self, presented: &str, _now: u64) -> ConnectAccess {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.answers
-            .get(presented)
-            .cloned()
-            .unwrap_or(ConnectAccess::Unknown)
+        // The fake's record hash is the token itself; the hub only
+        // ever hands it back to `access_live`.
+        match self.answers.get(presented).cloned() {
+            Some(ConnectAccess::Live {
+                identity,
+                connector_audience,
+                connector_scope,
+                expires_at,
+                ..
+            }) => ConnectAccess::Live {
+                identity,
+                connector_audience,
+                connector_scope,
+                expires_at,
+                token_hash: presented.to_owned(),
+            },
+            _ => ConnectAccess::Unknown,
+        }
+    }
+    fn access_live(&self, token_hash: &str, now: u64) -> bool {
+        matches!(
+            self.answers.get(token_hash),
+            Some(ConnectAccess::Live { expires_at, .. }) if now < *expires_at
+        )
     }
     fn is_connect(&self, agent_id: &str) -> bool {
         agent_id == CID || agent_id == OTHER
@@ -69,6 +89,7 @@ fn live(identity: &str, audience: bool, expires_at: u64) -> ConnectAccess {
         connector_audience: audience,
         connector_scope: true,
         expires_at,
+        token_hash: String::new(),
     }
 }
 

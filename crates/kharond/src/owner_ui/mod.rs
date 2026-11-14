@@ -2917,7 +2917,7 @@ const SHELL_PAGE: &str = r#"<!DOCTYPE html>
 <h2>Connections</h2>
 <p id="connections-empty">No dashboards connected.</p>
 <table id="connections" hidden>
-<thead><tr><th>Identity</th><th>Client</th><th>Host</th><th>Scopes</th><th>Connected</th><th>Channel</th><th></th></tr></thead>
+<thead><tr><th>Identity</th><th>Client</th><th>Host</th><th>Scopes</th><th>Connected</th><th>Channel</th><th>Browser</th><th></th></tr></thead>
 <tbody id="connection-rows"></tbody>
 </table>
 <h2>Audit</h2>
@@ -3003,7 +3003,8 @@ async function refreshConnections() {
     const tr = document.createElement("tr");
     tr.dataset.agentId = c.agent_id;
     tr.append(cell(c.agent_id), cell(c.client_name), cell(c.host || "", "origin"),
-      cell(c.scopes.join(", ")), cell(c.connected_at), cell(c.channel));
+      cell(c.scopes.join(", ")), cell(c.connected_at), cell(c.channel),
+      cell(c.browser ? "attached " + c.browser_since : "none"));
     const actions = document.createElement("td");
     if (c.suspended) {
       actions.append(button("Unsuspend", () => decide("/owner/connections/unsuspend", { agent_id: c.agent_id })), " ");
@@ -4880,6 +4881,8 @@ mod tests {
                 connected_at: "2026-11-12T00:00:00Z".into(),
                 channel: "oauth".into(),
                 suspended: true,
+                browser: true,
+                browser_since: Some("2026-11-12T01:00:00Z".into()),
             }]
         }
 
@@ -5523,6 +5526,9 @@ mod tests {
         assert_eq!(c["connected_at"], "2026-11-12T00:00:00Z");
         assert_eq!(c["channel"], "oauth");
         assert_eq!(c["suspended"], true);
+        // #235 slice 6: the live-session half of the row.
+        assert_eq!(c["browser"], true);
+        assert_eq!(c["browser_since"], "2026-11-12T01:00:00Z");
         assert!(rig.calls().is_empty(), "listing is read-only");
     }
 

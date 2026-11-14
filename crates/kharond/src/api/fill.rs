@@ -640,10 +640,29 @@ impl FillBackend for CdpFillBackend {
 /// fill itself runs on a clone of the engine.
 pub struct ConnectingCdpBackend {
     agents: HashMap<String, AgentBrowser>,
+    /// The connector hub, when [`Self::with_connector`] attached
+    /// one: path B for the configured agents, and the only browser
+    /// path a Connect identity has (#235 slice 6).
+    hub: Option<Arc<crate::connector::Hub>>,
+    /// Browsers of Connect identities, one per `c-…` id, built on
+    /// first use against [`CONNECT_ENDPOINT`]. A Connect id is
+    /// minted at runtime, so unlike the configured agents it cannot
+    /// be in the map at startup. Entries hold only the cached CDP
+    /// connection; the session they ride is the hub's, and an entry
+    /// is served only while that session is live.
+    dynamic: std::sync::Mutex<HashMap<String, Arc<AgentBrowser>>>,
     connect_timeout: Duration,
     teardown_timeout: Duration,
     generation: Arc<AtomicU64>,
 }
+
+/// The CDP address a Connect session's browser is reached at: the
+/// address on the agent host, as for a configured
+/// `via = agent_connector` agent. The connector proxies every mux
+/// stream to its own configured loopback CDP socket, so this is the
+/// request target the browser answers, never a socket the broker
+/// dials (REQ-ARCH-002).
+const CONNECT_ENDPOINT: &str = "ws://127.0.0.1:9222";
 
 /// Budget for one background connect (socket, handshake and
 /// `createBrowserContext`); matches the per-request CDP hang-guard.
@@ -707,6 +726,8 @@ impl ConnectingCdpBackend {
                     )
                 })
                 .collect(),
+            hub: None,
+            dynamic: std::sync::Mutex::new(HashMap::new()),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             teardown_timeout: DEFAULT_TEARDOWN_TIMEOUT,
             generation: Arc::new(AtomicU64::new(0)),
@@ -731,11 +752,71 @@ impl ConnectingCdpBackend {
     }
 
     /// Path B: CDP for `via = agent_connector` opens streams on `hub`.
+    /// The hub is also the browser path of every Connect identity
+    /// (#235 slice 6): an id with a live session on it is served
+    /// through a per-id browser built on first use.
     pub fn with_connector(mut self, hub: Arc<crate::connector::Hub>) -> Self {
         for agent in self.agents.values_mut() {
             agent.hub = Some(Arc::clone(&hub));
         }
+        self.hub = Some(hub);
         self
+    }
+
+    /// The browser for `agent_id`: a configured agent's own, or —
+    /// for an id the config does not name — a Connect identity's,
+    /// when the hub holds a live session for it. The two never
+    /// substitute (REQ-OAU-007): a configured id is answered from
+    /// the config map alone, and a Connect session is looked up
+    /// under its own `c-…` id only.
+    fn agent_for(&self, agent_id: &str) -> Option<AgentRef<'_>> {
+        if let Some(agent) = self.agents.get(agent_id) {
+            return Some(AgentRef::Configured(agent));
+        }
+        let hub = self.hub.as_ref()?;
+        if !hub.is_connected(agent_id) {
+            return None;
+        }
+        let mut dynamic = self.dynamic.lock().unwrap_or_else(|p| p.into_inner());
+        let agent = dynamic.entry(agent_id.to_owned()).or_insert_with(|| {
+            Arc::new(AgentBrowser {
+                endpoint: CdpEndpoint::validate(CONNECT_ENDPOINT, Tunnel::AgentConnector, None)
+                    .expect("the constant Connect endpoint validates"),
+                hub: Some(Arc::clone(hub)),
+                live: Arc::new(tokio::sync::Mutex::new(None)),
+                published: Arc::new(std::sync::Mutex::new(None)),
+            })
+        });
+        Some(AgentRef::Dynamic(Arc::clone(agent)))
+    }
+
+    /// Whether `agent_id` could be served at all: configured, or a
+    /// Connect identity with a live session on the hub. A query
+    /// only — unlike [`Self::agent_for`] it builds nothing.
+    fn serves(&self, agent_id: &str) -> bool {
+        self.agents.contains_key(agent_id)
+            || self
+                .hub
+                .as_ref()
+                .is_some_and(|hub| hub.is_connected(agent_id))
+    }
+}
+
+/// One agent's browser, configured or built for a Connect identity
+/// on first use. Derefs to [`AgentBrowser`] either way.
+enum AgentRef<'a> {
+    Configured(&'a AgentBrowser),
+    Dynamic(Arc<AgentBrowser>),
+}
+
+impl std::ops::Deref for AgentRef<'_> {
+    type Target = AgentBrowser;
+
+    fn deref(&self) -> &AgentBrowser {
+        match self {
+            Self::Configured(agent) => agent,
+            Self::Dynamic(agent) => agent,
+        }
     }
 }
 
@@ -906,7 +987,7 @@ async fn open_agent_browser(
 
 impl FillBackend for ConnectingCdpBackend {
     fn has_agent(&self, agent_id: &str) -> bool {
-        self.agents.contains_key(agent_id)
+        self.serves(agent_id)
     }
 
     fn fill<'a>(
@@ -930,7 +1011,7 @@ impl FillBackend for ConnectingCdpBackend {
         generation: u64,
     ) -> FillFuture<'a> {
         Box::pin(async move {
-            let Some(agent) = self.agents.get(agent_id) else {
+            let Some(agent) = self.agent_for(agent_id) else {
                 return FillOutcome::TargetNotOwned;
             };
             let c = match agent
@@ -966,7 +1047,7 @@ impl FillBackend for ConnectingCdpBackend {
         generation: u64,
     ) -> ContextFuture<'a> {
         Box::pin(async move {
-            let Some(agent) = self.agents.get(agent_id) else {
+            let Some(agent) = self.agent_for(agent_id) else {
                 return Err(FillOutcome::Error(NO_CONTEXTS.into()));
             };
             let c = agent
@@ -996,7 +1077,7 @@ impl FillBackend for ConnectingCdpBackend {
         allow_default: bool,
     ) -> ObserveFuture<'a> {
         Box::pin(async move {
-            let agent = self.agents.get(agent_id)?;
+            let agent = self.agent_for(agent_id)?;
             let generation = self.generation();
             let c = agent
                 .engine(
@@ -1022,7 +1103,7 @@ impl FillBackend for ConnectingCdpBackend {
     /// context from a locked generation or on a connection that ended
     /// is reported as none, even before its teardown has run.
     fn cached_context_id(&self, agent_id: &str) -> Option<String> {
-        let agent = self.agents.get(agent_id)?;
+        let agent = self.agent_for(agent_id)?;
         let published = agent.published.lock().unwrap_or_else(|p| p.into_inner());
         match &*published {
             Some(c) if c.generation == self.generation() && !c.engine.is_closed() => {
@@ -1047,6 +1128,26 @@ impl FillBackend for ConnectingCdpBackend {
                 Arc::clone(&agent.live),
                 Arc::clone(&agent.published),
                 agent_id.clone(),
+                lock_generation,
+                self.teardown_timeout,
+            ));
+        }
+        // Connect identities too: the lock closes their CDP
+        // connections and contexts like any agent's (SPEC §8). The
+        // connector session itself is the hub's and stays up
+        // (REQ-OAU-007, A9) — the next fill reconnects over it.
+        let dynamic: Vec<(String, Arc<AgentBrowser>)> = self
+            .dynamic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(id, agent)| (id.clone(), Arc::clone(agent)))
+            .collect();
+        for (agent_id, agent) in dynamic {
+            rt.spawn(close_cached(
+                Arc::clone(&agent.live),
+                Arc::clone(&agent.published),
+                agent_id,
                 lock_generation,
                 self.teardown_timeout,
             ));

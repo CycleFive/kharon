@@ -747,15 +747,27 @@ mod tests {
 
     #[test]
     fn token_file_refuses_other_material() {
+        // REQ-ARCH-001's guarantee, with the real prefixes: an agent API
+        // token (kh_agent_) or a refresh token (kh_rt_) left in the file
+        // by mistake is refused before any dial, like anything else that
+        // is not a connector credential.
         let scratch = Scratch::new();
         for body in [
-            b"kh_api_x\n".as_slice(),
+            b"kh_agent_x\n".as_slice(),
+            b"kh_rt_x\n".as_slice(),
             b"hunter2\n".as_slice(),
             b"\n".as_slice(),
         ] {
             let path = scratch.file("token", body, 0o600);
             assert!(read_token(&path).is_err());
         }
+    }
+
+    #[test]
+    fn token_file_mode_check_applies_to_access_tokens() {
+        let scratch = Scratch::new();
+        let path = scratch.file("token", b"kh_at_x\n", 0o644);
+        assert!(read_token(&path).is_err());
     }
 
     #[test]

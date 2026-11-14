@@ -2006,6 +2006,10 @@ cdp = "127.0.0.1:9222"
 - `server_name` sets the inner TLS server name on both transports; it
   defaults to the broker host (or the URL's host). The server name is
   not what authenticates the broker, `broker_pin` is.
+- `token_file` holds the tunnel credential — or, for a connector
+  spawned by a dashboard through Connect (#235), the connector access
+  token (`kh_at_`) the broker issued for it. The broker enforces that
+  token's connector audience at authenticate time.
 - An existing raw-TLS config (`broker`, no `transport`) keeps working
   unchanged.
 

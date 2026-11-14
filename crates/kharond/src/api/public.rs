@@ -10,6 +10,7 @@
 //! | `POST /mcp` | the MCP transport ([`super::mcp`]), exactly as on `[api]`: same bearer auth, rate limits, audit |
 //! | `GET /connector` | the agent-connector WebSocket upgrade (#199) when `[connector] websocket = true`; 404 otherwise |
 //! | `GET /.well-known/oauth-protected-resource[/mcp]` | RFC 9728 protected-resource metadata (REQ-OAU-001) when `[oauth]` is set; 404 otherwise |
+//! | `GET /.well-known/oauth-protected-resource/connector` | RFC 9728 connector metadata with the inner pin (#235 D1, REQ-OAU-009) when `[oauth]` and a connector certificate are both set; 404 otherwise |
 //! | anything else | 404 `not_found` / `no_such_route` |
 //!
 //! "Anything else" includes `/v1/*` and `/v1/openapi.json` (the tailnet
@@ -43,7 +44,9 @@ use super::core::{Broker, VaultView};
 use super::error::{ApiError, Detail, ErrorCode};
 use super::http::{AppState, TlsListener, error, json_response};
 use super::mcp::MCP_PATH;
-use super::oauth::{PROTECTED_RESOURCE_MCP_PATH, PROTECTED_RESOURCE_PATH};
+use super::oauth::{
+    PROTECTED_RESOURCE_CONNECTOR_PATH, PROTECTED_RESOURCE_MCP_PATH, PROTECTED_RESOURCE_PATH,
+};
 use super::transport::ClientIp;
 use crate::connector::WsEntry;
 use crate::lock::Clock;
@@ -294,6 +297,13 @@ enum Admit {
     /// answers 404 when `[oauth]` is not configured, so the route's
     /// existence never leaks the config.
     ProtectedResource,
+    /// `GET /.well-known/oauth-protected-resource/connector`: the
+    /// connector document with the pin (#235 D1, REQ-OAU-009).
+    /// Admitted by shape; the handler answers 404 unless `[oauth]`
+    /// and a connector certificate are both configured. This is a
+    /// GET metadata path, not the WebSocket: `GET /connector` stays
+    /// the upgrade.
+    ProtectedResourceConnector,
 }
 
 fn admit(method: &Method, path: &str) -> Option<Admit> {
@@ -302,6 +312,9 @@ fn admit(method: &Method, path: &str) -> Option<Admit> {
         (&Method::GET, CONNECTOR_PATH) => Some(Admit::Connector),
         (&Method::GET, PROTECTED_RESOURCE_PATH | PROTECTED_RESOURCE_MCP_PATH) => {
             Some(Admit::ProtectedResource)
+        }
+        (&Method::GET, PROTECTED_RESOURCE_CONNECTOR_PATH) => {
+            Some(Admit::ProtectedResourceConnector)
         }
         _ => None,
     }
@@ -356,6 +369,21 @@ where
             ),
             None => not_found(),
         },
+        // The connector document (#235 D1): same unauthenticated
+        // discovery shape, but it exists only when a connector
+        // certificate pin is configured. `json_response` carries
+        // `Cache-Control: no-store`, so no cache can freeze a pin
+        // across a certificate rotation.
+        Some(Admit::ProtectedResourceConnector) => {
+            match state
+                .broker
+                .oauth_discovery()
+                .and_then(|d| d.connector_protected_resource_metadata())
+            {
+                Some(doc) => json_response(axum::http::StatusCode::OK, doc.to_string()),
+                None => not_found(),
+            }
+        }
         None => not_found(),
     }
 }
@@ -490,6 +518,15 @@ mod tests {
                 "GET {path}"
             );
         }
+        // The connector document (#235 D1) is its own route, not
+        // the WebSocket upgrade and not the /mcp document.
+        assert_eq!(
+            admit(
+                &Method::GET,
+                "/.well-known/oauth-protected-resource/connector"
+            ),
+            Some(Admit::ProtectedResourceConnector)
+        );
         for (method, path) in [
             (Method::GET, "/mcp"),
             (Method::DELETE, "/mcp"),
@@ -513,8 +550,16 @@ mod tests {
             // lives on the owner hostname, not here.
             (Method::POST, "/.well-known/oauth-protected-resource"),
             (Method::POST, "/.well-known/oauth-protected-resource/mcp"),
+            (
+                Method::POST,
+                "/.well-known/oauth-protected-resource/connector",
+            ),
             (Method::GET, "/.well-known/oauth-protected-resource/"),
             (Method::GET, "/.well-known/oauth-protected-resource/mcp/"),
+            (
+                Method::GET,
+                "/.well-known/oauth-protected-resource/connector/",
+            ),
             (Method::GET, "/.well-known/oauth-authorization-server"),
             (Method::GET, "/.well-known/openid-configuration"),
         ] {

@@ -82,6 +82,13 @@ const CONSENT_PURPOSE: &str = "consent";
 pub(super) const CONNECT_NOTICE: &str = "Connecting does not let it sign in anywhere on its own. \
      Every sign-in still needs your approval in kharon.";
 
+/// The extra sentence under the Fill bundle when the client's
+/// document declares the connector grant (Q2, ruled by Lothrop
+/// 2026-11-14; #324): the password lands in the dashboard's own
+/// browser, and that browser stays signed in afterward.
+pub(super) const CONNECTOR_BROWSER_NOTICE: &str = "This dashboard has its own browser. \
+     kharon types your password into it, and the dashboard stays signed in afterward.";
+
 const UNUSABLE: &str = "This connection request isn't valid.";
 const EXPIRED_PAGE: &str = "This connection request has expired or was already answered. \
      Go back to the dashboard and start again.";
@@ -473,9 +480,17 @@ impl OwnerUi {
             .scopes
             .iter()
             .map(|s| {
+                // Q2 (#324): a client that declares the connector
+                // grant gets the browser sentence under its Fill
+                // bundle; every other screen is unchanged.
+                let words = if *s == Scope::Fill && pending.connector_grant_declared {
+                    format!("{} {}", s.words(), CONNECTOR_BROWSER_NOTICE)
+                } else {
+                    s.words().to_owned()
+                };
                 json!({
                     "id": s.as_str(),
-                    "words": s.words(),
+                    "words": words,
                     "optional": s.optional(),
                 })
             })

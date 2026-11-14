@@ -17,8 +17,8 @@ use super::super::{
     Incoming, NoApprovals, NoAudit, OwnerAudit, OwnerUi, OwnerUiOptions, ShellView, StaticShell,
 };
 use super::{
-    AuthorizeBudget, CODE_TTL, CONNECT_NOTICE, CodeStore, OauthAs, PENDING_PURPOSE, PENDING_TTL,
-    Scope, consent_challenge, parse_query,
+    AuthorizeBudget, CODE_TTL, CONNECT_NOTICE, CONNECTOR_BROWSER_NOTICE, CodeStore, OauthAs,
+    PENDING_PURPOSE, PENDING_TTL, Scope, consent_challenge, parse_query,
 };
 use crate::api::cimd::{ClientAdmission, RefusalAudit};
 use crate::api::oauth::Discovery;
@@ -635,6 +635,53 @@ fn consent_page_signs_in_first_then_shows_plain_words() {
             .unwrap()
             .contains("You approve every sign-in here first.")
     );
+}
+
+#[test]
+fn consent_view_names_the_dashboard_browser_only_when_the_grant_is_declared() {
+    // Q2 (#324): the browser sentence rides the Fill bundle's words
+    // when the admitted document declares the connector grant, and
+    // appears nowhere when it does not.
+    let declaring = cimd_document("Muse", &[REDIRECT]).replace(
+        r#""token_endpoint_auth_method""#,
+        r#""grant_types":["authorization_code","refresh_token","urn:kharon:oauth:grant-type:connector"],"token_endpoint_auth_method""#,
+    );
+    for (doc, declared) in [
+        (cimd_document("Muse", &[REDIRECT]), false),
+        (declaring, true),
+    ] {
+        let clients = admission(
+            vec![Ok((doc, Some("max-age=86400".into())))],
+            Arc::new(SilentAudit),
+        );
+        let (ui, _dir) = open_ui(clients, Arc::new(NoAudit), false);
+        let (_s, _b, location) = authorize(&ui, &valid_query("kharon:fill", "xyz"));
+        let token = consent_token(&location.unwrap()).to_owned();
+        let cookie = cookie_of(&ui.issue_session(&[0x11; 16]));
+        let view_body = json!({"pending": token}).to_string();
+        let (status, view, _) = body_of(ui.dispatch(incoming(
+            Method::POST,
+            "/oauth/consent/view",
+            None,
+            Some(&cookie),
+            &view_body,
+        )));
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let view: Value = serde_json::from_str(&view).unwrap();
+        assert_eq!(view["scopes"][1]["id"], "kharon:fill");
+        let fill_words = view["scopes"][1]["words"].as_str().unwrap();
+        assert_eq!(
+            fill_words.contains(CONNECTOR_BROWSER_NOTICE),
+            declared,
+            "{fill_words}"
+        );
+        assert!(
+            !view["scopes"][0]["words"]
+                .as_str()
+                .unwrap()
+                .contains(CONNECTOR_BROWSER_NOTICE)
+        );
+    }
 }
 
 #[test]

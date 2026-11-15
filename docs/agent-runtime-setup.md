@@ -44,7 +44,9 @@ needs a secret except step 5.
    with password manager, leak detection, autofill, payment-method
    query, sync and metrics off, to the policy directory of the
    browser you run: `/etc/chromium/policies/managed/` for Debian's
-   `chromium`, `/etc/opt/chrome/policies/managed/` for Google Chrome.
+   `chromium`, `/etc/opt/chrome/policies/managed/` for Google Chrome,
+   `/etc/opt/chrome_for_testing/policies/managed/` for Chrome for
+   Testing (the browser Hermes packages).
    The file is in
    [`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
    (`no-password-manager.json`). Check it took effect: open
@@ -109,43 +111,56 @@ install. Used as-is for stock Hermes, the preset scans
 `/var/lib/kharon-connector/.hermes`, which Hermes never writes, and
 `ProtectHome=yes` hides Hermes's real home under `/home` even when
 `hermes_home` names it. `--check` still prints `check: ok`, because
-it never opens the file. The next fill then fails the dial
-(`no_browser`). On start the connector logs the path it will scan,
-`cdp: discover hermes_home=…`.
+it never opens the file. `kharon_context` and `kharon_fill` then
+return `error` with detail `cdp_error`. A connector that is not
+running at all shows up as `timeout`, not as the connector's
+`no_browser` dial result and not as REQ-OAU-007's MCP `no_browser`.
+On start the connector logs the path it will scan,
+`cdp: discover hermes_home=…`. A later dial that cannot read a live
+file logs `cdp: discover failed`, at most once a minute.
 
-When the connector and Hermes are different users, which is that
-layout:
+The setup that was checked on a stock Hermes host is to run the
+connector as Hermes's own user. The default home is then Hermes's
+home, and `ProtectHome` can stay.
 
-1. Set `hermes_home` to Hermes's home, or set `HERMES_HOME` in the
-   connector's environment to that same directory.
-2. Give the connector user read and traverse on
-   `<home>/cache/browser/chromium` and on each profile's
-   `DevToolsActivePort`. Hermes creates those directories mode
-   `0700`, so a path in the unit is not enough on its own.
-3. Drop `ProtectHome=yes`, or keep it and add `ReadOnlyPaths=` for
-   that tree so systemd mounts it back into the service.
+A separate connector uid is the layout
+[`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
+uses, and it is not yet shown to work for this preset. Hermes
+creates `~/.hermes`, the ephemeral root, and every per-launch
+profile directory mode `0700`. A one-time `chmod` or ACL on a
+directory that already exists does not cover the directory the next
+launch creates, and an explicit mode at `mkdir` does not keep a
+default ACL set on the parent. `ProtectHome=yes` also hides
+`/home` until the unit drops it or adds `ReadOnlyPaths=` for the
+tree. If file permissions cannot follow those new directories, the
+connector user needs a capability such as `CAP_DAC_READ_SEARCH` to
+read them. That capability lets the process read files its uid
+could not otherwise read, which is wider than the port file. Do
+not describe the separate-uid options as a finished install until
+that is checked on a host.
 
-Running the connector as Hermes's own user also works. The default
-home is then Hermes's home, and `ProtectHome` can stay.
-
-Each option spends a different isolation boundary. Tell the customer
-which one they are getting, the same way as the root-agent note
-above.
+If a host check shows the connector uid can see each new profile,
+the boundaries are the same kind of choice as the root-agent note
+above:
 
 - **The connector's uid is Hermes's uid.** The tunnel credential
   file is mode `0400` owned by that user, so Hermes can read it, and
   so can a shell the model runs. The split between the agent and the
   credential is gone. The connector is also the owner of the browser
-  profile, so it cannot be kept out of that profile.
+  profile, so it cannot be kept out of that profile. This is the
+  option a live stock Hermes session has exercised.
 - **Separate uid, `ProtectHome=yes` removed.** The credential stays
   unreadable to Hermes. The connector can open every home path its
-  file permissions allow, not only the DevTools file.
+  file permissions and any capability allow, not only the DevTools
+  file.
 - **Separate uid, `ProtectHome=yes` kept, `ReadOnlyPaths=` on the
   chromium cache tree.** The credential stays unreadable to Hermes,
   and the rest of `/home` stays hidden. The connector can still read
   the throwaway profiles in that tree (cookies and page storage from
   the session), because those directories are where the port file
-  lives. This is the narrower of the two cross-user options.
+  lives. This is the narrower of the two cross-user options, and it
+  still depends on the connector uid being able to read directories
+  Hermes creates mode `0700`.
 
 ### Dashboard runtimes and `/connector`
 
@@ -224,20 +239,26 @@ set `hermes_home` or `HERMES_HOME` for the connector process.
    With no explicit endpoint the connector scans
    `<hermes home>/cache/browser/chromium/*/DevToolsActivePort` and
    dials `127.0.0.1` on the port in the newest file whose
-   `/json/version` browser id still matches line 2. It re-reads
-   that tree on every CDP dial. A broker reconnect does not read
-   the file until the next dial, and `--check` does not read it at
-   all. A missing, unreadable, truncated, or stale file is
-   `no_browser`: that dial fails and the connector stays up. It
-   never dials anything but loopback. The broker pin and `agent_id`
-   checks are unchanged.
+   `/json/version` browser id still matches line 2. One live Hermes
+   browser per connector. Two concurrent Hermes sessions can leave
+   the tab you want in the older browser while the connector dials
+   the newer one, and the fill is then `target_not_owned`. Picking
+   among several live browsers is a later change. It re-reads that
+   tree on every CDP dial. A broker reconnect does not read the
+   file until the next dial, and `--check` does not read it at all.
+   A missing, unreadable, truncated, or stale file fails that dial
+   and the connector stays up. On a hand-provisioned agent the MCP
+   tools report that as `error` / `cdp_error`, not as `no_browser`.
+   It never dials anything but loopback. The broker pin and
+   `agent_id` checks are unchanged.
 
    The home in that scan is the connector process's own
    `$HERMES_HOME` or `$HOME/.hermes`, not Hermes's home on another
    uid. On the documented connector unit (`User=connector`,
    `ProtectHome=yes`) that default does not see a stock Hermes
-   profile. Set `hermes_home`, open the cache tree to the connector
-   user, and adjust `ProtectHome` as in
+   profile. The setup checked on a stock Hermes host runs the
+   connector as Hermes's user. A separate uid is described, and
+   marked unchecked, in
    [Hermes discovery and the connector user](#hermes-discovery-and-the-connector-user).
    The process logs the path it will scan at start
    (`cdp: discover hermes_home=…`).
@@ -252,10 +273,14 @@ set `hermes_home` or `HERMES_HOME` for the connector process.
    | `devtools_active_port` | That file, exactly. |
 
 3. **Put the managed policy on the browser Hermes launches.** The
-   file from step 2 above must be in that Chromium's policy
-   directory, or the browser may offer to save a filled password
-   (REQ-ARCH-004). The host gets its own agent id (#281). Run
-   `--check` and start the connector as in step 7. `--check`
+   file from step 2 of the hosted-runtime list must be in that
+   Chromium's policy directory. Hermes's packaged browser is Chrome
+   for Testing, which reads
+   `/etc/opt/chrome_for_testing/policies/managed/`, not the Debian
+   `chromium` or Google Chrome directories named for the other
+   builds. Without the file the browser may offer to save a filled
+   password (REQ-ARCH-004). The host gets its own agent id (#281).
+   Run `--check` and start the connector as in step 7. `--check`
    proves the broker leg; it does not require the browser to be
    up. Verify the install the same way as any other host:
    `kharon_context` returns `ok` with a live session on the

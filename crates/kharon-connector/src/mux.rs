@@ -435,13 +435,41 @@ async fn on_open(inner: &Arc<Inner>, id: u32) -> Result<(), FrameError> {
     }
 }
 
+/// At most one line a minute. A missing or unreadable profile otherwise
+/// leaves the connector journal empty while fills return `cdp_error`.
+fn note_discover_failed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const INTERVAL_MS: u64 = 60_000;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        if now.saturating_sub(prev) < INTERVAL_MS {
+            return;
+        }
+        match LAST.compare_exchange_weak(prev, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                eprintln!("kharon-agent-connector: cdp: discover failed");
+                return;
+            }
+            Err(seen) => prev = seen,
+        }
+    }
+}
+
 async fn dial(inner: &Arc<Inner>, id: u32, cdp: CdpTarget) {
     let connect = async {
         let addr = match &cdp {
             CdpTarget::Fixed(addr) => *addr,
             CdpTarget::Discover(source) => match crate::devtools::resolve_devtools(source).await {
                 Ok(ep) => ep.addr(),
-                Err(_) => return None,
+                Err(_) => {
+                    note_discover_failed();
+                    return None;
+                }
             },
         };
         // Discovery always builds 127.0.0.1. Refuse anything else rather

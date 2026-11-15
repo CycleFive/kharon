@@ -401,18 +401,23 @@ impl Browser {
             .and_then(Value::as_str)
             .ok_or_else(|| OwnershipError::Cdp("create_target_failed".into()))?
             .to_string();
+        // Armed until the open succeeds. A drop (the fill deadline
+        // cancelling this future mid-navigate) closes the tab, so a
+        // timeout does not leave the full URL open in the agent's
+        // context (REQ-API-012).
+        let mut guard = TabGuard::arm(self.client.clone(), target_id.clone());
         if let Err(e) = self
             .check_ownership(&target_id, agent_ctx, allow_default)
             .await
         {
-            self.close_target(&target_id).await;
+            self.close_guard(&mut guard).await;
             return Err(e);
         }
         let attached = self.client.attach(&target_id).await;
         let session = match attached {
             Ok(session) => session,
             Err(_) => {
-                self.close_target(&target_id).await;
+                self.close_guard(&mut guard).await;
                 return Err(OwnershipError::Cdp("navigate_failed".into()));
             }
         };
@@ -421,23 +426,33 @@ impl Browser {
             .await;
         session.detach().await;
         if navigated.is_err() {
-            self.close_target(&target_id).await;
+            self.close_guard(&mut guard).await;
             return Err(OwnershipError::Cdp("navigate_failed".into()));
         }
         match self.wait_https_origin(&target_id).await {
-            Ok(origin) => Ok((target_id, origin)),
+            Ok(origin) => {
+                guard.disarm();
+                Ok((target_id, origin))
+            }
             Err(e) => {
-                self.close_target(&target_id).await;
+                self.close_guard(&mut guard).await;
                 Err(e)
             }
         }
     }
 
-    async fn close_target(&self, target_id: &str) {
+    /// Close the guarded tab and disarm, so `Drop` does not close it
+    /// again. If this future is cancelled mid-close, `Drop` still
+    /// closes.
+    async fn close_guard(&self, guard: &mut TabGuard) {
+        let Some(id) = guard.target_id.clone() else {
+            return;
+        };
         let _ = self
             .client
-            .request("Target.closeTarget", json!({ "targetId": target_id }))
+            .request("Target.closeTarget", json!({ "targetId": id }))
             .await;
+        guard.disarm();
     }
 
     /// Poll the target until its live URL has an https origin, or the
@@ -459,6 +474,45 @@ impl Browser {
                 return Err(OwnershipError::Cdp("navigate_failed".into()));
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// Closes `target_id` if this open is dropped before it succeeds.
+///
+/// The broker bounds `kharon_open` with `timeout_at`, which drops the
+/// future. Without this, a deadline during `Page.navigate` or the
+/// origin poll would leave the tab at the full login URL (REQ-API-012).
+struct TabGuard {
+    client: CdpClient,
+    target_id: Option<String>,
+}
+
+impl TabGuard {
+    fn arm(client: CdpClient, target_id: String) -> Self {
+        Self {
+            client,
+            target_id: Some(target_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.target_id = None;
+    }
+}
+
+impl Drop for TabGuard {
+    fn drop(&mut self) {
+        let Some(target_id) = self.target_id.take() else {
+            return;
+        };
+        let client = self.client.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = client
+                    .request("Target.closeTarget", json!({ "targetId": target_id }))
+                    .await;
+            });
         }
     }
 }
@@ -509,7 +563,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -971,5 +1025,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info.browser_context_id.as_deref(), Some("ctx-plain"));
+    }
+
+    /// A navigate that never replies, dropped by the fill deadline,
+    /// still closes the tab (REQ-API-012).
+    #[tokio::test]
+    async fn req_api_012_dropped_navigate_closes_the_tab() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let closed_peer = Arc::clone(&closed);
+        let methods_peer = Arc::clone(&methods);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                ws.next().await
+            {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                let method = msg["method"].as_str().unwrap_or("").to_string();
+                methods_peer.lock().unwrap().push(method.clone());
+                if method == "Page.navigate" {
+                    continue;
+                }
+                if method == "Target.closeTarget" {
+                    closed_peer.store(true, Ordering::SeqCst);
+                }
+                let result = match method.as_str() {
+                    "Target.createBrowserContext" => json!({ "browserContextId": "ctx-A" }),
+                    "Target.createTarget" => json!({ "targetId": "tab-1" }),
+                    "Target.getTargetInfo" => {
+                        target_info_json("tab-1", Some("ctx-A"), "about:blank")
+                    }
+                    "Target.attachToTarget" => json!({ "sessionId": "sess-1" }),
+                    _ => json!({}),
+                };
+                let reply = json!({ "id": msg["id"], "result": result });
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    reply.to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        let endpoint = super::super::endpoint::CdpEndpoint::validate(
+            &format!("ws://{addr}/devtools/browser"),
+            super::super::endpoint::Tunnel::Direct,
+            None,
+        )
+        .unwrap();
+        let browser = Browser::new(CdpClient::connect(&endpoint).await.unwrap());
+        let ctx = browser.create_agent_context("agent-A").await.unwrap();
+        let open = browser.open_login_tab(
+            &ctx,
+            false,
+            "https://login.example.com/KHARON_OPEN_PATH_CANARY?q=1",
+        );
+        let timed = tokio::time::timeout(std::time::Duration::from_millis(300), open).await;
+        assert!(timed.is_err(), "a stalled navigate must still be pending");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !closed.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dropped navigate did not close the tab: {:?}",
+                methods.lock().unwrap()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }

@@ -302,12 +302,6 @@ impl FillEngine {
         self.browser.client().is_closed()
     }
 
-    /// The live serialized origin of `target_id` (REQ-APR-007, #20):
-    /// the ownership check a fill runs in its step 1, and nothing
-    /// else — no attach, no page code. Grant requests observe through
-    /// this so a prompt can show where the tab actually is, never
-    /// the agent's claim (REQ-ORG-002). An opaque origin (e.g.
-    /// `about:blank`) reports as `null`, like [`LiveOrigin`].
     /// Open `url` in a new tab and return `(target_id, live origin)`.
     /// The URL is not copied into the error (REQ-API-012).
     pub async fn open_login(
@@ -321,6 +315,12 @@ impl FillEngine {
             .await
     }
 
+    /// The live serialized origin of `target_id` (REQ-APR-007, #20):
+    /// the ownership check a fill runs in its step 1, and nothing
+    /// else — no attach, no page code. Grant requests observe through
+    /// this so a prompt can show where the tab actually is, never
+    /// the agent's claim (REQ-ORG-002). An opaque origin (e.g.
+    /// `about:blank`) reports as `null`, like [`LiveOrigin`].
     pub async fn observe_origin(
         &self,
         target_id: &str,

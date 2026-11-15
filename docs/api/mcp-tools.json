@@ -89,7 +89,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Open the item's saved login URL in a new tab in your own browser context. Returns only the new tab's target_id and its live origin (scheme, host, port). The path, query and fragment are not returned. Refuses with no_login_url, and does not navigate, when the item has no saved URI that is a full https URL the origin matcher would allow. Does not approve a fill: kharon_fill still needs its grant. Requires unlock. Audited. Same body as POST /v1/open.",
+    "description": "Open the item's saved login URL in a new tab in your own browser context. Returns only the new tab's target_id and its live origin (scheme, host, port). kharon does not return or log the path, query or fragment. The tab itself has the full URL. Refuses with no_login_url, and does not navigate, when the item has no saved URI that is a full https URL the origin matcher would allow. Does not approve a fill: kharon_fill still needs its grant. Requires unlock. Audited. Same body as POST /v1/open.",
     "inputSchema": {
       "additionalProperties": false,
       "description": "`kharon_open` arguments.",

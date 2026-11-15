@@ -2,9 +2,9 @@
 //!
 //! The agent names an item. The broker opens that item's saved login
 //! URL in a new tab in the agent's own browser context and returns
-//! only the tab's target id and live origin. The path, query and
-//! fragment stay in the broker: they are not in the result, and they
-//! are not written to a log line.
+//! only the tab's target id and live origin. kharon does not return
+//! or log the path, query or fragment. The opened tab has the full
+//! URL; whether the model sees it is the harness policy (SPEC OQ-3).
 //!
 //! A saved URI counts only when it is a full `https` URL the SPEC §6
 //! matcher would allow as a page at that same URL. A bare host, a

@@ -290,10 +290,12 @@ set `hermes_home` or `HERMES_HOME` for the connector process.
 
 Agents call `kharon_open` with the item id. kharon opens that item's
 saved login URL in a new tab in the agent's browser and returns the
-tab id and the live origin. The path and query stay in the broker.
-`kharon_search` still returns only the host. On a build that does
-not have `kharon_open`, put the login URL in the prompt. A fill
-after `kharon_open` still needs the owner's grant.
+tab id and the live origin. kharon does not return or log the path,
+query or fragment. The opened tab has the full URL, and whether the
+model sees it is the harness policy (SPEC OQ-3). `kharon_search`
+still returns only the host. On a build that does not have
+`kharon_open`, put the login URL in the prompt. A fill after
+`kharon_open` still needs the owner's grant.
 
 **Assumption (tab rule, pending #334).** Which tab a fill uses
 follows the same rule proposed for OpenClaw, as an explicit
@@ -380,10 +382,12 @@ notes are on the roadmap. The login page is the same rule as Hermes.
 
 Agents call `kharon_open` with the item id. kharon opens that item's
 saved login URL in a new tab in the agent's browser and returns the
-tab id and the live origin. The path and query stay in the broker.
-`kharon_search` still returns only the host. On a build that does
-not have `kharon_open`, put the login URL in the prompt. A fill
-after `kharon_open` still needs the owner's grant.
+tab id and the live origin. kharon does not return or log the path,
+query or fragment. The opened tab has the full URL, and whether the
+model sees it is the harness policy (SPEC OQ-3). `kharon_search`
+still returns only the host. On a build that does not have
+`kharon_open`, put the login URL in the prompt. A fill after
+`kharon_open` still needs the owner's grant.
 
 ## Handing over the secrets
 

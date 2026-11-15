@@ -2688,12 +2688,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         };
         let url = {
             let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-            if lock.require_unlocked().is_err() {
-                drop(lock);
-                self.append(base(Event::Open).result("locked"))?;
-                return Err(ApiError::LOCKED);
-            }
-            let session = lock.require_unlocked().map_err(|_| ApiError::LOCKED)?;
+            let session = match lock.require_unlocked() {
+                Ok(session) => session,
+                Err(_) => {
+                    drop(lock);
+                    self.append(base(Event::Open).result("locked"))?;
+                    return Err(ApiError::LOCKED);
+                }
+            };
             let item = match session.vault().get(&item_id) {
                 Ok(item) => item,
                 Err(_) => {

@@ -152,8 +152,9 @@ const INSTRUCTIONS: &str = "kharon credentials broker. No tool ever returns a se
 kharon_list and kharon_search return item metadata, and kharon_fill / kharon_fill_totp type the \
 item's username, password or current TOTP code into a tab in your own browser context and \
 report only which fields were filled. kharon_open opens the item's saved login URL in a new tab \
-in that context and returns only the tab id and the live origin: the path, query and fragment \
-stay in the broker. kharon_context returns your own browserContextId. The live page origin \
+in that context and returns only the tab id and the live origin. kharon does not return or log \
+the path, query or fragment; the tab itself has the full URL, and whether you see it depends on \
+your harness. kharon_context returns your own browserContextId. The live page origin \
 decides, never your claim. Every call is audited.";
 
 // ---------------------------------------------------------------- tools
@@ -316,7 +317,8 @@ impl Tool {
             Self::Open => {
                 "Open the item's saved login URL in a new tab in your own browser context. \
                  Returns only the new tab's target_id and its live origin (scheme, host, port). \
-                 The path, query and fragment are not returned. Refuses with no_login_url, and \
+                 kharon does not return or log the path, query or fragment. The tab itself has \
+                 the full URL. Refuses with no_login_url, and \
                  does not navigate, when the item has no saved URI that is a full https URL the \
                  origin matcher would allow. Does not approve a fill: kharon_fill still needs \
                  its grant. Requires unlock. Audited. Same body as POST /v1/open."

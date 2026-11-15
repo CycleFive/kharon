@@ -127,6 +127,103 @@ The install is done when the identity has a live session:
   with a "no browser attached" detail means the connector is not
   attached, whatever the MCP leg is doing.
 
+## Hermes: connector on an explicit local CDP endpoint
+
+Hermes Agent (Nous Research) drives its browser over CDP, so the
+connector can share a browser Hermes is already attached to. This
+section is the v0.6.0 slice (#338): an **explicit** local CDP
+endpoint only. It adds no transport — the connector still dials a
+loopback `host:port` on the agent host and attaches over the
+WebSocket as above. kharon does not launch the browser; Hermes, or
+an operator who started one for Hermes, owns it, and Hermes keeps
+driving it after a fill (REQ-ARCH-003).
+
+Hermes facts below are from its browser docs and the upstream
+source pass on #337 (`NousResearch/hermes-agent` `main` @
+`f578714`, 2026-11-15), not from a live Hermes install.
+
+### Set up the shared endpoint
+
+1. **Give Hermes a loopback Chromium on a fixed port.** Either let
+   Hermes attach to a Chromium the operator started with
+   `--remote-debugging-address=127.0.0.1
+   --remote-debugging-port=9222` and a dedicated `--user-data-dir`
+   (since Chrome 136 a debugging port on the default profile
+   directory is ignored), or rely on the auto-launch in step 2.
+   The examples use 9222, Hermes's documented default; any free
+   loopback port works if both sides use it.
+2. **Point Hermes at it, persistently.** In Hermes's `config.yaml`
+   (`$HERMES_HOME/config.yaml`):
+
+   ```yaml
+   browser:
+     cdp_url: "http://127.0.0.1:9222"
+   ```
+
+   or set `BROWSER_CDP_URL=http://127.0.0.1:9222` in Hermes's
+   environment. Hermes resolves its CDP override in the order:
+   a live `/browser connect` > `BROWSER_CDP_URL` >
+   `browser.cdp_url`.
+
+   `/browser connect` is a **CLI slash command only**. A gateway,
+   WebUI, or chat-platform session will not run it — the message
+   goes to the model as text — so never write an install or a
+   runbook that tells a gateway/WebUI operator to type it. Typed in
+   the CLI with no argument it attaches to
+   `http://127.0.0.1:9222` (or a `ws://` URL passed to it), and if
+   nothing is listening there it auto-launches a Chromium-family
+   browser with `--remote-debugging-port=9222` and a dedicated
+   user-data dir. For any non-CLI session, `browser.cdp_url` /
+   `BROWSER_CDP_URL` is the attach mechanism.
+3. **Point the connector at the same port.** Steps 4–8 above apply
+   unchanged (binary, tunnel credential file, MCP client), with
+   `connector.toml` naming that same loopback endpoint:
+
+   ```toml
+   cdp = "127.0.0.1:9222"
+   ```
+
+   The host gets its own agent id (#281). The managed policy from
+   step 2 above must be in the policy directory of the Chromium
+   Hermes drives — including an operator-launched one — or that
+   browser may offer to save a filled password (REQ-ARCH-004).
+   Run `--check` and start the connector as in step 7, and verify
+   the install the same way: `kharon_context` returns `ok` with a
+   live session on the owner's Connections page.
+
+**Assumption (tab rule, pending #334).** Which tab a fill uses
+follows the same rule proposed for OpenClaw, as an explicit
+assumption until #334 decides it on a real profile: the fill
+targets the browser context `kharon_context` returns, and a
+default-context target is refused unless `allow_default_context`
+is set, which is legal only with exactly one agent on the deploy.
+If #334 or the Hermes canary (#339) shows Hermes cannot honour
+that, this section changes before v0.6.0 ships — it is not a
+settled Hermes fact.
+
+### Modes this section does not cover
+
+- **Default packaged Chromium (no `browser.cdp_url`).** The #337
+  source pass found that the stock launch does publish a loopback
+  DevTools port — `--remote-debugging-port=0`, an ephemeral port
+  discoverable from the profile's `DevToolsActivePort` file — but
+  the four live sub-checks on a real Hermes install are still
+  open, and the connector has no discovery step for an ephemeral
+  port. Until #337's live check passes, the default launch is
+  **not** a supported install; use the explicit endpoint above.
+- **Cloud providers** (Nous subscription, Browserbase, Browser
+  Use, Firecrawl, another provider plugin). The browser is off
+  the host; the connector dials loopback only.
+- **Lightpanda** (`browser.engine: lightpanda`). Not Chromium;
+  kharon's fill path is Chromium CDP.
+- **`browser_vault`.** Hermes's own login store and fill tool.
+  kharon does not call it; the customer vault stays the
+  Bitwarden collection on the broker.
+- **`browser.use_real_profile`.** A Hermes-managed snapshot of
+  the user's real profile. Whether that launch can share its
+  browser the way this section needs is unverified; out of this
+  slice.
+
 ## Handing over the secrets
 
 The tunnel credential and the agent token are each printed once, on

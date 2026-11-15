@@ -191,6 +191,13 @@ fn main() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
+    // Once, before any dial. The Hermes preset is this process's own
+    // home, so a unit that runs as `connector` must show that path here
+    // or a wrong home is invisible (`--check` never opens the file).
+    eprintln!(
+        "kharon-agent-connector: {}",
+        cdp_startup_line(cfg.cdp, cfg.devtools.as_ref())
+    );
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -462,6 +469,23 @@ fn cdp_target(raw: &RawConfig) -> Result<(SocketAddr, Option<DiscoverSource>), S
         SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9)),
         Some(source),
     ))
+}
+
+/// One line for stderr at startup. Discovery names the source the next
+/// dial will read; an explicit endpoint names the socket.
+fn cdp_startup_line(cdp: SocketAddr, devtools: Option<&DiscoverSource>) -> String {
+    match devtools {
+        Some(DiscoverSource::HermesEphemeral { home }) => {
+            format!("cdp: discover hermes_home={}", home.display())
+        }
+        Some(DiscoverSource::UserDataDir(dir)) => {
+            format!("cdp: discover user_data_dir={}", dir.display())
+        }
+        Some(DiscoverSource::File(path)) => {
+            format!("cdp: discover devtools_active_port={}", path.display())
+        }
+        None => format!("cdp: {cdp}"),
+    }
 }
 
 fn non_empty_path(path: &Path, key: &str) -> Result<(), String> {
@@ -1018,6 +1042,39 @@ mod tests {
             "transport = \"tls\"\nbroker = \"127.0.0.1:8789\"\nouter_ca_file = \"/nonexistent\"",
         )));
         assert!(err.contains("outer_ca_file"), "{err}");
+    }
+
+    #[test]
+    fn startup_line_names_the_discovery_source() {
+        let fixed: std::net::SocketAddr = "127.0.0.1:9222".parse().unwrap();
+        assert_eq!(super::cdp_startup_line(fixed, None), "cdp: 127.0.0.1:9222");
+        assert_eq!(
+            super::cdp_startup_line(
+                fixed,
+                Some(&super::DiscoverSource::HermesEphemeral {
+                    home: PathBuf::from("/var/lib/kharon-connector/.hermes"),
+                }),
+            ),
+            "cdp: discover hermes_home=/var/lib/kharon-connector/.hermes"
+        );
+        assert_eq!(
+            super::cdp_startup_line(
+                fixed,
+                Some(&super::DiscoverSource::UserDataDir(PathBuf::from(
+                    "/var/profile"
+                ))),
+            ),
+            "cdp: discover user_data_dir=/var/profile"
+        );
+        assert_eq!(
+            super::cdp_startup_line(
+                fixed,
+                Some(&super::DiscoverSource::File(PathBuf::from(
+                    "/var/profile/DevToolsActivePort"
+                ))),
+            ),
+            "cdp: discover devtools_active_port=/var/profile/DevToolsActivePort"
+        );
     }
 
     #[test]

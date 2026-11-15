@@ -96,6 +96,57 @@ Running the connector and Chromium as separate non-root users inside
 the runtime helps only if the agent itself is not root. Tell the
 customer which one they are getting.
 
+### Hermes discovery and the connector user
+
+Stock Hermes discovery reads the **connector process's** own
+`$HERMES_HOME`, or `$HOME/.hermes` when that variable is unset. It
+does not search another user's home.
+[`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
+runs the connector as `User=connector`, home
+`/var/lib/kharon-connector`, with `ProtectHome=yes`, and writes an
+explicit `cdp = "127.0.0.1:…"`. That unit is the fixed-port Chromium
+install. Used as-is for stock Hermes, the preset scans
+`/var/lib/kharon-connector/.hermes`, which Hermes never writes, and
+`ProtectHome=yes` hides Hermes's real home under `/home` even when
+`hermes_home` names it. `--check` still prints `check: ok`, because
+it never opens the file. The next fill then fails the dial
+(`no_browser`). On start the connector logs the path it will scan,
+`cdp: discover hermes_home=…`.
+
+When the connector and Hermes are different users, which is that
+layout:
+
+1. Set `hermes_home` to Hermes's home, or set `HERMES_HOME` in the
+   connector's environment to that same directory.
+2. Give the connector user read and traverse on
+   `<home>/cache/browser/chromium` and on each profile's
+   `DevToolsActivePort`. Hermes creates those directories mode
+   `0700`, so a path in the unit is not enough on its own.
+3. Drop `ProtectHome=yes`, or keep it and add `ReadOnlyPaths=` for
+   that tree so systemd mounts it back into the service.
+
+Running the connector as Hermes's own user also works. The default
+home is then Hermes's home, and `ProtectHome` can stay.
+
+Each option spends a different isolation boundary. Tell the customer
+which one they are getting, the same way as the root-agent note
+above.
+
+- **The connector's uid is Hermes's uid.** The tunnel credential
+  file is mode `0400` owned by that user, so Hermes can read it, and
+  so can a shell the model runs. The split between the agent and the
+  credential is gone. The connector is also the owner of the browser
+  profile, so it cannot be kept out of that profile.
+- **Separate uid, `ProtectHome=yes` removed.** The credential stays
+  unreadable to Hermes. The connector can open every home path its
+  file permissions allow, not only the DevTools file.
+- **Separate uid, `ProtectHome=yes` kept, `ReadOnlyPaths=` on the
+  chromium cache tree.** The credential stays unreadable to Hermes,
+  and the rest of `/home` stays hidden. The connector can still read
+  the throwaway profiles in that tree (cookies and page storage from
+  the session), because those directories are where the port file
+  lives. This is the narrower of the two cross-user options.
+
 ### Dashboard runtimes and `/connector`
 
 Since v0.3.0 (#235 phase 2), a dashboard Connect can also spawn the
@@ -174,14 +225,25 @@ set `hermes_home` or `HERMES_HOME` for the connector process.
    `<hermes home>/cache/browser/chromium/*/DevToolsActivePort` and
    dials `127.0.0.1` on the port in the newest file whose
    `/json/version` browser id still matches line 2. It re-reads
-   that tree on every CDP dial and on every broker reconnect. A
-   missing, unreadable, truncated, or stale file is `no_browser`:
-   that dial fails and the connector stays up. It never dials
-   anything but loopback. The broker pin and `agent_id` checks are
-   unchanged.
+   that tree on every CDP dial. A broker reconnect does not read
+   the file until the next dial, and `--check` does not read it at
+   all. A missing, unreadable, truncated, or stale file is
+   `no_browser`: that dial fails and the connector stays up. It
+   never dials anything but loopback. The broker pin and `agent_id`
+   checks are unchanged.
 
-   Override the preset when the browser is not in the default
-   home. Set one of these, not a combination:
+   The home in that scan is the connector process's own
+   `$HERMES_HOME` or `$HOME/.hermes`, not Hermes's home on another
+   uid. On the documented connector unit (`User=connector`,
+   `ProtectHome=yes`) that default does not see a stock Hermes
+   profile. Set `hermes_home`, open the cache tree to the connector
+   user, and adjust `ProtectHome` as in
+   [Hermes discovery and the connector user](#hermes-discovery-and-the-connector-user).
+   The process logs the path it will scan at start
+   (`cdp: discover hermes_home=…`).
+
+   Override the preset when the browser is not in that home. Set
+   one of these, not a combination:
 
    | Key | What it reads |
    |---|---|

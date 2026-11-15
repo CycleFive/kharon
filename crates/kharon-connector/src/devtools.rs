@@ -92,13 +92,19 @@ impl DevToolsEndpoint {
 }
 
 /// Hermes home when the operator sets neither `hermes_home` nor an
-/// explicit endpoint: `$HERMES_HOME` if that variable is non-empty,
-/// otherwise `~/.hermes`.
+/// explicit endpoint. It is **this process's** environment:
+/// `$HERMES_HOME` if that variable is non-empty, otherwise
+/// `$HOME/.hermes`.
 ///
-/// This matches `get_process_hermes_home` in upstream
-/// `hermes_constants.py`: the environment variable, else the platform
-/// default `~/.hermes`. A profile home other than that default is not
-/// inferred; set `hermes_home` or `HERMES_HOME`.
+/// That matches `get_process_hermes_home` in upstream
+/// `hermes_constants.py`. It does not look up another user's home. A
+/// connector running as `User=connector` with home
+/// `/var/lib/kharon-connector` and no `HERMES_HOME` therefore scans
+/// `/var/lib/kharon-connector/.hermes`. `ProtectHome=yes` on that unit
+/// also hides `/home`, so a `hermes_home` under the Hermes user's home
+/// stays invisible until the unit opens that path. A profile home other
+/// than the platform default is not inferred; set `hermes_home` or
+/// `HERMES_HOME`.
 pub fn default_hermes_home() -> PathBuf {
     if let Some(raw) = std::env::var_os("HERMES_HOME") {
         let text = raw.to_string_lossy();

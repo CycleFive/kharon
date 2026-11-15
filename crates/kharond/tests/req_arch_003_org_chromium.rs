@@ -31,6 +31,13 @@
 //!   is `filled`, even though the top-level page matches none of the
 //!   item's URIs: the allowlist admits the frame on its own origin.
 //!
+//! - **REQ-ARCH-005 (#342).** A tab opened in the browser's default
+//!   context. Chromium gives that context a `browserContextId` too, so
+//!   the broker has to know which id is the default one: with
+//!   `allow_default_context = true` the tab is `filled`, without it
+//!   the fill is `target_not_owned`, and a tab in a context another
+//!   client created is `target_not_owned` under either setting.
+//!
 //! Skips when no Chromium binary is found (as `req_apr_005` does);
 //! `KHARON_CHROMIUM` names one, and `KHARON_REQUIRE_CHROMIUM=1` turns
 //! the skip into a failure. The Chromium flags are for this throwaway
@@ -523,13 +530,18 @@ impl Cdp {
     /// Open `url` in a new tab in `context`. Returns (target, session)
     /// once the page has loaded.
     async fn open(&mut self, context: &str, url: &str) -> (String, String) {
-        let r = self
-            .call(
-                None,
-                "Target.createTarget",
-                json!({"url": url, "browserContextId": context}),
-            )
-            .await;
+        self.open_in(Some(context), url).await
+    }
+
+    /// [`Cdp::open`], or with no `context` a tab in the browser's
+    /// default context, the way an agent runtime that knows nothing of
+    /// kharon's context opens one (#342).
+    async fn open_in(&mut self, context: Option<&str>, url: &str) -> (String, String) {
+        let mut params = json!({"url": url});
+        if let Some(context) = context {
+            params["browserContextId"] = json!(context);
+        }
+        let r = self.call(None, "Target.createTarget", params).await;
         let target = r["targetId"].as_str().unwrap().to_owned();
         let session = self.attach_loaded(&target, url).await;
         (target, session)
@@ -1160,6 +1172,117 @@ async fn req_org_004_cross_site_iframe_fill_is_refused_by_default() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn req_org_004_allowlisted_iframe_host_is_filled() {
     req_org_004("req_org_004_allowlisted_iframe_host_is_filled", true).await;
+}
+
+/// #342 (REQ-ARCH-005): a tab in the browser's default context, on a
+/// real Chromium, which gives that context a `browserContextId` of its
+/// own. With `allow_default_context` the tab is filled; without it the
+/// fill is refused. Either way a tab in a context someone else created
+/// is refused: with the flag on, that is what separates "default" from
+/// "not mine".
+async fn req_arch_005_default_context(test: &str, allowed: bool) {
+    let Some(bin) = chromium_or_skip(test) else {
+        return;
+    };
+    let (port, spki) = serve_https().await;
+    let chromium = launch_chromium(&bin, Some(&spki));
+    let policy = if allowed {
+        "allow_default_context = true"
+    } else {
+        ""
+    };
+    let run = Running::start(&chromium, policy).await;
+
+    let login = format!("https://{HOST}:{port}/login");
+    let origin = format!("https://{HOST}:{port}");
+    let mut cdp = Cdp::connect(&chromium.ws).await;
+    let (tab, session) = cdp.open_in(None, &login).await;
+
+    // The premise of #342: the default context has an id, it is not the
+    // agent's, and it is the one the browser names as its default.
+    let info = cdp
+        .call(None, "Target.getTargetInfo", json!({"targetId": tab}))
+        .await;
+    let tab_context = info["targetInfo"]["browserContextId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !tab_context.is_empty(),
+        "this Chromium sets no browserContextId on a default-context tab: {info}"
+    );
+    assert_ne!(tab_context, run.context);
+    let contexts = cdp.call(None, "Target.getBrowserContexts", json!({})).await;
+    if let Some(default) = contexts["defaultBrowserContextId"].as_str() {
+        assert_eq!(tab_context, default, "{contexts}");
+    }
+
+    let first = run.fill(&tab, &origin).await;
+    if allowed {
+        assert_eq!(first.status, "pending_approval", "{first:?}");
+        run.approve_once(first.grant_request_id.as_deref().unwrap())
+            .await;
+        let outcome = run.fill(&tab, &origin).await;
+        assert_eq!(outcome.status, "filled", "{outcome:?}");
+        assert_eq!(outcome.fields_filled, ["username", "password"]);
+        let (username, password) = cdp.fields(&session).await;
+        assert_eq!(username, ITEM_USERNAME);
+        assert!(
+            password == SECRETS[0],
+            "the tab's password field does not hold the item's password"
+        );
+    } else {
+        // Refused before a grant request exists. That pre-grant refusal
+        // is plain `target_not_owned` for every ownership failure (the
+        // `default_context_refused` detail belongs to a fill that already
+        // holds a grant), so this half guards the fix, it does not prove
+        // it: the browser-level unit tests tell the two refusals apart.
+        assert_eq!(first.status, "target_not_owned", "{first:?}");
+        assert_eq!(first.grant_request_id, None, "{first:?}");
+        assert_eq!(
+            cdp.fields(&session).await,
+            (String::new(), String::new()),
+            "a refused tab's fields must stay empty"
+        );
+    }
+
+    // A context another client created (another agent's, or the agent
+    // runtime's own isolated one) is not the default context.
+    let other = cdp
+        .call(None, "Target.createBrowserContext", json!({}))
+        .await;
+    let other = other["browserContextId"].as_str().unwrap().to_owned();
+    let (foreign, foreign_session) = cdp.open_in(Some(&other), &login).await;
+    let refused = run.fill(&foreign, &origin).await;
+    assert_eq!(refused.status, "target_not_owned", "{refused:?}");
+    assert_eq!(refused.grant_request_id, None, "{refused:?}");
+    assert_eq!(
+        cdp.fields(&foreign_session).await,
+        (String::new(), String::new()),
+        "a tab in another created context must stay empty"
+    );
+
+    drop(cdp);
+    run.shutdown().await;
+    drop(chromium);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_arch_005_default_context_tab_is_refused_by_default() {
+    req_arch_005_default_context(
+        "req_arch_005_default_context_tab_is_refused_by_default",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn req_arch_005_default_context_tab_is_filled_when_allowed() {
+    req_arch_005_default_context(
+        "req_arch_005_default_context_tab_is_filled_when_allowed",
+        true,
+    )
+    .await;
 }
 
 /// How many race iterations to run: REQ-ORG-003's 1000 by default.

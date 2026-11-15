@@ -7,7 +7,14 @@
 //! the requesting agent's context. Default-context targets (the
 //! browser's shared context) are refused unless `allow_default_context`
 //! is set — the single-agent escape hatch from the spec.
+//!
+//! Chromium puts a `browserContextId` on every target, the default
+//! context's included (#342), so "default" is decided by that id: the
+//! one `Target.getBrowserContexts` names as `defaultBrowserContextId`,
+//! or, on a browser that does not report it, any id that is not a
+//! created context. A context someone else created is never default.
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -74,11 +81,24 @@ impl AgentContext {
     }
 }
 
+/// The `Target.getBrowserContexts` reply.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserContexts {
+    /// Every context created with `Target.createBrowserContext`, by any
+    /// client. Absent only from a peer that is not a real browser.
+    browser_context_ids: Option<Vec<String>>,
+    /// The default context's id. Older Chromium does not send it.
+    default_browser_context_id: Option<String>,
+}
+
 /// A live target the broker knows about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetInfo {
     pub target_id: String,
-    /// `None` = the browser's default context.
+    /// The target's context. Chromium sets it for the default context
+    /// too (#342); `None` (a stub, or a browser that omits the field)
+    /// is treated as the default context.
     pub browser_context_id: Option<String>,
     pub url: String,
     pub title: String,
@@ -132,6 +152,39 @@ impl Browser {
         Ok(())
     }
 
+    async fn browser_contexts(&self) -> Result<BrowserContexts, OwnershipError> {
+        let result = self
+            .client
+            .request(
+                "Target.getBrowserContexts",
+                Value::Object(Default::default()),
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|_| OwnershipError::Cdp("malformed getBrowserContexts reply".into()))
+    }
+
+    /// Whether `context_id`, which is not the requesting agent's own
+    /// context, is the browser's default context (#342). Asked of the
+    /// browser at each such check, so a fill into the agent's own
+    /// context costs nothing extra and no answer can go stale.
+    async fn is_default_context(&self, context_id: &str) -> Result<bool, OwnershipError> {
+        let contexts = self.browser_contexts().await?;
+        Ok(
+            match (
+                contexts.default_browser_context_id,
+                contexts.browser_context_ids,
+            ) {
+                (Some(default), _) => context_id == default,
+                // Older Chromium: the default context is the one nobody
+                // created.
+                (None, Some(created)) => !created.iter().any(|c| c == context_id),
+                // Nothing to tell the default context by.
+                (None, None) => false,
+            },
+        )
+    }
+
     /// Live info for one target (never from agent input — REQ-ORG-002).
     pub async fn target_info(&self, target_id: &str) -> Result<TargetInfo, OwnershipError> {
         let result = self
@@ -167,16 +220,17 @@ impl Browser {
         allow_default: bool,
     ) -> Result<TargetInfo, OwnershipError> {
         let info = self.target_info(target_id).await?;
-        match info.browser_context_id.as_deref() {
-            Some(id) if id == agent_ctx.browser_context_id() => Ok(info),
-            Some(_) => Err(OwnershipError::TargetNotOwned),
-            None => {
-                if allow_default {
-                    Ok(info)
-                } else {
-                    Err(OwnershipError::DefaultContextRefused)
-                }
-            }
+        let in_default_context = match info.browser_context_id.as_deref() {
+            Some(id) if id == agent_ctx.browser_context_id() => return Ok(info),
+            Some(id) => self.is_default_context(id).await?,
+            None => true,
+        };
+        if !in_default_context {
+            Err(OwnershipError::TargetNotOwned)
+        } else if allow_default {
+            Ok(info)
+        } else {
+            Err(OwnershipError::DefaultContextRefused)
         }
     }
 }
@@ -310,5 +364,115 @@ mod tests {
         // the default context.
         let info = browser.check_ownership("t-1", &ctx, true).await.unwrap();
         assert_eq!(info.browser_context_id, None);
+    }
+
+    /// A browser whose agent context is `ctx-A`, whose one target `t-1`
+    /// is in `target_context`, and whose `Target.getBrowserContexts`
+    /// reply is `contexts`.
+    async fn browser_with_contexts(
+        target_context: &str,
+        contexts: Value,
+    ) -> (MockBrowser, Browser, AgentContext) {
+        let mut script = HashMap::new();
+        script.insert(
+            "Target.createBrowserContext".to_string(),
+            json!({ "browserContextId": "ctx-A" }),
+        );
+        script.insert(
+            "Target.getTargetInfo".to_string(),
+            target_info_json(Some(target_context), "https://default.example/"),
+        );
+        script.insert("Target.getBrowserContexts".to_string(), contexts);
+        let mock = MockBrowser::start(script).await;
+        let browser = Browser::new(mock.client().await);
+        let ctx = browser.create_agent_context("agent-A").await.unwrap();
+        (mock, browser, ctx)
+    }
+
+    // #342: real Chromium puts a `browserContextId` on default-context
+    // targets too, and names that id in `Target.getBrowserContexts`.
+    #[tokio::test]
+    async fn req_arch_005_default_context_with_its_own_id_refused_unless_allowed() {
+        let (_mock, browser, ctx) = browser_with_contexts(
+            "ctx-default",
+            json!({ "browserContextIds": ["ctx-A"], "defaultBrowserContextId": "ctx-default" }),
+        )
+        .await;
+
+        let err = browser
+            .check_ownership("t-1", &ctx, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::DefaultContextRefused);
+
+        let info = browser.check_ownership("t-1", &ctx, true).await.unwrap();
+        assert_eq!(info.browser_context_id.as_deref(), Some("ctx-default"));
+    }
+
+    // #342: a context someone else created (another agent's, or the
+    // host runtime's own isolated one) is never the default context,
+    // whatever `allow_default_context` says.
+    #[tokio::test]
+    async fn req_arch_005_another_created_context_is_not_the_default() {
+        let (_mock, browser, ctx) = browser_with_contexts(
+            "ctx-other",
+            json!({
+                "browserContextIds": ["ctx-A", "ctx-other"],
+                "defaultBrowserContextId": "ctx-default",
+            }),
+        )
+        .await;
+        for allow_default in [false, true] {
+            let err = browser
+                .check_ownership("t-1", &ctx, allow_default)
+                .await
+                .unwrap_err();
+            assert_eq!(err, OwnershipError::TargetNotOwned);
+        }
+    }
+
+    // #342, older Chromium: no `defaultBrowserContextId` in the reply.
+    // A target whose context nobody created is in the default context.
+    #[tokio::test]
+    async fn req_arch_005_unreported_default_is_the_context_nobody_created() {
+        let (_mock, browser, ctx) = browser_with_contexts(
+            "ctx-unlisted",
+            json!({ "browserContextIds": ["ctx-A", "ctx-other"] }),
+        )
+        .await;
+
+        let err = browser
+            .check_ownership("t-1", &ctx, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::DefaultContextRefused);
+        browser.check_ownership("t-1", &ctx, true).await.unwrap();
+    }
+
+    // #342, older Chromium: a created context stays `target_not_owned`.
+    #[tokio::test]
+    async fn req_arch_005_unreported_default_never_admits_a_created_context() {
+        let (_mock, browser, ctx) = browser_with_contexts(
+            "ctx-other",
+            json!({ "browserContextIds": ["ctx-A", "ctx-other"] }),
+        )
+        .await;
+        let err = browser
+            .check_ownership("t-1", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+    }
+
+    // #342: a browser that lists no contexts at all gives nothing to
+    // tell the default context by, so an unknown id stays refused.
+    #[tokio::test]
+    async fn req_arch_005_no_context_list_keeps_an_unknown_context_refused() {
+        let (_mock, browser, ctx) = browser_with_contexts("ctx-B", json!({})).await;
+        let err = browser
+            .check_ownership("t-1", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
     }
 }

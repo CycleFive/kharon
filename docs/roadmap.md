@@ -199,13 +199,11 @@ kharon does not start a second browser. The platform keeps driving
 its own CDP session after the fill (REQ-ARCH-003). The host gets its
 own agent id (#281).
 
-Which tab the fill uses is undecided. See
-[Open questions](#open-questions). SPEC gives the agent a browser
-context from `kharon_context` and refuses a default-context target
-unless `allow_default_context` is set, and that flag is legal only
-with exactly one agent. OpenClaw's docs show no setting for a Chrome
-`browserContextId` kharon created. That gap was not verified past
-those docs.
+Which tab the fill uses is decided on
+[#334](https://github.com/CycleFive/kharon/issues/334): option (b),
+the tab OpenClaw already opened, under `allow_default_context` with
+one agent. [#343](https://github.com/CycleFive/kharon/pull/343)
+fixed the bug that blocked it.
 
 ### Goal
 
@@ -236,11 +234,11 @@ them absorb #328. They sit on milestone `next`, labelled
 `platform:openclaw`, and are listed on
 [#346](https://github.com/CycleFive/kharon/issues/346).
 
-1. **design: which tab an OpenClaw fill uses** — On one managed
-   profile, see whether the canary can target the context
-   `kharon_context` returns, or only a tab OpenClaw already opened
-   (`allow_default_context`, one agent on that deploy). Record the
-   decision. No SPEC edit until it is decided.
+1. **design: which tab an OpenClaw fill uses** — Decided on #334
+   (2026-11-15): option (b), the tab OpenClaw already opened, under
+   `allow_default_context` with one agent.
+   [#343](https://github.com/CycleFive/kharon/pull/343) fixed the
+   bug that blocked it.
 2. **docs(dep): OpenClaw connector install for the managed local
    browser** — The repeatable steps from the decision above, plus
    the profiles OpenClaw support does not cover. Follows whatever
@@ -373,18 +371,19 @@ same way: a platform label and a `tracking: <platform> support`
 issue, not a milestone. A host qualifies when it already exposes
 Chromium CDP on loopback on a machine where
 `kharon-agent-connector` can run, and kharon can fill and let go.
-The survey below picks the order. This page does not. The work runs
-in parallel with OpenClaw and Hermes, because it is gated on
-external live checks, and it ships in whichever rolling release has
-its canary test and live check.
+The survey below names the order. The work runs in parallel with
+OpenClaw and Hermes, because it is gated on external live checks,
+and it ships in whichever rolling release has its canary test and
+live check.
 
 ### Exit criteria
 
-For whichever host the survey names first, the same bar as OpenClaw
-and Hermes: a written install, one approved canary, Disconnect
-leaves the platform driving the browser, and the modes that are not
-loopback Chromium CDP stated as out of that platform. The host
-counts as supported only once the canary test and live check pass.
+For browser-use, the first host that survey names after Hermes, the
+same bar as OpenClaw and Hermes: a written install, one approved
+canary, Disconnect leaves the platform driving the browser, and the
+modes that are not loopback Chromium CDP stated as out of that
+platform. The host counts as supported only once the canary test
+and live check pass.
 
 ### Proposed issues
 
@@ -392,13 +391,12 @@ None named, and none filed from this page. When a host is chosen,
 the set is the same three: a short design check for anything the
 docs leave unverified, the install doc, and the canary report.
 
-### Placeholder: platform priority after Hermes
+### Platform priority after Hermes
 
-> **Placeholder.** Claude Duet (cycle-five-duet) will share a kharon
-> adoption survey. Platform priority after Hermes will be informed
-> by that survey. This section stays empty of a ranked list until
-> that survey is in. Do not file the later hosts, and do not invent
-> an order, ahead of it.
+The survey is
+[`docs/agent-adoption-survey.md`](agent-adoption-survey.md) (#340).
+After OpenClaw and Hermes it ranks browser-use, then Playwright MCP
+and Chrome DevTools MCP.
 
 ## Parked / not planned
 
@@ -428,21 +426,22 @@ docs leave unverified, the install doc, and the canary report.
   customer-only approvals on the owner socket.** Parked optional
   design. The operator CLI keeps its current powers. Not scheduled.
 
+**Which tab is filled?** Closed on
+[#334](https://github.com/CycleFive/kharon/issues/334) (2026-11-15):
+option (b), under `allow_default_context` with one agent.
+[#343](https://github.com/CycleFive/kharon/pull/343) fixed the bug
+that blocked it;
+[#345](https://github.com/CycleFive/kharon/pull/345) added the
+follow-ups.
+
 ## Open questions
 
-1. **Which tab is filled?** `kharon_context` creates a browser
-   context the agent is expected to use. `allow_default_context`
-   allows the tab the platform already opened, and only on a deploy
-   with one agent. Neither OpenClaw nor Hermes documents a way to
-   pass a `browserContextId` kharon created (unverified past the
-   docs read on 2026-11-14). OpenClaw's design issue answers it for
-   OpenClaw; Hermes reuses that answer unless it cannot.
-2. **Which OpenClaw profile does the soak host actually run?**
+1. **Which OpenClaw profile does the soak host actually run?**
    OpenClaw support targets the managed profile that has a CDP port.
    If #328's host is on the extension relay, that profile has no CDP
    URL and stays out with #331. The platform order stays OpenClaw,
    then Hermes.
-3. **Is Hermes's default packaged Chromium included?** The
+2. **Is Hermes's default packaged Chromium included?** The
    [#337](https://github.com/CycleFive/kharon/issues/337) live check
    passed on 2026-11-15 (VM 126, Chrome for Testing 145): an
    ephemeral loopback DevTools port, discovered from

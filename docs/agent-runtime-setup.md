@@ -297,15 +297,17 @@ still returns only the host. On a build that does not have
 `kharon_open`, put the login URL in the prompt. A fill after
 `kharon_open` still needs the owner's grant.
 
-**Assumption (tab rule, pending #334).** Which tab a fill uses
-follows the same rule proposed for OpenClaw, as an explicit
-assumption until #334 decides it on a real profile: the fill
-targets the browser context `kharon_context` returns, and a
-default-context target is refused unless `allow_default_context`
-is set, which is legal only with exactly one agent on the deploy.
-If #334 or the Hermes canary (#339) shows Hermes cannot honour
-that, this section changes before v0.6.0 ships — it is not a
-settled Hermes fact.
+**Tab rule (pending #339).** #334 settled the tab rule for
+OpenClaw: a fill targets the platform's own tab in the default
+browser context, under `allow_default_context` with exactly one
+agent on the deploy (see
+[Which tab a fill uses](#which-tab-a-fill-uses)). Hermes also opens
+its tabs in the default context, and the
+[Hermes end-to-end run](hermes-end-to-end.md) filled one that way
+with the flag on. For Hermes this is still an assumption, not a
+settled fact: the Hermes canary (#339) decides it, and this section
+changes before Hermes support (#347) closes if the canary shows
+Hermes cannot honor it.
 
 ### Explicit endpoint, when you need one
 
@@ -374,20 +376,272 @@ a browser you started on a fixed port.
   Point `user_data_dir` at that profile if you want discovery
   there; otherwise it stays outside this install.
 
-## OpenClaw
+## OpenClaw: the managed local browser
 
-OpenClaw's managed-profile install is the connector install on this
-page pointed at the profile's loopback CDP port. The full profile
-notes are on the roadmap. The login page is the same rule as Hermes.
+OpenClaw's managed profile is a Chromium that OpenClaw launches and
+drives over CDP on a loopback port. The connector shares that
+browser through an explicit `cdp` port. kharon does not launch a
+browser here and adds no transport. OpenClaw keeps driving the
+browser after a fill (REQ-ARCH-003), which the live run below saw.
+That it keeps the browser after the connector lets go is the
+canary's check (#336).
 
-Agents call `kharon_open` with the item id. kharon opens that item's
-saved login URL in a new tab in the agent's browser and returns the
-tab id and the live origin. kharon does not return or log the path,
-query or fragment. The opened tab has the full URL, and whether the
-model sees it is the harness policy (SPEC OQ-3). `kharon_search`
-still returns only the host. On a build that does not have
+Where each statement comes from:
+
+- **Live run:** #334's run on a fresh Debian 13 guest (pve VM 127),
+  OpenClaw 2026.11.3 (`847611d`), profile `openclaw`, driver
+  `openclaw`, Debian `chromium` 156.0.8078.79 headless, a throwaway
+  broker on a fixture vault. Tabs came from `openclaw browser open`,
+  not a model-driven agent turn, because no model was configured.
+- **Source:** `openclaw/openclaw` tag `v2026.11.3` (`847611d`) and
+  `main` @ `de40bf5c`, under `extensions/browser/src/`. Where the
+  two differ, this section says so.
+- **Not run yet:** anything marked so below waits for the OpenClaw
+  canary (#336).
+
+### What this install supports
+
+- **In:** the managed `openclaw` driver (the default profile, also
+  named `openclaw`) on the same host as the connector. Also
+  `attachOnly` to a browser on that same host, when the connector
+  dials the same loopback port.
+- **Out:** `driver: "extension"` (the relay drives a signed-in
+  Chrome; there is no CDP port to share, same family as #331),
+  `driver: "existing-session"` (Chrome DevTools MCP; no stable raw
+  CDP port), and a remote `cdpUrl` (Browserless, Browserbase,
+  Browser Use and any other off-host browser). The connector dials
+  loopback only.
+
+The roadmap's [OpenClaw](roadmap.md#openclaw) section has the longer
+profile notes.
+
+### Ports: `cdpPort` is not the control port
+
+OpenClaw uses two loopback ports. Only one of them is CDP.
+
+| Port | Default | What it is | The connector |
+|---|---|---|---|
+| Control port | 18791 (`gateway.port` + 2) | OpenClaw's browser control service | Never dials it |
+| `cdpPort` | 18800, the first of 18800–18899 (control port + 9) | The managed Chromium's `--remote-debugging-port` | `cdp = "127.0.0.1:<cdpPort>"` |
+
+Both defaults are from `extensions/browser/src/config/port-defaults.ts`.
+Creating a profile writes its chosen `cdpPort` into OpenClaw's
+config, so read the port from there or from the running browser,
+not from this table:
+
+```sh
+ps -eo args | grep -o -- '--remote-debugging-port=[0-9]*' | sort -u
+ss -ltnp | grep '127.0.0.1:<cdpPort>'
+```
+
+OpenClaw launches the browser with `--remote-debugging-port`, its
+own `--user-data-dir` and no `--remote-debugging-address`
+(`browser/chrome.ts`). Chromium's remote-debugging server then
+binds `127.0.0.1` only (Chromium source, read on #334). The live
+run saw exactly that (`ss -ltnp`: `127.0.0.1:18800`).
+
+`browser.extraArgs` is appended to that launch line. Do not put
+`--remote-debugging-address` in it. A non-loopback bind exposes the
+browser to the network, and the connector would still dial
+`127.0.0.1`.
+
+### Which browser OpenClaw launches
+
+The managed policy has to go in the policy directory of the binary
+OpenClaw actually runs. On Linux, OpenClaw 2026.11.3 picks
+(`browser/chrome.executables.ts`):
+
+1. `browser.executablePath`, when set.
+2. Otherwise the desktop's default browser (`xdg-settings`), if it
+   is Chromium-family.
+3. Otherwise the first that exists of Google Chrome
+   (`/usr/bin/google-chrome` …), Brave, Microsoft Edge, Chromium
+   (`/usr/bin/chromium` …), then a Playwright-cached Chromium.
+
+So a host with Google Chrome installed runs Google Chrome, even when
+Debian's `chromium` is also there. Pin the binary in OpenClaw's
+config (`~/.openclaw/openclaw.json` by default) so the policy
+directory can't change under you:
+
+```json
+{
+  "browser": {
+    "executablePath": "/usr/bin/chromium"
+  }
+}
+```
+
+The live run had no `browser` block and got `/usr/bin/chromium`,
+because nothing earlier in that order was installed. Pinning
+`executablePath` is **not run yet**.
+
+### Install, step by step
+
+1. **OpenClaw and its managed profile.** Install OpenClaw and leave
+   the `openclaw` profile on the `openclaw` driver. Note its
+   `cdpPort` and the browser binary, as above. Do not run
+   [`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
+   as-is on this host: it installs and starts its own
+   `browser.service`, a second Chromium.
+2. **The managed policy.** Write the policy file from step 2 of the
+   [hosted-runtime list](#hosted-or-root-runtime-step-by-step) to
+   the policy directory of the binary from the section above:
+   `/etc/chromium/policies/managed/` for Debian's `chromium`,
+   `/etc/opt/chrome/policies/managed/` for Google Chrome. For any
+   other binary, use that browser's managed-policy directory and
+   rely on the `chrome://policy` check, not on this page. The
+   managed profile persists between launches, so this policy is the
+   whole mitigation for saved passwords and form data there
+   ([post-fill exposure](post-fill-exposure.md), rows C1 and C2).
+   Then open `chrome://policy` through CDP and look for the seven
+   policies with status OK; restart OpenClaw's browser if they are
+   missing. The policy check on an OpenClaw host is **not run
+   yet** (#336).
+3. **Steps 3–8 of the hosted-runtime list**: `ptrace_scope`, the
+   connector binary, the tunnel credential file, `connector.toml`,
+   check and run, the MCP client. In step 6, set `cdp` explicitly:
+
+   ```toml
+   transport = "ws"
+   broker_url = "wss://<host>/connector"
+   broker_pin = "<64 hex chars>"
+   agent_id = "<agent>"
+   token_file = "/etc/kharon-connector/token"
+   cdp = "127.0.0.1:<cdpPort>"
+   ```
+
+   Do not leave `cdp` and `cdp_url` out. With neither, the
+   connector turns on the
+   [Hermes discovery preset](#zero-config-attach) and scans
+   `<hermes home>/cache/browser/chromium/`, which OpenClaw never
+   writes. `--check` still prints `check: ok`, because it never
+   dials the browser. Fills then fail with `error` / `cdp_error`.
+   An explicit `cdp` reads no file, so the connector can run as its
+   own user without access to OpenClaw's home. That layout is
+   **not run yet** on an OpenClaw host.
+4. **The broker.** The host gets its own agent id (#281). In
+   `kharon.toml`, set
+
+   ```toml
+   [policy]
+   allow_default_context = true
+   ```
+
+   kharond refuses to start with this flag and more than one
+   `[agents.*]` entry (`config/raw.rs`), so this deploy serves
+   exactly one agent. The reason is under
+   [Which tab a fill uses](#which-tab-a-fill-uses).
+5. **The agent harness.** Apply the
+   [agent harness policy](deployment.md#agent-harness-policy-spec-oq-3)
+   as below.
+
+[What a root agent costs](#what-a-root-agent-costs-g1) applies here
+too: if OpenClaw runs as root, the isolation goals don't hold.
+
+### Which tab a fill uses
+
+Decided on #334, option (b): a fill targets a tab in the browser's
+**default** context, the context OpenClaw opens its tabs in, with
+`allow_default_context = true` and one agent on the deploy.
+OpenClaw has no setting for a browser context and its agent tool
+has no raw CDP action, so the agent can't open a tab in the context
+`kharon_context` returns. This needs a kharon build that includes
+#343 (master `f393b00` or later). Before that fix, a
+default-context tab on real Chromium was refused as
+`target_not_owned` whatever the flag said (#342).
+
+- **Fills work on** tabs OpenClaw's browser tool opens, and on tabs
+  `kharon_open` opens. With the flag on, `kharon_open` creates its
+  tab in the default context too, so OpenClaw can drive it.
+  `kharon_open` returns the target id. For a tab OpenClaw opened,
+  the agent passes that tab's CDP target id as the fill's
+  `target.cdp_target_id`, with `expected_origin`.
+  The live run filled a tab from `openclaw browser open`.
+  `kharon_open` on OpenClaw is **not run yet** (#336).
+- **Fills do not work on** tabs a session dashboard opens. OpenClaw
+  puts those in its own isolated context, and kharon refuses them
+  as `target_not_owned`. Not run live; a stand-in (a tab in a
+  context a second CDP client created) was refused that way.
+- **With the flag off**, a fill into OpenClaw's tab is
+  `target_not_owned` and asks for no grant. In the live run a
+  refusal before any grant was plain `target_not_owned`; the detail
+  `default_context_refused` only appeared on a fill that already
+  held a grant.
+
+`kharon_open` is the way to reach the login page, as for Hermes.
+kharon opens the item's saved login URL in a new tab and returns
+only the tab id and the live origin, not the path, query or
+fragment. The tab itself has the full URL, and whether the model
+sees it is the harness policy (SPEC OQ-3). On a build without
 `kharon_open`, put the login URL in the prompt. A fill after
 `kharon_open` still needs the owner's grant.
+
+### Harness policy on stock OpenClaw
+
+Stock OpenClaw does not meet the
+[agent harness policy](deployment.md#agent-harness-policy-spec-oq-3)
+out of the box. The operator has to close two gaps and tell the
+customer what stays open.
+
+- **Page JavaScript.** `act:evaluate` (and `wait` with a function)
+  is on by default (`browser.evaluateEnabled`, default `true`).
+  Turn it off:
+
+  ```json
+  {
+    "browser": {
+      "evaluateEnabled": false
+    }
+  }
+  ```
+
+  OpenClaw then refuses those actions with a 403
+  (`routes/agent.act.ts`). This is read from source; the setting is
+  **not run yet** on a kharon host.
+- **Snapshots.** On OpenClaw 2026.11.3, `openclaw browser snapshot`
+  returned a filled password in clear in the live run
+  (`textbox "Password": <value>`). OpenClaw's `main` masks
+  password-type and credential `autocomplete` fields in snapshots
+  as `[redacted]` (`da41e7de`, `browser/sensitive-field-values.ts`),
+  but no release has it as of 2026-11-15 (checked through
+  `v2026.11.5-beta.3`). Even with it, other field values, such as
+  the username, still appear. Until a release with masking is
+  installed, either keep the model away from snapshots while a
+  filled login form is on the page, or fill with `submit: true`
+  (`fill_and_submit`) so the form leaves the page as soon as it is
+  filled, and tell the customer the model can read a filled value
+  in the meantime.
+- **Screenshots.** Not checked. The browser draws password inputs
+  masked; the username shows.
+
+kharon can't close these from its side: the value has to be in the
+page for the form to submit (SPEC §2.4).
+
+### Verify, Connect and the canary
+
+Verify the install as for any host
+([Verify the install](#verify-the-install)): `--check` prints
+`check: ok`, kharond logs `agent connector attached`, and
+`kharon_context` returns `ok` with a live session on the owner's
+Connections page. Then one fill: open a tab, `kharon_fill` returns
+`pending_approval`, the owner approves, and the result is `filled`
+with the fields holding the item's values.
+
+The canary is #336: an approved fill into the managed browser,
+then the connector stopped, OpenClaw still driving the same tab,
+and the next fill refused. The roadmap expects that refusal to be
+`no_browser`. A hand-provisioned agent with its connector stopped
+has so far shown up as `timeout` (see
+[Hermes discovery and the connector user](#hermes-discovery-and-the-connector-user)),
+so #336 records the wire result as seen.
+
+### Known side effect: a stale context per kharond restart
+
+kharond creates its browser context when it attaches. A kharond
+restart doesn't dispose the old one, so OpenClaw's Chromium keeps
+it: the live run listed five contexts, one live. They hold no tabs
+kharon opened under this install (fills use the default context)
+and go away when OpenClaw restarts its browser.
 
 ## Handing over the secrets
 

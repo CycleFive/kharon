@@ -104,7 +104,7 @@ names the evidence, or says unverified.
 | # | Path | Class | Tested |
 |---|---|---|---|
 | D1 | Agent reads `input.value` via `js()` / `Runtime.evaluate` / `callFunctionOn` after a fill | **host** — kharon cannot mitigate this: the plaintext must exist in the renderer for the form to submit (SPEC §2.4). The mitigation is the agent harness policy (SPEC OQ-3, [`deployment.md`](deployment.md#agent-harness-policy-spec-oq-3)): no JavaScript evaluation in pages | Yes, negatively: stock Hermes does **not** meet the policy — its agent read the filled fields' lengths and could read the values (#353). OpenClaw: unverified |
-| D2 | DOM or accessibility-tree snapshots that include field values | **host** — same policy: the harness returns text and structure, never `value` attributes or form data | Hermes: the exposure is via `js()` (D1); snapshot tooling itself unverified |
+| D2 | DOM or accessibility-tree snapshots that include field values | **host** — same policy: the harness returns text and structure, never `value` attributes or form data | Hermes: the exposure is via `js()` (D1); snapshot tooling itself unverified. OpenClaw: yes, negatively: on 2026.11.3, `openclaw browser snapshot` returned a filled password in clear (#334). OpenClaw `main` masks password-type fields in snapshots (`da41e7de`), in no release as of 2026-11-15 ([agent-runtime-setup.md](agent-runtime-setup.md#harness-policy-on-stock-openclaw)) |
 | D3 | Screenshots while a login form is on screen | **host** — password inputs render masked by the browser, so the residual is the username and any show-password state (A6); the harness policy still recommends masking or none during login | Unverified |
 | D4 | Agent enables the Network domain and captures the login POST body | **host** — the POST goes to the bound origin by design; watching it needs raw CDP, the same capability as D1, and is a harness question. kharon's own client never enables Network | Unverified |
 | D5 | Observation *during* the fill window, before submit | **kharon**, in part — fill-and-submit is one in-page call on a millisecond budget, so with `submit: true` the readable window is the page's own submit handling. With `submit: false` there is no window to shrink (A4) | The budget is tested (REQ-API-009); a concurrent-observer race test does not exist — unverified as a race |
@@ -121,7 +121,8 @@ names the evidence, or says unverified.
 - **OpenClaw** ([#346](https://github.com/CycleFive/kharon/issues/346)):
   the persistent managed profile puts C1/C2 entirely on managed
   policy. Whether its model-facing tools can read field values
-  (D1/D2) is unverified until the OpenClaw canary (#336); fills
+  (D1) is unverified until the OpenClaw canary (#336); stock
+  2026.11.3 snapshots expose a filled password (D2, #334); fills
   there use the platform's own tab under `allow_default_context`
   (one agent, #334), which is A4 by design.
 

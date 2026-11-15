@@ -32,14 +32,29 @@ in the code today (`crates/kharond/src/cdp/fill.rs`,
   page-side budget (REQ-API-009, #118) expires — every element the
   call wrote is blanked before the error propagates, and submit is
   never dispatched.
-- **Step-4 scrub.** After a non-submit fill, the broker re-reads
-  the loader; if the page navigated on its own, it clears the
-  written fields in the old world (best effort) and reports
-  `navigated`. A navigation the fill's own submit caused is not
-  scrubbed (#102): the page consumed the value.
+- **Step-4 scrub.** After a non-submit fill, the broker
+  immediately re-reads the loader; if the page navigated on its
+  own before that read, it attempts a scrub in the old world and
+  reports `navigated`. The scrub is narrower than the fill: it
+  re-resolves fields by kind instead of reusing the written
+  elements, its username resolution has no fallback scan (so a
+  username the fill wrote through its own fallback is not
+  found), and it sets `value` without dispatching
+  `input`/`change`, so framework-held state can keep the value.
+  A navigation that commits after the re-read is not caught at
+  all (row A2). A navigation the fill's own submit caused is
+  not scrubbed (#102): the page consumed the value.
 - **Password values go to password fields.** By default
-  resolution a `password` field is `input[type="password"]`, and
-  username resolution excludes password inputs.
+  resolution a `password` field is `input[type="password"]`.
+  Username resolution is weaker: its hint query
+  (`input[type="email"]`, `input[autocomplete*="username"]`,
+  `input[name*="user" i]`) has no type filter, so it can match
+  a password input whose name contains "user"; only the
+  fallback scan excludes password inputs, and an explicit
+  selector in the fill plan is used as given. A username in a
+  password field is not a secret exposure — the password value
+  still only goes to a password field — but the stronger claim
+  would be false.
 - **kharon's outputs carry no values.** Fill returns status and
   field names; there is no read endpoint; audit entries carry
   ids, origins and field counts, never values. kharon's own CDP
@@ -59,7 +74,7 @@ names the evidence, or says unverified.
 | # | Path | Class | Tested |
 |---|---|---|---|
 | A1 | Fill fails partway (field miss, origin recheck, budget expiry): earlier fields already written | **kharon** — clear-on-failure blanks every written field before the error propagates; submit never dispatched | Yes: `req_api_008` suite and `page_js` tests |
-| A2 | Non-submit fill, then the page navigates by itself | **kharon** — step-4 loader recheck scrubs the old world's fields, reports `navigated` | Yes: daemon-CDP tests |
+| A2 | Non-submit fill, then the page navigates by itself | **kharon**, narrowly — the loader recheck catches only a navigation committed before the immediate post-call read (a few-ms window); a later navigation is A4, or C3 if the cache keeps the form. The scrub itself can miss a fallback-written username and cannot clear framework-held state (see "What kharon does at the boundary") | Yes: daemon-CDP tests, for the committed-before-read case |
 | A3 | Submit dispatched, page stays: rejected login, MFA step, SPA keeps the form mounted. The value sits in the field indefinitely | **gap** — no mitigation today; kharon reports `filled` and never looks again. Filed as #355 (post-submit scrub, with the mid-flow-clearing tension stated on the issue) | The behaviour is the current code's, read directly; no test asserts a scrub because none exists |
 | A4 | `submit: false`: the value stays in the field because the agent's flow continues from there | **scope** — by design; the agent owns the page after delivery. What the agent can then read is row D1 | n/a |
 | A5 | Multi-step login (username page, then password page) | Each step is its own fill; the secret is only ever written on its own step. The final step inherits A3/A4 | n/a |

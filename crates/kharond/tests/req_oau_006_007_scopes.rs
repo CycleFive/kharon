@@ -210,7 +210,7 @@ async fn tools_list_returns_only_the_tokens_scope_tools() {
     // the full registry.
     for token in [&full, &h.alpha] {
         let r = mcp_request(addr, Some(token), "tools/list", "{}").await;
-        assert_eq!(tool_names(&r.json()).len(), 7, "{}", r.body);
+        assert_eq!(tool_names(&r.json()).len(), 8, "{}", r.body);
     }
 }
 

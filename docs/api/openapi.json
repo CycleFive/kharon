@@ -187,6 +187,63 @@
         }
       }
     },
+    "/v1/open": {
+      "post": {
+        "operationId": "kharon_open",
+        "summary": "Open the item's saved login URL in a new tab in the caller's browser context (REQ-API-012). Returns only the new tab's target id and its live origin. The path, query and fragment are not returned. Refuses with no_login_url, and does not navigate, when the item has no saved URI that is a full https URL the origin matcher would allow. Does not approve a fill. Requires unlock. Bounded by the fill deadline.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["item_id"],
+                "properties": {
+                  "item_id": {
+                    "type": "string",
+                    "description": "Item id (UUID)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new tab and its live origin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "423": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/context": {
       "post": {
         "operationId": "kharon_context",
@@ -859,6 +916,22 @@
               "target_not_owned",
               "timeout"
             ]
+          }
+        }
+      },
+      "OpenResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_id", "origin"],
+        "description": "REQ-API-012. target_id is the new tab. origin is the tab's live origin (scheme, host, port) and never a path, query or fragment.",
+        "properties": {
+          "target_id": {
+            "type": "string",
+            "description": "CDP target id of the new tab. It belongs to the calling agent."
+          },
+          "origin": {
+            "type": "string",
+            "description": "Live origin, https://host[:port]."
           }
         }
       },

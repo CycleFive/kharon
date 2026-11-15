@@ -575,6 +575,7 @@ async fn req_api_002_openapi_document_matches_the_routes() {
             "/v1/fill",
             "/v1/fill_totp",
             "/v1/context",
+            "/v1/open",
             "/v1/grants",
             "/v1/openapi.json"
         ])
@@ -628,8 +629,8 @@ async fn req_api_002_openapi_document_matches_the_routes() {
     assert_eq!(r.status, 405);
     assert_eq!(r.header("allow"), Some("GET"));
     assert_eq!(r.header("cache-control"), Some("no-store"));
-    // The fill routes and /v1/context are POST-only.
-    for p in ["/v1/fill", "/v1/fill_totp", "/v1/context"] {
+    // The fill routes, /v1/open and /v1/context are POST-only.
+    for p in ["/v1/fill", "/v1/fill_totp", "/v1/open", "/v1/context"] {
         let r = get(addr, p, Some(&h.alpha)).await;
         assert_eq!(r.status, 405, "{p}");
         assert_eq!(r.header("allow"), Some("POST"), "{p}");

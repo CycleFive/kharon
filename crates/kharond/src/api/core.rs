@@ -58,13 +58,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::approval::{ApprovalAction, ApprovalTokenStore, TokenGone};
 use super::error::{ApiError, Detail};
-use super::fill::{FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus};
+use super::fill::{
+    FillBackend, FillOperation, FillPolicy, FillRequest, FillResult, FillStatus, OpenError,
+};
 use super::grant::{
     Channel, Grant, GrantAction, GrantError, GrantPolicy, GrantRequest, GrantRequestArgs,
     GrantRequestBody, GrantScope, GrantStore, GrantTerms, GrantView, RequestState,
 };
 use super::meta::{ItemMeta, matches_origin, matches_query};
 use super::notify::ApprovalNotifier;
+use super::open::{OpenResult, verifiable_login_url};
 use super::rate::{FillBacking, RateDenied, RateLimiter, RatePolicy};
 use super::rollback::RollbackGuard;
 use super::token::TokenStore;
@@ -307,6 +310,8 @@ pub enum Outcome {
     Context(ContextResult),
     /// `kharon_request_grant` result (any state, including refusals).
     GrantRequest(GrantRequestBody),
+    /// `kharon_open` result: target id and live origin only.
+    Open(OpenResult),
 }
 
 impl Outcome {
@@ -318,6 +323,7 @@ impl Outcome {
             Self::Fill(r) => serde_json::to_value(r),
             Self::Context(r) => serde_json::to_value(r),
             Self::GrantRequest(r) => serde_json::to_value(r),
+            Self::Open(r) => serde_json::to_value(r),
         };
         v.expect("invariant: API bodies serialize")
     }
@@ -2638,6 +2644,157 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         };
         self.append(entry)?;
         Ok(Outcome::Context(body))
+    }
+
+    /// Open the item's saved login URL in a new tab in `agent`'s
+    /// browser context (REQ-API-012). Returns the target id and the
+    /// tab's live origin. Does not approve a fill, and does not reset
+    /// the idle timer.
+    ///
+    /// Refusals before any browser command (`no_login_url`, unknown
+    /// item, locked, `no_browser`) write one `open` outcome and do not
+    /// navigate. A call that reaches the browser is two transitions:
+    /// `open_dispatch` before the CDP write, then one `open` outcome
+    /// whose `live_origin` is the origin only.
+    pub async fn open(
+        &self,
+        agent: &AgentId,
+        item_id: String,
+        received: Instant,
+    ) -> Result<Outcome, ApiError> {
+        self.open_from(agent, item_id, received, None).await
+    }
+
+    /// [`open`](Self::open) admitted by a network transport.
+    pub async fn open_from(
+        &self,
+        agent: &AgentId,
+        item_id: String,
+        received: Instant,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Outcome, ApiError> {
+        self.require_tool(agent, "kharon_open")?;
+        self.require_browser(agent)?;
+        let deadline = received + self.fill_policy.deadline;
+        let request_id = new_request_id();
+        let base = |e: Event| {
+            stamp(
+                Entry::new(e)
+                    .agent_id(agent.id.clone())
+                    .item_id(item_id.clone())
+                    .request_id(request_id.clone()),
+                &client_ip,
+            )
+        };
+        let url = {
+            let mut lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            if lock.require_unlocked().is_err() {
+                drop(lock);
+                self.append(base(Event::Open).result("locked"))?;
+                return Err(ApiError::LOCKED);
+            }
+            let session = lock.require_unlocked().map_err(|_| ApiError::LOCKED)?;
+            let item = match session.vault().get(&item_id) {
+                Ok(item) => item,
+                Err(_) => {
+                    drop(lock);
+                    self.append(base(Event::Open).result("not_found"))?;
+                    return Err(ApiError::UNKNOWN_ITEM);
+                }
+            };
+            match verifiable_login_url(item) {
+                Some(url) => url,
+                None => {
+                    drop(lock);
+                    self.append(base(Event::Open).result("no_login_url"))?;
+                    return Err(ApiError::NO_LOGIN_URL);
+                }
+            }
+        };
+        let generation = {
+            // Read under the gate's mutex, as for a fill (#66).
+            let _lock = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            match &self.fill_backend {
+                Some(b) if b.has_agent(agent.as_str()) => Some((Arc::clone(b), b.generation())),
+                _ => None,
+            }
+        };
+        // The URL is held only to hand to the browser. It is not an
+        // audit field and not a log line (REQ-API-012).
+        let opened = match generation {
+            None => Err(OpenError::Unavailable),
+            Some(_) if Instant::now() >= deadline => Err(OpenError::Cdp),
+            Some((backend, generation)) => {
+                self.append(base(Event::OpenDispatch).result("dispatched"))?;
+                let mut guard = ContextGuard {
+                    audit: &self.audit,
+                    abort_entry: Some(
+                        base(Event::Open)
+                            .result("aborted")
+                            .detail_code("handler_dropped"),
+                    ),
+                };
+                let allow_default = self.fill_policy.allow_default_context;
+                let open =
+                    backend.open_in_generation(agent.as_str(), &url, allow_default, generation);
+                let r = match tokio::time::timeout_at(deadline, open).await {
+                    Ok(r) => r,
+                    Err(_) => Err(OpenError::Cdp),
+                };
+                guard.abort_entry = None;
+                // A timeout is distinguished from a browser failure by
+                // the clock, not by the URL.
+                if Instant::now() >= deadline && r.is_err() {
+                    Err(OpenError::Unavailable)
+                } else {
+                    r
+                }
+            }
+        };
+        // Drop the URL before the outcome is built so a later format
+        // of this frame cannot print it. `opened` does not borrow it.
+        drop(url);
+        match opened {
+            Ok(tab) => {
+                self.append(
+                    base(Event::Open)
+                        .result("ok")
+                        .live_origin(tab.origin.clone()),
+                )?;
+                Ok(Outcome::Open(OpenResult {
+                    target_id: tab.target_id,
+                    origin: tab.origin,
+                }))
+            }
+            Err(OpenError::TargetNotOwned) => {
+                self.append(base(Event::Open).result("target_not_owned"))?;
+                Err(ApiError::TARGET_NOT_OWNED)
+            }
+            Err(OpenError::Unavailable) if Instant::now() >= deadline => {
+                self.append(
+                    base(Event::Open)
+                        .result("timeout")
+                        .detail_code("deadline_expired"),
+                )?;
+                Err(ApiError::DEADLINE)
+            }
+            Err(OpenError::Unavailable) => {
+                self.append(base(Event::Open).result("error").detail_code("cdp_error"))?;
+                Err(ApiError::BROWSER_FAILED)
+            }
+            Err(OpenError::Cdp) if Instant::now() >= deadline => {
+                self.append(
+                    base(Event::Open)
+                        .result("timeout")
+                        .detail_code("deadline_expired"),
+                )?;
+                Err(ApiError::DEADLINE)
+            }
+            Err(OpenError::Cdp) => {
+                self.append(base(Event::Open).result("error").detail_code("cdp_error"))?;
+                Err(ApiError::BROWSER_FAILED)
+            }
+        }
     }
 
     /// SPEC §8 (REQ-CRY-009, issue #100): if the unlocked vault is

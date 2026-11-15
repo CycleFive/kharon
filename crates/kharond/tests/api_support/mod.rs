@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use argon2::Argon2;
 use kharon_bwcrypto::Kdf;
-use kharond::api::fill::{ContextFuture, FillFuture, ObserveFuture};
+use kharond::api::fill::{ContextFuture, FillFuture, ObserveFuture, OpenFuture, OpenedTab};
 use kharond::api::grant::{Channel, GrantAction, GrantScope, GrantTerms};
 use kharond::api::token::{ParamFloor, TokenStore, generate_with};
 use kharond::api::{AuditSink, Broker, FillBackend, VaultView};
@@ -640,6 +640,9 @@ pub struct FakeFill {
     /// Answers to give, one per fill, before falling back to `answer`
     /// (REQ-APR-008 tests refuse a fill, then fill on the same grant).
     pub script: Arc<Mutex<VecDeque<FakeAnswer>>>,
+    /// URLs `kharon_open` handed this backend. The tool result must not
+    /// echo them (REQ-API-012).
+    pub opened: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeFill {
@@ -651,6 +654,7 @@ impl FakeFill {
             context_calls: Arc::default(),
             locks: Arc::default(),
             script: Arc::default(),
+            opened: Arc::default(),
         }
     }
 
@@ -769,6 +773,25 @@ impl FillBackend for FakeFill {
 
     fn on_lock(&self) {
         *self.locks.lock().unwrap() += 1;
+    }
+
+    fn open_in_generation<'a>(
+        &'a self,
+        _agent_id: &'a str,
+        url: &'a str,
+        _allow_default: bool,
+        _generation: u64,
+    ) -> OpenFuture<'a> {
+        self.opened.lock().unwrap().push(url.to_owned());
+        let origin = url::Url::parse(url)
+            .map(|u| u.origin().ascii_serialization())
+            .unwrap_or_else(|_| "null".to_owned());
+        Box::pin(async move {
+            Ok(OpenedTab {
+                target_id: "tab-open".to_owned(),
+                origin,
+            })
+        })
     }
 }
 

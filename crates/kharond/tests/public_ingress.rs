@@ -38,6 +38,7 @@ const REFUSED: &[(&str, &str)] = &[
     ("POST", "/v1/fill"),
     ("POST", "/v1/fill_totp"),
     ("POST", "/v1/context"),
+    ("POST", "/v1/open"),
     ("POST", "/v1/grants"),
     ("GET", "/owner/session"),
     ("POST", "/owner/unlock"),
@@ -98,7 +99,7 @@ async fn public_ingress_serves_mcp_like_the_api_listener() {
 
     let r = mcp_request(addr, Some(&h.alpha), "tools/list", "{}").await;
     assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(r.json()["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(r.json()["result"]["tools"].as_array().unwrap().len(), 8);
 
     let r = mcp_call(addr, Some(&h.alpha), "kharon_status", "{}").await;
     assert_eq!(r.status, 200, "{}", r.body);

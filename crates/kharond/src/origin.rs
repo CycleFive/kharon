@@ -312,6 +312,29 @@ impl OriginMatcher {
             Decision::refuse(MismatchReason::HrefMismatch)
         }
     }
+
+    /// Whether this saved URI is a full `https` URL the matcher would
+    /// allow as a page at that same URL (REQ-API-012).
+    ///
+    /// Regex, never, and any non-https scheme are not. A bare host never
+    /// reaches here: [`Self::new`] rejects it. `allow_http` is not
+    /// consulted: `kharon_open` does not navigate to `http`.
+    pub fn verifiable_https_login(&self) -> bool {
+        self.url.scheme() == "https"
+            && self
+                .decide(self.url.as_str(), &OriginConfig { allow_http: false })
+                .allowed
+    }
+
+    /// The URL `kharon_open` navigates to: the saved URL with userinfo
+    /// removed. Path, query and fragment stay. Callers must not log
+    /// this string (REQ-API-012).
+    pub fn navigation_url(&self) -> String {
+        let mut url = self.url.clone();
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.to_string()
+    }
 }
 
 /// How a host participates in a `Domain` comparison. Derived once by

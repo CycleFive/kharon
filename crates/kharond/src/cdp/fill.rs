@@ -308,6 +308,19 @@ impl FillEngine {
     /// this so a prompt can show where the tab actually is, never
     /// the agent's claim (REQ-ORG-002). An opaque origin (e.g.
     /// `about:blank`) reports as `null`, like [`LiveOrigin`].
+    /// Open `url` in a new tab and return `(target_id, live origin)`.
+    /// The URL is not copied into the error (REQ-API-012).
+    pub async fn open_login(
+        &self,
+        url: &str,
+        agent_ctx: &AgentContext,
+        allow_default: bool,
+    ) -> Result<(String, String), OwnershipError> {
+        self.browser
+            .open_login_tab(agent_ctx, allow_default, url)
+            .await
+    }
+
     pub async fn observe_origin(
         &self,
         target_id: &str,

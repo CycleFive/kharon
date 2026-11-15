@@ -35,7 +35,7 @@ async fn allow_list_filters_tools_list_and_refuses_calls() {
 
     // Beta (unrestricted) sees the full registry.
     let r = mcp_request(addr, Some(&h.beta), "tools/list", "{}").await;
-    assert_eq!(tool_names(&r.json()).len(), 7);
+    assert_eq!(tool_names(&r.json()).len(), 8);
 
     // Alpha calling outside its list: a tool error, 403 shape.
     let r = mcp_call(addr, Some(&h.alpha), "kharon_list", "{}").await;
@@ -96,11 +96,13 @@ async fn allow_list_refuses_every_other_tool_on_both_transports() {
         r#"{{"item_id":"{ITEM_A}","target":{{"cdp_target_id":"tab-1","expected_origin":"https://login.example.com"}}}}"#
     );
 
-    // /mcp: each of the five remaining tools, with valid arguments
+    let open = format!(r#"{{"item_id":"{ITEM_A}"}}"#);
+    // /mcp: each of the remaining tools, with valid arguments
     // (argument parsing precedes the broker, so only a valid call
     // reaches the allow-list check).
     for (tool, args) in [
         ("kharon_search", r#"{"q":"example"}"#),
+        ("kharon_open", open.as_str()),
         ("kharon_fill", &fill),
         ("kharon_fill_totp", &totp),
         ("kharon_context", "{}"),
@@ -114,6 +116,7 @@ async fn allow_list_refuses_every_other_tool_on_both_transports() {
     // /v1 alike (REQ-API-011's AC): the same restricted token is
     // refused 403 with the allow-list detail on every other route.
     for (path, body) in [
+        ("/v1/open", open.as_str()),
         ("/v1/fill", fill.as_str()),
         ("/v1/fill_totp", totp.as_str()),
         ("/v1/context", "{}"),

@@ -295,7 +295,7 @@ fn from_json<T: for<'de> Deserialize<'de>>(json: &[u8]) -> Result<T, ApiError> {
 }
 
 /// `8-4-4-4-12` hex digits; returned lowercase (vault ids are).
-fn canonical_uuid(id: &str) -> Result<String, ApiError> {
+pub(crate) fn canonical_uuid(id: &str) -> Result<String, ApiError> {
     let ok = id.len() == ITEM_ID_LEN
         && id.bytes().enumerate().all(|(i, b)| match i {
             8 | 13 | 18 | 23 => b == b'-',
@@ -434,6 +434,30 @@ pub type ContextFuture<'a> = Pin<Box<dyn Future<Output = Result<String, FillOutc
 /// cannot observe).
 pub type ObserveFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 
+/// A tab `kharon_open` created (REQ-API-012). `origin` is the live
+/// origin only: scheme, host and port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedTab {
+    /// CDP target id of the new tab.
+    pub target_id: String,
+    /// Live origin (`https://host[:port]`).
+    pub origin: String,
+}
+
+/// Why opening a tab failed, with no URL in the value (REQ-API-012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// The new tab is not in the agent's context.
+    TargetNotOwned,
+    /// This backend has no browser for the agent.
+    Unavailable,
+    /// A browser command failed. The browser's message is dropped.
+    Cdp,
+}
+
+/// A boxed open future (REQ-API-012).
+pub type OpenFuture<'a> = Pin<Box<dyn Future<Output = Result<OpenedTab, OpenError>> + Send + 'a>>;
+
 /// Why a backend without browser contexts refuses a context request.
 const NO_CONTEXTS: &str = "backend has no browser contexts";
 
@@ -525,6 +549,20 @@ pub trait FillBackend: Send + Sync {
         let _ = (agent_id, target_id, allow_default);
         Box::pin(async { None })
     }
+
+    /// Open `url` in a new tab in the agent's context (REQ-API-012).
+    /// The returned origin is the tab's live origin. `url` must not be
+    /// logged. The default backend cannot open a tab.
+    fn open_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        url: &'a str,
+        allow_default: bool,
+        generation: u64,
+    ) -> OpenFuture<'a> {
+        let _ = (agent_id, url, allow_default, generation);
+        Box::pin(async { Err(OpenError::Unavailable) })
+    }
 }
 
 /// The production backend: the CDP [`FillEngine`], one [`AgentContext`]
@@ -593,6 +631,29 @@ impl FillBackend for CdpFillBackend {
                 .observe_origin(target_id, ctx, allow_default)
                 .await
                 .ok()
+        })
+    }
+
+    fn open_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        url: &'a str,
+        allow_default: bool,
+        generation: u64,
+    ) -> OpenFuture<'a> {
+        let _ = generation;
+        Box::pin(async move {
+            let Some((engine, ctx)) = self.agents.get(agent_id) else {
+                return Err(OpenError::TargetNotOwned);
+            };
+            match engine.open_login(url, ctx, allow_default).await {
+                Ok((target_id, origin)) => Ok(OpenedTab { target_id, origin }),
+                Err(crate::cdp::OwnershipError::TargetNotOwned)
+                | Err(crate::cdp::OwnershipError::DefaultContextRefused) => {
+                    Err(OpenError::TargetNotOwned)
+                }
+                Err(_) => Err(OpenError::Cdp),
+            }
         })
     }
 }
@@ -1099,6 +1160,45 @@ impl FillBackend for ConnectingCdpBackend {
                 .observe_origin(target_id, &c.ctx, allow_default)
                 .await
                 .ok()
+        })
+    }
+
+    /// Same lazy connect as a fill, then one new tab (REQ-API-012).
+    fn open_in_generation<'a>(
+        &'a self,
+        agent_id: &'a str,
+        url: &'a str,
+        allow_default: bool,
+        generation: u64,
+    ) -> OpenFuture<'a> {
+        Box::pin(async move {
+            let Some(agent) = self.agent_for(agent_id) else {
+                return Err(OpenError::TargetNotOwned);
+            };
+            let c = match agent
+                .engine(
+                    agent_id,
+                    self.connect_timeout,
+                    self.teardown_timeout,
+                    generation,
+                    &self.generation,
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(_) => return Err(OpenError::Cdp),
+            };
+            if self.generation() != generation {
+                return Err(OpenError::Cdp);
+            }
+            match c.engine.open_login(url, &c.ctx, allow_default).await {
+                Ok((target_id, origin)) => Ok(OpenedTab { target_id, origin }),
+                Err(crate::cdp::OwnershipError::TargetNotOwned)
+                | Err(crate::cdp::OwnershipError::DefaultContextRefused) => {
+                    Err(OpenError::TargetNotOwned)
+                }
+                Err(_) => Err(OpenError::Cdp),
+            }
         })
     }
 

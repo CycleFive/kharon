@@ -89,6 +89,32 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
+    "description": "Open the item's saved login URL in a new tab in your own browser context. Returns only the new tab's target_id and its live origin (scheme, host, port). The path, query and fragment are not returned. Refuses with no_login_url, and does not navigate, when the item has no saved URI that is a full https URL the origin matcher would allow. Does not approve a fill: kharon_fill still needs its grant. Requires unlock. Audited. Same body as POST /v1/open.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "`kharon_open` arguments.",
+      "properties": {
+        "item_id": {
+          "description": "The item whose saved login URL to open.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "item_id"
+      ],
+      "title": "OpenArgs",
+      "type": "object"
+    },
+    "name": "kharon_open",
+    "title": "Open an item's login URL"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
     "description": "Type the item's username and/or password into the tab cdp_target_id in your own browser context; with submit: true, submit the form once every field filled. The secret never leaves the broker: the result is a status and the kinds filled. The live origin must match the item and expected_origin. Bounded by the fill deadline (10 s). Audited. Same body as POST /v1/fill.",
     "inputSchema": {
       "$defs": {

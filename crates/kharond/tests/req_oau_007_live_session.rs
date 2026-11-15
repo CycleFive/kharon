@@ -296,6 +296,17 @@ async fn fills_ride_the_live_session_and_disconnect_ends_it() {
     // reached the stub (no configured endpoint is a fallback).
     assert_eq!(context(&lr).await, Err(ApiError::NO_BROWSER));
     assert_eq!(fill(&lr).await, Err(ApiError::NO_BROWSER));
+    assert_eq!(
+        lr.h.broker
+            .open_from(
+                &lr.agent,
+                ITEM_A.to_owned(),
+                tokio::time::Instant::now(),
+                None,
+            )
+            .await,
+        Err(ApiError::NO_BROWSER)
+    );
     let totp = FillRequest {
         operation: FillOperation::FillTotp,
         fields: vec![(FieldKind::Totp, None)],
@@ -321,6 +332,13 @@ async fn fills_ride_the_live_session_and_disconnect_ends_it() {
         &lr.mcp_access,
         "kharon_fill_totp",
         &mcp_fill_args("totp"),
+    )
+    .await;
+    assert_mcp_no_browser(
+        addr,
+        &lr.mcp_access,
+        "kharon_open",
+        &format!(r#"{{"item_id":"{ITEM_A}"}}"#),
     )
     .await;
     assert!(lr.rig.received.lock().unwrap().is_empty());

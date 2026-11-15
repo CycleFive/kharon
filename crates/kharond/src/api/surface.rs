@@ -26,12 +26,14 @@ use super::fill::FillResult;
 use super::grant::GrantRequestBody;
 use super::mcp::Tool;
 use super::meta::ItemMeta;
+use super::open::OpenResult;
 
 /// The HTTP route serving the same operation as `tool`: `(method, path)`.
 pub const fn http_route(tool: Tool) -> (&'static str, &'static str) {
     match tool {
         Tool::Status => ("GET", "/v1/status"),
         Tool::List | Tool::Search => ("GET", "/v1/items"),
+        Tool::Open => ("POST", super::http::OPEN_PATH),
         Tool::Fill => ("POST", super::http::FILL_PATH),
         Tool::FillTotp => ("POST", super::http::FILL_TOTP_PATH),
         Tool::Context => ("POST", super::http::CONTEXT_PATH),
@@ -45,6 +47,7 @@ pub fn response_schema(tool: Tool) -> Schema {
     match tool {
         Tool::Status => schema_of::<StatusBody>(),
         Tool::List | Tool::Search => schema_of::<Vec<ItemMeta>>(),
+        Tool::Open => schema_of::<OpenResult>(),
         Tool::Fill | Tool::FillTotp => schema_of::<FillResult>(),
         Tool::Context => schema_of::<ContextResult>(),
         Tool::RequestGrant => schema_of::<GrantRequestBody>(),

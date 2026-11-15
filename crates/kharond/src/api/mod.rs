@@ -40,6 +40,7 @@ pub mod meta;
 pub mod notify;
 pub mod oauth;
 pub mod oauth_store;
+pub mod open;
 pub mod public;
 pub mod rate;
 pub mod revocation;
@@ -67,6 +68,7 @@ pub use grant::{
 };
 pub use meta::ItemMeta;
 pub use notify::{ApprovalNotifier, NtfyApprovalNotifier};
+pub use open::{OpenResult, parse_open};
 pub use rate::{RateDenied, RateLimiter, RatePolicy};
 pub use rollback::{RollbackGuard, RollbackReason};
 pub use token::{ParamFloor, TokenStore};

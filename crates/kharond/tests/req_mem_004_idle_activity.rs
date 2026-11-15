@@ -3,8 +3,7 @@
 //!
 //! Activity is an owner unlock, a fill, or the approval that issues
 //! a grant. Agent calls — status, list, search, `kharon_context`,
-//! `kharon_request_grant` — do not move the timer. Tab navigation
-//! never reaches the broker, so it has no way to move it either.
+//! `kharon_open`, `kharon_request_grant` — do not move the timer.
 //! A live (unconsumed, unexpired) grant defers the idle lock until
 //! that grant is consumed or its own TTL elapses. Owner lock and
 //! panic are not deferred.
@@ -122,6 +121,11 @@ impl Rig {
             .context(&agent, Instant::now())
             .await
             .expect("context");
+        // Opening a tab is not idle activity (REQ-API-012).
+        self.broker
+            .open(&agent, ITEM_A.to_owned(), Instant::now())
+            .await
+            .expect("open");
         let args = GrantRequestArgs {
             item_id: ITEM_A.to_owned(),
             target_id: "tab-1".into(),

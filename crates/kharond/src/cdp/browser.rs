@@ -367,6 +367,128 @@ impl Browser {
             .iter()
             .any(|created| created == id)
     }
+
+    /// Open `url` in a new tab in the agent's context and return the
+    /// target id plus the tab's live https origin (REQ-API-012).
+    ///
+    /// `allow_default` creates the tab in the browser's default context
+    /// (the single-agent escape hatch, the same one fills accept).
+    /// Otherwise the tab is created in `agent_ctx`. The new target is
+    /// checked with [`Self::check_ownership`] before navigation; a tab
+    /// that would not belong to the agent is closed and not navigated.
+    ///
+    /// `url` is sent only as the `Page.navigate` parameter. It is not
+    /// logged, and it is not copied into the error text: a browser
+    /// message can echo it (REQ-API-012). The returned origin is
+    /// scheme, host and port.
+    pub async fn open_login_tab(
+        &self,
+        agent_ctx: &AgentContext,
+        allow_default: bool,
+        url: &str,
+    ) -> Result<(String, String), OwnershipError> {
+        let mut params = json!({ "url": "about:blank" });
+        if !allow_default {
+            params["browserContextId"] = json!(agent_ctx.browser_context_id());
+        }
+        let created = self
+            .client
+            .request("Target.createTarget", params)
+            .await
+            .map_err(|_| OwnershipError::Cdp("create_target_failed".into()))?;
+        let target_id = created
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| OwnershipError::Cdp("create_target_failed".into()))?
+            .to_string();
+        if let Err(e) = self
+            .check_ownership(&target_id, agent_ctx, allow_default)
+            .await
+        {
+            self.close_target(&target_id).await;
+            return Err(e);
+        }
+        let attached = self.client.attach(&target_id).await;
+        let session = match attached {
+            Ok(session) => session,
+            Err(_) => {
+                self.close_target(&target_id).await;
+                return Err(OwnershipError::Cdp("navigate_failed".into()));
+            }
+        };
+        let navigated = session
+            .request("Page.navigate", json!({ "url": url }))
+            .await;
+        session.detach().await;
+        if navigated.is_err() {
+            self.close_target(&target_id).await;
+            return Err(OwnershipError::Cdp("navigate_failed".into()));
+        }
+        match self.wait_https_origin(&target_id).await {
+            Ok(origin) => Ok((target_id, origin)),
+            Err(e) => {
+                self.close_target(&target_id).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn close_target(&self, target_id: &str) {
+        let _ = self
+            .client
+            .request("Target.closeTarget", json!({ "targetId": target_id }))
+            .await;
+    }
+
+    /// Poll the target until its live URL has an https origin, or the
+    /// navigation has clearly failed. The URL itself is never returned.
+    async fn wait_https_origin(&self, target_id: &str) -> Result<String, OwnershipError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let info = self
+                .target_info(target_id)
+                .await
+                .map_err(|_| OwnershipError::Cdp("navigate_failed".into()))?;
+            if let Some(origin) = https_origin_only(&info.url) {
+                return Ok(origin);
+            }
+            if !is_blank_url(&info.url) {
+                return Err(OwnershipError::Cdp("navigate_failed".into()));
+            }
+            if started.elapsed() > std::time::Duration::from_secs(8) {
+                return Err(OwnershipError::Cdp("navigate_failed".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// `about:blank` and the empty URL, which a new tab reports before
+/// navigation commits.
+fn is_blank_url(href: &str) -> bool {
+    href.is_empty() || href == "about:blank" || href.starts_with("about:blank#")
+}
+
+/// Scheme, host and port of an https URL. `None` when `href` is not
+/// https, or when the origin serialization still carries a path,
+/// query, fragment or userinfo.
+fn https_origin_only(href: &str) -> Option<String> {
+    let url = url::Url::parse(href).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" || origin.contains('?') || origin.contains('#') || origin.contains('@') {
+        return None;
+    }
+    let parsed = url::Url::parse(&origin).ok()?;
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return None;
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    Some(origin)
 }
 
 /// `allow_default` admits a target the broker has classified as the

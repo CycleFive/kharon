@@ -4,7 +4,7 @@
 //! test. (Semantics are REQ-API-002's contract test, which runs every
 //! case over MCP too.)
 //!
-//! All seven tools exist: `kharon_request_grant` landed with #20
+//! All eight tools exist: `kharon_request_grant` landed with #20
 //! and is in [`Tool::ALL`] and the snapshot.
 
 mod api_support;
@@ -205,6 +205,7 @@ async fn req_api_001_tools_list_serves_the_generated_tools() {
             "kharon_status",
             "kharon_list",
             "kharon_search",
+            "kharon_open",
             "kharon_fill",
             "kharon_fill_totp",
             "kharon_context",

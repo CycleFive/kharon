@@ -16,6 +16,7 @@
 //! | `kharon_status` | `GET /v1/status` |
 //! | `kharon_list` | `GET /v1/items[?origin=]` |
 //! | `kharon_search` | `GET /v1/items?q=[&origin=]` |
+//! | `kharon_open` | `POST /v1/open` |
 //! | `kharon_fill` | `POST /v1/fill` |
 //! | `kharon_fill_totp` | `POST /v1/fill_totp` |
 //! | `kharon_context` | `POST /v1/context` (#65) |
@@ -150,9 +151,10 @@ const CACHE_TTL_MS: u64 = 3_600_000;
 const INSTRUCTIONS: &str = "kharon credentials broker. No tool ever returns a secret: \
 kharon_list and kharon_search return item metadata, and kharon_fill / kharon_fill_totp type the \
 item's username, password or current TOTP code into a tab in your own browser context and \
-report only which fields were filled. kharon_context returns your own browserContextId: open the \
-tabs you want filled in it. The live page origin decides, never your claim. Every call is \
-audited.";
+report only which fields were filled. kharon_open opens the item's saved login URL in a new tab \
+in that context and returns only the tab id and the live origin: the path, query and fragment \
+stay in the broker. kharon_context returns your own browserContextId. The live page origin \
+decides, never your claim. Every call is audited.";
 
 // ---------------------------------------------------------------- tools
 
@@ -199,6 +201,8 @@ pub enum Tool {
     List,
     /// `kharon_search`.
     Search,
+    /// `kharon_open` (REQ-API-012).
+    Open,
     /// `kharon_fill` (#18).
     Fill,
     /// `kharon_fill_totp` (#19).
@@ -211,10 +215,11 @@ pub enum Tool {
 
 impl Tool {
     /// Every tool, in `tools/list` order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Status,
         Self::List,
         Self::Search,
+        Self::Open,
         Self::Fill,
         Self::FillTotp,
         Self::Context,
@@ -227,6 +232,7 @@ impl Tool {
             Self::Status => "kharon_status",
             Self::List => "kharon_list",
             Self::Search => "kharon_search",
+            Self::Open => "kharon_open",
             Self::Fill => "kharon_fill",
             Self::FillTotp => "kharon_fill_totp",
             Self::Context => "kharon_context",
@@ -247,7 +253,7 @@ impl Tool {
             Self::Status => Some(Operation::Status),
             Self::List => Some(Operation::List),
             Self::Search => Some(Operation::Search),
-            Self::Fill | Self::FillTotp | Self::Context | Self::RequestGrant => None,
+            Self::Fill | Self::FillTotp | Self::Context | Self::RequestGrant | Self::Open => None,
         }
     }
 
@@ -257,7 +263,12 @@ impl Tool {
         match self {
             Self::Fill => Some(FillOperation::Fill),
             Self::FillTotp => Some(FillOperation::FillTotp),
-            Self::Status | Self::List | Self::Search | Self::Context | Self::RequestGrant => None,
+            Self::Status
+            | Self::List
+            | Self::Search
+            | Self::Open
+            | Self::Context
+            | Self::RequestGrant => None,
         }
     }
 
@@ -267,6 +278,7 @@ impl Tool {
             Self::Status | Self::Context => &[],
             Self::List => &["origin"],
             Self::Search => &["q", "origin"],
+            Self::Open => &["item_id"],
             Self::Fill | Self::FillTotp => &["item_id", "target", "fields", "submit", "grant_id"],
             Self::RequestGrant => &["item_id", "target", "action"],
         }
@@ -277,6 +289,7 @@ impl Tool {
             Self::Status => "Broker status",
             Self::List => "List items",
             Self::Search => "Search items",
+            Self::Open => "Open an item's login URL",
             Self::Fill => "Fill a login form",
             Self::FillTotp => "Fill a TOTP code",
             Self::Context => "Your browser context",
@@ -299,6 +312,14 @@ impl Tool {
             Self::Search => {
                 "Item metadata (never secrets) whose name or URI host contains q, optionally \
                  filtered by origin. Audited. Same body as GET /v1/items?q=."
+            }
+            Self::Open => {
+                "Open the item's saved login URL in a new tab in your own browser context. \
+                 Returns only the new tab's target_id and its live origin (scheme, host, port). \
+                 The path, query and fragment are not returned. Refuses with no_login_url, and \
+                 does not navigate, when the item has no saved URI that is a full https URL the \
+                 origin matcher would allow. Does not approve a fill: kharon_fill still needs \
+                 its grant. Requires unlock. Audited. Same body as POST /v1/open."
             }
             Self::Fill => {
                 "Type the item's username and/or password into the tab cdp_target_id in your \
@@ -344,6 +365,7 @@ impl Tool {
             Self::Status => generator.into_root_schema_for::<StatusArgs>(),
             Self::List => generator.into_root_schema_for::<ListArgs>(),
             Self::Search => generator.into_root_schema_for::<SearchArgs>(),
+            Self::Open => generator.into_root_schema_for::<super::open::OpenArgs>(),
             Self::Fill => generator.into_root_schema_for::<FillArgs>(),
             Self::FillTotp => generator.into_root_schema_for::<FillTotpArgs>(),
             Self::Context => generator.into_root_schema_for::<ContextArgs>(),
@@ -845,7 +867,15 @@ where
                             Err(e) => Err(e),
                         }
                     }
-                    _ => unreachable!("only context and request_grant have no operation"),
+                    Tool::Open => {
+                        match fill_arguments(call.arguments).and_then(super::open::parse_open) {
+                            Ok(item_id) => {
+                                broker.open_from(agent, item_id, received, client_ip).await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => unreachable!("only context, open and request_grant have no operation"),
                 },
             };
             match outcome {

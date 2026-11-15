@@ -14,6 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::devtools::CdpTarget;
 use crate::frame::{Frame, FrameError, read_frame, write_frame};
 use crate::{
     CLOSE_DIAL_FAILED, CLOSE_NORMAL, CLOSE_RESET, DIAL_TIMEOUT, DUPLEX_BYTES, MAX_STREAMS,
@@ -158,7 +159,29 @@ pub async fn serve_agent<S>(stream: S, cdp: std::net::SocketAddr) -> Result<(), 
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    if !cdp.ip().is_loopback() || cdp.port() == 0 {
+    serve_cdp(stream, CdpTarget::Fixed(cdp)).await
+}
+
+/// [`serve_agent`], but each [`FRAME_OPEN`] re-reads `source`. A missing
+/// or stale file fails that dial ([`CLOSE_DIAL_FAILED`]) and does not
+/// end the session.
+pub(crate) async fn serve_agent_discovering<S>(
+    stream: S,
+    source: crate::DiscoverSource,
+) -> Result<(), crate::ClientError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    serve_cdp(stream, CdpTarget::Discover(source)).await
+}
+
+async fn serve_cdp<S>(stream: S, cdp: CdpTarget) -> Result<(), crate::ClientError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    if let CdpTarget::Fixed(addr) = &cdp
+        && (!addr.ip().is_loopback() || addr.port() == 0)
+    {
         return Err(crate::ClientError::CdpNotLoopback);
     }
     let (inner, task) = start(stream, Role::Agent { cdp });
@@ -182,7 +205,7 @@ where
 
 enum Role {
     Broker,
-    Agent { cdp: std::net::SocketAddr },
+    Agent { cdp: CdpTarget },
 }
 
 struct Slot {
@@ -200,7 +223,7 @@ struct Inner {
     dead: watch::Receiver<bool>,
     dead_tx: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    role_cdp: Option<std::net::SocketAddr>,
+    role_cdp: Option<CdpTarget>,
 }
 
 impl Inner {
@@ -381,7 +404,7 @@ async fn handle_frame(inner: &Arc<Inner>, frame: Frame) -> Result<(), FrameError
 }
 
 async fn on_open(inner: &Arc<Inner>, id: u32) -> Result<(), FrameError> {
-    if let Some(cdp) = inner.role_cdp {
+    if let Some(cdp) = inner.role_cdp.clone() {
         // Agent: an OPEN is a dial request. A second OPEN for a live id is a bug.
         let exists = inner
             .streams
@@ -412,9 +435,52 @@ async fn on_open(inner: &Arc<Inner>, id: u32) -> Result<(), FrameError> {
     }
 }
 
-async fn dial(inner: &Arc<Inner>, id: u32, cdp: std::net::SocketAddr) {
-    let stream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(cdp)).await {
-        Ok(Ok(stream)) => stream,
+/// At most one line a minute. A missing or unreadable profile otherwise
+/// leaves the connector journal empty while fills return `cdp_error`.
+fn note_discover_failed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const INTERVAL_MS: u64 = 60_000;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        if now.saturating_sub(prev) < INTERVAL_MS {
+            return;
+        }
+        match LAST.compare_exchange_weak(prev, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                eprintln!("kharon-agent-connector: cdp: discover failed");
+                return;
+            }
+            Err(seen) => prev = seen,
+        }
+    }
+}
+
+async fn dial(inner: &Arc<Inner>, id: u32, cdp: CdpTarget) {
+    let connect = async {
+        let addr = match &cdp {
+            CdpTarget::Fixed(addr) => *addr,
+            CdpTarget::Discover(source) => match crate::devtools::resolve_devtools(source).await {
+                Ok(ep) => ep.addr(),
+                Err(_) => {
+                    note_discover_failed();
+                    return None;
+                }
+            },
+        };
+        // Discovery always builds 127.0.0.1. Refuse anything else rather
+        // than dial it: the broker cannot aim this socket.
+        if !addr.ip().is_loopback() || addr.port() == 0 {
+            return None;
+        }
+        TcpStream::connect(addr).await.ok()
+    };
+    let stream = match tokio::time::timeout(DIAL_TIMEOUT, connect).await {
+        Ok(Some(stream)) => stream,
         _ => {
             let _ = inner
                 .out

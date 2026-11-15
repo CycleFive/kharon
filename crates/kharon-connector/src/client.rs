@@ -14,7 +14,8 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use zeroize::Zeroizing;
 
 use crate::auth::{read_server_hello, write_client_hello};
-use crate::mux::serve_agent;
+use crate::devtools::DiscoverSource;
+use crate::mux::{serve_agent, serve_agent_discovering};
 use crate::proxy::http_connect;
 use crate::tls::{TlsVersions, connect_pinned_stream, is_pin_mismatch};
 use crate::ws::{WsByteStream, ws_config};
@@ -74,6 +75,11 @@ pub struct AgentParams {
     pub agent_id: String,
     pub token: Zeroizing<String>,
     pub cdp: SocketAddr,
+    /// When set, every CDP dial re-reads this source and does not dial
+    /// [`Self::cdp`]. The connector binary sets it only when no explicit
+    /// `cdp` / `cdp_url` was configured. `cdp` is still checked for
+    /// loopback before auth when this is `None`.
+    pub devtools: Option<DiscoverSource>,
     pub proxy: Option<SocketAddr>,
     pub proxy_creds: Option<Zeroizing<Vec<u8>>>,
     pub outer_roots: Option<Arc<rustls::RootCertStore>>,
@@ -88,12 +94,17 @@ type DynStream = Box<dyn AsyncStream>;
 pub struct AuthedSession {
     stream: DynStream,
     cdp: SocketAddr,
+    devtools: Option<DiscoverSource>,
 }
 
 impl AuthedSession {
-    /// Relay until the session ends.
+    /// Relay until the session ends. A discovery source is read again
+    /// on every CDP dial.
     pub async fn serve(self) -> Result<(), ClientError> {
-        serve_agent(self.stream, self.cdp).await
+        match self.devtools {
+            Some(source) => serve_agent_discovering(self.stream, source).await,
+            None => serve_agent(self.stream, self.cdp).await,
+        }
     }
 }
 
@@ -129,7 +140,7 @@ fn note(legs: &mut Legs, leg: Leg, r: Result<(), ClientError>) {
 }
 
 async fn dial(params: &AgentParams, legs: &mut Legs) -> Result<AuthedSession, ClientError> {
-    if !params.cdp.ip().is_loopback() || params.cdp.port() == 0 {
+    if params.devtools.is_none() && (!params.cdp.ip().is_loopback() || params.cdp.port() == 0) {
         return Err(ClientError::CdpNotLoopback);
     }
     match &params.transport {
@@ -422,6 +433,7 @@ where
     Ok(AuthedSession {
         stream: Box::new(tls),
         cdp: params.cdp,
+        devtools: params.devtools.clone(),
     })
 }
 
@@ -475,6 +487,7 @@ mod tests {
             agent_id: "a".into(),
             token: Zeroizing::new(String::new()),
             cdp: "127.0.0.1:9".parse().unwrap(),
+            devtools: None,
             proxy: None,
             proxy_creds: None,
             outer_roots: None,

@@ -156,6 +156,7 @@ fn dial(rig: &Rig, transport: SessionTransport, agent: &str, token: &str) -> Age
         agent_id: agent.into(),
         token: Zeroizing::new(token.to_owned()),
         cdp: "127.0.0.1:9".parse().unwrap(),
+        devtools: None,
         proxy: None,
         proxy_creds: None,
         outer_roots: None,

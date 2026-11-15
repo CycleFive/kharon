@@ -44,7 +44,9 @@ needs a secret except step 5.
    with password manager, leak detection, autofill, payment-method
    query, sync and metrics off, to the policy directory of the
    browser you run: `/etc/chromium/policies/managed/` for Debian's
-   `chromium`, `/etc/opt/chrome/policies/managed/` for Google Chrome.
+   `chromium`, `/etc/opt/chrome/policies/managed/` for Google Chrome,
+   `/etc/opt/chrome_for_testing/policies/managed/` for Chrome for
+   Testing (the browser Hermes packages).
    The file is in
    [`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
    (`no-password-manager.json`). Check it took effect: open
@@ -96,6 +98,70 @@ Running the connector and Chromium as separate non-root users inside
 the runtime helps only if the agent itself is not root. Tell the
 customer which one they are getting.
 
+### Hermes discovery and the connector user
+
+Stock Hermes discovery reads the **connector process's** own
+`$HERMES_HOME`, or `$HOME/.hermes` when that variable is unset. It
+does not search another user's home.
+[`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
+runs the connector as `User=connector`, home
+`/var/lib/kharon-connector`, with `ProtectHome=yes`, and writes an
+explicit `cdp = "127.0.0.1:…"`. That unit is the fixed-port Chromium
+install. Used as-is for stock Hermes, the preset scans
+`/var/lib/kharon-connector/.hermes`, which Hermes never writes, and
+`ProtectHome=yes` hides Hermes's real home under `/home` even when
+`hermes_home` names it. `--check` still prints `check: ok`, because
+it never opens the file. `kharon_context` and `kharon_fill` then
+return `error` with detail `cdp_error`. A connector that is not
+running at all shows up as `timeout`, not as the connector's
+`no_browser` dial result and not as REQ-OAU-007's MCP `no_browser`.
+On start the connector logs the path it will scan,
+`cdp: discover hermes_home=…`. A later dial that cannot read a live
+file logs `cdp: discover failed`, at most once a minute.
+
+The setup that was checked on a stock Hermes host is to run the
+connector as Hermes's own user. The default home is then Hermes's
+home, and `ProtectHome` can stay.
+
+A separate connector uid is the layout
+[`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
+uses, and it is not yet shown to work for this preset. Hermes
+creates `~/.hermes`, the ephemeral root, and every per-launch
+profile directory mode `0700`. A one-time `chmod` or ACL on a
+directory that already exists does not cover the directory the next
+launch creates, and an explicit mode at `mkdir` does not keep a
+default ACL set on the parent. `ProtectHome=yes` also hides
+`/home` until the unit drops it or adds `ReadOnlyPaths=` for the
+tree. If file permissions cannot follow those new directories, the
+connector user needs a capability such as `CAP_DAC_READ_SEARCH` to
+read them. That capability lets the process read files its uid
+could not otherwise read, which is wider than the port file. Do
+not describe the separate-uid options as a finished install until
+that is checked on a host.
+
+If a host check shows the connector uid can see each new profile,
+the boundaries are the same kind of choice as the root-agent note
+above:
+
+- **The connector's uid is Hermes's uid.** The tunnel credential
+  file is mode `0400` owned by that user, so Hermes can read it, and
+  so can a shell the model runs. The split between the agent and the
+  credential is gone. The connector is also the owner of the browser
+  profile, so it cannot be kept out of that profile. This is the
+  option a live stock Hermes session has exercised.
+- **Separate uid, `ProtectHome=yes` removed.** The credential stays
+  unreadable to Hermes. The connector can open every home path its
+  file permissions and any capability allow, not only the DevTools
+  file.
+- **Separate uid, `ProtectHome=yes` kept, `ReadOnlyPaths=` on the
+  chromium cache tree.** The credential stays unreadable to Hermes,
+  and the rest of `/home` stays hidden. The connector can still read
+  the throwaway profiles in that tree (cookies and page storage from
+  the session), because those directories are where the port file
+  lives. This is the narrower of the two cross-user options, and it
+  still depends on the connector uid being able to read directories
+  Hermes creates mode `0700`.
+
 ### Dashboard runtimes and `/connector`
 
 Since v0.3.0 (#235 phase 2), a dashboard Connect can also spawn the
@@ -127,77 +193,98 @@ The install is done when the identity has a live session:
   with a "no browser attached" detail means the connector is not
   attached, whatever the MCP leg is doing.
 
-## Hermes: connector on an explicit local CDP endpoint
+## Hermes: stock Chromium, no CDP config
 
 Hermes Agent (Nous Research) drives its browser over CDP, so the
-connector can share a browser Hermes is already attached to. This
-section is the v0.6.0 slice (#338): an **explicit** local CDP
-endpoint only. It adds no transport — the connector still dials a
-loopback `host:port` on the agent host and attaches over the
-WebSocket as above. kharon does not launch the browser; Hermes, or
-an operator who started one for Hermes, owns it, and Hermes keeps
-driving it after a fill (REQ-ARCH-003).
+connector can share a browser Hermes is already attached to. The
+stock path needs no `browser.cdp_url` and no port in
+`connector.toml` (#337, #349). kharon does not launch the browser.
+Hermes owns it and keeps driving it after a fill (REQ-ARCH-003).
 
-Hermes facts below are from its browser docs and the upstream
-source pass on #337 (`NousResearch/hermes-agent` `main` @
-`f578714`, 2026-11-15), not from a live Hermes install.
+The connector still dials loopback only. It adds no transport.
 
-### Set up the shared endpoint
+Hermes facts below are from its browser docs and from
+`NousResearch/hermes-agent` `main` @ `f578714` (2026-11-15), the
+source pin from #337. `hermes_constants.py`
+`_platform_default_hermes_home` is `$HERMES_HOME` or `~/.hermes`.
+`tools/browser_launcher.py` `_ephemeral_root` is
+`<home>/cache/browser/chromium`, and `_default_user_data_dir`
+creates a new directory under that root for each stock launch
+(`<digest>-<pid>-<start>`). `_read_devtools_file` reads line 1 as
+the port and line 2 as `/devtools/browser/<id>`. `_make_browser`
+builds `ws://127.0.0.1:<port><path>`. The same three functions are
+what the connector's preset implements. A Hermes home other than
+the platform default (a profile under `profiles/`) is not inferred;
+set `hermes_home` or `HERMES_HOME` for the connector process.
 
-1. **Give Hermes a loopback Chromium on a fixed port.** The
-   operator starts a Chromium with
-   `--remote-debugging-address=127.0.0.1
-   --remote-debugging-port=9222` and a dedicated `--user-data-dir`
-   (since Chrome 136 a debugging port on the default profile
-   directory is ignored), and keeps it running under a supervisor
-   — for any non-CLI session this operator-started browser is the
-   only path: nothing else will launch one for it, and a
-   `browser.cdp_url` pointing at a port where nothing is
-   listening attaches to nothing. The auto-launch in step 2 is a
-   CLI-only convenience, and even there the browser it launches
-   lives only as long as the CLI session that launched it, so it
-   is not a stable target for a supervised connector.
-   The examples use 9222, Hermes's documented default; any free
-   loopback port works if both sides use it.
-2. **Point Hermes at it, persistently.** In Hermes's `config.yaml`
-   (`$HERMES_HOME/config.yaml`):
+### Zero-config attach
 
-   ```yaml
-   browser:
-     cdp_url: "http://127.0.0.1:9222"
-   ```
-
-   or set `BROWSER_CDP_URL=http://127.0.0.1:9222` in Hermes's
-   environment. Hermes resolves its CDP override in the order:
-   a live `/browser connect` > `BROWSER_CDP_URL` >
-   `browser.cdp_url`.
-
-   `/browser connect` is a **CLI slash command only**. A gateway,
-   WebUI, or chat-platform session will not run it — the message
-   goes to the model as text — so never write an install or a
-   runbook that tells a gateway/WebUI operator to type it. Typed in
-   the CLI with no argument it attaches to
-   `http://127.0.0.1:9222` (or a `ws://` URL passed to it), and if
-   nothing is listening there it auto-launches a Chromium-family
-   browser with `--remote-debugging-port=9222` and a dedicated
-   user-data dir. For any non-CLI session, `browser.cdp_url` /
-   `BROWSER_CDP_URL` is the attach mechanism.
-3. **Point the connector at the same port.** Steps 3–8 above apply
-   unchanged (`ptrace_scope`, binary, tunnel credential file,
-   MCP client), with
-   `connector.toml` naming that same loopback endpoint:
+1. **Leave Hermes on its stock local Chromium.** Do not set
+   `browser.cdp_url` or `BROWSER_CDP_URL`. Hermes launches with
+   `--remote-debugging-port=0` and writes
+   `<user-data-dir>/DevToolsActivePort`. The port changes every
+   time that browser starts.
+2. **Point the connector at the preset, not a port.** Steps 3–8
+   above apply (`ptrace_scope`, binary, tunnel credential file,
+   MCP client), but `connector.toml` omits `cdp` and `cdp_url`:
 
    ```toml
-   cdp = "127.0.0.1:9222"
+   transport = "ws"
+   broker_url = "wss://<host>/connector"
+   broker_pin = "<64 hex chars>"
+   agent_id = "<agent>"
+   token_file = "/etc/kharon-connector/token"
    ```
 
-   The host gets its own agent id (#281). The managed policy from
-   step 2 above must be in the policy directory of the Chromium
-   Hermes drives — including an operator-launched one — or that
-   browser may offer to save a filled password (REQ-ARCH-004).
-   Run `--check` and start the connector as in step 7, and verify
-   the install the same way: `kharon_context` returns `ok` with a
-   live session on the owner's Connections page.
+   With no explicit endpoint the connector scans
+   `<hermes home>/cache/browser/chromium/*/DevToolsActivePort` and
+   dials `127.0.0.1` on the port in the newest file whose
+   `/json/version` browser id still matches line 2. One live Hermes
+   browser per connector. Two concurrent Hermes sessions can leave
+   the tab you want in the older browser while the connector dials
+   the newer one, and the fill is then `target_not_owned`. Picking
+   among several live browsers is a later change. It re-reads that
+   tree on every CDP dial. A broker reconnect does not read the
+   file until the next dial, and `--check` does not read it at all.
+   A missing, unreadable, truncated, or stale file fails that dial
+   and the connector stays up. On a hand-provisioned agent the MCP
+   tools report that as `error` / `cdp_error`, not as `no_browser`.
+   It never dials anything but loopback. The broker pin and
+   `agent_id` checks are unchanged.
+
+   The home in that scan is the connector process's own
+   `$HERMES_HOME` or `$HOME/.hermes`, not Hermes's home on another
+   uid. On the documented connector unit (`User=connector`,
+   `ProtectHome=yes`) that default does not see a stock Hermes
+   profile. The setup checked on a stock Hermes host runs the
+   connector as Hermes's user. A separate uid is described, and
+   marked unchecked, in
+   [Hermes discovery and the connector user](#hermes-discovery-and-the-connector-user).
+   The process logs the path it will scan at start
+   (`cdp: discover hermes_home=…`).
+
+   Override the preset when the browser is not in that home. Set
+   one of these, not a combination:
+
+   | Key | What it reads |
+   |---|---|
+   | `hermes_home` | `<path>/cache/browser/chromium/*/DevToolsActivePort`. `$HERMES_HOME` in the connector's environment is the same knob when `hermes_home` is unset. |
+   | `user_data_dir` | `<path>/DevToolsActivePort`, one Chromium profile. Use this for `browser.user_data_dir`. |
+   | `devtools_active_port` | That file, exactly. |
+
+3. **Put the managed policy on the browser Hermes launches.** The
+   file from step 2 of the hosted-runtime list must be in that
+   Chromium's policy directory. Hermes's packaged browser is Chrome
+   for Testing, which reads
+   `/etc/opt/chrome_for_testing/policies/managed/`, not the Debian
+   `chromium` or Google Chrome directories named for the other
+   builds. Without the file the browser may offer to save a filled
+   password (REQ-ARCH-004). The host gets its own agent id (#281).
+   Run `--check` and start the connector as in step 7. `--check`
+   proves the broker leg; it does not require the browser to be
+   up. Verify the install the same way as any other host:
+   `kharon_context` returns `ok` with a live session on the
+   owner's Connections page.
 
 **Assumption (tab rule, pending #334).** Which tab a fill uses
 follows the same rule proposed for OpenClaw, as an explicit
@@ -209,16 +296,60 @@ If #334 or the Hermes canary (#339) shows Hermes cannot honour
 that, this section changes before v0.6.0 ships — it is not a
 settled Hermes fact.
 
+### Explicit endpoint, when you need one
+
+An explicit endpoint wins over discovery. Set `cdp` or `cdp_url`
+(not both) and the connector dials that loopback socket and does
+not read `DevToolsActivePort`. Use this when Hermes is attached to
+a browser you started on a fixed port.
+
+1. Start Chromium with
+   `--remote-debugging-address=127.0.0.1
+   --remote-debugging-port=9222` and a dedicated `--user-data-dir`
+   (since Chrome 136 a debugging port on the default profile
+   directory is ignored). Keep it running under a supervisor. A
+   `browser.cdp_url` pointing at a port where nothing is listening
+   attaches to nothing.
+2. Point Hermes at it in `$HERMES_HOME/config.yaml`:
+
+   ```yaml
+   browser:
+     cdp_url: "http://127.0.0.1:9222"
+   ```
+
+   or set `BROWSER_CDP_URL=http://127.0.0.1:9222`. Hermes resolves
+   its CDP override in the order: a live `/browser connect` >
+   `BROWSER_CDP_URL` > `browser.cdp_url`.
+
+   `/browser connect` is a **CLI slash command only**. A gateway,
+   WebUI, or chat-platform session will not run it — the message
+   goes to the model as text — so never write an install or a
+   runbook that tells a gateway/WebUI operator to type it. Typed
+   in the CLI with no argument it attaches to
+   `http://127.0.0.1:9222` (or a `ws://` URL passed to it), and if
+   nothing is listening there it auto-launches a Chromium-family
+   browser with `--remote-debugging-port=9222` and a dedicated
+   user-data dir. That auto-launch lives only as long as the CLI
+   session. For any non-CLI session, `browser.cdp_url` /
+   `BROWSER_CDP_URL` is the attach mechanism.
+3. Name the same loopback port in `connector.toml`. Either form
+   works; a path on `cdp_url` is ignored because the connector
+   dials the port and the broker resolves `/devtools/browser/<id>`:
+
+   ```toml
+   cdp = "127.0.0.1:9222"
+   ```
+
+   ```toml
+   cdp_url = "http://127.0.0.1:9222"
+   ```
+
+   `http://` and `ws://` to `127.0.0.1` or `::1` are accepted.
+   Any other host is refused. The examples use 9222; any free
+   loopback port works if both sides use it.
+
 ### Modes this section does not cover
 
-- **Default packaged Chromium (no `browser.cdp_url`).** The #337
-  source pass found that the stock launch does publish a loopback
-  DevTools port — `--remote-debugging-port=0`, an ephemeral port
-  discoverable from the profile's `DevToolsActivePort` file — but
-  the four live sub-checks on a real Hermes install are still
-  open, and the connector has no discovery step for an ephemeral
-  port. Until #337's live check passes, the default launch is
-  **not** a supported install; use the explicit endpoint above.
 - **Cloud providers** (Nous subscription, Browserbase, Browser
   Use, Firecrawl, another provider plugin). The browser is off
   the host; the connector dials loopback only.
@@ -228,9 +359,9 @@ settled Hermes fact.
   kharon does not call it; the customer vault stays the
   Bitwarden collection on the broker.
 - **`browser.use_real_profile`.** A Hermes-managed snapshot of
-  the user's real profile. Whether that launch can share its
-  browser the way this section needs is unverified; out of this
-  slice.
+  the user's real profile. The stock preset does not scan it.
+  Point `user_data_dir` at that profile if you want discovery
+  there; otherwise it stays outside this install.
 
 ## Handing over the secrets
 

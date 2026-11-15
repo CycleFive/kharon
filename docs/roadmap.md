@@ -311,15 +311,18 @@ Bitwarden collection on the broker.
 
 ### What the connector install needs
 
-The install leads with the zero-config path. The connector discovers
-the loopback endpoint from `DevToolsActivePort` and re-reads that
-file on each reconnect
-([#349](https://github.com/CycleFive/kharon/issues/349)). Stock
-Hermes needs no `browser.cdp_url`. An explicit `cdp_url`, or the CLI
-`/browser connect`, is the fallback: `connector.toml` `cdp` names
-that same loopback `host:port`. The docs' example port for the
-fallback is 9222, which matches the connector examples already in
-the agent-runtime guide. An explicit `cdp_url` still wins over
+Today's install page
+([`docs/agent-runtime-setup.md`](agent-runtime-setup.md), #338,
+merged in #341) leads with the explicit local endpoint. #349's docs
+scope is what makes that page lead with the zero-config path. Once
+[#349](https://github.com/CycleFive/kharon/issues/349) lands, the
+connector discovers the loopback endpoint from `DevToolsActivePort`
+and re-reads that file on each reconnect. Stock Hermes then needs
+no `browser.cdp_url`. An explicit `cdp_url`, or the CLI
+`/browser connect`, stays the fallback: `connector.toml` `cdp`
+names that same loopback `host:port`. The docs' example port for
+the fallback is 9222, which matches the connector examples already
+in the agent-runtime guide. An explicit `cdp_url` still wins over
 discovery. The browser process is Hermes's. kharon does not launch
 it. Policy, pin, agent id, and the tab-ownership question are the
 same as for OpenClaw.
@@ -335,10 +338,11 @@ approves one fill, and Hermes keeps that browser.
 - The default-launch check is recorded (#337, closed as decided),
   and the install doc matches it: zero-config `DevToolsActivePort`
   discovery first, the explicit endpoint as the fallback.
-- The agent-host docs grow a Hermes section that leads with that
-  zero-config path, with the CLI-only note on `/browser connect`,
-  and the modes Hermes support does not cover (cloud providers,
-  Lightpanda, `browser_vault`).
+- #349 rewrites the Hermes section of the agent-host docs so it
+  leads with the zero-config path, with the CLI-only note on
+  `/browser connect`, and the modes Hermes support does not cover
+  (cloud providers, Lightpanda, `browser_vault`). Until that
+  rewrite, #338's page leads with the explicit endpoint.
 - One recorded canary on that shared browser: approved fill,
   Disconnect, Hermes still driving it, next fill `no_browser`.
 - No new transport.
@@ -347,7 +351,7 @@ approves one fill, and Hermes keeps that browser.
 
 Filed
 ([#337](https://github.com/CycleFive/kharon/issues/337), closed;
-[#338](https://github.com/CycleFive/kharon/issues/338),
+[#338](https://github.com/CycleFive/kharon/issues/338), closed;
 [#339](https://github.com/CycleFive/kharon/issues/339),
 [#349](https://github.com/CycleFive/kharon/issues/349)). They are
 labelled `platform:hermes` and listed on
@@ -362,9 +366,10 @@ labelled `platform:hermes` and listed on
    ([#349](https://github.com/CycleFive/kharon/issues/349)) — The
    connector reads the file, re-reads it on each reconnect, and an
    explicit `cdp_url` still wins.
-3. **docs(dep): Hermes connector install**
-   ([#338](https://github.com/CycleFive/kharon/issues/338)) — The
-   page leads with the zero-config path. The explicit
+3. **docs(dep): Hermes connector install** — #338 is closed. Its
+   page, merged in #341, leads with the explicit endpoint.
+   [#349](https://github.com/CycleFive/kharon/issues/349) rewrites
+   that page so it leads with the zero-config path, and the explicit
    `browser.cdp_url` endpoint is the fallback. CLI `/browser connect`
    stays called out as not a gateway command. Cloud and Lightpanda
    stay excluded. The tab rule is #334's.
@@ -437,26 +442,25 @@ and Chrome DevTools MCP.
   customer-only approvals on the owner socket.** Parked optional
   design. The operator CLI keeps its current powers. Not scheduled.
 
-**Which tab is filled?** Closed on
-[#334](https://github.com/CycleFive/kharon/issues/334) (2026-11-15):
-option (b), under `allow_default_context` with one agent.
-[#343](https://github.com/CycleFive/kharon/pull/343) fixed the bug
-that blocked it;
-[#345](https://github.com/CycleFive/kharon/pull/345) added the
-follow-ups.
-
-**Is Hermes's default packaged Chromium included?** Yes. Closed on
-[#337](https://github.com/CycleFive/kharon/issues/337) (2026-11-15):
-the ephemeral loopback port, discovered from `DevToolsActivePort`,
-counts. Hermes support includes it through that discovery
-([#349](https://github.com/CycleFive/kharon/issues/349)). The
-install doc leads with the zero-config path; an explicit endpoint
-is the fallback. Cloud providers, Lightpanda, and `browser_vault`
-stay out.
-
 ## Open questions
 
-1. **Which OpenClaw profile does the soak host actually run?**
+1. **Which tab is filled?** Closed on
+   [#334](https://github.com/CycleFive/kharon/issues/334)
+   (2026-11-15): option (b), under `allow_default_context` with one
+   agent. [#343](https://github.com/CycleFive/kharon/pull/343) fixed
+   the bug that blocked it;
+   [#345](https://github.com/CycleFive/kharon/pull/345) added the
+   follow-ups.
+2. **Is Hermes's default packaged Chromium included?** Closed on
+   [#337](https://github.com/CycleFive/kharon/issues/337)
+   (2026-11-15): yes. The ephemeral loopback port, discovered from
+   `DevToolsActivePort`, counts. Hermes support includes it through
+   that discovery
+   ([#349](https://github.com/CycleFive/kharon/issues/349)). Once
+   #349 lands, the install doc leads with the zero-config path, and
+   the explicit endpoint is the fallback. Cloud providers,
+   Lightpanda, and `browser_vault` stay out.
+3. **Which OpenClaw profile does the soak host actually run?**
    OpenClaw support targets the managed profile that has a CDP port.
    If #328's host is on the extension relay, that profile has no CDP
    URL and stays out with #331. The platform order stays OpenClaw,

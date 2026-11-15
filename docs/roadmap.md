@@ -95,10 +95,11 @@ Lothrop, 2026-11-15: releases are rolling trains.
 The platform order is kept. OpenClaw's default managed profile
 already publishes a local CDP port, and #328 is the soak install of
 the connector that ships today. Hermes's documented way for a second
-client to share the browser is an explicit CDP URL, and the default
-packaged Chromium does not offer its raw CDP tool (details under
-[Hermes](#hermes); the listen port there is unverified). The
-published order stays.
+client to share the browser is an explicit CDP URL. The default
+packaged Chromium's loopback port was checked live on
+[#337](https://github.com/CycleFive/kharon/issues/337) (2026-11-15):
+it is ephemeral, and the issue stays open (details under
+[Hermes](#hermes)). The published order stays.
 
 ## Soak and carry-over
 
@@ -117,10 +118,8 @@ check pass.
 - #323 and #324 stay merged.
 - #326 closes when the soak week ends (about 2026-11-21) and every
   break has its own issue. Muse's host and OpenClaw (#328) are
-  the soak hosts. #327 is parked, so the Duet checkbox on #326 is
-  leftover tracker text. This page leaves the tracker as it is.
-  Clearing #327's milestone field, and striking that checkbox, is
-  a separate tracker edit.
+  the soak hosts. #327 is parked and on no milestone, so it is not
+  a soak host. The Duet line on #326 is already struck.
 - #328 meets the acceptance already written on it: the connector
   attaches with the pin checked, Connect completes, `kharon_context`
   returns ok, one approved canary fills, Disconnect makes the next
@@ -140,9 +139,8 @@ Filed. None proposed. Proposing new soak issues would rescope it.
 | #326 | open | Soak tracking for the week of 2026-11-14. |
 | #328 | open, unclaimed | Soak install of the v0.3.0 connector on OpenClaw. Stays here. OpenClaw support does not absorb it. |
 
-#327 is open, labelled `parked`, and still has milestone v0.4.0 in
-the tracker. It is listed under
-[Parked / not planned](#parked--not-planned), not in the table.
+#327 is open, labelled `parked`, and on no milestone. It is listed
+under [Parked / not planned](#parked--not-planned), not in the table.
 
 ## OpenClaw
 
@@ -257,7 +255,10 @@ them absorb #328. They sit on milestone `next`, labelled
 Hermes here is Hermes Agent (Nous Research). Read from its browser
 docs on 2026-11-14
 ([Browser automation](https://hermes-agent.nousresearch.com/docs/user-guide/features/browser)).
-Nothing in this section was checked by installing Hermes.
+The default-launch live check is on
+[#337](https://github.com/CycleFive/kharon/issues/337) (2026-11-15).
+The other modes in this section were not checked by installing
+Hermes.
 
 ### How Hermes exposes a browser
 
@@ -269,10 +270,15 @@ engine. Where that browser comes from is a separate choice:
   unless `browser.user_data_dir` is set. The docs say this path does
   not touch the installed Chrome and does not raise the remote
   debugging approval dialog. The raw `browser_cdp` tool is offered
-  only when a CDP endpoint is configured. So the default launch is
-  CDP inside the harness, and it is **unverified** whether that
-  Chromium listens on a stable loopback port a second client can
-  open.
+  only when a CDP endpoint is configured. The default launch is CDP
+  inside the harness. On 2026-11-15 the
+  [#337](https://github.com/CycleFive/kharon/issues/337) live check
+  passed on the VM 126 Hermes host: a stock session's packaged
+  Chromium (Chrome for Testing 145) published a loopback DevTools
+  port, ephemeral, discovered from `DevToolsActivePort`, and a second
+  client attached while `browser_exec` drove. The port is not a fixed
+  configured endpoint. #337 stays open on whether that ephemeral port
+  is stable enough for the connector.
 - **Explicit CDP attach.** `browser.cdp_url` or `BROWSER_CDP_URL`.
   The CLI command `/browser connect` uses `http://127.0.0.1:9222`,
   or a `ws://` URL passed to it. If nothing is listening, Hermes
@@ -310,10 +316,10 @@ process is Hermes's, or one the operator started for Hermes. kharon
 does not launch it. Policy, pin, agent id, and the tab-ownership
 question are the same as for OpenClaw.
 
-The default packaged Chromium joins Hermes support only if the design
-issue shows a stable loopback port the connector can open while
-`browser_exec` is attached. Until that check, it stays out of the
-install doc.
+The [#337](https://github.com/CycleFive/kharon/issues/337) live check
+passed on 2026-11-15, as above. Whether that ephemeral port is a
+stable one the connector can open is still open on #337. Until that
+call, the install doc stays on the explicit endpoint.
 
 ### Goal
 
@@ -328,8 +334,8 @@ that browser.
 - The agent-host docs grow a Hermes section for `browser.cdp_url` /
   `BROWSER_CDP_URL`, with the CLI-only note on `/browser connect`,
   the shared loopback port, and the modes Hermes support does not
-  cover (default packaged Chromium until the check passes, cloud
-  providers, Lightpanda, `browser_vault`).
+  cover (default packaged Chromium until #337's stable-port call,
+  cloud providers, Lightpanda, `browser_vault`).
 - One recorded canary on that shared browser: approved fill,
   Disconnect, Hermes still driving it, next fill `no_browser`.
 - No new transport.
@@ -344,10 +350,11 @@ labelled `platform:hermes` and listed on
 [#347](https://github.com/CycleFive/kharon/issues/347).
 
 1. **design: does Hermes's default local Chromium publish a loopback
-   CDP port?** — With a stock session and no `browser.cdp_url`, see
-   whether a second client can open the debugging port while
-   `browser_exec` is driving. A no keeps Hermes support on the
-   explicit endpoint only.
+   CDP port?** — The live sub-checks passed on 2026-11-15: an
+   ephemeral loopback port, discovered from `DevToolsActivePort`,
+   and a second client attached while `browser_exec` drove. #337
+   stays open on whether that counts as stable. A no keeps Hermes
+   support on the explicit endpoint only.
 2. **docs(dep): Hermes connector install on an explicit local CDP
    endpoint** — `browser.cdp_url` and the connector on the same
    loopback port, CLI `/browser connect` called out as not a gateway
@@ -406,9 +413,8 @@ docs leave unverified, the install doc, and the canary report.
 - **[#327](https://github.com/CycleFive/kharon/issues/327), Duet's
   standing host.** Parked 2026-11-14. A standing host for Duet would
   mean running a whole browser for that agent, which is the line
-  above. The issue is open, labelled `parked`, and still carries
-  milestone v0.4.0 in the tracker until that field is cleared. It is
-  not soak work and not a platform release.
+  above. The issue is open, labelled `parked`, and on no milestone.
+  It is not soak work and not a platform release.
 - **[#331](https://github.com/CycleFive/kharon/issues/331), Claude
   in Chrome extension.** Maybe later. Design only, parked, no
   milestone: an extension would fill in the user's Chrome when
@@ -436,11 +442,15 @@ docs leave unverified, the install doc, and the canary report.
    If #328's host is on the extension relay, that profile has no CDP
    URL and stays out with #331. The platform order stays OpenClaw,
    then Hermes.
-3. **Is Hermes's default packaged Chromium included?** The plan
-   excludes it until a second client can open a stable loopback
-   port while `browser_exec` is attached. Cloud providers,
-   Lightpanda, and `browser_vault` stay out either way. Confirm that
-   cut.
+3. **Is Hermes's default packaged Chromium included?** The
+   [#337](https://github.com/CycleFive/kharon/issues/337) live check
+   passed on 2026-11-15 (VM 126, Chrome for Testing 145): an
+   ephemeral loopback DevTools port, discovered from
+   `DevToolsActivePort`, and a second client attached while
+   `browser_exec` drove. #337 stays open on whether that port is
+   stable enough to join Hermes support. Until that call, the
+   install doc stays on the explicit endpoint. Cloud providers,
+   Lightpanda, and `browser_vault` stay out either way.
 
 The platform order is settled: OpenClaw, then Hermes. The research
 above leaves it there.

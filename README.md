@@ -14,6 +14,7 @@ Vaultwarden fill broker: lets AI agents fill credentials without ever seeing the
 ### Design and security
 
 - [`docs/crypto.md`](docs/crypto.md): the Bitwarden key chain step by step (REQ-CRY-010), with the source for each construction.
+- [`docs/post-fill-exposure.md`](docs/post-fill-exposure.md): the threat model for what happens to a secret after kharon fills it — page leftovers, browser-retained state, and what an agent sharing the CDP session can read (#354).
 - [`docs/1password-agent-model.md`](docs/1password-agent-model.md): how 1Password serves agents, the research behind kharon's agent-initiated transport (#121).
 - [`docs/fill-deadline-exploration.md`](docs/fill-deadline-exploration.md): exploration of a page-side fill deadline (#75), beyond the broker-side REQ-API-009 timeout.
 

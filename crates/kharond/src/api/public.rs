@@ -548,6 +548,7 @@ mod tests {
             (Method::GET, "/v1/items"),
             (Method::GET, "/v1/openapi.json"),
             (Method::POST, "/v1/fill"),
+            (Method::POST, "/v1/open"),
             (Method::POST, "/v1/grants"),
             (Method::GET, "/owner/session"),
             (Method::GET, "/owner/approve/x"),

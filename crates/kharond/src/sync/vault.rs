@@ -167,6 +167,15 @@ impl Item {
         self.revision = revision;
     }
 
+    /// Clone this item with different login URIs. Secrets and the
+    /// rest of the metadata are preserved (tests retarget a fixture
+    /// item at a loopback page).
+    pub fn with_uris(&self, uris: Vec<ItemUri>) -> Self {
+        let mut item = self.clone();
+        item.uris = uris;
+        item
+    }
+
     /// Clone this item with a different `revisionDate` (REQ-REV-004
     /// tests): secrets and metadata are preserved.
     pub fn with_revision(&self, revision: Option<String>) -> Self {

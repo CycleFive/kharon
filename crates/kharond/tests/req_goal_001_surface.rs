@@ -101,6 +101,11 @@ const REVIEWED_STRINGS: &[(&str, &str)] = &[
         "a CDP id the broker created",
     ),
     ("ContextResult.detail", "fixed detail-code literal"),
+    ("OpenResult.target_id", "a CDP target id the broker created"),
+    (
+        "OpenResult.origin",
+        "live origin: scheme, host and port only",
+    ),
     ("ErrorBody.error", "fixed ErrorCode literal"),
     ("ErrorBody.detail", "fixed Detail literal"),
 ];

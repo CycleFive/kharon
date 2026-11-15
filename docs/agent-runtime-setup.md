@@ -286,6 +286,17 @@ set `hermes_home` or `HERMES_HOME` for the connector process.
    `kharon_context` returns `ok` with a live session on the
    owner's Connections page.
 
+### Finding the login page
+
+Agents call `kharon_open` with the item id. kharon opens that item's
+saved login URL in a new tab in the agent's browser and returns the
+tab id and the live origin. kharon does not return or log the path,
+query or fragment. The opened tab has the full URL, and whether the
+model sees it is the harness policy (SPEC OQ-3). `kharon_search`
+still returns only the host. On a build that does not have
+`kharon_open`, put the login URL in the prompt. A fill after
+`kharon_open` still needs the owner's grant.
+
 **Assumption (tab rule, pending #334).** Which tab a fill uses
 follows the same rule proposed for OpenClaw, as an explicit
 assumption until #334 decides it on a real profile: the fill
@@ -362,6 +373,21 @@ a browser you started on a fixed port.
   the user's real profile. The stock preset does not scan it.
   Point `user_data_dir` at that profile if you want discovery
   there; otherwise it stays outside this install.
+
+## OpenClaw
+
+OpenClaw's managed-profile install is the connector install on this
+page pointed at the profile's loopback CDP port. The full profile
+notes are on the roadmap. The login page is the same rule as Hermes.
+
+Agents call `kharon_open` with the item id. kharon opens that item's
+saved login URL in a new tab in the agent's browser and returns the
+tab id and the live origin. kharon does not return or log the path,
+query or fragment. The opened tab has the full URL, and whether the
+model sees it is the harness policy (SPEC OQ-3). `kharon_search`
+still returns only the host. On a build that does not have
+`kharon_open`, put the login URL in the prompt. A fill after
+`kharon_open` still needs the owner's grant.
 
 ## Handing over the secrets
 

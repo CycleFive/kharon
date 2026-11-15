@@ -66,6 +66,15 @@ pub enum Event {
     /// (`cdp_error`, `fill_unavailable`), `locked`, or `aborted`
     /// (`handler_dropped`, best effort from a drop guard).
     Context,
+    /// REQ-API-012: `kharon_open` is about to create a tab and navigate
+    /// it. Appended before any CDP write. Carries the request id and
+    /// item id, never the URL.
+    OpenDispatch,
+    /// REQ-API-012: the outcome of `kharon_open`. `live_origin` on an
+    /// `ok` result is the origin only (scheme, host, port). Result
+    /// `no_login_url`, `not_found` and `locked` are written with no
+    /// preceding dispatch, because the browser was not touched.
+    Open,
     /// REQ-API-007: the system clock differs from the Vaultwarden
     /// server's `Date` by more than `clock_skew_warn` (result `warn` or
     /// `refuse`), or a previous skew was resolved (result `resolved`).
@@ -168,6 +177,8 @@ impl Event {
             Event::FillAborted => "fill_aborted",
             Event::ContextOpen => "context_open",
             Event::Context => "context",
+            Event::OpenDispatch => "open_dispatch",
+            Event::Open => "open",
             Event::ClockSkew => "clock_skew",
             Event::LogTruncated => "log_truncated",
             Event::ConnectorAuthFail => "connector_auth_fail",
@@ -220,6 +231,8 @@ impl<'de> Deserialize<'de> for Event {
             "fill_aborted" => Event::FillAborted,
             "context_open" => Event::ContextOpen,
             "context" => Event::Context,
+            "open_dispatch" => Event::OpenDispatch,
+            "open" => Event::Open,
             "clock_skew" => Event::ClockSkew,
             "log_truncated" => Event::LogTruncated,
             "connector_auth_fail" => Event::ConnectorAuthFail,

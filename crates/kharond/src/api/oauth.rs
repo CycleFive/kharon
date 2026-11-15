@@ -78,7 +78,12 @@ pub const SCOPE_TOOLS: [(&str, &[&str]); 3] = [
     ),
     (
         "kharon:fill",
-        &["kharon_context", "kharon_fill", "kharon_fill_totp"],
+        &[
+            "kharon_context",
+            "kharon_open",
+            "kharon_fill",
+            "kharon_fill_totp",
+        ],
     ),
     ("kharon:request", &["kharon_request_grant"]),
 ];

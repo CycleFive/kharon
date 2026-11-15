@@ -164,6 +164,22 @@ pub enum Detail {
     /// context/fill cannot run (REQ-OAU-007 phase 1; #232). The
     /// typed error's name is `no_browser`; this is its plain message.
     NoBrowser,
+    /// The item has no saved URI that is a full `https` URL the
+    /// origin matcher would allow (REQ-API-012). The typed error's
+    /// name is `no_login_url`.
+    NoLoginUrl,
+    /// The tab is not in the calling agent's browser context
+    /// (REQ-ARCH-005). The typed error's name is `target_not_owned`.
+    TargetNotOwned,
+    /// `item_id` is not an in-scope vault item.
+    UnknownItem,
+    /// `kharon_open` did not finish inside the fill deadline.
+    Deadline,
+    /// A browser command failed. The text is fixed: a CDP message can
+    /// echo the URL the broker just sent (REQ-API-012).
+    BrowserFailed,
+    /// `kharon_open` arguments do not match the schema.
+    InvalidOpenRequest,
 }
 
 impl Detail {
@@ -201,11 +217,17 @@ impl Detail {
             Self::RateLimited => "rate limited; retry later or ask the owner to unsuspend",
             Self::InsufficientScope => "token does not have the scope this tool needs",
             Self::NoBrowser => "this connection has no browser attached yet",
+            Self::NoLoginUrl => "this item has no verifiable https login URL",
+            Self::TargetNotOwned => "target is not in this agent's browser context",
+            Self::UnknownItem => "no such item",
+            Self::Deadline => "the deadline expired",
+            Self::BrowserFailed => "the browser command failed",
+            Self::InvalidOpenRequest => "open request does not match the schema",
         }
     }
 
     /// Every detail (for the REQ-API-006 tests).
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 37] = [
         Self::MissingToken,
         Self::InvalidToken,
         Self::ToolNotAllowed,
@@ -237,6 +259,12 @@ impl Detail {
         Self::RateLimited,
         Self::InsufficientScope,
         Self::NoBrowser,
+        Self::NoLoginUrl,
+        Self::TargetNotOwned,
+        Self::UnknownItem,
+        Self::Deadline,
+        Self::BrowserFailed,
+        Self::InvalidOpenRequest,
     ];
 }
 
@@ -272,6 +300,19 @@ impl ApiError {
     /// ([`Self::tool_error`]); [`Self::body`] keeps the `forbidden`
     /// class, which this error shares with other 403s.
     pub const NO_BROWSER: Self = Self::new(ErrorCode::Forbidden, Detail::NoBrowser);
+    /// 403, the item has no verifiable https login URL (REQ-API-012).
+    /// MCP tool results report `no_login_url`.
+    pub const NO_LOGIN_URL: Self = Self::new(ErrorCode::Forbidden, Detail::NoLoginUrl);
+    /// 403, the tab is not in this agent's browser context.
+    /// MCP tool results report `target_not_owned`.
+    pub const TARGET_NOT_OWNED: Self = Self::new(ErrorCode::Forbidden, Detail::TargetNotOwned);
+    /// 404, `item_id` is not an in-scope item.
+    pub const UNKNOWN_ITEM: Self = Self::new(ErrorCode::NotFound, Detail::UnknownItem);
+    /// 400, `kharon_open` passed the fill deadline. MCP reports `timeout`.
+    pub const DEADLINE: Self = Self::new(ErrorCode::BadRequest, Detail::Deadline);
+    /// 400, a browser command failed. The detail does not carry the
+    /// browser's message (REQ-API-012). MCP reports `cdp_error`.
+    pub const BROWSER_FAILED: Self = Self::new(ErrorCode::BadRequest, Detail::BrowserFailed);
     /// 423.
     pub const LOCKED: Self = Self::new(ErrorCode::Locked, Detail::Locked);
     /// 500, REQ-AUD-003 fail-closed.
@@ -308,6 +349,10 @@ impl ApiError {
     pub const fn tool_error(self) -> &'static str {
         match (self.code, self.detail) {
             (ErrorCode::Forbidden, Detail::NoBrowser) => "no_browser",
+            (ErrorCode::Forbidden, Detail::NoLoginUrl) => "no_login_url",
+            (ErrorCode::Forbidden, Detail::TargetNotOwned) => "target_not_owned",
+            (ErrorCode::BadRequest, Detail::Deadline) => "timeout",
+            (ErrorCode::BadRequest, Detail::BrowserFailed) => "cdp_error",
             _ => self.code.as_str(),
         }
     }

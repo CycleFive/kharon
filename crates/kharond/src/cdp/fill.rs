@@ -302,6 +302,19 @@ impl FillEngine {
         self.browser.client().is_closed()
     }
 
+    /// Open `url` in a new tab and return `(target_id, live origin)`.
+    /// The URL is not copied into the error (REQ-API-012).
+    pub async fn open_login(
+        &self,
+        url: &str,
+        agent_ctx: &AgentContext,
+        allow_default: bool,
+    ) -> Result<(String, String), OwnershipError> {
+        self.browser
+            .open_login_tab(agent_ctx, allow_default, url)
+            .await
+    }
+
     /// The live serialized origin of `target_id` (REQ-APR-007, #20):
     /// the ownership check a fill runs in its step 1, and nothing
     /// else — no attach, no page code. Grant requests observe through

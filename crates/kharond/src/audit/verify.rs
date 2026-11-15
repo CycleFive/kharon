@@ -146,7 +146,7 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
     let mut hashes: Vec<String> = Vec::new();
     let mut log_id: Option<String> = None;
     // request_id → (dispatch seq, outcome seen, is context_open).
-    let mut dispatches: HashMap<String, (u64, bool, bool)> = HashMap::new();
+    let mut dispatches: HashMap<String, (u64, bool, u8)> = HashMap::new();
     let mut duplicate: Option<u64> = None;
     let mut tail: VecDeque<Entry> = VecDeque::with_capacity(TAIL_KEEP);
     for (i, line) in data.lines().enumerate() {
@@ -203,8 +203,12 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
 
         if let Some(rid) = &entry.request_id {
             match entry.event {
-                Event::FillDispatch | Event::ContextOpen => {
-                    let kind = entry.event == Event::ContextOpen;
+                Event::FillDispatch | Event::ContextOpen | Event::OpenDispatch => {
+                    let kind = match entry.event {
+                        Event::ContextOpen => 1u8,
+                        Event::OpenDispatch => 2u8,
+                        _ => 0u8,
+                    };
                     dispatches
                         .entry(rid.clone())
                         .or_insert((entry.seq, false, kind));
@@ -213,8 +217,13 @@ pub(crate) fn read_chain(path: &Path) -> Result<Chain, VerifyError> {
                 | Event::FillTotp
                 | Event::FillTimeout
                 | Event::FillAborted
-                | Event::Context => {
-                    let kind = entry.event == Event::Context;
+                | Event::Context
+                | Event::Open => {
+                    let kind = match entry.event {
+                        Event::Context => 1u8,
+                        Event::Open => 2u8,
+                        _ => 0u8,
+                    };
                     if let Some((_, seen, k)) = dispatches.get_mut(rid)
                         && *k == kind
                     {

@@ -802,7 +802,7 @@ async fn req_apr_request_grant_transports_agree() {
     // Seven tools now (REQ-API-001's count with #20's tool).
     let list = api_support::mcp_request(addr, Some(&h.alpha), "tools/list", "{}").await;
     let tools = list.json()["result"]["tools"].as_array().unwrap().clone();
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 8);
     assert!(tools.iter().any(|t| t["name"] == "kharon_request_grant"));
 }
 

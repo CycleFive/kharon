@@ -2221,14 +2221,22 @@ kharond answers a method other than POST with HTTP 405
 (`deploy/checks/edge-checks.sh`, and the curl in
 [Verifying](#verifying)). While the broker is locked,
 `kharon_status` still answers and reports that. `kharon_list`,
-`kharon_search`, `kharon_fill`, `kharon_fill_totp`, `kharon_context`
+`kharon_search`, `kharon_open`, `kharon_fill`, `kharon_fill_totp`,
+`kharon_context`
 and `kharon_request_grant` are HTTP 423
 `{"error":"locked","detail":"broker is locked; owner unlock required"}`.
 
 The server accepts protocol versions `2026-07-28`, `2025-11-25` and
 `2025-06-18`, and issues no session id. Tool names and JSON Schemas
-are [`docs/api/mcp-tools.json`](api/mcp-tools.json) (seven tools:
-`kharon_status`, `kharon_list`, `kharon_search`, `kharon_fill`,
-`kharon_fill_totp`, `kharon_context`, `kharon_request_grant`). No
-tool returns a secret. Apply the
+are [`docs/api/mcp-tools.json`](api/mcp-tools.json) (eight tools:
+`kharon_status`, `kharon_list`, `kharon_search`, `kharon_open`,
+`kharon_fill`, `kharon_fill_totp`, `kharon_context`,
+`kharon_request_grant`). No
+tool returns a secret. An agent opens a vault item's login page with
+`kharon_open`: kharon navigates a new tab in that agent's browser to
+the saved URL and returns the tab id and the live origin. kharon does
+not return or log the path, query or fragment. The opened tab has the
+full URL, and whether the model sees it is the harness policy
+(SPEC OQ-3). On a build that does not have `kharon_open`, put the
+login URL in the prompt. `kharon_search` returns the host only. Apply the
 [agent harness policy](#agent-harness-policy-spec-oq-3).

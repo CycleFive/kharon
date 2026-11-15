@@ -13,6 +13,7 @@
 //! | `GET /v1/items?q=[&origin=]` | bearer | search, `[ItemMeta]` |
 //! | `POST /v1/fill` | bearer | `FillRequest` → `FillResult` (`submit: true` is `fill_and_submit`) |
 //! | `POST /v1/fill_totp` | bearer | `FillTotpRequest` → `FillResult` |
+//! | `POST /v1/open` | bearer | `{item_id}` → `{target_id, origin}` (REQ-API-012) |
 //! | `POST /v1/context` | bearer | empty or `{}` → `ContextResult` (the agent's `browserContextId`, #65) |
 //! | `POST /v1/grants` | bearer | `GrantRequest` → `GrantRequestBody` (`{grant_request_id, state}`, #20) |
 //! | `GET /v1/openapi.json` | none | the OpenAPI document |
@@ -61,6 +62,7 @@ use super::error::{ApiError, Detail, ErrorCode};
 use super::fill::{FillOperation, parse_fill};
 use super::grant::{ApprovalPrompt, parse_grant};
 use super::mcp::{MAX_BODY_BYTES, is_json};
+use super::open::parse_open;
 use super::transport::ClientIp;
 use crate::lock::Clock;
 
@@ -318,6 +320,8 @@ enum Route {
     OpenApi,
 }
 
+/// `POST /v1/open` (REQ-API-012).
+pub const OPEN_PATH: &str = "/v1/open";
 /// `POST /v1/fill`.
 pub const FILL_PATH: &str = "/v1/fill";
 /// `POST /v1/fill_totp`.
@@ -345,6 +349,7 @@ where
         "/v1/status" => Route::Status,
         "/v1/items" => Route::Items,
         "/v1/openapi.json" => Route::OpenApi,
+        OPEN_PATH => return handle_open(state, req, received).await,
         FILL_PATH => return handle_fill(state, req, FillOperation::Fill, received).await,
         FILL_TOTP_PATH => {
             return handle_fill(state, req, FillOperation::FillTotp, received).await;
@@ -432,6 +437,56 @@ where
     {
         Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
         Err(e) => error(e),
+    }
+}
+
+async fn handle_open<S, C>(state: Arc<AppState<S, C>>, req: Request, received: Instant) -> Response
+where
+    S: VaultView + 'static,
+    C: Clock + Send + 'static,
+{
+    if req.method() != Method::POST {
+        return method_not_allowed("POST");
+    }
+    if req.headers().contains_key(header::ORIGIN) {
+        return error(ApiError::new(
+            ErrorCode::Forbidden,
+            Detail::BrowserOriginRefused,
+        ));
+    }
+    let token = bearer_token(&req);
+    let (parts, body) = req.into_parts();
+    let agent = match authenticate(&state, token).await {
+        Ok(a) => a,
+        Err(e) => return error(e),
+    };
+    if !is_json(&parts.headers) {
+        return error(ApiError::bad_request(Detail::UnsupportedContentType));
+    }
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
+    drop(parts);
+    let Ok(bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+        return error(ApiError::BODY_TOO_LARGE);
+    };
+    let item_id = match parse_open(&bytes) {
+        Ok(id) => id,
+        Err(e) => return error(e),
+    };
+    drop(bytes);
+    match state
+        .broker
+        .open_from(&agent, item_id, received, client_ip)
+        .await
+    {
+        Ok(o) => json_response(StatusCode::OK, o.body().to_string()),
+        // Typed names (`no_login_url`, `target_not_owned`, `no_browser`,
+        // `timeout`, `cdp_error`) on both transports. The HTTP status
+        // stays the error's class.
+        Err(e) => {
+            let status = StatusCode::from_u16(e.code.http_status())
+                .expect("invariant: ErrorCode maps to valid statuses");
+            json_response(status, e.tool_body().to_string())
+        }
     }
 }
 

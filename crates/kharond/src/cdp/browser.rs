@@ -18,7 +18,10 @@
 //! as the default. An older Chromium that only returns
 //! `browserContextIds` treats a target id as the default when it is
 //! neither one of those created contexts nor a context this connection
-//! created.
+//! created. An id that misses that list is checked against one fresh
+//! `Target.getBrowserContexts` before it is called the default, so a
+//! context another client creates later is not (#344). A failed
+//! re-read is not the default and is not cached.
 
 use std::sync::{Arc, Mutex};
 
@@ -124,13 +127,21 @@ impl DefaultContext {
         Self { id, created }
     }
 
+    /// The browser sent `defaultBrowserContextId`. The fallback list
+    /// is not consulted once this is set.
+    fn named(&self) -> bool {
+        self.id.is_some()
+    }
+
     /// Whether `id` is this browser's default context.
     ///
     /// A named default is that id and no other. Without one, `id` is
     /// the default only when the browser listed the contexts it
     /// created and `id` is neither in that list nor a context this
     /// connection created (`agent_owned`). A reply with neither field
-    /// is not a guess.
+    /// is not a guess. A fallback miss is not trusted on its own:
+    /// [`Browser::is_default_context`] re-reads the list once first
+    /// (#344).
     fn is_default(&self, id: &str, agent_owned: bool) -> bool {
         if let Some(default_id) = &self.id {
             return id == default_id;
@@ -169,6 +180,11 @@ pub struct Browser {
     /// Contexts this connection created. An id here is never the
     /// default, including when the context list was read before the
     /// create returned.
+    ///
+    /// Lifetime is the connection. Dispose does not prune: the vec
+    /// only ever holds ids this connection created, and a browser
+    /// does not reuse a context id, so it stays bounded by that
+    /// connection's own creates (#344).
     agent_contexts: Arc<Mutex<Vec<String>>>,
     /// Filled on the first ownership check that needs it. Empty on a
     /// new connection, so a restarted browser's id cannot linger.
@@ -255,7 +271,9 @@ impl Browser {
     /// or whose id is the `defaultBrowserContextId` this connection
     /// learned from `Target.getBrowserContexts`. When the browser did
     /// not name one, a present id is the default only if it is neither
-    /// an agent context nor in the returned `browserContextIds`.
+    /// an agent context nor in the returned `browserContextIds`. A
+    /// miss re-reads that list once before the id is the default
+    /// (#344).
     pub async fn check_ownership(
         &self,
         target_id: &str,
@@ -278,15 +296,47 @@ impl Browser {
 
     async fn is_default_context(&self, id: &str) -> Result<bool, OwnershipError> {
         let resolved = self.default_context().await?;
-        Ok(resolved.is_default(id, self.agent_owned(id)))
+        let owned = self.agent_owned(id);
+        // Named-id mode is settled by the snapshot. Fallback mode
+        // re-reads once when the id misses it, before calling the id
+        // the default (#344).
+        if resolved.named() || !resolved.is_default(id, owned) {
+            return Ok(resolved.is_default(id, owned));
+        }
+        self.reread_fallback(id).await
     }
 
-    /// The default-context snapshot for this connection, resolved once.
+    /// One fresh `Target.getBrowserContexts` before a fallback miss is
+    /// the default (#344).
     ///
-    /// A failed read is not cached: the next check tries again. A
-    /// cancelled check (the fill deadline dropping this future) stores
-    /// nothing, because the value is written only after the reply
-    /// arrives.
+    /// The std mutex is taken only to publish a successful reply, never
+    /// across this await. A failed read is not stored and is not the
+    /// default: the fill is refused, and the next check tries again
+    /// against the snapshot already cached.
+    async fn reread_fallback(&self, id: &str) -> Result<bool, OwnershipError> {
+        let fresh = match DefaultContext::resolve(&self.client).await {
+            Ok(fresh) => fresh,
+            Err(_) => return Ok(false),
+        };
+        self.store_default(fresh.clone());
+        Ok(fresh.is_default(id, self.agent_owned(id)))
+    }
+
+    fn store_default(&self, resolved: DefaultContext) {
+        *self
+            .default_context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(resolved);
+    }
+
+    /// The default-context snapshot for this connection.
+    ///
+    /// Learned on the first check that needs it. A failed read is not
+    /// cached: the next check tries again. A cancelled check (the fill
+    /// deadline dropping this future) stores nothing, because the value
+    /// is written only after the reply arrives. A fallback miss may
+    /// replace a stored snapshot ([`Self::reread_fallback`]); that
+    /// refresh follows the same "store only a reply we received" rule.
     async fn default_context(&self) -> Result<DefaultContext, OwnershipError> {
         if let Some(resolved) = self.cached_default() {
             return Ok(resolved);
@@ -362,6 +412,13 @@ mod tests {
         }
 
         async fn start_with(script: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self {
+            Self::start_messages(move |msg| json!({ "id": msg["id"], "result": script(msg) })).await
+        }
+
+        /// `script` returns the whole reply, including the echoed `id`,
+        /// so a test can answer with an `error` object instead of a
+        /// `result`.
+        async fn start_messages(script: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let script = Arc::new(script);
@@ -372,8 +429,7 @@ mod tests {
                     ws.next().await
                 {
                     let msg: Value = serde_json::from_str(&text).unwrap();
-                    let result = script(&msg);
-                    let reply = json!({ "id": msg["id"], "result": result });
+                    let reply = script(&msg);
                     ws.send(tokio_tungstenite::tungstenite::Message::Text(
                         reply.to_string(),
                     ))
@@ -648,5 +704,150 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, OwnershipError::DefaultContextRefused);
+    }
+
+    /// #344: fallback mode. The `browserContextIds` snapshot is taken
+    /// on the first ownership check. A context another CDP client
+    /// creates after that is not the default: the miss re-reads
+    /// `Target.getBrowserContexts` once before the classification.
+    #[tokio::test]
+    async fn req_arch_005_fallback_rereads_a_context_created_after_the_snapshot() {
+        let contexts = Arc::new(std::sync::Mutex::new(vec!["ctx-A".to_string()]));
+        let listed = Arc::clone(&contexts);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_script = Arc::clone(&reads);
+        let (_mock, browser) = connect(move |msg| match msg["method"].as_str() {
+            Some("Target.createBrowserContext") => json!({ "browserContextId": "ctx-A" }),
+            Some("Target.getBrowserContexts") => {
+                let _ = reads_script.fetch_add(1, Ordering::SeqCst);
+                let ids = listed.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                json!({ "browserContextIds": ids })
+            }
+            Some("Target.getTargetInfo") => {
+                let (id, ctx) = match msg["params"]["targetId"].as_str() {
+                    Some("t-later") => ("t-later", Some("ctx-later")),
+                    _ => ("t-plain", Some("ctx-plain")),
+                };
+                target_info_json(id, ctx, "https://old.example/")
+            }
+            _ => json!({}),
+        })
+        .await;
+        let ctx = browser.create_agent_context("agent-A").await.unwrap();
+
+        // First check caches [ctx-A]. ctx-plain misses it, so this
+        // also re-reads once, and the id is still the default.
+        let info = browser
+            .check_ownership("t-plain", &ctx, true)
+            .await
+            .unwrap();
+        assert_eq!(info.browser_context_id.as_deref(), Some("ctx-plain"));
+        let after_first = reads.load(Ordering::SeqCst);
+        assert!(after_first >= 1, "the snapshot was read");
+
+        // Another client creates a context. The cached list does not
+        // have it until the re-read.
+        contexts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push("ctx-later".to_string());
+
+        let err = browser
+            .check_ownership("t-later", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            after_first + 1,
+            "a fallback miss re-reads getBrowserContexts once"
+        );
+
+        // An id that is still on neither list stays the default.
+        let info = browser
+            .check_ownership("t-plain", &ctx, true)
+            .await
+            .unwrap();
+        assert_eq!(info.browser_context_id.as_deref(), Some("ctx-plain"));
+    }
+
+    /// #344: a failed fallback re-read is not the default and is not
+    /// cached. The next check asks the browser again.
+    #[tokio::test]
+    async fn req_arch_005_fallback_reread_failure_is_not_default_and_not_cached() {
+        // 0: list without the late context. 1: the re-read fails.
+        // 2: the browser answers again, now including that context.
+        let phase = Arc::new(AtomicUsize::new(0));
+        let phase_script = Arc::clone(&phase);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_script = Arc::clone(&reads);
+        let mock = MockBrowser::start_messages(move |msg| {
+            let result = match msg["method"].as_str() {
+                Some("Target.createBrowserContext") => json!({ "browserContextId": "ctx-A" }),
+                Some("Target.getBrowserContexts") => {
+                    let _ = reads_script.fetch_add(1, Ordering::SeqCst);
+                    if phase_script.load(Ordering::SeqCst) == 1 {
+                        return json!({
+                            "id": msg["id"],
+                            "error": { "code": -32000, "message": "unavailable" },
+                        });
+                    }
+                    let ids = if phase_script.load(Ordering::SeqCst) == 0 {
+                        vec!["ctx-A", "ctx-known"]
+                    } else {
+                        vec!["ctx-A", "ctx-known", "ctx-later"]
+                    };
+                    json!({ "browserContextIds": ids })
+                }
+                Some("Target.getTargetInfo") => {
+                    let (id, ctx) = match msg["params"]["targetId"].as_str() {
+                        Some("t-known") => ("t-known", Some("ctx-known")),
+                        Some("t-later") => ("t-later", Some("ctx-later")),
+                        _ => ("t-plain", Some("ctx-plain")),
+                    };
+                    target_info_json(id, ctx, "https://old.example/")
+                }
+                _ => json!({}),
+            };
+            json!({ "id": msg["id"], "result": result })
+        })
+        .await;
+        let browser = Browser::new(mock.client().await);
+        let ctx = browser.create_agent_context("agent-A").await.unwrap();
+
+        // In the snapshot, so this primes the cache and does not re-read.
+        let err = browser
+            .check_ownership("t-known", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        phase.store(1, Ordering::SeqCst);
+        let err = browser
+            .check_ownership("t-later", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "the miss re-reads once and does not retry the failure"
+        );
+
+        // The failure was not cached: a later read sees the context
+        // the other client created, and an id still missing the list
+        // is the default.
+        phase.store(2, Ordering::SeqCst);
+        let err = browser
+            .check_ownership("t-later", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+        let info = browser
+            .check_ownership("t-plain", &ctx, true)
+            .await
+            .unwrap();
+        assert_eq!(info.browser_context_id.as_deref(), Some("ctx-plain"));
     }
 }

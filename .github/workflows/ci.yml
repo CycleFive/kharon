@@ -6,8 +6,42 @@ permissions: { contents: read }
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      # #344: a missing Chromium binary fails the real-browser tests
+      # (req_arch_005, and the same gate in req_arch_003) instead of
+      # skipping. ubuntu-latest ships google-chrome; the step below
+      # checks a path those tests already search.
+      KHARON_REQUIRE_CHROMIUM: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: chromium binary for the real-browser tests
+        # Same paths as `chromium_bin` in the req_arch_003 / req_arch_005
+        # tests. A hit means discovery finds it with no KHARON_CHROMIUM.
+        # A binary only on PATH is handed to the tests through that var.
+        run: |
+          paths=(
+            /usr/bin/google-chrome
+            /usr/bin/google-chrome-stable
+            /usr/local/bin/google-chrome
+            /usr/bin/chromium
+            /usr/bin/chromium-browser
+          )
+          for p in "${paths[@]}"; do
+            if [ -e "$p" ]; then
+              echo "Chromium for tests: $p"
+              "$p" --version
+              exit 0
+            fi
+          done
+          bin=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)
+          if [ -n "$bin" ]; then
+            echo "KHARON_CHROMIUM=$bin" >> "$GITHUB_ENV"
+            echo "Chromium for tests (via PATH): $bin"
+            "$bin" --version
+            exit 0
+          fi
+          echo "no Chrome/Chromium binary for the real-browser tests" >&2
+          exit 1
       - name: shellcheck deploy/checks
         run: shellcheck --severity=warning deploy/checks/*.sh
       - uses: dtolnay/rust-toolchain@stable

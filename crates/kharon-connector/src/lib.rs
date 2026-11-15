@@ -22,7 +22,10 @@
 //!    length, payload (max [`MAX_PAYLOAD`]).
 //!    - [`FRAME_OPEN`] broker → agent, **empty payload**. The agent dials
 //!      only the loopback address in its own config. A non-empty payload
-//!      is a protocol error (the broker cannot aim the dial).
+//!      is a protocol error (the broker cannot aim the dial). With
+//!      DevToolsActivePort discovery that address is read from the file
+//!      on every open (`127.0.0.1` plus the file's port); a missing or
+//!      stale file fails the dial and leaves the session up.
 //!    - The agent replies [`FRAME_OPEN`] with an empty payload once the
 //!      TCP connect succeeded, or [`FRAME_CLOSE`] with
 //!      [`CLOSE_DIAL_FAILED`].
@@ -68,6 +71,7 @@
 
 mod auth;
 mod client;
+mod devtools;
 mod frame;
 mod mux;
 mod proxy;
@@ -77,6 +81,10 @@ mod ws;
 pub use auth::{read_client_hello, read_server_hello, write_client_hello, write_server_hello};
 pub use client::{
     AgentParams, AuthedSession, Leg, Transport, check_once, connect_and_auth, run_agent_once,
+};
+pub use devtools::{
+    DevToolsEndpoint, DiscoverError, DiscoverSource, default_hermes_home, hermes_ephemeral_root,
+    parse_devtools_active_port, read_devtools_active_port, resolve_devtools,
 };
 pub use frame::{Frame, encode_frame};
 pub use mux::{BrokerSession, MuxIo, OpenError, serve_agent, spawn_broker};

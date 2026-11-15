@@ -211,6 +211,7 @@ fn agent_params(rig: &Rig, pin: [u8; 32]) -> AgentParams {
         agent_id: "assistant".into(),
         token: Zeroizing::new(rig.token.clone()),
         cdp: rig.cdp,
+        devtools: None,
         proxy: None,
         proxy_creds: None,
         outer_roots: None,

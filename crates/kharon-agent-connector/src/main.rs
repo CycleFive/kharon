@@ -18,6 +18,11 @@
 //! Reconnects with jittered backoff until SIGINT or SIGTERM. v1 wire constants
 //! live in `kharon-connector` (SPEC OQ-14).
 //!
+//! With no `cdp` or `cdp_url`, each CDP dial re-reads Chromium's
+//! `DevToolsActivePort` (the stock Hermes preset, or a path the operator
+//! set). An explicit endpoint wins. A missing or stale file fails that
+//! dial with `no_browser` and does not stop the process.
+//!
 //! An optional HTTP CONNECT proxy is `http://host:port` with no
 //! userinfo. When that proxy requires authentication,
 //! `proxy_creds_file` is a mode `0400` or `0600` file of one
@@ -37,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use backoff::{At, Backoff, Outage, err_text, fmt_dur, is_fixed_wait, leg_line_at};
 use kharon_connector::{
-    AgentParams, ClientError, Leg, Transport, check_once, connect_and_auth, proxy_creds_line,
+    AgentParams, ClientError, DiscoverSource, Leg, Transport, check_once, connect_and_auth,
+    default_hermes_home, proxy_creds_line,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -80,7 +86,23 @@ struct RawConfig {
     outer_ca_file: Option<PathBuf>,
     agent_id: String,
     token_file: PathBuf,
-    cdp: String,
+    /// Explicit loopback `host:port`. Wins over discovery.
+    #[serde(default)]
+    cdp: Option<String>,
+    /// Explicit loopback URL (`http://` or `ws://`). Wins over discovery.
+    /// Not combined with `cdp`.
+    #[serde(default)]
+    cdp_url: Option<String>,
+    /// Path of one Chromium `DevToolsActivePort` file.
+    #[serde(default)]
+    devtools_active_port: Option<PathBuf>,
+    /// One Chromium `--user-data-dir`. The file is `<dir>/DevToolsActivePort`.
+    #[serde(default)]
+    user_data_dir: Option<PathBuf>,
+    /// Hermes home for the stock preset (`<home>/cache/browser/chromium`).
+    /// Default is `$HERMES_HOME` or `~/.hermes`.
+    #[serde(default)]
+    hermes_home: Option<PathBuf>,
     /// `http://host:port` with no userinfo. A password does not belong here.
     #[serde(default)]
     proxy: Option<String>,
@@ -108,7 +130,10 @@ struct Config {
     pin: kharon_connector::CertSha256,
     agent_id: String,
     token: Zeroizing<String>,
+    /// Dialed only when `devtools` is `None`.
     cdp: SocketAddr,
+    /// Re-read on every CDP dial. Set when no explicit endpoint was configured.
+    devtools: Option<DiscoverSource>,
     proxy: Option<(String, u16)>,
     proxy_creds: Option<Zeroizing<Vec<u8>>>,
 }
@@ -241,9 +266,9 @@ fn load(path: &Path) -> Result<Config, String> {
             )
         }
     };
-    let server_name = match raw.server_name {
+    let server_name = match &raw.server_name {
         Some(n) if n.trim().is_empty() => return Err("server_name must not be empty".to_owned()),
-        Some(n) => n,
+        Some(n) => n.clone(),
         None => default_name,
     };
     let outer_roots = match &raw.outer_ca_file {
@@ -254,13 +279,7 @@ fn load(path: &Path) -> Result<Config, String> {
         return Err("agent_id must match [a-z0-9-]{1,64}".to_owned());
     }
     let pin = parse_pin(&raw.broker_pin)?;
-    let cdp: SocketAddr = raw
-        .cdp
-        .parse()
-        .map_err(|_| "cdp must be a loopback socket, e.g. 127.0.0.1:9222".to_owned())?;
-    if !cdp.ip().is_loopback() || cdp.port() == 0 {
-        return Err("cdp must be a loopback socket, e.g. 127.0.0.1:9222".to_owned());
-    }
+    let (cdp, devtools) = cdp_target(&raw)?;
     let proxy = match raw.proxy {
         None => None,
         Some(p) => Some(parse_proxy(&p)?),
@@ -283,6 +302,7 @@ fn load(path: &Path) -> Result<Config, String> {
         agent_id: raw.agent_id,
         token,
         cdp,
+        devtools,
         proxy,
         proxy_creds,
     })
@@ -395,6 +415,99 @@ fn read_token(path: &Path) -> Result<Zeroizing<String>, String> {
     Ok(Zeroizing::new(token))
 }
 
+/// Explicit `cdp` / `cdp_url`, or DevToolsActivePort discovery.
+///
+/// An explicit endpoint wins and the discovery keys are not read. With
+/// none set, the stock Hermes preset is `<hermes_home>/cache/browser/chromium`.
+fn cdp_target(raw: &RawConfig) -> Result<(SocketAddr, Option<DiscoverSource>), String> {
+    let explicit = match (&raw.cdp, &raw.cdp_url) {
+        (Some(_), Some(_)) => return Err("set cdp or cdp_url, not both".to_owned()),
+        (Some(cdp), None) => Some(parse_cdp_socket(cdp)?),
+        (None, Some(url)) => Some(parse_cdp_url(url)?),
+        (None, None) => None,
+    };
+    if let Some(addr) = explicit {
+        return Ok((addr, None));
+    }
+    if raw.devtools_active_port.is_some() && raw.user_data_dir.is_some() {
+        return Err("set devtools_active_port or user_data_dir, not both".to_owned());
+    }
+    if raw.hermes_home.is_some()
+        && (raw.devtools_active_port.is_some() || raw.user_data_dir.is_some())
+    {
+        return Err(
+            "hermes_home is the preset root; do not combine it with devtools_active_port or user_data_dir"
+                .to_owned(),
+        );
+    }
+    let source = if let Some(path) = &raw.devtools_active_port {
+        non_empty_path(path, "devtools_active_port")?;
+        DiscoverSource::File(path.clone())
+    } else if let Some(dir) = &raw.user_data_dir {
+        non_empty_path(dir, "user_data_dir")?;
+        DiscoverSource::UserDataDir(dir.clone())
+    } else {
+        let home = match &raw.hermes_home {
+            Some(path) => {
+                non_empty_path(path, "hermes_home")?;
+                path.clone()
+            }
+            None => default_hermes_home(),
+        };
+        DiscoverSource::HermesEphemeral { home }
+    };
+    // Not dialed. Discovery replaces it on every CDP open, and only with
+    // 127.0.0.1.
+    Ok((
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9)),
+        Some(source),
+    ))
+}
+
+fn non_empty_path(path: &Path, key: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{key} must not be empty"));
+    }
+    Ok(())
+}
+
+fn parse_cdp_socket(raw: &str) -> Result<SocketAddr, String> {
+    let cdp: SocketAddr = raw
+        .parse()
+        .map_err(|_| "cdp must be a loopback socket, e.g. 127.0.0.1:9222".to_owned())?;
+    if !cdp.ip().is_loopback() || cdp.port() == 0 {
+        return Err("cdp must be a loopback socket, e.g. 127.0.0.1:9222".to_owned());
+    }
+    Ok(cdp)
+}
+
+/// `http://` or `ws://` loopback URL, or a bare `host:port`. The path is
+/// ignored: the connector dials the port, and the broker names the
+/// WebSocket path. Anything that is not a loopback IP is refused.
+fn parse_cdp_url(raw: &str) -> Result<SocketAddr, String> {
+    const BAD: &str = "cdp_url must be a loopback socket, e.g. http://127.0.0.1:9222";
+    let raw = raw.trim();
+    let rest = if let Some(rest) = raw.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("ws://") {
+        rest
+    } else if raw.contains("://") {
+        return Err(BAD.to_owned());
+    } else {
+        raw
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if authority.is_empty() || authority.contains('@') {
+        return Err(BAD.to_owned());
+    }
+    let (host, port) = split_host_port(authority).ok_or_else(|| BAD.to_owned())?;
+    let ip: std::net::IpAddr = host.parse().map_err(|_| BAD.to_owned())?;
+    if !ip.is_loopback() || port == 0 {
+        return Err(BAD.to_owned());
+    }
+    Ok(SocketAddr::new(ip, port))
+}
+
 fn parse_pin(hex_pin: &str) -> Result<kharon_connector::CertSha256, String> {
     let hex_pin = hex_pin.trim();
     if hex_pin.len() != 64 || !hex_pin.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -474,6 +587,7 @@ async fn resolve(cfg: &Config) -> Result<AgentParams, String> {
         agent_id: cfg.agent_id.clone(),
         token: cfg.token.clone(),
         cdp: cfg.cdp,
+        devtools: cfg.devtools.clone(),
         proxy,
         proxy_creds: cfg.proxy_creds.clone(),
         outer_roots: cfg.outer_roots.clone(),
@@ -674,6 +788,23 @@ mod tests {
                  token_file = \"{token}\"\n\
                  cdp = \"127.0.0.1:9222\"\n\
                  {keys}\n",
+                pin = "00".repeat(32),
+                token = token.display(),
+            );
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+
+        /// Like [`Self::config_raw`] but the caller supplies the CDP keys.
+        fn config_lines(&self, lines: &str) -> PathBuf {
+            let token = self.file("token", b"kh_tunnel_assistant_testtoken\n", 0o600);
+            let path = self.0.join("connector.toml");
+            let text = format!(
+                "broker = \"127.0.0.1:8788\"\n\
+                 broker_pin = \"{pin}\"\n\
+                 agent_id = \"assistant\"\n\
+                 token_file = \"{token}\"\n\
+                 {lines}\n",
                 pin = "00".repeat(32),
                 token = token.display(),
             );
@@ -887,5 +1018,134 @@ mod tests {
             "transport = \"tls\"\nbroker = \"127.0.0.1:8789\"\nouter_ca_file = \"/nonexistent\"",
         )));
         assert!(err.contains("outer_ca_file"), "{err}");
+    }
+
+    #[test]
+    fn explicit_cdp_wins_over_discovery() {
+        let scratch = Scratch::new();
+        let cfg = load(&scratch.config_lines(
+            "cdp = \"127.0.0.1:9333\"\ndevtools_active_port = \"/no/such/DevToolsActivePort\"",
+        ))
+        .unwrap();
+        assert_eq!(cfg.cdp, "127.0.0.1:9333".parse().unwrap());
+        assert!(cfg.devtools.is_none());
+
+        let cfg = load(&scratch.config_lines(
+            "cdp_url = \"http://127.0.0.1:9444/devtools/browser/ignored\"\nuser_data_dir = \"/no/such\"",
+        ))
+        .unwrap();
+        assert_eq!(cfg.cdp, "127.0.0.1:9444".parse().unwrap());
+        assert!(cfg.devtools.is_none());
+
+        let cfg = load(&scratch.config_lines("cdp_url = \"ws://[::1]:9222\"")).unwrap();
+        assert_eq!(cfg.cdp, "[::1]:9222".parse().unwrap());
+        assert!(cfg.devtools.is_none());
+    }
+
+    #[test]
+    fn cdp_url_rejects_non_loopback_and_both_explicit_keys() {
+        let scratch = Scratch::new();
+        for line in [
+            "cdp_url = \"http://10.1.2.3:9222\"",
+            "cdp_url = \"http://localhost:9222\"",
+            "cdp_url = \"https://127.0.0.1:9222\"",
+            "cdp_url = \"wss://127.0.0.1:9222\"",
+            "cdp = \"10.1.2.3:9222\"",
+            "cdp = \"127.0.0.1:0\"",
+        ] {
+            let err = expect_err(load(&scratch.config_lines(line)));
+            assert!(err.contains("loopback"), "{line}: {err}");
+        }
+        let err = expect_err(load(&scratch.config_lines(
+            "cdp = \"127.0.0.1:9222\"\ncdp_url = \"http://127.0.0.1:9222\"",
+        )));
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn omitted_endpoint_uses_the_hermes_preset_and_overrides() {
+        let scratch = Scratch::new();
+        let cfg = load(&scratch.config_lines("")).unwrap();
+        match cfg.devtools {
+            Some(super::DiscoverSource::HermesEphemeral { home }) => {
+                assert_eq!(home, super::default_hermes_home());
+            }
+            other => panic!("expected the Hermes preset, got {other:?}"),
+        }
+        // The placeholder is loopback and is not the discovered port.
+        assert!(cfg.cdp.ip().is_loopback());
+
+        let cfg = load(&scratch.config_lines("hermes_home = \"/var/hermes\"")).unwrap();
+        match cfg.devtools {
+            Some(super::DiscoverSource::HermesEphemeral { home }) => {
+                assert_eq!(home, PathBuf::from("/var/hermes"));
+            }
+            other => panic!("expected hermes_home, got {other:?}"),
+        }
+
+        let cfg = load(&scratch.config_lines("user_data_dir = \"/var/profile\"")).unwrap();
+        match cfg.devtools {
+            Some(super::DiscoverSource::UserDataDir(dir)) => {
+                assert_eq!(dir, PathBuf::from("/var/profile"));
+            }
+            other => panic!("expected user_data_dir, got {other:?}"),
+        }
+
+        let cfg = load(
+            &scratch.config_lines("devtools_active_port = \"/var/profile/DevToolsActivePort\""),
+        )
+        .unwrap();
+        match cfg.devtools {
+            Some(super::DiscoverSource::File(path)) => {
+                assert_eq!(path, PathBuf::from("/var/profile/DevToolsActivePort"));
+            }
+            other => panic!("expected a file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discovery_keys_are_unambiguous_and_pin_and_agent_id_still_apply() {
+        let scratch = Scratch::new();
+        let err = expect_err(load(
+            &scratch.config_lines("devtools_active_port = \"/a\"\nuser_data_dir = \"/b\""),
+        ));
+        assert!(err.contains("not both"), "{err}");
+        let err = expect_err(load(
+            &scratch.config_lines("hermes_home = \"/h\"\ndevtools_active_port = \"/a\""),
+        ));
+        assert!(err.contains("hermes_home"), "{err}");
+
+        let path = scratch.0.join("bad-id.toml");
+        let token = scratch.file("token2", b"kh_tunnel_assistant_testtoken\n", 0o600);
+        std::fs::write(
+            &path,
+            format!(
+                "broker = \"127.0.0.1:8788\"\n\
+                 broker_pin = \"{pin}\"\n\
+                 agent_id = \"Not-Valid\"\n\
+                 token_file = \"{token}\"\n",
+                pin = "00".repeat(32),
+                token = token.display(),
+            ),
+        )
+        .unwrap();
+        let err = expect_err(load(&path));
+        assert!(err.contains("agent_id"), "{err}");
+
+        let path = scratch.0.join("bad-pin.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "broker = \"127.0.0.1:8788\"\n\
+                 broker_pin = \"abcd\"\n\
+                 agent_id = \"assistant\"\n\
+                 token_file = \"{token}\"\n\
+                 user_data_dir = \"/var/profile\"\n",
+                token = token.display(),
+            ),
+        )
+        .unwrap();
+        let err = expect_err(load(&path));
+        assert!(err.contains("broker_pin"), "{err}");
     }
 }

@@ -85,6 +85,7 @@ fn params(rig: &Rig) -> AgentParams {
         token: Zeroizing::new(rig.token.clone()),
         // Never dialed: these tests open no CDP stream.
         cdp: "127.0.0.1:9".parse().unwrap(),
+        devtools: None,
         proxy: None,
         proxy_creds: None,
         outer_roots: None,

@@ -68,6 +68,7 @@ fn params(broker: SocketAddr, pin: [u8; 32], token: &str, cdp: SocketAddr) -> Ag
         agent_id: "assistant".into(),
         token: Zeroizing::new(token.into()),
         cdp,
+        devtools: None,
         proxy: None,
         proxy_creds: None,
         outer_roots: None,

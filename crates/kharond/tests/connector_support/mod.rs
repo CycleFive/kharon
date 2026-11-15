@@ -252,6 +252,7 @@ pub fn ws_dial(rig: &Rig, token: &str) -> AgentParams {
         agent_id: "assistant".into(),
         token: Zeroizing::new(token.to_owned()),
         cdp: rig.cdp,
+        devtools: None,
         proxy: None,
         proxy_creds: None,
         outer_roots: None,

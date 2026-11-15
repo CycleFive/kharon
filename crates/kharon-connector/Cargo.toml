@@ -21,5 +21,7 @@ rustls-native-certs = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rcgen = { version = "0.13", features = ["crypto", "ring"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }

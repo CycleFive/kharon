@@ -144,12 +144,19 @@ source pass on #337 (`NousResearch/hermes-agent` `main` @
 
 ### Set up the shared endpoint
 
-1. **Give Hermes a loopback Chromium on a fixed port.** Either let
-   Hermes attach to a Chromium the operator started with
+1. **Give Hermes a loopback Chromium on a fixed port.** The
+   operator starts a Chromium with
    `--remote-debugging-address=127.0.0.1
    --remote-debugging-port=9222` and a dedicated `--user-data-dir`
    (since Chrome 136 a debugging port on the default profile
-   directory is ignored), or rely on the auto-launch in step 2.
+   directory is ignored), and keeps it running under a supervisor
+   — for any non-CLI session this operator-started browser is the
+   only path: nothing else will launch one for it, and a
+   `browser.cdp_url` pointing at a port where nothing is
+   listening attaches to nothing. The auto-launch in step 2 is a
+   CLI-only convenience, and even there the browser it launches
+   lives only as long as the CLI session that launched it, so it
+   is not a stable target for a supervised connector.
    The examples use 9222, Hermes's documented default; any free
    loopback port works if both sides use it.
 2. **Point Hermes at it, persistently.** In Hermes's `config.yaml`
@@ -175,8 +182,9 @@ source pass on #337 (`NousResearch/hermes-agent` `main` @
    browser with `--remote-debugging-port=9222` and a dedicated
    user-data dir. For any non-CLI session, `browser.cdp_url` /
    `BROWSER_CDP_URL` is the attach mechanism.
-3. **Point the connector at the same port.** Steps 4–8 above apply
-   unchanged (binary, tunnel credential file, MCP client), with
+3. **Point the connector at the same port.** Steps 3–8 above apply
+   unchanged (`ptrace_scope`, binary, tunnel credential file,
+   MCP client), with
    `connector.toml` naming that same loopback endpoint:
 
    ```toml

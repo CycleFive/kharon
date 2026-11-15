@@ -7,6 +7,20 @@
 //! the requesting agent's context. Default-context targets (the
 //! browser's shared context) are refused unless `allow_default_context`
 //! is set — the single-agent escape hatch from the spec.
+//!
+//! Chromium names that shared context with a `browserContextId` like
+//! any other (#342). Each connection learns the id from
+//! `Target.getBrowserContexts` (`defaultBrowserContextId`) the first
+//! time it has to classify a target, and keeps it on the [`Browser`].
+//! A reconnect builds a new `Browser`, so it learns the id again and
+//! cannot reuse the previous browser's. A peer that omits the id
+//! (stubs, older Chromium) still treats a missing `browserContextId`
+//! as the default. An older Chromium that only returns
+//! `browserContextIds` treats a target id as the default when it is
+//! neither one of those created contexts nor a context this connection
+//! created.
+
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -74,11 +88,68 @@ impl AgentContext {
     }
 }
 
+/// What `Target.getBrowserContexts` said about the default context,
+/// for one connection (#342).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefaultContext {
+    /// `defaultBrowserContextId`, when the browser sent one.
+    id: Option<String>,
+    /// `browserContextIds`, when the reply included the field. `None`
+    /// means the peer did not list created contexts, so an id is not
+    /// guessed to be the default.
+    created: Option<Vec<String>>,
+}
+
+impl DefaultContext {
+    async fn resolve(client: &CdpClient) -> Result<Self, OwnershipError> {
+        let result = client
+            .request("Target.getBrowserContexts", json!({}))
+            .await?;
+        Ok(Self::from_reply(&result))
+    }
+
+    fn from_reply(result: &Value) -> Self {
+        let id = result
+            .get("defaultBrowserContextId")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let created = result.get("browserContextIds").and_then(|value| {
+            value.as_array().map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+        });
+        Self { id, created }
+    }
+
+    /// Whether `id` is this browser's default context.
+    ///
+    /// A named default is that id and no other. Without one, `id` is
+    /// the default only when the browser listed the contexts it
+    /// created and `id` is neither in that list nor a context this
+    /// connection created (`agent_owned`). A reply with neither field
+    /// is not a guess.
+    fn is_default(&self, id: &str, agent_owned: bool) -> bool {
+        if let Some(default_id) = &self.id {
+            return id == default_id;
+        }
+        let Some(created) = &self.created else {
+            return false;
+        };
+        !agent_owned && !created.iter().any(|created_id| created_id == id)
+    }
+}
+
 /// A live target the broker knows about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetInfo {
     pub target_id: String,
-    /// `None` = the browser's default context.
+    /// `browserContextId` as the browser reported it. `None` when the
+    /// field was omitted, which stubs and some peers do for the default
+    /// context. Chromium sets it for the default context too; that id
+    /// is recognized in [`Browser::check_ownership`].
     pub browser_context_id: Option<String>,
     pub url: String,
     pub title: String,
@@ -88,14 +159,29 @@ pub struct TargetInfo {
 }
 
 /// Browser-level context/target management on top of a [`CdpClient`].
+///
+/// Clones share one connection's default-context resolution. A
+/// reconnect does not clone: it constructs a new [`Browser`], which
+/// resolves again (#342).
 #[derive(Clone)]
 pub struct Browser {
     client: CdpClient,
+    /// Contexts this connection created. An id here is never the
+    /// default, including when the context list was read before the
+    /// create returned.
+    agent_contexts: Arc<Mutex<Vec<String>>>,
+    /// Filled on the first ownership check that needs it. Empty on a
+    /// new connection, so a restarted browser's id cannot linger.
+    default_context: Arc<Mutex<Option<DefaultContext>>>,
 }
 
 impl Browser {
     pub fn new(client: CdpClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            agent_contexts: Arc::new(Mutex::new(Vec::new())),
+            default_context: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn client(&self) -> &CdpClient {
@@ -116,6 +202,10 @@ impl Browser {
             .get("browserContextId")
             .and_then(Value::as_str)
             .ok_or_else(|| OwnershipError::Cdp("createBrowserContext lacked an id".into()))?;
+        self.agent_contexts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(id.to_string());
         Ok(AgentContext {
             browser_context_id: id.to_string(),
             agent_id: agent_id.to_string(),
@@ -160,6 +250,12 @@ impl Browser {
 
     /// The ownership check that gates every fill: `target_id` must be in
     /// `agent_ctx`, or in the default context when `allow_default`.
+    ///
+    /// The default context is a target that omitted `browserContextId`,
+    /// or whose id is the `defaultBrowserContextId` this connection
+    /// learned from `Target.getBrowserContexts`. When the browser did
+    /// not name one, a present id is the default only if it is neither
+    /// an agent context nor in the returned `browserContextIds`.
     pub async fn check_ownership(
         &self,
         target_id: &str,
@@ -169,15 +265,70 @@ impl Browser {
         let info = self.target_info(target_id).await?;
         match info.browser_context_id.as_deref() {
             Some(id) if id == agent_ctx.browser_context_id() => Ok(info),
-            Some(_) => Err(OwnershipError::TargetNotOwned),
-            None => {
-                if allow_default {
-                    Ok(info)
+            Some(id) => {
+                if self.is_default_context(id).await? {
+                    default_context_gate(allow_default, info)
                 } else {
-                    Err(OwnershipError::DefaultContextRefused)
+                    Err(OwnershipError::TargetNotOwned)
                 }
             }
+            None => default_context_gate(allow_default, info),
         }
+    }
+
+    async fn is_default_context(&self, id: &str) -> Result<bool, OwnershipError> {
+        let resolved = self.default_context().await?;
+        Ok(resolved.is_default(id, self.agent_owned(id)))
+    }
+
+    /// The default-context snapshot for this connection, resolved once.
+    ///
+    /// A failed read is not cached: the next check tries again. A
+    /// cancelled check (the fill deadline dropping this future) stores
+    /// nothing, because the value is written only after the reply
+    /// arrives.
+    async fn default_context(&self) -> Result<DefaultContext, OwnershipError> {
+        if let Some(resolved) = self.cached_default() {
+            return Ok(resolved);
+        }
+        let resolved = DefaultContext::resolve(&self.client).await?;
+        let mut slot = self
+            .default_context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = slot.clone() {
+            return Ok(existing);
+        }
+        *slot = Some(resolved.clone());
+        Ok(resolved)
+    }
+
+    fn cached_default(&self) -> Option<DefaultContext> {
+        self.default_context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn agent_owned(&self, id: &str) -> bool {
+        self.agent_contexts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|created| created == id)
+    }
+}
+
+/// `allow_default` admits a target the broker has classified as the
+/// browser's default context; otherwise the fill is refused.
+fn default_context_gate(
+    allow_default: bool,
+    info: TargetInfo,
+) -> Result<TargetInfo, OwnershipError> {
+    if allow_default {
+        Ok(info)
+    } else {
+        Err(OwnershipError::DefaultContextRefused)
     }
 }
 
@@ -185,12 +336,16 @@ impl Browser {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
-    /// Mock browser peer scripted per method.
+    /// Mock browser peer. `start` answers each method with one fixed
+    /// result; `start_with` sees the request, so a test can vary by
+    /// target id.
     struct MockBrowser {
         addr: std::net::SocketAddr,
         _task: tokio::task::JoinHandle<()>,
@@ -198,20 +353,27 @@ mod tests {
 
     impl MockBrowser {
         async fn start(script: HashMap<String, Value>) -> Self {
+            let script = Arc::new(script);
+            Self::start_with(move |msg| {
+                let method = msg["method"].as_str().unwrap_or("");
+                script.get(method).cloned().unwrap_or_else(|| json!({}))
+            })
+            .await
+        }
+
+        async fn start_with(script: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            let script = Arc::new(script);
             let _task = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
-                let mut next_id = 1u64;
                 while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
                     ws.next().await
                 {
                     let msg: Value = serde_json::from_str(&text).unwrap();
-                    let method = msg["method"].as_str().unwrap();
-                    let result = script.get(method).cloned().unwrap_or_else(|| json!({}));
-                    let reply = json!({ "id": next_id, "result": result });
-                    next_id += 1;
+                    let result = script(&msg);
+                    let reply = json!({ "id": msg["id"], "result": result });
                     ws.send(tokio_tungstenite::tungstenite::Message::Text(
                         reply.to_string(),
                     ))
@@ -233,9 +395,9 @@ mod tests {
         }
     }
 
-    fn target_info_json(context: Option<&str>, url: &str) -> Value {
+    fn target_info_json(target_id: &str, context: Option<&str>, url: &str) -> Value {
         let mut ti = json!({
-            "targetId": "t-1",
+            "targetId": target_id,
             "url": url,
             "title": "",
             "type": "page",
@@ -244,6 +406,14 @@ mod tests {
             ti["browserContextId"] = Value::String(c.to_string());
         }
         json!({ "targetInfo": ti })
+    }
+
+    async fn connect(
+        script: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    ) -> (MockBrowser, Browser) {
+        let mock = MockBrowser::start_with(script).await;
+        let browser = Browser::new(mock.client().await);
+        (mock, browser)
     }
 
     #[tokio::test]
@@ -255,7 +425,7 @@ mod tests {
         );
         script.insert(
             "Target.getTargetInfo".to_string(),
-            target_info_json(Some("ctx-A"), "https://accounts.example.com/login"),
+            target_info_json("t-1", Some("ctx-A"), "https://accounts.example.com/login"),
         );
         let mock = MockBrowser::start(script).await;
         let browser = Browser::new(mock.client().await);
@@ -273,7 +443,7 @@ mod tests {
         );
         script.insert(
             "Target.getTargetInfo".to_string(),
-            target_info_json(Some("ctx-B"), "https://b.example/"),
+            target_info_json("t-1", Some("ctx-B"), "https://b.example/"),
         );
         let mock = MockBrowser::start(script).await;
         let browser = Browser::new(mock.client().await);
@@ -294,7 +464,7 @@ mod tests {
         );
         script.insert(
             "Target.getTargetInfo".to_string(),
-            target_info_json(None, "https://default.example/"),
+            target_info_json("t-1", None, "https://default.example/"),
         );
         let mock = MockBrowser::start(script).await;
         let browser = Browser::new(mock.client().await);
@@ -310,5 +480,173 @@ mod tests {
         // the default context.
         let info = browser.check_ownership("t-1", &ctx, true).await.unwrap();
         assert_eq!(info.browser_context_id, None);
+    }
+
+    /// #342: Chromium sets `browserContextId` on a default-context tab.
+    /// The stub names that id. The flag still decides, and a context
+    /// the browser created (not the default) stays unowned.
+    #[tokio::test]
+    async fn req_arch_005_named_default_context_follows_the_flag() {
+        let (_mock, browser) = connect(|msg| match msg["method"].as_str() {
+            Some("Target.createBrowserContext") => json!({ "browserContextId": "ctx-A" }),
+            Some("Target.getBrowserContexts") => json!({
+                "browserContextIds": ["ctx-A", "ctx-other"],
+                "defaultBrowserContextId": "def-1",
+            }),
+            Some("Target.getTargetInfo") => {
+                let (id, ctx) = match msg["params"]["targetId"].as_str() {
+                    Some("t-other") => ("t-other", Some("ctx-other")),
+                    Some("t-stray") => ("t-stray", Some("ctx-stray")),
+                    Some("t-omit") => ("t-omit", None),
+                    _ => ("t-default", Some("def-1")),
+                };
+                target_info_json(id, ctx, "https://default.example/")
+            }
+            _ => json!({}),
+        })
+        .await;
+        let ctx = browser.create_agent_context("agent-A").await.unwrap();
+
+        let err = browser
+            .check_ownership("t-default", &ctx, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::DefaultContextRefused);
+        let info = browser
+            .check_ownership("t-default", &ctx, true)
+            .await
+            .unwrap();
+        assert_eq!(info.browser_context_id.as_deref(), Some("def-1"));
+
+        // Another created context, even with the flag on.
+        let err = browser
+            .check_ownership("t-other", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+
+        // Knowing the default id, an id that merely fails to appear in
+        // `browserContextIds` is not the default. The older-Chromium
+        // fallback does not run once the browser named one.
+        let err = browser
+            .check_ownership("t-stray", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+
+        // Peers that omit the field are still the default context.
+        let err = browser
+            .check_ownership("t-omit", &ctx, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::DefaultContextRefused);
+        let info = browser.check_ownership("t-omit", &ctx, true).await.unwrap();
+        assert_eq!(info.browser_context_id, None);
+    }
+
+    /// #342: older Chromium returns `browserContextIds` and no
+    /// `defaultBrowserContextId`. An id in neither that list nor the
+    /// contexts this connection created is the default. A created
+    /// context (OpenClaw's dashboard, or another agent context) is not.
+    #[tokio::test]
+    async fn req_arch_005_unlisted_context_is_default_without_a_named_id() {
+        let creates = Arc::new(AtomicUsize::new(0));
+        let (_mock, browser) = connect(move |msg| match msg["method"].as_str() {
+            Some("Target.createBrowserContext") => {
+                let n = creates.fetch_add(1, Ordering::SeqCst);
+                json!({ "browserContextId": if n == 0 { "ctx-A" } else { "ctx-B" } })
+            }
+            Some("Target.getBrowserContexts") => json!({
+                "browserContextIds": ["ctx-dash"],
+            }),
+            Some("Target.getTargetInfo") => {
+                let (id, ctx) = match msg["params"]["targetId"].as_str() {
+                    Some("t-dash") => ("t-dash", Some("ctx-dash")),
+                    Some("t-agent") => ("t-agent", Some("ctx-B")),
+                    Some("t-own") => ("t-own", Some("ctx-A")),
+                    _ => ("t-plain", Some("ctx-plain")),
+                };
+                target_info_json(id, ctx, "https://old.example/")
+            }
+            _ => json!({}),
+        })
+        .await;
+        let ctx = browser.create_agent_context("agent-A").await.unwrap();
+        // Created on this connection, and absent from `browserContextIds`.
+        let _other = browser.create_agent_context("agent-B").await.unwrap();
+
+        let own = browser.check_ownership("t-own", &ctx, false).await.unwrap();
+        assert_eq!(own.browser_context_id.as_deref(), Some("ctx-A"));
+
+        let err = browser
+            .check_ownership("t-plain", &ctx, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::DefaultContextRefused);
+        let info = browser
+            .check_ownership("t-plain", &ctx, true)
+            .await
+            .unwrap();
+        assert_eq!(info.browser_context_id.as_deref(), Some("ctx-plain"));
+
+        let err = browser
+            .check_ownership("t-dash", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+        let err = browser
+            .check_ownership("t-agent", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+    }
+
+    /// #342: the resolved id belongs to the connection. A reconnect
+    /// (a new [`Browser`]) learns the new browser's id; the previous
+    /// default id is not still the default.
+    #[tokio::test]
+    async fn req_arch_005_default_context_id_refreshes_on_reconnect() {
+        async fn open(default_id: &'static str) -> (MockBrowser, Browser, AgentContext) {
+            let (mock, browser) = connect(move |msg| match msg["method"].as_str() {
+                Some("Target.createBrowserContext") => json!({ "browserContextId": "ctx-A" }),
+                Some("Target.getBrowserContexts") => json!({
+                    "browserContextIds": ["ctx-A"],
+                    "defaultBrowserContextId": default_id,
+                }),
+                Some("Target.getTargetInfo") => {
+                    let id = msg["params"]["targetId"].as_str().unwrap_or("t-new");
+                    let ctx = if id == "t-old" { "def-1" } else { default_id };
+                    target_info_json(id, Some(ctx), "https://default.example/")
+                }
+                _ => json!({}),
+            })
+            .await;
+            let ctx = browser.create_agent_context("agent-A").await.unwrap();
+            (mock, browser, ctx)
+        }
+
+        let (mock, browser, ctx) = open("def-1").await;
+        let err = browser
+            .check_ownership("t-new", &ctx, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::DefaultContextRefused);
+        drop(browser);
+        drop(ctx);
+        drop(mock);
+
+        let (_mock, browser, ctx) = open("def-2").await;
+        let err = browser
+            .check_ownership("t-old", &ctx, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::TargetNotOwned);
+        let info = browser.check_ownership("t-new", &ctx, true).await.unwrap();
+        assert_eq!(info.browser_context_id.as_deref(), Some("def-2"));
+        let err = browser
+            .check_ownership("t-new", &ctx, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OwnershipError::DefaultContextRefused);
     }
 }

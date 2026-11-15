@@ -968,6 +968,9 @@ async fn open_agent_browser(
         Ok(Err(e)) => return Err(e.to_string()),
         Err(_) => return Err("cdp connect timed out".into()),
     };
+    // A new `Browser` per connection. The default-context id (#342)
+    // lives on it, so the next ownership check resolves it for this
+    // socket and a reconnect cannot reuse the previous browser's id.
     let browser = Browser::new(client.clone());
     let error = match tokio::time::timeout_at(until, browser.create_agent_context(agent_id)).await {
         Ok(Ok(ctx)) => {

@@ -1,16 +1,15 @@
 # Roadmap: agent platform support
 
-Status: proposal, 2026-11-14. This page is the plan. Milestones and
-issues for v0.5.0 and later are filed after it merges. v0.4.0 stays
-the milestone already on the tracker, with one owner decision applied:
+Status: updated 2026-11-15. This page is the plan. Lothrop switched
+versioning to rolling releases that day (see
+[Versioning](#versioning)).
 [#327](https://github.com/CycleFive/kharon/issues/327) is parked and
 is not part of that plan.
 
-Direction the same day, from Lothrop: kharon stays on the
+Direction from Lothrop, 2026-11-14: kharon stays on the
 agent-connector. It grabs a CDP endpoint the agent platform already
 exposes, fills, and hands the browser back. The next platforms are
 OpenClaw, then Hermes, then other hosts that expose CDP the same way.
-After v0.4.0, one minor release per platform.
 
 ## Current state
 
@@ -43,7 +42,7 @@ gate a release.
 
 ## Principles
 
-These hold for every milestone on this page.
+These hold for every platform on this page.
 
 - **The connector is CDP, on the browser the agent already has.**
   Path B: `kharon-agent-connector` dials the broker over an outbound
@@ -71,29 +70,47 @@ A second host uses its own agent id. Two connectors on one agent id
 evict each other; that case is the parked
 [#281](https://github.com/CycleFive/kharon/issues/281).
 
-## Order
+## Versioning
 
-v0.5.0 is OpenClaw. v0.6.0 is Hermes. Further minors follow, one host
-each, in an order this page does not set.
+Lothrop, 2026-11-15: releases are rolling trains.
 
-That order is kept. OpenClaw's default managed profile already
-publishes a local CDP port, and #328 is the soak install of the
-connector that ships today. Hermes's documented way for a second
+- A minor release ships whatever has passed its gate since the last
+  one. It is cut when master is green and at least one user-visible
+  change has landed. There is no fixed platform per version. Releases
+  are still tagged and published as the `cycle-five` identity.
+- Platform goals stay OpenClaw first, then Hermes, then other CDP
+  hosts. They are tracked with the `platform:openclaw` /
+  `platform:hermes` labels and a `tracking: <platform> support` issue
+  each
+  ([#346](https://github.com/CycleFive/kharon/issues/346),
+  [#347](https://github.com/CycleFive/kharon/issues/347)), not with
+  milestones. Work on platforms runs in parallel, because it is gated
+  on external live checks.
+- A platform counts as supported in a release only once its canary
+  test and live check pass. Release notes list the supported
+  platforms.
+- The open milestone is `next`. The old v0.4.0, v0.5.0, and v0.6.0
+  milestones are closed.
+
+The platform order is kept. OpenClaw's default managed profile
+already publishes a local CDP port, and #328 is the soak install of
+the connector that ships today. Hermes's documented way for a second
 client to share the browser is an explicit CDP URL, and the default
 packaged Chromium does not offer its raw CDP tool (details under
-v0.6.0; the listen port there is unverified). The published order
-stays.
+[Hermes](#hermes); the listen port there is unverified). The
+published order stays.
 
-## v0.4.0 — soak and carry-over
+## Soak and carry-over
 
-The open milestone. Description on the tracker: carry-over from
-v0.3.0 (rolling nits) and next work. Nothing here adds a platform.
+The v0.3.0 soak and the carry-over already filed. Nothing here adds
+a platform. These issues sit on milestone `next`.
 
 ### Goal
 
 Finish the v0.3.0 soak week and the carry-over already filed.
-OpenClaw in this milestone is the soak install of the current
-connector (#328). The supported-platform release is v0.5.0.
+OpenClaw here is the soak install of the current connector (#328).
+OpenClaw counts as supported only once its canary test and live
+check pass.
 
 ### Exit criteria
 
@@ -107,13 +124,13 @@ connector (#328). The supported-platform release is v0.5.0.
 - #328 meets the acceptance already written on it: the connector
   attaches with the pin checked, Connect completes, `kharon_context`
   returns ok, one approved canary fills, Disconnect makes the next
-  fill refuse, and any doc gap is fixed or filed under v0.4.0.
+  fill refuse, and any doc gap is fixed or filed on milestone `next`.
   It is unclaimed.
-- #286 stays the nit list. Nits do not gate the milestone.
+- #286 stays the nit list. Nits do not gate a release.
 
 ### Issues
 
-Filed. None proposed. Proposing new v0.4.0 issues would rescope it.
+Filed. None proposed. Proposing new soak issues would rescope it.
 
 | Issue | State | Scope |
 |---|---|---|
@@ -121,13 +138,13 @@ Filed. None proposed. Proposing new v0.4.0 issues would rescope it.
 | #324 | closed | Consent names the dashboard browser when the client declares the connector grant. |
 | #286 | open | Rolling doc nits. Does not gate. |
 | #326 | open | Soak tracking for the week of 2026-11-14. |
-| #328 | open, unclaimed | Soak install of the v0.3.0 connector on OpenClaw. Stays here. v0.5.0 does not absorb it. |
+| #328 | open, unclaimed | Soak install of the v0.3.0 connector on OpenClaw. Stays here. OpenClaw support does not absorb it. |
 
 #327 is open, labelled `parked`, and still has milestone v0.4.0 in
 the tracker. It is listed under
 [Parked / not planned](#parked--not-planned), not in the table.
 
-## v0.5.0 — OpenClaw
+## OpenClaw
 
 ### How OpenClaw exposes a browser
 
@@ -152,25 +169,26 @@ confirmed from OpenClaw's source.
 
 Other profiles, and what they mean for the connector:
 
-- **Managed `openclaw` driver.** This is the v0.5.0 browser. The
-  connector's `cdp` is `127.0.0.1:<cdpPort>` on that host. It is not
-  the control port, and it is not assumed to be 9222.
+- **Managed `openclaw` driver.** This is the browser OpenClaw
+  support uses. The connector's `cdp` is `127.0.0.1:<cdpPort>` on
+  that host. It is not the control port, and it is not assumed to
+  be 9222.
 - **`attachOnly` to a loopback CDP URL.** OpenClaw attaches and does
-  not launch. In this release only when the connector runs on that
-  same host and dials the same loopback port. The browser still
+  not launch. In OpenClaw support only when the connector runs on
+  that same host and dials the same loopback port. The browser still
   belongs to whoever started it.
 - **`driver: "extension"`.** The relay drives the signed-in Chrome.
   These profiles reject `cdpUrl`. There is no CDP port for the
-  connector to grab. Out of this release, same family as
+  connector to grab. Out of OpenClaw support, same family as
   [#331](https://github.com/CycleFive/kharon/issues/331).
 - **`driver: "existing-session"`.** Chrome DevTools MCP, including
   auto-connect to the user's Chrome. The docs do not show a stable
-  raw CDP port the connector can share. Treated as out of this
-  release. Unverified whether some `cdpUrl` setups in this driver
+  raw CDP port the connector can share. Treated as out of OpenClaw
+  support. Unverified whether some `cdpUrl` setups in this driver
   publish one.
 - **Remote `cdpUrl`.** Browserless, Browserbase, Browser Use, Notte,
   and any other off-host browser. The connector dials a loopback
-  `host:port` on the agent host. Out of this release.
+  `host:port` on the agent host. Out of OpenClaw support.
 
 ### What the connector install needs
 
@@ -203,8 +221,8 @@ browser when the connector lets go.
   steps freeze.
 - The agent-host docs grow an OpenClaw section: managed profile,
   `cdpPort` versus the control port, connector `cdp`, the managed
-  policy, Connect, the canary, and the profiles this release does
-  not cover.
+  policy, Connect, the canary, and the profiles OpenClaw support
+  does not cover.
 - One recorded canary on a managed OpenClaw browser: approved fill,
   then Disconnect, OpenClaw still driving that browser, and the next
   fill refusing with `no_browser`.
@@ -212,7 +230,13 @@ browser when the connector lets go.
 
 ### Proposed issues
 
-Filed after this page merges. None of them absorb #328.
+Filed
+([#334](https://github.com/CycleFive/kharon/issues/334),
+[#335](https://github.com/CycleFive/kharon/issues/335),
+[#336](https://github.com/CycleFive/kharon/issues/336)). None of
+them absorb #328. They sit on milestone `next`, labelled
+`platform:openclaw`, and are listed on
+[#346](https://github.com/CycleFive/kharon/issues/346).
 
 1. **design: which tab an OpenClaw fill uses** — On one managed
    profile, see whether the canary can target the context
@@ -221,13 +245,14 @@ Filed after this page merges. None of them absorb #328.
    decision. No SPEC edit until it is decided.
 2. **docs(dep): OpenClaw connector install for the managed local
    browser** — The repeatable steps from the decision above, plus
-   the out-of-release profiles. Follows whatever #328 learned.
-3. **test: OpenClaw canary on the managed browser** — The v0.5.0
+   the profiles OpenClaw support does not cover. Follows whatever
+   #328 learned.
+3. **test: OpenClaw canary on the managed browser** — The OpenClaw
    evidence: one approved fill, Disconnect, the platform still
-   driving the browser, versions recorded. #328 remains the v0.4.0
-   soak attempt.
+   driving the browser, versions recorded. #328 remains the soak
+   attempt.
 
-## v0.6.0 — Hermes
+## Hermes
 
 Hermes here is Hermes Agent (Nous Research). Read from its browser
 docs on 2026-11-14
@@ -264,7 +289,7 @@ engine. Where that browser comes from is a separate choice:
   Firecrawl, or another provider plugin. The browser is off the
   host. Same exclusion as OpenClaw's remote `cdpUrl`.
 - **Lightpanda.** `lightpanda serve --host 127.0.0.1`. Not Chromium.
-  kharon's fill path is Chromium CDP. Out of this release.
+  kharon's fill path is Chromium CDP. Out of Hermes support.
 - **`browser.use_real_profile`.** A snapshot of the user's profile,
   launched by Hermes. Whether that launch publishes a loopback CDP
   port for a second client is unverified. Out of the first slice
@@ -283,9 +308,9 @@ a loopback Chromium, and `connector.toml` `cdp` names that same
 connector examples already in the agent-runtime guide. The browser
 process is Hermes's, or one the operator started for Hermes. kharon
 does not launch it. Policy, pin, agent id, and the tab-ownership
-question are the same as v0.5.0.
+question are the same as for OpenClaw.
 
-The default packaged Chromium joins this release only if the design
+The default packaged Chromium joins Hermes support only if the design
 issue shows a stable loopback port the connector can open while
 `browser_exec` is attached. Until that check, it stays out of the
 install doc.
@@ -302,7 +327,7 @@ that browser.
   it.
 - The agent-host docs grow a Hermes section for `browser.cdp_url` /
   `BROWSER_CDP_URL`, with the CLI-only note on `/browser connect`,
-  the shared loopback port, and the modes this release does not
+  the shared loopback port, and the modes Hermes support does not
   cover (default packaged Chromium until the check passes, cloud
   providers, Lightpanda, `browser_vault`).
 - One recorded canary on that shared browser: approved fill,
@@ -311,39 +336,48 @@ that browser.
 
 ### Proposed issues
 
-Filed after this page merges. Nothing existing to absorb.
+Filed
+([#337](https://github.com/CycleFive/kharon/issues/337),
+[#338](https://github.com/CycleFive/kharon/issues/338),
+[#339](https://github.com/CycleFive/kharon/issues/339)). They are
+labelled `platform:hermes` and listed on
+[#347](https://github.com/CycleFive/kharon/issues/347).
 
 1. **design: does Hermes's default local Chromium publish a loopback
    CDP port?** — With a stock session and no `browser.cdp_url`, see
    whether a second client can open the debugging port while
-   `browser_exec` is driving. A no keeps v0.6.0 on the explicit
-   endpoint only.
+   `browser_exec` is driving. A no keeps Hermes support on the
+   explicit endpoint only.
 2. **docs(dep): Hermes connector install on an explicit local CDP
    endpoint** — `browser.cdp_url` and the connector on the same
    loopback port, CLI `/browser connect` called out as not a gateway
-   command, cloud and Lightpanda excluded. Depends on the v0.5.0
+   command, cloud and Lightpanda excluded. Depends on the OpenClaw
    tab-ownership decision; Hermes gets the same rule unless this
    check shows it cannot.
 3. **test: Hermes canary on the shared loopback browser** — The
-   v0.6.0 evidence, same shape as the OpenClaw canary.
+   Hermes evidence, same shape as the OpenClaw canary.
 
 ## Later CDP hosts
 
 ### Goal
 
-After v0.6.0, each further CDP-capable agent host gets its own minor
-release. A host qualifies when it already exposes Chromium CDP on
-loopback on a machine where `kharon-agent-connector` can run, and
-kharon can fill and let go. The survey below picks the order. This
-page does not.
+After Hermes, each further CDP-capable agent host is tracked the
+same way: a platform label and a `tracking: <platform> support`
+issue, not a milestone. A host qualifies when it already exposes
+Chromium CDP on loopback on a machine where
+`kharon-agent-connector` can run, and kharon can fill and let go.
+The survey below picks the order. This page does not. The work runs
+in parallel with OpenClaw and Hermes, because it is gated on
+external live checks, and it ships in whichever rolling release has
+its canary test and live check.
 
 ### Exit criteria
 
-For whichever host the survey names first, the same bar as v0.5.0
-and v0.6.0: a written install, one approved canary, Disconnect
+For whichever host the survey names first, the same bar as OpenClaw
+and Hermes: a written install, one approved canary, Disconnect
 leaves the platform driving the browser, and the modes that are not
-loopback Chromium CDP stated as out of that minor. One host per
-release.
+loopback Chromium CDP stated as out of that platform. The host
+counts as supported only once the canary test and live check pass.
 
 ### Proposed issues
 
@@ -351,12 +385,12 @@ None named, and none filed from this page. When a host is chosen,
 the set is the same three: a short design check for anything the
 docs leave unverified, the install doc, and the canary report.
 
-### Placeholder: platform priority after v0.6.0
+### Placeholder: platform priority after Hermes
 
 > **Placeholder.** Claude Duet (cycle-five-duet) will share a kharon
-> adoption survey. Platform priority after v0.6.0 will be informed
+> adoption survey. Platform priority after Hermes will be informed
 > by that survey. This section stays empty of a ranked list until
-> that survey is in. Do not file the later minors, and do not invent
+> that survey is in. Do not file the later hosts, and do not invent
 > an order, ahead of it.
 
 ## Parked / not planned
@@ -395,20 +429,20 @@ docs leave unverified, the install doc, and the canary report.
    allows the tab the platform already opened, and only on a deploy
    with one agent. Neither OpenClaw nor Hermes documents a way to
    pass a `browserContextId` kharon created (unverified past the
-   docs read on 2026-11-14). v0.5.0's design issue answers it for
-   OpenClaw; v0.6.0 reuses that answer unless Hermes cannot.
+   docs read on 2026-11-14). OpenClaw's design issue answers it for
+   OpenClaw; Hermes reuses that answer unless it cannot.
 2. **Which OpenClaw profile does the soak host actually run?**
-   v0.5.0 targets the managed profile that has a CDP port. If #328's
-   host is on the extension relay, that profile has no CDP URL and
-   stays out with #331. The order of releases stays OpenClaw, then
-   Hermes.
-3. **Is Hermes's default packaged Chromium in v0.6.0?** The plan
+   OpenClaw support targets the managed profile that has a CDP port.
+   If #328's host is on the extension relay, that profile has no CDP
+   URL and stays out with #331. The platform order stays OpenClaw,
+   then Hermes.
+3. **Is Hermes's default packaged Chromium included?** The plan
    excludes it until a second client can open a stable loopback
    port while `browser_exec` is attached. Cloud providers,
    Lightpanda, and `browser_vault` stay out either way. Confirm that
    cut.
 
-The release order is settled: OpenClaw, then Hermes. The research
+The platform order is settled: OpenClaw, then Hermes. The research
 above leaves it there.
 
 ## Sources
@@ -428,3 +462,8 @@ Hermes Agent, fetched 2026-11-14:
 
 Tracker, same day: milestone v0.4.0; issues #236, #281, #286, #322,
 #323, #324, #326, #327, #328, #331.
+
+Tracker, 2026-11-15: the open milestone is `next`. Milestones
+v0.4.0, v0.5.0, and v0.6.0 are closed. Platform tracking is
+[#346](https://github.com/CycleFive/kharon/issues/346) (OpenClaw)
+and [#347](https://github.com/CycleFive/kharon/issues/347) (Hermes).

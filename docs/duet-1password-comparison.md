@@ -2,11 +2,13 @@
 
 > Point-in-time research record from Claude Duet, Nov 14, 2026. Check claims against current code and the linked sources before relying on them.
 
+> **Superseded (Nov 14, 2026):** #327 is parked (a standing Duet host is out of scope) and 1Password is out; kharon stays on CDP hosts. See [roadmap.md](roadmap.md) (#332). The research below is kept as the record.
+
 Nov 14, 2026.
 
 ## Verdict
 
-No: kharon can't reproduce this shape as a custom connector, so #327's VM is still needed for the soak.
+No: kharon can't reproduce this shape as a custom connector. (At the time this pointed to #327's VM for the soak; #327 has since been parked.)
 
 - **Why:** Duet's 1Password fill is a platform feature. Its two tools are the app's own and act on the app's own cloud browser. A custom MCP connector gets tool calls and nothing else: it gets no tab handle, no CDP endpoint and no way to install an extension in that browser.
 - **What would make it work:** Anthropic opening that password-manager slot to a Bitwarden-backed provider. kharon's broker could be that provider, but that integration is Anthropic's call, not something kharon can ship on its own.
@@ -58,7 +60,7 @@ The two designs agree on the security core and differ on who owns the browser. L
 | **C. Platform provider slot**: Anthropic or Bitwarden adds a Bitwarden-backed provider next to 1Password | Any Duet thread, in its own browser | An open provider protocol. The press says 1Password's framework is meant for other platforms "as the market develops"; no public route is documented (doc) | Not in your hands. kharon's broker is close to a reference backend if the slot opens |
 | **D. Pass the value to Duet's browser** | Any thread | Nothing new | Ruled out: it breaks G1, and Duet's own rules forbid the model handling a password |
 
-Recommendation: keep A for the v0.3.0 soak, because it tests kharon as shipped. If the soak shows that handing work from cloud threads to the VM is the painful part, B is the next spec; it removes the VM and the handoff, not the host.
+Recommendation (since reversed: #327 is parked): keep A for the v0.3.0 soak, because it tests kharon as shipped. If the soak shows that handing work from cloud threads to the VM is the painful part, B is the next spec; it removes the VM and the handoff, not the host.
 
 ## Live test, 2026-11-14
 
@@ -68,7 +70,7 @@ The target was the Login Test Page on login.page.twkr.io, opened in this thread'
 
 | Time (ET) | Call | Arguments | Result |
 | --- | --- | --- | --- |
-| 4:27 PM | `browser_credentials_request` | goal, one login: website login.page.twkr.io, reason, 5 keywords | `needs_user_message`: Lothrop's address message in the main chat, passed along by the main session, didn't count |
+| 4:27 PM | `browser_credentials_request` | goal, one login: website login.page.twkr.io, reason, 5 keywords | `needs_user_message`: a message relayed from another Duet session didn't count |
 | 4:29 PM | same, after he typed "go ahead" in this task's conversation | same | `asked`, with a request name and a 10-minute expiry |
 | 4:29 to 4:31 PM | same, polling by request name | request name | `waiting` three times, then `approved` with login.page.twkr.io under `not_granted` |
 | 4:32 to 4:34 PM | second request, on his "Yes" | same login, reworded keywords | `waiting` three times, then the same `approved`, nothing granted |
@@ -77,7 +79,7 @@ What this shows and doesn't show:
 
 - **Shown (obs):** the request leg carries no secret. Its results are statuses, site names and an expiry. The platform also gates the request on a message the user types in the asking task's own conversation; a relayed message doesn't count.
 - **Not shown:** whether the fill leg keeps the value out of the session (`browser_credential_fill` was never called), and what the page looks like after a fill.
-- **No change to the verdict:** nothing in this test touched the custom-connector question, so #327's VM is still needed for the soak.
+- **No change to the verdict:** nothing in this test touched the custom-connector question. The #327 VM it pointed to has since been parked.
 
 ### Rerun after the vault was shared (4:38 PM ET)
 

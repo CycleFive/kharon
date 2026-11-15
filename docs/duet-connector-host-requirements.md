@@ -2,6 +2,8 @@
 
 > Point-in-time research record from Claude Duet, Nov 14, 2026. Check claims against current code and the linked sources before relying on them.
 
+> **Superseded (Nov 14, 2026):** #327 is parked (a standing Duet host is out of scope) and 1Password is out; kharon stays on CDP hosts. See [roadmap.md](roadmap.md) (#332). The research below is kept as the record.
+
 Nov 14, 2026.
 
 A small Debian 12 or 13 VM on Proxmox can run kharon-agent-connector and Chromium exactly as the repo's provision-connector.sh sets them up. The hard part is not the host: it is how Duet drives that Chromium, because Duet's cloud sessions can reach neither the host's loopback CDP nor kharon.twkr.io.
@@ -89,10 +91,10 @@ My pick: plain Chromium containers (kernel-images, or the browser.service unit i
 
 ## Open questions
 
-**Decided by Lothrop (Nov 14)**
+**Decided earlier Nov 14, since reversed (#327 parked)**
 
-- [x] Box: a new Proxmox VM.
-- [x] Duet's browser path: option A, Remote Control on the box.
+- [x] ~~Box: a new Proxmox VM.~~
+- [x] ~~Duet's browser path: option A, Remote Control on the box.~~
 - [x] Identity: a static agent in \[agents.\<id>\], not a Connect identity. The id itself (for example duet) is still open.
 
 **For Nyx**

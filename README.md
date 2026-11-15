@@ -46,7 +46,7 @@ Research and setup notes for running Claude Duet as a kharon agent. These are po
 - [`docs/claude-browser-credential-access.md`](docs/claude-browser-credential-access.md): what access 1Password got from Anthropic, whether any third party can fill Claude's browser, Bitwarden's Agent Access SDK, and the routes open to kharon.
 - [`docs/duet-connector-host-requirements.md`](docs/duet-connector-host-requirements.md): requirements for a host running the connector and Chromium for Duet, Duet's side of the gap, and browser pool options.
 - [`docs/duet-vm-runbook.md`](docs/duet-vm-runbook.md): ten steps from a new Proxmox VM to a box where Duet fills through kharon (#327, parked). Untested; kept as a record.
-- [`docs/agent-adoption-survey.md`](docs/agent-adoption-survey.md): the agent platforms kharon can plug into, ranked by fit and reach, with the Bitwarden Agent Access SDK and 1Password compared. Open agents to push first: Hermes Agent, OpenClaw and browser-use.
+- [`docs/agent-adoption-survey.md`](docs/agent-adoption-survey.md): the agent platforms kharon can plug into, ranked by fit and reach, with the Bitwarden Agent Access SDK and 1Password compared (1Password is out; see the roadmap for order).
 
 ### Design specs
 

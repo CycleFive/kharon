@@ -2,9 +2,11 @@
 
 > Point-in-time research record from Claude Duet, Nov 14, 2026. Check claims against current code and the linked sources before relying on them.
 
+> **Owner decisions (Nov 14, 2026):** 1Password is out (no integration planned; kharon stays on CDP + Bitwarden). [roadmap.md](roadmap.md) (#332) sets the order: v0.5.0 OpenClaw (#334–#336), v0.6.0 Hermes (#337–#339), then one minor per CDP host. This ranking is input to that roadmap, not the plan.
+
 Nov 14, 2026.
 
-Push kharon first into Hermes Agent, OpenClaw and browser-use: all three drive a Chromium over a CDP URL you choose, take kharon in days, and together reach over 750k GitHub stars. Two closed agents already work: kharon's CDP fill is proven with Nyx on Grok Bot, and with Muse in the VM 125 live test on 2026-11-14. dots signed with 1Password on 2026-10-22 and documents no CDP, so kharon reaches only its MCP side so far.
+The three open agents with the best fit are Hermes Agent, OpenClaw and browser-use (the roadmap takes OpenClaw first, then Hermes): all three drive a Chromium over a CDP URL you choose, take kharon in days, and together reach over 750k GitHub stars. Two closed agents already work: kharon's CDP fill is proven with Nyx on Grok Bot, and with Muse in the VM 125 live test on 2026-11-14. dots signed with 1Password on 2026-10-22 and documents no CDP, so kharon reaches only its MCP side so far.
 
 1. **Hermes Agent** is the best technical fit: its browser defaults to 127.0.0.1:9222, its MCP client speaks OAuth 2.1, and `browser_exec` can open a tab in kharon's own browser context, so it works with kharon as it is. Its built-in vault fills from `bw` with no per-fill approval, which is the pitch.
 2. **OpenClaw** is the biggest audience (393k stars) with the clearest gap: its 1Password plugin hands secret values to the model. An MCP entry plus a ClawHub skill is the whole integration.
@@ -16,7 +18,7 @@ Grok Bot and Muse are the proof that a closed vendor agent can work: kharon's CD
 
 ## Ranking
 
-Scores are my judgment from the notes below (inference): fit 1 to 5 is how much of kharon works there without vendor help; reach 1 to 5 is audience size. Sorted by fit times reach; ties keep the open agent first. Muse's fit was raised from 1 to 4 after the VM 125 live test proved its fill (inference: 4, not 5, because Muse's app has no official custom-MCP setting).
+Scores are my judgment from the notes below (inference): fit 1 to 5 is how much of kharon works there without vendor help; reach 1 to 5 is audience size. Sorted by fit times reach; ties go to the higher fit, then the open agent. Muse's fit was raised from 1 to 4 after the VM 125 live test proved its fill (inference: 4, not 5, because Muse's app has no official custom-MCP setting).
 
 | # | Platform | Reach (as read) | Browser control | kharon hook | kharon path and size | Fit × reach |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -28,11 +30,11 @@ Scores are my judgment from the notes below (inference): fit 1 to 5 is how much 
 | 6 | Playwright MCP / Chrome DevTools MCP (covers Codex CLI, Gemini CLI, Cursor, Cline, Goose, Claude Code) | 10.5M + 2.4M npm/week | CDP via `--cdp-endpoint` / `--browserUrl` | Host's MCP client | Shared-CDP launcher + snippets (1 to 3 days), but needs kharon to fill a tab outside its own browser context | 3 × 5 = 15 |
 | 7 | Stagehand / Browserbase | 25.5k stars; $40M Series B | CDP; cloud `connectUrl` over wss | User code calls MCP | Connector dials a wss CDP URL with a header + example. Days | 3 × 3 = 9 |
 | 8 | OpenHands | 92.6k stars | browser-use inside sandbox, no `cdp_url` | MCP client with bearer, OAuth | Sandbox image + upstream PR. 1 to 2 weeks | 2.5 × 3 ≈ 8 |
-| 9 | dots / ChatGPT Work | No numbers found | Vendor cloud Chrome | OAuth 2.1 + CIMD plugins, which kharon already speaks | MCP side only so far; fill path unproven | 1 × 4 = 4 |
+| 9 | Agent Zero | 19.6k stars | Host Chromium over CDP | MCP with bearer headers | Config + skill. Days | 4 × 1 = 4 |
 | 10 | Skyvern | 23.1k stars | Playwright, attaches over CDP | Custom Credential Service API | Implement API (returns plaintext) or upstream delegated fill | 2 × 2 = 4 |
-| 11 | Agent Zero | 19.6k stars | Host Chromium over CDP | MCP with bearer headers | Config + skill. Days | 4 × 1 = 4 |
+| 11 | dots / ChatGPT Work | No numbers found | Vendor cloud Chrome | OAuth 2.1 + CIMD plugins, which kharon already speaks | MCP side only so far; fill path unproven | 1 × 4 = 4 |
 
-The shared kharon-side blocker (inference from `kharon_context` in [mcp-tools.json](api/mcp-tools.json)): kharon fills only tabs created in its own browser context, and other tabs are `target_not_owned`. Hermes can create that tab itself with raw CDP; OpenClaw and browser-use need a skill or action that does; Playwright MCP and DevTools MCP drive the default context and can't. An owner-approved way to adopt an existing tab would unlock row 6 and simplify rows 2 and 4. The connector's `cdp` setting is already configurable, so OpenClaw's port 18800 needs no change.
+The shared kharon-side blocker (inference from `kharon_context` in [mcp-tools.json](api/mcp-tools.json)): kharon fills only tabs created in its own browser context, and other tabs are `target_not_owned`. Hermes can create that tab itself with raw CDP; OpenClaw and browser-use need a skill or action that does; Playwright MCP and DevTools MCP drive the default context and can't. An owner-approved way to adopt an existing tab would unlock row 6 and simplify rows 2 and 4. The roadmap's design issues take this up for OpenClaw in [#334](https://github.com/CycleFive/kharon/issues/334) and for Hermes in [#337](https://github.com/CycleFive/kharon/issues/337). The connector's `cdp` setting is already configurable, so OpenClaw's port 18800 needs no change.
 
 ## Platform notes
 

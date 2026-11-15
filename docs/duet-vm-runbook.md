@@ -2,6 +2,8 @@
 
 > Point-in-time research record from Claude Duet, Nov 14, 2026. Check claims against current code and the linked sources before relying on them.
 
+> **Superseded (Nov 14, 2026):** #327 is parked (a standing Duet host is out of scope) and 1Password is out; kharon stays on CDP hosts. See [roadmap.md](roadmap.md) (#332). The research below is kept as the record.
+
 Nov 14, 2026.
 
 Ten steps take a new Proxmox VM to a box where Duet fills logins through kharon. It runs as a static agent (duet below), with Claude Code under Remote Control as Duet's hands on the box. Steps 1 and 2 happen on the broker and a build machine; the rest happen on the VM. Nothing here is posted anywhere, and no secret goes in chat, Discord, argv or this doc.

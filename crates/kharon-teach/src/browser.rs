@@ -632,7 +632,9 @@ mod tests {
 
     /// A non-dumpable process's `/proc/self` belongs to root, so a sweep that learned its uid
     /// from there would compare against 0 and never remove anything. The check runs in a child
-    /// process (this test binary again) so the parent stays dumpable.
+    /// process (this test binary again) so the parent stays dumpable. On newer kernels
+    /// `/proc/self` stays owned by the user after that call, so the old code passes this test
+    /// too: it exercises the sweep under `PR_SET_DUMPABLE 0` and is not proof of the fix.
     #[test]
     fn sweep_still_removes_a_leftover_when_the_process_is_non_dumpable() {
         const MARK: &str = "KHARON_TEACH_SWEEP_NONDUMPABLE_DIR";

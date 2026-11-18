@@ -15,8 +15,8 @@ pub mod strip;
 pub mod testing;
 
 use cli::{
-    Cli, Command, Refusal, check_dir_writable, check_out_path, default_file_name, summary,
-    validate_login_url,
+    Cli, Command, Refusal, check_dir_writable, check_out_path, default_file_name,
+    default_file_name_at, summary, validate_login_url,
 };
 use kharon_recording::Recording;
 use session::{End, Outcome, Ready, RecordOptions, record};
@@ -96,7 +96,11 @@ pub enum Naming {
 /// to `.9` added (before the `.kharon-recording.json` ending for a generated name, at the end
 /// for an `--out` name) is tried, so a demonstration is not lost to a name clash.
 #[doc(hidden)]
-pub fn write_new(first: &Path, naming: Naming, text: &str) -> std::io::Result<PathBuf> {
+pub fn write_new(
+    first: &Path,
+    naming: Naming,
+    text: &str,
+) -> Result<PathBuf, (PathBuf, std::io::Error)> {
     use std::os::unix::fs::OpenOptionsExt;
     let name = first
         .file_name()
@@ -120,17 +124,26 @@ pub fn write_new(first: &Path, naming: Naming, text: &str) -> std::io::Result<Pa
             .open(&path)
         {
             Ok(mut f) => {
-                f.write_all(text.as_bytes())?;
-                f.flush()?;
-                return Ok(path);
+                return match f.write_all(text.as_bytes()).and_then(|()| f.flush()) {
+                    Ok(()) => Ok(path),
+                    Err(e) => {
+                        // Never leave a truncated file where the next run would refuse to write.
+                        drop(f);
+                        let _ = std::fs::remove_file(&path);
+                        Err((path, e))
+                    }
+                };
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err((path, e)),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "ten files of that name already exist",
+    Err((
+        first.to_owned(),
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "ten files of that name already exist",
+        ),
     ))
 }
 
@@ -334,13 +347,17 @@ pub async fn run_with(
     drop(rec);
     match outcome {
         Ok(Outcome::Recorded(r)) => {
-            let first = match &prep.target {
-                Target::Explicit(p) => p.clone(),
-                Target::Here => PathBuf::from(default_file_name(
-                    prep.url.host_str().unwrap_or("login"),
-                    std::time::SystemTime::now(),
-                )),
-            };
+            let first =
+                match &prep.target {
+                    Target::Explicit(p) => p.clone(),
+                    Target::Here => {
+                        let host = prep.url.host_str().unwrap_or("login");
+                        // The name carries the instant the recording ended, not the time of the write.
+                        PathBuf::from(default_file_name_at(host, &r.ended_at).unwrap_or_else(
+                            || default_file_name(host, std::time::SystemTime::now()),
+                        ))
+                    }
+                };
             let naming = match prep.target {
                 Target::Explicit(_) => Naming::Explicit,
                 Target::Here => Naming::Default,
@@ -351,9 +368,9 @@ pub async fn run_with(
                     let _ = writeln!(stdout, "Saved: {}", path.display());
                     Exit::Done
                 }
-                Err(e) => fail(
+                Err((at, e)) => fail(
                     &mut stderr,
-                    &format_args!("cannot write {}: {e}", first.display()),
+                    &format_args!("cannot write {}: {e}", at.display()),
                     Exit::Failed,
                 ),
             }
@@ -382,12 +399,18 @@ mod tests {
         Cli::try_parse_from(std::iter::once("kharon-teach").chain(args.iter().copied())).unwrap()
     }
 
-    fn temp_listing() -> Vec<std::ffi::OsString> {
+    /// Profile directories in the temp directory that name THIS process as their owner. Other
+    /// tests and other processes make profiles too; only ours can come from `run_with` here.
+    fn my_profiles() -> Vec<std::path::PathBuf> {
+        let me = std::process::id().to_string();
         std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .flatten()
-            .map(|e| e.file_name())
-            .filter(|n| n.to_string_lossy().starts_with("kharon-teach-"))
+            .filter(|e| e.file_name().to_string_lossy().starts_with("kharon-teach-"))
+            .map(|e| e.path())
+            .filter(|p| {
+                std::fs::read_to_string(p.join(browser::OWNER_FILE)).is_ok_and(|t| t.trim() == me)
+            })
             .collect()
     }
 
@@ -428,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn refusals_exit_2_before_the_notice() {
-        let before = temp_listing();
+        let before = my_profiles();
         let d = private_dir("refuse");
         let browser = fake_browser(&d);
         let existing = d.join("taken.json");
@@ -463,9 +486,9 @@ mod tests {
             assert!(r.err.starts_with("kharon-teach: "), "{}", r.err);
             assert_eq!(r.err.lines().count(), 1, "{}", r.err);
         }
-        let after = temp_listing();
+        let after = my_profiles();
         assert!(
-            after.iter().all(|n| before.contains(n)),
+            after.iter().all(|p| before.contains(p)),
             "a refusal created a profile directory"
         );
         std::fs::remove_dir_all(&d).unwrap();

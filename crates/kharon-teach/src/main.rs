@@ -20,5 +20,15 @@ fn main() -> ExitCode {
         std::io::stdout(),
         std::io::stderr(),
     ));
+    // `run` has already closed the browser and removed its profile, whatever ended the session
+    // (the window, a confirm, Ctrl-C or SIGTERM). What is left is the blocking thread of the
+    // end-prompt read, which cannot be cancelled and would hold the process until Enter, so
+    // the runtime is shut down without waiting for it.
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+    }
+    runtime.shutdown_background();
     exit.into()
 }

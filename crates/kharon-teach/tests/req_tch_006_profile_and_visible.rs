@@ -242,38 +242,50 @@ async fn a_stale_profile_is_swept_at_the_next_start() {
 
 #[test]
 fn the_shipped_main_never_asks_for_headless() {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut files,
-    );
-    for p in files {
-        let text = std::fs::read_to_string(&p).unwrap();
-        let shipped = text.split("#[cfg(test)]").next().unwrap();
+    let sources = support::shipped_sources();
+    let mut env_reads = Vec::new();
+    for (p, shipped) in &sources {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
             !shipped.contains("headless: true"),
             "{} asks for headless",
             p.display()
         );
-        // Browser discovery reads PATH; nothing else reads the environment.
-        if !p.ends_with("browser.rs") {
-            assert!(
-                !shipped.contains("env::var"),
-                "{} reads the environment",
-                p.display()
-            );
+        // Every `headless:` initializer outside the session and the browser launcher is the
+        // literal `false` or a pass-through of the hook inside `run_with`.
+        if name != "session.rs" && name != "browser.rs" {
+            for (n, line) in shipped.lines().enumerate() {
+                let t = line.trim();
+                if t.starts_with("//") || !t.contains("headless:") {
+                    continue;
+                }
+                let ok = t == "headless: false," || t == "headless: hooks.headless,";
+                let decl = t.starts_with("pub headless: bool");
+                assert!(ok || decl, "{}:{}: {t}", p.display(), n + 1);
+            }
+        }
+        for pat in [
+            "env::var(",
+            "env::var_os(",
+            "env::vars(",
+            "env::vars_os(",
+            "use std::env::{",
+            "use std::env::var",
+            "use std::env;",
+        ] {
+            for (n, line) in shipped.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains(pat) {
+                    env_reads.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                }
+            }
         }
     }
+    // Browser discovery reads PATH, and that is the only read of the environment.
+    assert_eq!(env_reads.len(), 1, "{env_reads:?}");
+    assert!(
+        env_reads[0].starts_with("browser.rs:") && env_reads[0].contains("var_os(\"PATH\")"),
+        "{env_reads:?}"
+    );
 }
 
 /// A `kharon-teach-*` profile directory in the temp directory whose owner file holds `pid`.
@@ -397,4 +409,176 @@ async fn a_browser_that_quits_by_itself_ends_the_session_and_the_profile_stays_g
     run.person.close_browser().await;
     outcome_is_unconfirmed_or_never_started(run.wait().await).await;
     assert!(gone(&profile).await, "the profile is still there");
+}
+
+/// The shipped binary, past `Ready`, in a browser without a display.
+struct Live {
+    child: std::process::Child,
+    /// Held open and never written to: end of input must not end the recording.
+    _stdin: std::process::ChildStdin,
+    stdout: std::sync::Arc<std::sync::Mutex<String>>,
+    dir: PathBuf,
+    out: PathBuf,
+    profile: PathBuf,
+    _fixture: support::Fixture,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl Live {
+    /// `None` when there is no browser and none is required.
+    async fn start(test: &str) -> Option<Live> {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let chromium = support::chromium_or_skip(test)?;
+        let permit = support::browser_permit().await;
+        let fixture = support::Fixture::start().await;
+        let dir = std::env::temp_dir().join(format!(
+            "kharon-live-{}-{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        // Only this test wrapper adds the switch; the program believes it launched a visible browser.
+        let wrapper = dir.join("browser");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexec {} --headless=new \"$@\"\n",
+                chromium.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = dir.join("login.kharon-recording.json");
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kharon-teach"))
+            .args(["--yes", fixture.url("/form").as_str(), "--browser"])
+            .arg(&wrapper)
+            .arg("--out")
+            .arg(&out)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut pipe = child.stdout.take().unwrap();
+        let sink = stdout.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let live = Live {
+            profile: PathBuf::new(),
+            child,
+            _stdin: stdin,
+            stdout,
+            dir,
+            out,
+            _fixture: fixture,
+            _permit: permit,
+        };
+        let mut live = live;
+        let limit = std::time::Instant::now() + Duration::from_secs(40);
+        while !live
+            .printed()
+            .contains("Press Enter once you are logged in")
+        {
+            assert!(
+                std::time::Instant::now() < limit,
+                "the end prompt never showed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        live.profile = profile_of(live.child.id()).expect("the profile exists");
+        Some(live)
+    }
+
+    fn printed(&self) -> String {
+        self.stdout.lock().unwrap().clone()
+    }
+
+    /// The exit code, or `None` when the program is still running after `secs`.
+    async fn exit_within(&mut self, secs: u64) -> Option<Option<i32>> {
+        let limit = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                return Some(s.code());
+            }
+            if std::time::Instant::now() >= limit {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[tokio::test]
+async fn sigint_after_the_prompt_exits_1_without_enter() {
+    let Some(mut live) = Live::start("sigint_after_prompt").await else {
+        return;
+    };
+    let pid = live.child.id().to_string();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        live.exit_within(10).await,
+        Some(Some(1)),
+        "the program did not exit on SIGINT without Enter"
+    );
+    assert!(!live.out.exists(), "a file was written");
+    assert!(gone(&live.profile).await, "the profile is still there");
+}
+
+#[tokio::test]
+async fn closing_the_window_after_the_prompt_saves_and_exits_without_enter() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mut live) = Live::start("close_after_prompt").await else {
+        return;
+    };
+    let port: u16 = std::fs::read_to_string(live.profile.join("DevToolsActivePort"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let person = support::Person::connect(port).await;
+    person.click("a").await;
+    person.wait_for_path("/form").await;
+    person.type_into("input[name=user]", USER).await;
+    person.type_into("input[name=pass]", PASS).await;
+    person.close_all_pages().await;
+    assert_eq!(
+        live.exit_within(10).await,
+        Some(Some(0)),
+        "the program did not exit after the window closed"
+    );
+    assert!(live.printed().contains("Saved:"), "{}", live.printed());
+    let mode = std::fs::metadata(&live.out).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let rec = kharon_recording::Recording::from_json(&std::fs::read_to_string(&live.out).unwrap())
+        .unwrap();
+    assert_eq!(rec.ended_by, EndedBy::WindowClosed);
+    assert!(!rec.success_confirmed);
 }

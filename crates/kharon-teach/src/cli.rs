@@ -88,11 +88,8 @@ pub fn validate_login_url(s: &str) -> Result<url::Url, Refusal> {
     }
 }
 
-/// `<host>-<YYYYMMDDTHHMMSSZ>.kharon-recording.json`. Every character of the host outside
-/// `[a-z0-9.-]` becomes `_`, so an IPv6 host puts no `[`, `]` or `:` in a file name.
-pub fn default_file_name(host: &str, utc: SystemTime) -> String {
-    let host: String = host
-        .to_ascii_lowercase()
+fn sanitize_host(host: &str) -> String {
+    host.to_ascii_lowercase()
         .chars()
         .map(|c| {
             if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' {
@@ -101,10 +98,16 @@ pub fn default_file_name(host: &str, utc: SystemTime) -> String {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// `<host>-<YYYYMMDDTHHMMSSZ>.kharon-recording.json`. Every character of the host outside
+/// `[a-z0-9.-]` becomes `_`, so an IPv6 host puts no `[`, `]` or `:` in a file name.
+pub fn default_file_name(host: &str, utc: SystemTime) -> String {
     let t = time::OffsetDateTime::from(utc);
     format!(
-        "{host}-{:04}{:02}{:02}T{:02}{:02}{:02}Z{FILE_SUFFIX}",
+        "{}-{:04}{:02}{:02}T{:02}{:02}{:02}Z{FILE_SUFFIX}",
+        sanitize_host(host),
         t.year(),
         u8::from(t.month()),
         t.day(),
@@ -112,6 +115,26 @@ pub fn default_file_name(host: &str, utc: SystemTime) -> String {
         t.minute(),
         t.second()
     )
+}
+
+/// [`default_file_name`] for the instant a recording says it ended (`ended_at`, UTC RFC 3339
+/// as `session::utc_rfc3339` writes it). `None` when the text is not in that shape.
+pub fn default_file_name_at(host: &str, ended_at: &str) -> Option<String> {
+    let digits: Vec<char> = ended_at
+        .chars()
+        .take(19)
+        .filter(char::is_ascii_digit)
+        .collect();
+    if digits.len() != 14 || !ended_at.is_ascii() {
+        return None;
+    }
+    let d: String = digits.into_iter().collect();
+    Some(format!(
+        "{}-{}T{}Z{FILE_SUFFIX}",
+        sanitize_host(host),
+        &d[..8],
+        &d[8..]
+    ))
 }
 
 /// `dir` is an existing directory this user can create files in. Tried, not read from
@@ -312,6 +335,15 @@ pub(crate) mod tests {
             ),
             "ex.test-20261118T040400Z.kharon-recording.json"
         );
+    }
+
+    #[test]
+    fn file_name_follows_the_recordings_end_time() {
+        assert_eq!(
+            default_file_name_at("Ex.test", "2026-11-18T04:04:00.123Z").unwrap(),
+            "ex.test-20261118T040400Z.kharon-recording.json"
+        );
+        assert!(default_file_name_at("ex.test", "yesterday").is_none());
     }
 
     #[test]

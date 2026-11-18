@@ -939,3 +939,39 @@ impl Person {
         None
     }
 }
+
+// ---- shared by tests that drive or scan the shipped program ----
+
+/// Waits for one of the browser slots (see `GATE`); hold the permit while a browser runs.
+pub async fn browser_permit() -> tokio::sync::SemaphorePermit<'static> {
+    GATE.acquire().await.unwrap()
+}
+
+/// Every `.rs` file under `dir`.
+pub fn rust_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(rust_files(&p));
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Shipped code only: for each file under `crates/kharon-teach/src`, the text before its first
+/// `#[cfg(test)]`.
+pub fn shipped_sources() -> Vec<(PathBuf, String)> {
+    let files = rust_files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    assert!(!files.is_empty());
+    files
+        .into_iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(&p).unwrap();
+            let shipped = text.split("#[cfg(test)]").next().unwrap().to_owned();
+            (p, shipped)
+        })
+        .collect()
+}

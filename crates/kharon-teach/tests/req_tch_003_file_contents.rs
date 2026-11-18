@@ -35,11 +35,29 @@ async fn the_file_is_0600_and_holds_only_what_the_spec_keeps() {
             "a page title is in the file: {title}"
         );
     }
-    // Headers are reduced to the content type.
-    for r in &rec.requests {
-        if let Some(ct) = &r.content_type {
-            assert!(!ct.is_empty());
-        }
+    // Headers are reduced to the content type: no other header the fixture and the browser
+    // exchanged is in the file, by name or by value.
+    let lower = text.to_ascii_lowercase();
+    for header in [
+        "set-cookie",
+        "user-agent",
+        "referer",
+        "accept-language",
+        "accept-encoding",
+        "content-length",
+        "location",
+        "\"cookie\"",
+    ] {
+        assert!(!lower.contains(header), "header {header} is in the file");
     }
-    assert!(!text.to_ascii_lowercase().contains("set-cookie:"));
+    // The cookie was set by the response, and the file says only that it was.
+    let login = rec
+        .requests
+        .iter()
+        .find(|r| r.url.path == "/form-login")
+        .expect("the sign-in request was stored");
+    assert!(
+        login.response.as_ref().is_some_and(|r| r.set_cookie),
+        "the response's Set-Cookie was not noted as a flag"
+    );
 }

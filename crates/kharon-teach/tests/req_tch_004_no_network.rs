@@ -1,34 +1,8 @@
 //! SPEC req_tch_004: the recorder opens no socket but loopback CDP, and links no TLS or HTTP client.
 
-use std::path::{Path, PathBuf};
+mod support;
 
-/// Shipped code only: the text before the first `#[cfg(test)]` of each file under `src/`.
-fn shipped_sources() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut files,
-    );
-    assert!(!files.is_empty());
-    files
-        .into_iter()
-        .map(|p| {
-            let text = std::fs::read_to_string(&p).unwrap();
-            let shipped = text.split("#[cfg(test)]").next().unwrap().to_owned();
-            (p, shipped)
-        })
-        .collect()
-}
+use support::shipped_sources;
 
 #[test]
 fn the_crate_listens_on_nothing_and_has_no_tls() {

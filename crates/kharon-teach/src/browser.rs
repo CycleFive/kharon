@@ -183,8 +183,8 @@ impl Profile {
     /// [`Profile::sweep_stale`] over `dir`.
     pub(crate) fn sweep_stale_in(dir: &Path) -> std::io::Result<usize> {
         use std::os::unix::fs::MetadataExt;
-        // /proc/self is owned by this process's effective uid.
-        let me = std::fs::metadata("/proc/self")?.uid();
+        // Not /proc/self: a non-dumpable process's /proc entries belong to root.
+        let me = rustix::process::geteuid().as_raw();
         let mut n = 0;
         for entry in std::fs::read_dir(dir)? {
             let Ok(entry) = entry else { continue };
@@ -562,6 +562,39 @@ mod tests {
         let b = dir_with_owner(&sb, "kharon-teach-big", &big);
         assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 2);
         assert!(!a.exists() && !b.exists());
+    }
+
+    /// A non-dumpable process's `/proc/self` belongs to root, so a sweep that learned its uid
+    /// from there would compare against 0 and never remove anything. The check runs in a child
+    /// process (this test binary again) so the parent stays dumpable.
+    #[test]
+    fn sweep_still_removes_a_leftover_when_the_process_is_non_dumpable() {
+        const MARK: &str = "KHARON_TEACH_SWEEP_NONDUMPABLE_DIR";
+        if let Some(dir) = std::env::var_os(MARK) {
+            use rustix::process::{DumpableBehavior, set_dumpable_behavior};
+            set_dumpable_behavior(DumpableBehavior::NotDumpable).unwrap();
+            let removed = Profile::sweep_stale_in(Path::new(&dir)).unwrap();
+            assert_eq!(removed, 1, "the sweep did not remove the leftover");
+            return;
+        }
+        let sb = Sandbox::new("nondump");
+        let d = sb.mkdir("kharon-teach-leftover");
+        std::fs::write(d.join("f"), b"x").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "browser::tests::sweep_still_removes_a_leftover_when_the_process_is_non_dumpable",
+                "--test-threads=1",
+            ])
+            .env(MARK, sb.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(!d.exists());
     }
 
     #[test]

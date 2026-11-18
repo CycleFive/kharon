@@ -598,3 +598,116 @@ impl Person {
         .await
     }
 }
+
+// ---- the whole program, driven through `run_with` ----
+
+/// A cloneable in-memory writer; the program gets one clone and the test reads the other.
+#[derive(Clone, Default)]
+pub struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Shared {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Shared {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a whole run of the program left behind.
+pub struct Program {
+    pub exit: kharon_teach::Exit,
+    pub path: PathBuf,
+    pub file_text: String,
+    pub file_mode: u32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs the program headless against the fixture's `/form` login (the path may carry a query),
+/// as a person would: says `yes`, opens the login page from the notice, types the throwaway
+/// values, signs in, presses Enter. `None` when there is no browser and none is required.
+pub async fn run_program(test: &str, form_path_and_query: &str) -> Option<Program> {
+    use clap::Parser;
+    use std::os::unix::fs::PermissionsExt;
+    let bin = chromium_or_skip(test)?;
+    let _permit = GATE.acquire().await.unwrap();
+    let fixture = Fixture::start().await;
+    let login = fixture.url(form_path_and_query);
+    let dir = std::env::temp_dir().join(format!(
+        "kharon-prog-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let out = dir.join("login.kharon-recording.json");
+    let cli = kharon_teach::cli::Cli::try_parse_from([
+        "kharon-teach",
+        login.as_str(),
+        "--browser",
+        bin.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ])
+    .unwrap();
+    let (stdout, stderr) = (Shared::default(), Shared::default());
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (mut keys, stdin) = tokio::io::duplex(1024);
+    let task = tokio::spawn({
+        let (stdout, stderr) = (stdout.clone(), stderr.clone());
+        async move {
+            kharon_teach::run_with(
+                cli,
+                tokio::io::BufReader::new(stdin),
+                stdout,
+                stderr,
+                kharon_teach::Hooks {
+                    headless: true,
+                    ready: Some(ready_tx),
+                },
+            )
+            .await
+        }
+    });
+    keys.write_all(b"yes\n").await.unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(40), ready_rx)
+        .await
+        .expect("the program was not ready in 40 s")
+        .expect("the program ended before it was ready");
+    let person = Person::connect(ready.devtools_port).await;
+    person.click("a").await;
+    person.wait_for_path(path_of(form_path_and_query)).await;
+    person.type_into("input[name=user]", USER).await;
+    person.type_into("input[name=pass]", PASS).await;
+    person.click("#go").await;
+    person.wait_for_path("/home").await;
+    keys.write_all(b"\n").await.unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("the program did not end in 20 s")
+        .expect("the program panicked");
+    let file_text = std::fs::read_to_string(&out).unwrap_or_default();
+    let file_mode = std::fs::metadata(&out)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0);
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(Program {
+        exit,
+        path: out,
+        file_text,
+        file_mode,
+        stdout: stdout.text(),
+        stderr: stderr.text(),
+    })
+}
+
+fn path_of(path_and_query: &str) -> &str {
+    path_and_query.split('?').next().unwrap_or("")
+}

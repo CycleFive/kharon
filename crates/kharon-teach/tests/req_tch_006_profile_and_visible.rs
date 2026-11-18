@@ -199,3 +199,122 @@ async fn a_stale_profile_is_swept_at_the_next_start() {
     assert!(!stale.exists(), "the stale profile was not swept");
     let _ = run.finish(End::Discard).await;
 }
+
+#[test]
+fn the_shipped_main_never_asks_for_headless() {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    for p in files {
+        let text = std::fs::read_to_string(&p).unwrap();
+        let shipped = text.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !shipped.contains("headless: true"),
+            "{} asks for headless",
+            p.display()
+        );
+        // Browser discovery reads PATH; nothing else reads the environment.
+        if !p.ends_with("browser.rs") {
+            assert!(
+                !shipped.contains("env::var"),
+                "{} reads the environment",
+                p.display()
+            );
+        }
+    }
+}
+
+/// A `kharon-teach-*` profile directory in the temp directory whose owner file holds `pid`.
+fn profile_of(pid: u32) -> Option<PathBuf> {
+    std::fs::read_dir(std::env::temp_dir())
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("kharon-teach-"))
+        .map(|e| e.path())
+        .find(|p| {
+            std::fs::read_to_string(p.join("kharon-teach.owner"))
+                .is_ok_and(|t| t.trim() == pid.to_string())
+        })
+}
+
+/// Runs the built program against a browser that never opens a DevTools port, sends it `signal`,
+/// and checks: exit code 1, the profile removed, no file written, all within 10 s.
+fn interrupted_by(signal: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "kharon-sig-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let fake = dir.join("fake-browser");
+    std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = dir.join("login.kharon-recording.json");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kharon-teach"))
+        .args(["--yes", "https://ex.test/login", "--browser"])
+        .arg(&fake)
+        .arg("--out")
+        .arg(&out)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let limit = std::time::Instant::now() + Duration::from_secs(10);
+    let profile = loop {
+        if let Some(p) = profile_of(pid) {
+            break p;
+        }
+        assert!(
+            std::time::Instant::now() < limit,
+            "the program made no profile in 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let sent = std::process::Command::new("kill")
+        .args([&format!("-{signal}"), &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() >= limit + Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!("the program did not stop after {signal}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1), "exit status after {signal}");
+    let mut err = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    assert!(err.contains("Interrupted. Nothing was saved."), "{err}");
+    assert!(!profile.exists(), "the profile is still there");
+    assert!(!out.exists(), "a file was written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sigint_exits_1_and_removes_the_profile() {
+    interrupted_by("INT");
+}
+
+#[test]
+fn sigterm_exits_1_and_removes_the_profile() {
+    interrupted_by("TERM");
+}

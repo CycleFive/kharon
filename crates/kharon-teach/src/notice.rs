@@ -8,6 +8,13 @@ Use a THROWAWAY account. Everything you type in the window that\n\
 opens is read by this program. Nothing you type is saved, and\n\
 nothing is sent anywhere. The result is one file on this computer.\n";
 
+/// Asked on the terminal before anything starts.
+pub const CONSENT_PROMPT: &str = "Type yes to open the browser window and start: ";
+/// Printed once the browser window is showing the notice.
+pub const END_PROMPT: &str = "Press Enter once you are logged in. Type q to discard.";
+/// Printed when consent was not given.
+pub const NOTHING_RECORDED: &str = "Nothing was recorded.";
+
 const KEEP: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')

@@ -1084,6 +1084,7 @@ name = "kharon-teach"
 version = "0.0.0"
 dependencies = [
  "base64ct",
+ "clap",
  "futures-util",
  "hex",
  "kharon-recording",
@@ -1092,6 +1093,7 @@ dependencies = [
  "percent-encoding",
  "publicsuffix",
  "rand",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

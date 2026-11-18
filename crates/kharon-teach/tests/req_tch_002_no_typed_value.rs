@@ -22,3 +22,17 @@ async fn no_typed_value_in_the_recording_for_any_fixture() {
         assert_holds_no_typed_value(&json, &[USER, PASS]);
     }
 }
+
+#[tokio::test]
+async fn nothing_typed_reaches_the_file_or_the_output() {
+    let Some(p) = support::run_program("whole_program_no_typed_value", "/form").await else {
+        return;
+    };
+    assert_eq!(p.exit, kharon_teach::Exit::Done, "{}", p.stderr);
+    assert_eq!(p.file_mode, 0o600);
+    assert!(p.file_text.contains("\"value_len\""), "the file is empty");
+    assert!(p.stdout.contains(&p.path.display().to_string()));
+    for text in [&p.file_text, &p.stdout, &p.stderr] {
+        assert_holds_no_typed_value(text, &[USER, PASS]);
+    }
+}

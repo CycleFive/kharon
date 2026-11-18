@@ -5,11 +5,11 @@
 //! ordinary `String`s that serde_json does not zeroize.
 
 use kharon_recording::{BodyShape, FieldShape, JsonField, JsonShape, ValueKind, ValueShape};
-use percent_encoding::percent_decode;
+use memchr::memmem;
 use zeroize::Zeroizing;
 
 use crate::marker::Marker;
-use crate::strip::{TYPED, any_hit, hits_in};
+use crate::strip::{TYPED, decode_percent, hits_in, holds_typed};
 
 /// Bodies larger than this are not parsed: they are `Opaque`.
 pub const MAX_BODY_BYTES: usize = 1 << 20;
@@ -145,23 +145,14 @@ fn text_value(bytes: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>
     value_shape(ValueKind::String, char_len(bytes), bytes, markers, pair)
 }
 
-/// A name that is kept only when it holds no typed value.
+/// A name that is kept only when it holds no typed value (any encoding, or the text in any
+/// letter case, raw or percent-decoded; see `strip::holds_typed`).
 fn name(bytes: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> String {
-    if any_hit(bytes, markers, pair) {
+    if holds_typed(bytes, markers, pair) {
         TYPED.to_owned()
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     }
-}
-
-/// Form decoding: `+` is a space, then percent-decoding. A lone `%` stays as it is.
-fn form_decode(raw: &[u8]) -> Zeroizing<Vec<u8>> {
-    let spaced: Zeroizing<Vec<u8>> = Zeroizing::new(
-        raw.iter()
-            .map(|b| if *b == b'+' { b' ' } else { *b })
-            .collect(),
-    );
-    Zeroizing::new(percent_decode(&spaced).collect())
 }
 
 fn urlencoded_fields(
@@ -176,8 +167,8 @@ fn urlencoded_fields(
                 Some(i) => (&piece[..i], &piece[i + 1..]),
                 None => (piece, &piece[..0]),
             };
-            let key = form_decode(k);
-            let value = form_decode(v);
+            let key = decode_percent(k, true);
+            let value = decode_percent(v, true);
             FieldShape {
                 key: name(&key, markers, pair),
                 value: text_value(&value, markers, pair),
@@ -240,14 +231,14 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > haystack.len() {
         return None;
     }
-    haystack[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|i| from + i)
+    memmem::find(&haystack[from..], needle).map(|i| from + i)
 }
 
 /// Parts of a `multipart/form-data` body, or `None` when it is not well formed (no opening
 /// delimiter, a part with no header end, or a part not closed by a delimiter).
+///
+/// The line ending (CRLF or LF) is read once, from the first delimiter line, and used for every
+/// part, so each search stops at its own terminator and the whole parse is linear in the body.
 fn multipart_parts(
     body: &[u8],
     boundary: &str,
@@ -256,13 +247,18 @@ fn multipart_parts(
 ) -> Option<Vec<FieldShape>> {
     let mut delim = b"--".to_vec();
     delim.extend_from_slice(boundary.as_bytes());
-    // The delimiter that closes a part is preceded by a line break.
-    let mut crlf_delim = b"\r\n".to_vec();
-    crlf_delim.extend_from_slice(&delim);
-    let mut lf_delim = b"\n".to_vec();
-    lf_delim.extend_from_slice(&delim);
 
     let mut pos = find(body, &delim, 0)? + delim.len();
+    let first_newline = pos + body[pos..].iter().position(|b| *b == b'\n')?;
+    let eol: &[u8] = if first_newline > pos && body[first_newline - 1] == b'\r' {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
+    let blank_line = [eol, eol].concat();
+    // The delimiter that closes a part is preceded by a line break.
+    let closing = [eol, delim.as_slice()].concat();
+
     let mut parts = Vec::new();
     loop {
         if body[pos..].starts_with(b"--") {
@@ -270,28 +266,14 @@ fn multipart_parts(
         }
         // Rest of the delimiter line (transport padding), then the headers.
         let headers_start = pos + body[pos..].iter().position(|b| *b == b'\n')? + 1;
-        let (headers_end, content_start) = match (
-            find(body, b"\r\n\r\n", headers_start),
-            find(body, b"\n\n", headers_start),
-        ) {
-            (Some(a), Some(b)) if b < a => (b, b + 2),
-            (Some(a), _) => (a, a + 4),
-            (None, Some(b)) => (b, b + 2),
-            (None, None) => return None,
-        };
+        let headers_end = find(body, &blank_line, headers_start)?;
+        let content_start = headers_end + blank_line.len();
         let headers = &body[headers_start..headers_end];
-        let (content_end, next) = match (
-            find(body, &crlf_delim, content_start.saturating_sub(2)),
-            find(body, &lf_delim, content_start.saturating_sub(1)),
-        ) {
-            (Some(a), Some(b)) if b < a => (b, b + 1),
-            (Some(a), _) => (a, a + 2),
-            (None, Some(b)) => (b, b + 1),
-            (None, None) => return None,
-        };
+        // The line break that ends an empty content is the blank line's own.
+        let content_end = find(body, &closing, content_start - eol.len())?;
         let content = body.get(content_start..content_end).unwrap_or(&[]);
         parts.push(part_shape(headers, content, markers, pair));
-        pos = next + delim.len();
+        pos = content_end + closing.len();
     }
 }
 
@@ -338,15 +320,10 @@ fn part_shape(
 mod tests {
     use super::*;
     use crate::strip::{reduce_authorization, strip_url};
+    use crate::testing::{assert_holds_no_typed_value, pw, user};
     use base64ct::{Base64, Encoding as B64};
     use kharon_recording::{Encoding, MarkerHit, Role};
 
-    fn user(s: &str) -> Marker {
-        Marker::new(Zeroizing::new(s.to_owned()), Role::Username)
-    }
-    fn pw(s: &str) -> Marker {
-        Marker::new(Zeroizing::new(s.to_owned()), Role::Password)
-    }
     fn markers() -> Vec<Marker> {
         vec![user("kh.throwaway7"), pw("Tr0ub4dor-9x")]
     }
@@ -722,48 +699,127 @@ mod tests {
                 let _ = shape(ct, body);
             }
         }
-        let _ = strip_url("https://ex.test/%", &markers());
-        let _ = strip_url("https://ex.test/%zz?%=%&%ff", &markers());
-        let _ = strip_url("data:text/plain,Tr0ub4dor-9x", &markers());
+        let _ = strip_url("https://ex.test/%", &markers(), None);
+        let _ = strip_url("https://ex.test/%zz?%=%&%ff", &markers(), None);
+        let _ = strip_url("data:text/plain,Tr0ub4dor-9x", &markers(), None);
         let _ = reduce_authorization(b"Basic \xff\xfe", &markers(), None);
         let _ = reduce_authorization(b"", &markers(), None);
         let _ = reduce_authorization(b" ", &markers(), None);
     }
 
     #[test]
-    fn serialized_shapes_never_contain_a_marker() {
+    fn a_site_cased_key_and_name_is_not_kept() {
+        let m = [user("Bob.Smith@Ex.Test")];
+        let s = shape_of_body(
+            Some(URLENC),
+            b"bob.smith%40ex.test=1&BOB.SMITH@EX.TEST=2",
+            &m,
+            None,
+        );
+        let BodyShape::Urlencoded { fields } = s else {
+            panic!()
+        };
+        assert!(fields.iter().all(|f| f.key == "{typed}"));
+        let s = shape_of_body(
+            Some("application/json"),
+            br#"{"bob.smith@ex.test":1}"#,
+            &m,
+            None,
+        );
+        let BodyShape::Json {
+            root: JsonShape::Object { fields },
+        } = s
+        else {
+            panic!()
+        };
+        assert_eq!(fields[0].key, "{typed}");
+        let body =
+            b"--b\r\nContent-Disposition: form-data; name=\"BOB.smith@ex.test\"\r\n\r\nx\r\n--b--";
+        let s = shape_of_body(Some("multipart/form-data; boundary=b"), body, &m, None);
+        let BodyShape::Multipart { parts } = s else {
+            panic!()
+        };
+        assert_eq!(parts[0].key, "{typed}");
+    }
+
+    #[test]
+    fn a_name_holding_the_combined_credential_is_not_kept() {
         let b64 = Base64::encode_string(b"kh.throwaway7:Tr0ub4dor-9x");
         let (u, p) = (user("kh.throwaway7"), pw("Tr0ub4dor-9x"));
-        let m = markers();
+        let body = format!("{b64}=1");
+        let s = shape_of_body(Some(URLENC), body.as_bytes(), &[], Some((&u, &p)));
+        let BodyShape::Urlencoded { fields } = s else {
+            panic!()
+        };
+        assert_eq!(fields[0].key, "{typed}");
+    }
+
+    #[test]
+    fn many_crlf_parts_are_read_in_linear_time() {
+        let mut body = Vec::new();
+        for i in 0..5000 {
+            body.extend_from_slice(
+                format!("--b\r\nContent-Disposition: form-data; name=\"f{i}\"\r\n\r\nv\r\n")
+                    .as_bytes(),
+            );
+        }
+        body.extend_from_slice(b"--b--\r\n");
+        let s = shape("multipart/form-data; boundary=b", &body);
+        let BodyShape::Multipart { parts } = s else {
+            panic!("not multipart")
+        };
+        assert_eq!(parts.len(), 5000);
+        // LF-only bodies too.
+        let lf = String::from_utf8_lossy(&body).replace("\r\n", "\n");
+        let s = shape("multipart/form-data; boundary=b", lf.as_bytes());
+        let BodyShape::Multipart { parts } = s else {
+            panic!("not multipart")
+        };
+        assert_eq!(parts.len(), 5000);
+    }
+
+    #[test]
+    fn serialized_shapes_never_contain_a_marker() {
+        let b64 = Base64::encode_string(b"kh.throwaway7:Tr0ub4dor-9x");
+        let values = [
+            "kh.throwaway7",
+            "Tr0ub4dor-9x",
+            "Tr0ub4/dor",
+            "Bob.Smith@Ex.Test",
+        ];
+        let m: Vec<Marker> = vec![
+            user(values[0]),
+            pw(values[1]),
+            pw(values[2]),
+            user(values[3]),
+        ];
+        let (u, p) = (user(values[0]), pw(values[1]));
+        let pair = Some((&u, &p));
         let json_pair = format!(r#"{{"auth":"{b64}","n":1}}"#);
-        let multipart = b"--XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nTr0ub4dor-9x\r\n--XyZ\r\nContent-Disposition: form-data; name=\"kh.throwaway7\"; filename=\"kh.throwaway7\"\r\n\r\nkh.throwaway7\r\n--XyZ--\r\n";
-        let bodies: Vec<BodyShape> = vec![
-            shape(
-                URLENC,
-                b"user=kh.throwaway7&password=Tr0ub4dor-9x&remember=1",
-            ),
-            shape(URLENC, b"password=Tr0ub4dor%2D9x&kh.throwaway7=1"),
-            shape(
+        let multipart = b"--XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nTr0ub4dor-9x\r\n--XyZ\r\nContent-Disposition: form-data; name=\"kh.throwaway7\"; filename=\"kh.throwaway7\"\r\n\r\nkh.throwaway7\r\n--XyZ\r\nContent-Disposition: form-data; name=\"bob.smith@ex.test\"\r\n\r\nTr0ub4/dor\r\n--XyZ--\r\n";
+        let body = |ct: &str, bytes: &[u8]| shape_of_body(Some(ct), bytes, &m, pair);
+        let bodies: Vec<BodyShape> =
+            vec![
+            body(URLENC, b"user=kh.throwaway7&password=Tr0ub4dor-9x&remember=1"),
+            body(URLENC, b"password=Tr0ub4dor%2D9x&kh.throwaway7=1&p=Tr0ub4%2Fdor"),
+            body(URLENC, b"bob.smith%40ex.test=1&BOB.SMITH@EX.TEST=2"),
+            body(URLENC, format!("{b64}=1").as_bytes()),
+            body(
                 "application/json",
                 br#"{"auth":{"id":"kh.throwaway7","secret":"Tr0ub4dor-9x"},"n":3}"#,
             ),
-            shape(
+            body(
                 "application/json",
                 br#"{"query":"x","variables":{"password":"Tr0ub4dor-9x"}}"#,
             ),
-            shape(
+            body(
                 "application/json",
-                br#"{"users":{"kh.throwaway7":{"secret":"Tr0ub4dor-9x"}}}"#,
+                br#"{"users":{"kh.throwaway7":{"secret":"Tr0ub4dor-9x"},"bob.smith@ex.test":1}}"#,
             ),
-            shape("multipart/form-data; boundary=XyZ", multipart),
-            shape("application/octet-stream", b"Tr0ub4dor-9x kh.throwaway7"),
-            shape("application/json", b"{Tr0ub4dor-9x"),
-            shape_of_body(
-                Some("application/json"),
-                json_pair.as_bytes(),
-                &m,
-                Some((&u, &p)),
-            ),
+            body("application/json", json_pair.as_bytes()),
+            body("application/json", b"{Tr0ub4dor-9x"),
+            body("multipart/form-data; boundary=XyZ", multipart),
+            body("application/octet-stream", b"Tr0ub4dor-9x kh.throwaway7"),
         ];
         let mut outputs: Vec<String> = bodies
             .iter()
@@ -771,26 +827,37 @@ mod tests {
             .collect();
         let urls = [
             "https://kh.throwaway7.ex.test/login",
+            "https://Bob.Smith@Ex.Test.ex.test/login",
+            "https://a.kh.throwaway7.ex.kh.throwaway7.test/",
             "https://ex.test/u/kh.throwaway7/dash?kh.throwaway7=1&password=Tr0ub4dor-9x",
+            "https://ex.test/u/kh%2Ethrow%61way7/x?kh%2Ethrowaway7=1",
             "https://ex.test/Tr0ub4dor-9x?x=Tr0ub4dor-9x#Tr0ub4dor-9x",
             "https://kh.throwaway7:Tr0ub4dor-9x@ex.test/",
+            "https://ex.test/a/Tr0ub4/dor/z",
+            "https://ex.test/a/Tr0ub4%2Fdor/z?Tr0ub4%2Fdor=1",
+            "https://ex.test/u/bob.smith@ex.test/x?BOB.SMITH%40EX.TEST=1",
+            "data:text/plain,Tr0ub4dor-9x,kh.throwaway7",
+            "kh.throwaway7://ex.test/",
         ];
         for url in urls {
-            let s = strip_url(url, &m).unwrap();
+            let s = strip_url(url, &m, pair).unwrap();
             outputs.push(serde_json::to_string(&s.value).unwrap());
         }
+        let in_path = format!("https://ex.test/{b64}/x?{b64}=1");
+        outputs
+            .push(serde_json::to_string(&strip_url(&in_path, &[], pair).unwrap().value).unwrap());
         for header in [
             format!("Basic {b64}"),
             "Bearer Tr0ub4dor-9x".to_owned(),
             "Tr0ub4dor-9x".to_owned(),
+            "kh.throwaway7".to_owned(),
             "Basic Tr0ub4dor-9x".to_owned(),
         ] {
-            let a = reduce_authorization(header.as_bytes(), &m, Some((&u, &p)));
+            let a = reduce_authorization(header.as_bytes(), &m, pair);
             outputs.push(serde_json::to_string(&a).unwrap());
         }
         for text in outputs {
-            assert!(!text.contains("Tr0ub4dor-9x"), "{text}");
-            assert!(!text.contains("kh.throwaway7"), "{text}");
+            assert_holds_no_typed_value(&text, &values);
         }
     }
 }

@@ -223,6 +223,26 @@ fn harden_process() -> Result<(), String> {
     Ok(())
 }
 
+/// One line from the person, with the reader handed back so the caller can ask again.
+async fn read_answer<R: AsyncBufRead + Unpin>(mut stdin: R) -> (String, std::io::Result<usize>, R) {
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line).await;
+    (line, read, stdin)
+}
+
+/// The answer a line at the end prompt gives: an empty line confirms, `q` or `quit` (any case)
+/// discards, anything else is no answer and the prompt is repeated.
+fn end_choice(line: &str) -> Option<End> {
+    let answer = line.trim();
+    if answer.is_empty() {
+        Some(End::Confirmed)
+    } else if answer.eq_ignore_ascii_case("q") || answer.eq_ignore_ascii_case("quit") {
+        Some(End::Discard)
+    } else {
+        None
+    }
+}
+
 enum Ended {
     Finished(Result<Outcome, session::SessionError>),
     Interrupted,
@@ -289,11 +309,9 @@ pub async fn run_with(
     ));
     let mut forward = hooks.ready;
     let (mut got_ready, mut stdin_done) = (false, false);
-    let stdin_line = async {
-        let mut line = String::new();
-        let read = stdin.read_line(&mut line).await;
-        (line, read)
-    };
+    // The reader goes into the future and comes back with the line, so another line can be
+    // asked for without a second read ever being dropped half way (a read is not cancel safe).
+    let stdin_line = read_answer(stdin);
     tokio::pin!(stdin_line);
     let ended = loop {
         tokio::select! {
@@ -319,18 +337,24 @@ pub async fn run_with(
                     }
                 }
             }
-            (line, read) = &mut stdin_line, if got_ready && !stdin_done => {
-                stdin_done = true;
+            (line, read, back) = &mut stdin_line, if got_ready && !stdin_done => {
                 // End of input is neither answer: keep recording until the window closes.
                 if matches!(read, Ok(n) if n > 0) {
-                    let how = if line.trim().eq_ignore_ascii_case("q") {
-                        End::Discard
-                    } else {
-                        End::Confirmed
-                    };
-                    if let Some(tx) = end_tx.take() {
-                        let _ = tx.send(how);
+                    match end_choice(&line) {
+                        Some(how) => {
+                            stdin_done = true;
+                            if let Some(tx) = end_tx.take() {
+                                let _ = tx.send(how);
+                            }
+                        }
+                        None => {
+                            let _ = writeln!(stdout, "{}", notice::END_RETRY);
+                            let _ = stdout.flush();
+                            stdin_line.set(read_answer(back));
+                        }
                     }
+                } else {
+                    stdin_done = true;
                 }
             }
             _ = sigint.recv() => break Ended::Interrupted,
@@ -387,10 +411,7 @@ pub async fn run_with(
             Exit::Done
         }
         Ok(Outcome::NeverStarted) => {
-            let _ = writeln!(
-                stdout,
-                "The window was closed before the login page opened. Nothing was saved."
-            );
+            let _ = writeln!(stdout, "{}", notice::NEVER_STARTED);
             Exit::Done
         }
         Err(e) => fail(&mut stderr, &e, Exit::Failed),
@@ -544,6 +565,29 @@ mod tests {
         assert_eq!(r.exit, Exit::Done, "{}", r.err);
         assert!(r.out.contains("Site: https://ex.test/login"));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_end_prompt_reads_enter_q_and_quit_and_asks_again_otherwise() {
+        assert!(matches!(end_choice("\n"), Some(End::Confirmed)));
+        assert!(matches!(end_choice("  \r\n"), Some(End::Confirmed)));
+        for discard in ["q\n", "Q", " quit ", "QUIT\n", "Quit"] {
+            assert!(
+                matches!(end_choice(discard), Some(End::Discard)),
+                "{discard:?}"
+            );
+        }
+        for again in ["no\n", "n", "discard", "qq", "y", "quit now", "exit"] {
+            assert!(end_choice(again).is_none(), "{again:?}");
+        }
+    }
+
+    #[test]
+    fn the_never_started_message_says_what_happened() {
+        assert_eq!(
+            notice::NEVER_STARTED,
+            "Recording never started: the login page was not opened in the first tab. Nothing was saved."
+        );
     }
 
     #[test]

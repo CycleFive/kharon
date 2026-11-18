@@ -122,6 +122,17 @@ const POPUP: &str = "<!doctype html><title>popup</title>\
 const FRAME_OUTER: &str = "<!doctype html><title>outer</title>\
 <iframe id=fr width=600 height=300 src=\"http://{HOST}/form\"></iframe>";
 
+/// Puts the typed values into text the recording keeps: a JSON key, and the next URL's path and
+/// query key.
+const TYPED_IN_TEXT: &str = "<!doctype html><title>typed</title><input name=user><input name=pass type=password>\
+<button type=button id=go>Sign in</button><script>\
+document.getElementById('go').addEventListener('click', async () => {\
+ const user = document.querySelector('[name=user]').value;\
+ const pass = document.querySelector('[name=pass]').value;\
+ await fetch('/api/typed', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({[user]: pass})});\
+ location = '/u/' + encodeURIComponent(user) + '?' + encodeURIComponent(user) + '=1';\
+});</script>";
+
 const HOME: &str = "<!doctype html><title>home</title><p>signed in</p>";
 
 fn response(status: &str, extra: &str, body: &str, ctype: &str) -> String {
@@ -158,6 +169,9 @@ fn route(method: &str, path: &str, host: &str) -> String {
             response("200 OK", "", &FRAME_OUTER.replace("{HOST}", &other), html)
         }
         ("GET", "/hashed") => response("200 OK", "", HASHED, html),
+        ("GET", "/typed") => response("200 OK", "", TYPED_IN_TEXT, html),
+        ("POST", "/api/typed") => response("200 OK", "", "{\"ok\":true}", "application/json"),
+        ("GET", p) if p.starts_with("/u/") => response("200 OK", "", HOME, html),
         ("GET", "/home") => response("200 OK", "", HOME, html),
         _ => response("404 Not Found", "", "not found", "text/plain"),
     }
@@ -961,8 +975,36 @@ pub fn rust_files(dir: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
-/// Shipped code only: for each file under `crates/kharon-teach/src`, the text before its first
-/// `#[cfg(test)]`.
+/// The shipped part of a source file: the text before its test MODULE (`#[cfg(test)]` followed
+/// by `mod tests`, with any visibility). A `#[cfg(test)]` item anywhere before it would hide
+/// shipped code from every scan, so that is an error.
+pub fn split_shipped(text: &str) -> Result<&str, String> {
+    let mut from = 0;
+    while let Some(at) = text[from..].find("#[cfg(test)]") {
+        let at = from + at;
+        let after = text[at + "#[cfg(test)]".len()..].trim_start();
+        let is_module = ["mod tests", "pub mod tests", "pub(crate) mod tests"]
+            .iter()
+            .any(|m| after.starts_with(m));
+        if is_module {
+            return if text[..at].contains("#[cfg(test)]") {
+                Err("a #[cfg(test)] item sits above the test module".to_owned())
+            } else {
+                Ok(&text[..at])
+            };
+        }
+        from = at + 1;
+    }
+    // No test module: the whole file is shipped, so it must have no test-only item either.
+    if text.contains("#[cfg(test)]") {
+        Err("a #[cfg(test)] item with no test module after it".to_owned())
+    } else {
+        Ok(text)
+    }
+}
+
+/// Shipped code only: for each file under `crates/kharon-teach/src`, the text before its test
+/// module (see [`split_shipped`]). Panics when a `#[cfg(test)]` item sits above that module.
 pub fn shipped_sources() -> Vec<(PathBuf, String)> {
     let files = rust_files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     assert!(!files.is_empty());
@@ -970,7 +1012,10 @@ pub fn shipped_sources() -> Vec<(PathBuf, String)> {
         .into_iter()
         .map(|p| {
             let text = std::fs::read_to_string(&p).unwrap();
-            let shipped = text.split("#[cfg(test)]").next().unwrap().to_owned();
+            let shipped = match split_shipped(&text) {
+                Ok(s) => s.to_owned(),
+                Err(why) => panic!("{}: {why}", p.display()),
+            };
             (p, shipped)
         })
         .collect()

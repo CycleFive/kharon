@@ -24,6 +24,57 @@ async fn no_typed_value_in_the_recording_for_any_fixture() {
     }
 }
 
+/// The typed values are in text the recording KEEPS: the next page's path and query key, and the
+/// key of the JSON body. They must be stripped there, not merely absent from the values. This
+/// fails if `strip_url` or the name check returned its input unchanged.
+#[tokio::test]
+async fn typed_values_in_a_url_and_a_json_key_are_stripped_from_kept_text() {
+    use kharon_recording::{BodyShape, JsonShape, Role, Step};
+    let Some(run) = Run::start("typed_in_text", "/typed").await else {
+        return;
+    };
+    run.begin("/typed").await;
+    run.person.type_into("input[name=user]", USER).await;
+    run.person.type_into("input[name=pass]", PASS).await;
+    run.person.click("#go").await;
+    run.person.wait_for_path(&format!("/u/{USER}")).await;
+    let Outcome::Recorded(r) = run.finish(End::Confirmed).await else {
+        panic!("expected a recording");
+    };
+    assert_holds_no_typed_value(&r.to_json(), &[USER, PASS]);
+
+    // The navigation to /u/<user>?<user>=1 is in the file, with both typed places replaced.
+    let moved = |url: &kharon_recording::StrippedUrl| {
+        url.path == "/u/{id}" && url.query_keys == ["{typed}"]
+    };
+    assert!(
+        r.steps
+            .iter()
+            .any(|s| matches!(s, Step::Navigation { url, .. } if moved(url))),
+        "no navigation step with the typed path replaced"
+    );
+    assert!(r.requests.iter().any(|q| moved(&q.url)));
+    assert!(r.final_url.as_ref().is_some_and(moved));
+
+    // The login posts JSON keyed by the user name: the key is {typed} and its hit is not lost.
+    let login = r
+        .requests
+        .iter()
+        .find(|q| q.url.path == "/api/typed")
+        .expect("the login request is stored");
+    let BodyShape::Json {
+        root: JsonShape::Object { fields },
+    } = &login.body
+    else {
+        panic!("the body is not a JSON object");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].key, "{typed}");
+    let hits = login.hits();
+    assert!(hits.iter().any(|h| h.role == Role::Password));
+    assert!(hits.iter().any(|h| h.role == Role::Username));
+}
+
 #[tokio::test]
 async fn nothing_typed_reaches_the_file_or_the_output() {
     let Some(p) = support::run_program("whole_program_no_typed_value", "/form").await else {

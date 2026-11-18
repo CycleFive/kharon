@@ -2,7 +2,18 @@ use clap::Parser;
 use kharon_teach::cli::Cli;
 use std::process::ExitCode;
 
+/// The one line a panic prints: where it happened and nothing from its message. The message of
+/// a panic can hold a slice of whatever text the program was handling.
+fn panic_line(file: &str, line: u32) -> String {
+    format!("kharon-teach: internal error at {file}:{line}")
+}
+
 fn main() -> ExitCode {
+    // First of all, so that no panic ever reaches the default hook, which prints its payload.
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(l) => eprintln!("{}", panic_line(l.file(), l.line())),
+        None => eprintln!("kharon-teach: internal error"),
+    }));
     let cli = Cli::parse();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -31,4 +42,17 @@ fn main() -> ExitCode {
     }
     runtime.shutdown_background();
     exit.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panic_line;
+
+    #[test]
+    fn the_panic_line_names_the_place_and_nothing_else() {
+        assert_eq!(
+            panic_line("src/strip.rs", 134),
+            "kharon-teach: internal error at src/strip.rs:134"
+        );
+    }
 }

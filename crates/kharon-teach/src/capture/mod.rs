@@ -163,14 +163,6 @@ impl Capture {
         }
     }
 
-    #[cfg(test)]
-    fn with_body_budget(start_url: &str, tool_version: &str, budget: usize) -> Self {
-        Self {
-            body_budget: budget,
-            ..Self::new(start_url, tool_version)
-        }
-    }
-
     pub fn started(&self) -> bool {
         self.started
     }
@@ -1655,6 +1647,14 @@ mod tests {
     }
 
     impl Capture {
+        /// A capture with a small body budget, for the test of that budget.
+        fn with_body_budget(start_url: &str, tool_version: &str, budget: usize) -> Self {
+            Self {
+                body_budget: budget,
+                ..Self::new(start_url, tool_version)
+            }
+        }
+
         /// A capture with small step and request limits, for the tests of those limits.
         fn with_limits(start_url: &str, max_steps: usize, max_requests: usize) -> Self {
             Self {

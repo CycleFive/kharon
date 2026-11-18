@@ -12,6 +12,14 @@ nothing is sent anywhere. The result is one file on this computer.\n";
 pub const CONSENT_PROMPT: &str = "Type yes to open the browser window and start: ";
 /// Printed once the browser window is showing the notice.
 pub const END_PROMPT: &str = "Press Enter once you are logged in. Type q to discard.";
+/// Printed when a line at the end prompt is neither Enter, `q` nor `quit`.
+pub const END_RETRY: &str = "Press Enter to save, or type q to discard.";
+/// Printed when the session ended before the recording ever started: the login page was not
+/// opened in the first tab (the window was closed, or the link was opened in another tab).
+pub const NEVER_STARTED: &str =
+    "Recording never started: the login page was not opened in the first tab. Nothing was saved.";
+/// Under the link on the notice page.
+pub const OPEN_IN_THIS_TAB: &str = "Open the link in this tab.";
 /// Printed when consent was not given.
 pub const NOTHING_RECORDED: &str = "Nothing was recorded.";
 
@@ -41,8 +49,9 @@ pub fn notice_page_html(login_url: &url::Url) -> String {
     let host = login_url.host_str().unwrap_or("the login page");
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>kharon-teach</title></head>\
-<body><pre>{notice}</pre><p><a href=\"{href}\">Start recording and open {host}</a></p></body></html>",
+<body><pre>{notice}</pre><p><a href=\"{href}\">Start recording and open {host}</a><br>{tab}</p></body></html>",
         notice = escape_html(NOTICE),
+        tab = escape_html(OPEN_IN_THIS_TAB),
         href = escape_html(login_url.as_str()),
         host = escape_html(host),
     )
@@ -71,6 +80,8 @@ mod tests {
         assert_eq!(html.matches("<a ").count(), 1);
         assert!(html.contains(r#"href="https://login.example.test/sign-in?next=a""#));
         assert!(!html.contains("<script"));
+        // A link opened in another tab starts nothing, so the page says to open it in this one.
+        assert!(html.contains("</a><br>Open the link in this tab.</p>"));
     }
 
     #[test]

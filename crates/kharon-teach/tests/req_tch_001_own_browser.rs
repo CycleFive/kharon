@@ -86,24 +86,9 @@ async fn launches_on_its_own_profile_and_binds_loopback_only() {
 
 #[test]
 fn the_library_has_no_way_to_attach_elsewhere() {
-    fn shipped_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap() {
-            let p = e.unwrap().path();
-            if p.is_dir() {
-                shipped_files(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
-            }
-        }
-    }
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    shipped_files(&src, &mut files);
-    assert!(!files.is_empty());
     let mut launch_src = None;
-    for f in files {
-        let text = std::fs::read_to_string(&f).unwrap();
-        let shipped = text.split("#[cfg(test)]").next().unwrap();
+    for (f, shipped) in support::shipped_sources() {
+        let shipped = shipped.as_str();
         for line in shipped.lines() {
             for lit in ["ws://", "http://"] {
                 assert!(

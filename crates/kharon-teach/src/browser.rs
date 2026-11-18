@@ -10,6 +10,10 @@ use std::time::Duration;
 pub enum BrowserError {
     #[error("no Chromium-family browser found; pass --browser <path>")]
     NotFound,
+    #[error(
+        "the only browser found is a snap package, which cannot use the recorder's profile folder; install Google Chrome or pass --browser <path>"
+    )]
+    SnapOnly,
     #[error("browser not found at {0}")]
     BadPath(PathBuf),
     #[error("the browser did not start: {0}")]
@@ -39,6 +43,16 @@ pub fn find_browser(explicit: Option<&Path>) -> Result<PathBuf, BrowserError> {
 }
 
 pub fn find_browser_in(explicit: Option<&Path>, path_var: &OsStr) -> Result<PathBuf, BrowserError> {
+    find_browser_with(explicit, path_var, &is_snap_browser)
+}
+
+/// [`find_browser_in`] with the snap test given, so a test can stand in for the file system.
+/// An explicit path is used as given, snap or not: the person chose it.
+pub(crate) fn find_browser_with(
+    explicit: Option<&Path>,
+    path_var: &OsStr,
+    is_snap: &dyn Fn(&Path) -> bool,
+) -> Result<PathBuf, BrowserError> {
     if let Some(p) = explicit {
         return if p.is_file() {
             Ok(p.to_owned())
@@ -46,15 +60,44 @@ pub fn find_browser_in(explicit: Option<&Path>, path_var: &OsStr) -> Result<Path
             Err(BrowserError::BadPath(p.to_owned()))
         };
     }
+    let mut saw_snap = false;
     for name in SEARCH_ORDER {
         for dir in std::env::split_paths(path_var) {
             let cand = dir.join(name);
-            if is_executable_file(&cand) {
-                return Ok(cand);
+            if !is_executable_file(&cand) {
+                continue;
             }
+            // A snap browser gets a private /tmp, so it never sees the recorder's profile.
+            if is_snap(&cand) {
+                saw_snap = true;
+                continue;
+            }
+            return Ok(cand);
         }
     }
-    Err(BrowserError::NotFound)
+    Err(if saw_snap {
+        BrowserError::SnapOnly
+    } else {
+        BrowserError::NotFound
+    })
+}
+
+/// Whether a path is inside a snap package: under `/snap`, or the `snap` launcher that a
+/// `/snap/bin/<name>` link resolves to.
+pub(crate) fn is_snap_path(path: &Path) -> bool {
+    path.starts_with("/snap") || path.file_name().is_some_and(|n| n == "snap")
+}
+
+/// Whether the candidate browser is a snap: its path or its canonical path is a snap path, or it
+/// is a short wrapper script that starts one (Ubuntu's `chromium-browser`).
+fn is_snap_browser(cand: &Path) -> bool {
+    use std::io::Read;
+    if is_snap_path(cand) || std::fs::canonicalize(cand).is_ok_and(|c| is_snap_path(&c)) {
+        return true;
+    }
+    let mut head = Vec::new();
+    let read = std::fs::File::open(cand).and_then(|f| f.take(4096).read_to_end(&mut head));
+    read.is_ok() && head.starts_with(b"#!") && head.windows(6).any(|w| w == b"/snap/")
 }
 
 fn is_executable_file(p: &Path) -> bool {
@@ -819,6 +862,95 @@ mod tests {
         }
         let found = find_browser_in(None, dir.as_os_str()).unwrap();
         assert_eq!(found, dir.join("chromium"));
+    }
+
+    #[test]
+    fn snap_paths_are_recognised() {
+        for snap in [
+            "/snap/bin/chromium",
+            "/snap/chromium/current/usr/lib/chromium-browser/chrome",
+            // What `/snap/bin/chromium` resolves to once canonicalised.
+            "/usr/bin/snap",
+        ] {
+            assert!(is_snap_path(Path::new(snap)), "{snap}");
+        }
+        for other in [
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/opt/google/chrome/chrome",
+            "/home/me/snapshots/chrome",
+            "/usr/bin/snapd",
+        ] {
+            assert!(!is_snap_path(Path::new(other)), "{other}");
+        }
+    }
+
+    fn executable(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        f
+    }
+
+    #[test]
+    fn a_snap_candidate_is_skipped_for_the_next_one_in_order() {
+        let sb = Sandbox::new("snaporder");
+        let a = sb.mkdir("a");
+        let b = sb.mkdir("b");
+        executable(&a, "chromium", "#!/bin/sh\n");
+        let chrome = executable(&b, "google-chrome", "#!/bin/sh\n");
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        // The stub calls only the first candidate a snap.
+        let is_snap = |p: &Path| p == a.join("chromium");
+        assert_eq!(find_browser_with(None, &path, &is_snap).unwrap(), chrome);
+        // With nothing to fall back on, the error says why.
+        let only_a = std::env::join_paths([&a]).unwrap();
+        assert!(matches!(
+            find_browser_with(None, &only_a, &is_snap),
+            Err(BrowserError::SnapOnly)
+        ));
+        // No candidate at all is still NotFound.
+        let empty = std::env::join_paths([sb.mkdir("empty")]).unwrap();
+        assert!(matches!(
+            find_browser_with(None, &empty, &is_snap),
+            Err(BrowserError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn an_explicit_snap_browser_is_used_as_given() {
+        let sb = Sandbox::new("snapexplicit");
+        let f = executable(sb.path(), "chromium", "#!/bin/sh\n");
+        let always = |_: &Path| true;
+        assert_eq!(
+            find_browser_with(Some(&f), OsStr::new(""), &always).unwrap(),
+            f
+        );
+    }
+
+    #[test]
+    fn the_snap_only_message_says_what_to_do() {
+        assert_eq!(
+            BrowserError::SnapOnly.to_string(),
+            "the only browser found is a snap package, which cannot use the recorder's profile folder; install Google Chrome or pass --browser <path>"
+        );
+    }
+
+    #[test]
+    fn a_wrapper_script_that_starts_a_snap_is_a_snap_and_a_plain_script_is_not() {
+        let sb = Sandbox::new("snapwrap");
+        let wrapper = executable(
+            sb.path(),
+            "chromium-browser",
+            "#!/bin/sh\nexec /snap/bin/chromium \"$@\"\n",
+        );
+        let plain = executable(
+            sb.path(),
+            "chromium",
+            "#!/bin/sh\nexec /opt/chrome \"$@\"\n",
+        );
+        assert!(is_snap_browser(&wrapper));
+        assert!(!is_snap_browser(&plain));
     }
 
     #[test]

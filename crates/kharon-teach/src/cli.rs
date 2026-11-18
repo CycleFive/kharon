@@ -181,8 +181,26 @@ pub fn check_out_path(p: &Path) -> Result<(), Refusal> {
     check_dir_writable(p.parent().unwrap_or(Path::new("")))
 }
 
+/// `text` from a recording file with every character a terminal could act on replaced by
+/// U+FFFD: control characters (escape sequences start with one), the line and paragraph
+/// separators, and the bidirectional controls that can make text read differently from how it
+/// is stored. A recording sent by someone else must not be able to drive the terminal.
+fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn site(u: &StrippedUrl) -> String {
-    format!("{}{}", u.origin, u.path)
+    plain(&format!("{}{}", u.origin, u.path))
 }
 
 /// What a recording says, in plain words, one fact per line. It is built from the recording
@@ -213,7 +231,8 @@ pub fn summary(r: &Recording) -> String {
             ),
             Shape::Transformed { digest } => match digest {
                 Some(d) => format!(
-                    "The page changes the password ({d} digest) before it sends it, so kharon cannot send it as typed."
+                    "The page changes the password ({} digest) before it sends it, so kharon cannot send it as typed.",
+                    plain(d)
                 ),
                 None => "The page changes the password before it sends it, so kharon cannot send it as typed.".to_owned(),
             },
@@ -260,7 +279,7 @@ pub fn summary(r: &Recording) -> String {
         }
     }
     for n in &r.classification.notes {
-        out.push(format!("Note: {n}"));
+        out.push(format!("Note: {}", plain(n)));
     }
     if r.listener_world == ListenerWorld::Main {
         out.push(
@@ -474,6 +493,31 @@ pub(crate) mod tests {
         capped.stripped.steps_dropped = 7;
         assert!(summary(&capped).contains("Not recorded: 7 step(s) past the recorder's limit."));
         assert!(quiet.contains("does not look like a candidate"));
+    }
+
+    #[test]
+    fn show_never_prints_a_control_character_from_the_file() {
+        let mut r = recording();
+        r.start_url.path = "/login\u{1b}[31mred".into();
+        r.start_url.origin = "https://ex.test\u{7}".into();
+        r.classification.notes =
+            vec!["a note \u{1b}[2J with escapes \u{202E}and bidi\u{2028}".into()];
+        r.classification.shape = Shape::Transformed {
+            digest: Some("sha\u{1b}[0m".into()),
+        };
+        let s = summary(&r);
+        for c in s.chars().filter(|c| *c != '\n') {
+            assert!(!c.is_control(), "a control character {:?} was printed", c);
+        }
+        for bad in ['\u{202E}', '\u{2028}', '\u{2029}', '\u{2066}', '\u{2069}'] {
+            assert!(!s.contains(bad), "{bad:?}");
+        }
+        assert!(s.contains("/login\u{FFFD}[31mred"));
+        assert!(s.contains("Note: a note \u{FFFD}[2J with escapes \u{FFFD}and bidi\u{FFFD}"));
+        // Ordinary text, including non-ASCII, passes through.
+        let mut r = recording();
+        r.classification.notes = vec!["héllo wörld".into()];
+        assert!(summary(&r).contains("Note: héllo wörld"));
     }
 
     #[test]

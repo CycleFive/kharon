@@ -280,6 +280,34 @@ async fn a_directory_the_program_did_not_make_survives_the_sweep() {
 }
 
 #[test]
+fn the_source_scan_covers_all_shipped_code() {
+    // A test-only item above the test module would hide shipped code from every scan.
+    assert!(support::split_shipped("fn a() {}\n#[cfg(test)]\nmod tests {}\n").is_ok());
+    assert!(support::split_shipped("fn a() {}\n#[cfg(test)]\npub(crate) mod tests {}\n").is_ok());
+    assert!(
+        support::split_shipped(
+            "#[cfg(test)]\nfn helper() {}\nfn b() {}\n#[cfg(test)]\nmod tests {}\n"
+        )
+        .is_err()
+    );
+    assert!(support::split_shipped("fn a() {}\n#[cfg(test)]\nfn helper() {}\n").is_err());
+    assert_eq!(
+        support::split_shipped("fn a() {}\n#[cfg(test)]\nmod tests {}\n").unwrap(),
+        "fn a() {}\n"
+    );
+    // The real sources: capture's `finish` and `request` are scanned, and no file has a
+    // test-only item outside its test module (`shipped_sources` panics when one does).
+    let sources = support::shipped_sources();
+    let capture = sources
+        .iter()
+        .find(|(p, _)| p.ends_with("capture/mod.rs"))
+        .expect("capture/mod.rs");
+    assert!(capture.1.contains("pub fn finish("));
+    assert!(capture.1.contains("fn request("));
+    assert!(!capture.1.contains("with_body_budget"));
+}
+
+#[test]
 fn the_shipped_main_never_asks_for_headless() {
     let sources = support::shipped_sources();
     let mut env_reads = Vec::new();
@@ -491,8 +519,9 @@ async fn a_browser_that_quits_by_itself_ends_the_session_and_the_profile_stays_g
 /// The shipped binary, past `Ready`, in a browser without a display.
 struct Live {
     child: std::process::Child,
-    /// Held open and never written to: end of input must not end the recording.
-    _stdin: std::process::ChildStdin,
+    /// Held open and, unless a test writes an answer, never written to: end of input must not
+    /// end the recording.
+    stdin: std::process::ChildStdin,
     stdout: std::sync::Arc<std::sync::Mutex<String>>,
     dir: PathBuf,
     out: PathBuf,
@@ -555,7 +584,7 @@ impl Live {
         let live = Live {
             profile: PathBuf::new(),
             child,
-            _stdin: stdin,
+            stdin,
             stdout,
             dir,
             out,
@@ -645,6 +674,47 @@ async fn sighup_after_the_prompt_exits_1_and_leaves_no_browser() {
 #[tokio::test]
 async fn sigquit_after_the_prompt_exits_1_and_leaves_no_browser() {
     signal_after_the_prompt("QUIT", "sigquit_after_prompt").await;
+}
+
+#[tokio::test]
+async fn a_line_that_is_not_an_answer_asks_again_and_quit_discards() {
+    use std::io::Write;
+    let Some(mut live) = Live::start("end_prompt_retry").await else {
+        return;
+    };
+    for not_an_answer in ["no\n", "discard\n"] {
+        let before = live
+            .printed()
+            .matches("Press Enter to save, or type q to discard.")
+            .count();
+        live.stdin.write_all(not_an_answer.as_bytes()).unwrap();
+        live.stdin.flush().unwrap();
+        let limit = std::time::Instant::now() + Duration::from_secs(10);
+        while live
+            .printed()
+            .matches("Press Enter to save, or type q to discard.")
+            .count()
+            == before
+        {
+            assert!(
+                std::time::Instant::now() < limit,
+                "no new prompt after {not_an_answer:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Still recording: nothing was confirmed or discarded.
+        assert_eq!(
+            live.exit_within(1).await,
+            None,
+            "{not_an_answer:?} ended it"
+        );
+    }
+    live.stdin.write_all(b"QUIT\n").unwrap();
+    live.stdin.flush().unwrap();
+    assert_eq!(live.exit_within(10).await, Some(Some(0)));
+    assert!(live.printed().contains("Discarded. Nothing was saved."));
+    assert!(!live.out.exists(), "a file was written");
+    assert!(gone(&live.profile).await, "the profile is still there");
 }
 
 #[tokio::test]

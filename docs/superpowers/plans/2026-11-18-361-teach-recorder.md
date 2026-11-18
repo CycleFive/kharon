@@ -27,6 +27,8 @@
 - The binary listens on no socket and opens no connection except loopback CDP to the browser it launched.
 - Real-browser tests follow the existing convention: find the binary with the same path list as `chromium_bin` in `crates/kharond/tests/req_arch_003_org_chromium.rs`, honor `KHARON_CHROMIUM`, skip when none is found unless `KHARON_REQUIRE_CHROMIUM` is set, in which case panic.
 - Test files that prove a SPEC row are named for it: `req_tch_00N_<what>.rs`.
+- A source scan in a test covers shipped code only: for each file under `crates/kharon-teach/src`, the text before its first `#[cfg(test)]`. Unit-test modules sit at the bottom of their file, so a test server or a test URL there does not trip a scan.
+- `cargo-deny` is not installed on the dev machine. Where a task says to run `cargo deny check`, CI runs it on the PR.
 - Linux only is built and tested. Platform-specific code sits behind `cfg`.
 
 ## Review Focus
@@ -360,15 +362,17 @@ pub struct Stripped<T> { pub value: T, pub query_values_removed: u64, pub path_s
 pub fn strip_url(url: &str, markers: &[Marker]) -> Option<Stripped<StrippedUrl>>; // None when `url` does not parse
 /// scheme = first token, lowercased. For `basic`, the credentials are base64-decoded and the decoded bytes
 /// are searched; a marker found there is reported with `Encoding::Base64`. Other schemes are searched as sent.
-pub fn reduce_authorization(header_value: &[u8], markers: &[Marker]) -> AuthShape;
+/// When `pair` is given the value is also searched with `search_pair`. No (role, encoding) is listed twice.
+pub fn reduce_authorization(header_value: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> AuthShape;
 // body.rs
 pub const MAX_BODY_BYTES: usize = 1 << 20;
 /// `content_type` picks the reader: application/x-www-form-urlencoded, application/json (and any +json),
 /// multipart/form-data; anything else, or a body that fails to parse as its declared type, is Opaque.
-pub fn shape_of_body(content_type: Option<&str>, body: &[u8], markers: &[Marker]) -> BodyShape;
+/// `pair` is (username, password) once both are known; see below.
+pub fn shape_of_body(content_type: Option<&str>, body: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> BodyShape;
 ```
 
-A multipart part with a `filename` is `ValueKind::File` with its length and no marker search. Every other value is searched with every marker. `shape_of_body` never returns `None` or `Unavailable`; the caller (Task 5) chooses those.
+A multipart part with a `filename` is `ValueKind::File` with its length and no marker search. Every other value is searched with every marker and, when `pair` is given, with `search_pair`, so a combined credential is recorded on the value that holds it (an `Opaque` body holds it at whole-body level). A place never lists the same role and encoding twice. `shape_of_body` never returns `None` or `Unavailable`; the caller (Task 5) chooses those.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -397,10 +401,12 @@ A multipart part with a `filename` is `ValueKind::File` with its length and no m
 #[test] fn multipart_text_and_file() { /* a text part "password" with a hit, a file part kind File with no hits */ }
 #[test] fn unknown_type_is_opaque_with_whole_body_hit() { /* content type application/octet-stream holding the password bytes -> Opaque { len, markers: [AsTyped] } */ }
 #[test] fn bad_json_falls_back_to_opaque() {}
+#[test] fn a_combined_credential_lands_on_the_value_that_holds_it() { /* {"auth":"<base64("kh.throwaway7:Tr0ub4dor-9x")>","n":1} with pair -> the auth value has [Username Base64, Password Base64]; without pair -> no hits */ }
+#[test] fn basic_auth_with_the_pair_lists_each_hit_once() { /* reduce_authorization on a Basic header with pair given -> still exactly [Username Base64, Password Base64] */ }
 #[test] fn serialized_shapes_never_contain_a_marker() { /* for each case above: serde_json::to_string(&shape) contains neither "Tr0ub4dor-9x" nor "kh.throwaway7" */ }
 ```
 
-- [ ] **Step 2: Run** `cargo test -p kharon-teach strip body`. Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p kharon-teach -- strip body` (cargo takes one filter before `--`; several go after it). Expected: FAIL.
 - [ ] **Step 3: Implement.** Add `url = "2"`, `serde_json`. The JSON body is the one place a site payload is read as `serde_json::Value`; say so in a comment. Urlencoded keys and JSON keys are kept as they are; values never are.
 - [ ] **Step 4: Run** tests, clippy, fmt. Expected: pass.
 - [ ] **Step 5: Commit** `feat(teach): strip URLs and reduce request bodies to shapes (#361)`
@@ -455,7 +461,7 @@ impl Capture {
 
 Decisions `finish` implements, beyond the spec's text:
 
-- Once the username is resolved, every buffered request's URL, `Authorization` header and body are also searched with `search_pair`; its hits are added to that request's hits (at whole-body level for a body).
+- Username candidates are tried against the raw buffered bytes first. Once the username is resolved, every buffered request is reduced with the pair: `search_pair` over the URL bytes goes into `url_markers`, and `reduce_authorization` and `shape_of_body` are called with `pair = Some((username, password))`, so a combined credential is recorded where it sits.
 - Elements are keyed by `(document_id, element_id)`. One `Marker` per element holds its latest value. An element is a password element if any of its reports had `is_password_now`.
 - Password markers: the latest values of password elements, with equal values merged. More than one distinct value sets `multiple_passwords`.
 - Username: among non-password elements with a non-empty value, prefer one in the same form as a password element; else one whose value is found in a request that also carries the password; else one whose value is found in any request; else the last one typed in before the first password input. Other typed values are dropped.
@@ -492,8 +498,8 @@ Decisions `finish` implements, beyond the spec's text:
 #[test] fn registrable_domains() { /* login.ex.co.uk -> ex.co.uk; 127.0.0.1 and localhost unchanged */ }
 ```
 
-- [ ] **Step 2: Run** `cargo test -p kharon-teach capture site`. Expected: FAIL.
-- [ ] **Step 3: Implement.** Load the public suffix list the way `crates/kharond/src/origin.rs` does. Requests are buffered with their bodies in `Zeroizing` buffers and analyzed in `finish`, after the markers are known.
+- [ ] **Step 2: Run** `cargo test -p kharon-teach -- capture site`. Expected: FAIL.
+- [ ] **Step 3: Implement.** Load the public suffix list the way `crates/kharond/src/origin.rs` does: `include_bytes!` of the same vendored snapshot, `crates/kharond/data/public_suffix_list.dat`, by relative path. That is one data file shared, not a crate dependency; do not copy it. Requests are buffered with their bodies in `Zeroizing` buffers and analyzed in `finish`, after the markers are known.
 - [ ] **Step 4: Run** tests, clippy, fmt. Expected: pass.
 - [ ] **Step 5: Commit** `feat(teach): capture state machine from events to a stripped recording (#361)`
 
@@ -611,7 +617,7 @@ impl Cdp {
 #[test] fn headers_are_read_case_insensitively()
 ```
 
-- [ ] **Step 2: Run** `cargo test -p kharon-teach cdp events`. Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p kharon-teach -- cdp events`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Add `tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }`, `futures-util`. One reader task routes replies by `id` to `oneshot` senders and everything else to the event channel. Outgoing frames are typed structs, never `json!`.
 - [ ] **Step 4: Run** tests, clippy, fmt. Expected: pass.
 - [ ] **Step 5: Commit** `feat(teach): a CDP client that subscribes to events (#361)`
@@ -646,6 +652,8 @@ pub struct Ready { pub devtools_port: u16, pub profile_dir: std::path::PathBuf, 
 pub enum SessionError { #[error(transparent)] Browser(#[from] BrowserError), #[error(transparent)] Cdp(#[from] CdpError),
     #[error(transparent)] Io(#[from] std::io::Error) }
 pub enum Outcome { Recorded(Box<Recording>), Discarded, NeverStarted }
+/// RFC 3339 UTC, with the `time` crate as `crates/kharond/src/audit/log.rs` does. Fills `EndInfo`; Task 9 reuses it.
+pub fn utc_rfc3339(t: std::time::SystemTime) -> String;
 /// Sweeps stale profiles, launches, records until `end` fires or the window closes, cleans up.
 /// `ready` fires once the browser is up. Dropping the future (Ctrl-C) still removes the profile.
 pub async fn record(opts: RecordOptions<'_>, ready: tokio::sync::oneshot::Sender<Ready>,
@@ -778,8 +786,8 @@ Exit codes: `0` a file was written, or the recording was discarded; `2` a refusa
 ```
 
 - [ ] **Step 2: Run** `cargo test -p kharon-teach`. Expected: the new tests FAIL.
-- [ ] **Step 3: Implement.** Add `clap` (derive) and, Linux only, `rustix` with the `process` feature. For the UTC timestamp use whatever `crates/kharond/src/audit/log.rs` uses for its `ts` field; do not add a second date crate.
-- [ ] **Step 4: Run** `KHARON_REQUIRE_CHROMIUM=1 cargo test -p kharon-teach`, clippy, fmt, `cargo deny check`. Then one manual run on this machine: `cargo run -p kharon-teach -- https://login.page.twkr.io/login.html`, log in with made-up values, press Enter, and read the file. Paste the printed summary into the commit body.
+- [ ] **Step 3: Implement.** Add `clap` (derive) and, Linux only, `rustix` with the `process` feature. For the file name's UTC timestamp use the `time` crate, already a dependency since Task 8's `utc_rfc3339`; do not add a second date crate.
+- [ ] **Step 4: Run** `KHARON_REQUIRE_CHROMIUM=1 cargo test -p kharon-teach`, clippy, fmt, `cargo deny check`. The manual run (`cargo run -p kharon-teach -- https://login.page.twkr.io/login.html`, log in with made-up values, press Enter, read the file) needs a person at a display. The implementer does not do it; the controller arranges it with Lothrop after this task and puts the printed summary in the PR body.
 - [ ] **Step 5: Commit** `feat(teach): kharon-teach command line, consent and the recording file (#361)`
 
 ---

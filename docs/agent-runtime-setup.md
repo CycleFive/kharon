@@ -50,8 +50,14 @@ needs a secret except step 5.
    The file is in
    [`provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
    (`no-password-manager.json`). Check it took effect: open
-   `chrome://policy` through CDP and look for the seven policies with
-   status OK. Without it Chromium may offer to save a filled password
+   `chrome://policy` through CDP and look for the seven policies,
+   each with source Platform and level Mandatory. The status column
+   depends on the browser version. Chrome for Testing 145 showed all
+   seven as OK (#339). Debian's Chromium 156 showed five as OK and
+   `AutofillAddressEnabled` and `AutofillCreditCardEnabled` as
+   `Deprecated` (#336); `autofill.profile_enabled` was still managed
+   and off there, and the credit-card pref was not checked. Without
+   the file Chromium may offer to save a filled password
    (REQ-ARCH-004).
 3. **`ptrace_scope`.** Set `kernel.yama.ptrace_scope = 1` if the
    runtime lets you. In most containers it is the host's setting and
@@ -297,17 +303,27 @@ still returns only the host. On a build that does not have
 `kharon_open`, put the login URL in the prompt. A fill after
 `kharon_open` still needs the owner's grant.
 
-**Tab rule (pending #339).** #334 settled the tab rule for
-OpenClaw: a fill targets the platform's own tab in the default
-browser context, under `allow_default_context` with exactly one
-agent on the deploy (see
-[Which tab a fill uses](#which-tab-a-fill-uses)). Hermes also opens
-its tabs in the default context, and the
-[Hermes end-to-end run](hermes-end-to-end.md) filled one that way
-with the flag on. For Hermes this is still an assumption, not a
-settled fact: the Hermes canary (#339) decides it, and this section
-changes before Hermes support (#347) closes if the canary shows
-Hermes cannot honor it.
+**Hermes has to open its browser first.** kharon does not launch
+the browser, and stock Hermes launches it only when its own browser
+tool first runs. Before that, `kharon_open` and `kharon_context`
+both return `cdp_error`. In the Hermes canary (#339) a model that
+called them first stopped and reported the browser unreachable. Tell
+the agent to open a page with its browser tool before it calls a
+kharon tool that needs the browser.
+
+`kharon_open` takes an `item_id` and nothing else. A model that has
+not looked the item up may pass a URL and get `bad_request`; one
+did on OpenClaw (#336). Tell the agent to call `kharon_search` or
+`kharon_list` first.
+
+**Tab rule.** #334 settled the tab rule for OpenClaw: a fill
+targets the platform's own tab in the default browser context,
+under `allow_default_context` with exactly one agent on the deploy
+(see [Which tab a fill uses](#which-tab-a-fill-uses)). Hermes also
+opens its tabs in the default context. The Hermes canary (#339, run
+2026-11-18 on master `13b2d53`) filled a tab Hermes had opened
+itself, with the flag on, so the same rule holds on Hermes. That
+run did not repeat the flag-off case on Hermes.
 
 ### Explicit endpoint, when you need one
 
@@ -382,9 +398,9 @@ OpenClaw's managed profile is a Chromium that OpenClaw launches and
 drives over CDP on a loopback port. The connector shares that
 browser through an explicit `cdp` port. kharon does not launch a
 browser here and adds no transport. OpenClaw keeps driving the
-browser after a fill (REQ-ARCH-003), which the live run below saw.
-That it keeps the browser after the connector lets go is the
-canary's check (#336).
+browser after a fill (REQ-ARCH-003), which the live runs below saw.
+The canary (#336) also saw it keep the browser after the connector
+stopped.
 
 Where each statement comes from:
 
@@ -393,11 +409,15 @@ Where each statement comes from:
   `openclaw`, Debian `chromium` 156.0.8078.79 headless, a throwaway
   broker on a fixture vault. Tabs came from `openclaw browser open`,
   not a model-driven agent turn, because no model was configured.
+- **Canary:** #336's run on the same guest on 2026-11-18, with
+  kharond and the connector built from master `13b2d53` and the
+  owner approving by hand. It ran the steps #334 had left open, and
+  one model-driven agent turn. The guest predates this section, so
+  an install on a fresh guest from this text alone is still
+  **not run yet**.
 - **Source:** `openclaw/openclaw` tag `v2026.11.3` (`847611d`) and
   `main` @ `de40bf5c`, under `extensions/browser/src/`. Where the
   two differ, this section says so.
-- **Not run yet:** anything marked so below waits for the OpenClaw
-  canary (#336).
 
 ### What this install supports
 
@@ -471,9 +491,12 @@ directory can't change under you:
 }
 ```
 
-The live run had no `browser` block and got `/usr/bin/chromium`,
-because nothing earlier in that order was installed. Pinning
-`executablePath` is **not run yet**.
+The #334 run had no `browser` block and got `/usr/bin/chromium`,
+because nothing earlier in that order was installed. The canary
+(#336) set the pin, and after a gateway restart
+`openclaw browser status` reported that binary. The guest had no
+other Chromium-family browser, so the pin overriding an earlier
+entry in that order is **not run yet**.
 
 ### Install, step by step
 
@@ -494,9 +517,11 @@ because nothing earlier in that order was installed. Pinning
    whole mitigation for saved passwords and form data there
    ([post-fill exposure](post-fill-exposure.md), rows C1 and C2).
    Then open `chrome://policy` through CDP and look for the seven
-   policies with status OK; restart OpenClaw's browser if they are
-   missing. The policy check on an OpenClaw host is **not run
-   yet** (#336).
+   policies; restart OpenClaw's browser if they are missing. On the
+   canary host (#336, Chromium 156) all seven were listed as
+   Platform, Mandatory: five with status OK, and
+   `AutofillAddressEnabled` and `AutofillCreditCardEnabled` with
+   status `Deprecated`.
 3. **Steps 3–8 of the hosted-runtime list**: `ptrace_scope`, the
    connector binary, the tunnel credential file, `connector.toml`,
    check and run, the MCP client. In step 6, set `cdp` explicitly:
@@ -517,8 +542,36 @@ because nothing earlier in that order was installed. Pinning
    writes. `--check` still prints `check: ok`, because it never
    dials the browser. Fills then fail with `error` / `cdp_error`.
    An explicit `cdp` reads no file, so the connector can run as its
-   own user without access to OpenClaw's home. That layout is
-   **not run yet** on an OpenClaw host.
+   own user without access to OpenClaw's home. The canary (#336)
+   ran that layout: the connector as its own `connector` user,
+   OpenClaw as another.
+
+   For the MCP client, OpenClaw keeps servers under `mcp.servers`
+   in its config and substitutes `${VAR}` in header values from its
+   environment, so the agent token stays out of the config file.
+   The canary used:
+
+   ```json
+   {
+     "mcp": {
+       "servers": {
+         "kharon": {
+           "url": "https://<host>/mcp",
+           "transport": "streamable-http",
+           "headers": { "Authorization": "Bearer ${KHARON_AGENT_TOKEN}" }
+         }
+       }
+     }
+   }
+   ```
+
+   with `KHARON_AGENT_TOKEN=kh_agent_<id>_…` in `~/.openclaw/.env`,
+   mode `0600`. That file belongs to OpenClaw's user. Whether
+   OpenClaw's tools refuse to read it was not tested, the same
+   open question as Hermes's `.env`. A broker behind a private CA needs
+   `NODE_EXTRA_CA_CERTS` in the gateway service's environment; the
+   `.env` file is read too late for that variable. A public edge
+   does not need it.
 4. **The broker.** The host gets its own agent id (#281). In
    `kharon.toml`, set
 
@@ -556,8 +609,9 @@ default-context tab on real Chromium was refused as
   `kharon_open` returns the target id. For a tab OpenClaw opened,
   the agent passes that tab's CDP target id as the fill's
   `target.cdp_target_id`, with `expected_origin`.
-  The live run filled a tab from `openclaw browser open`.
-  `kharon_open` on OpenClaw is **not run yet** (#336).
+  Both were filled in the canary (#336): a tab from
+  `openclaw browser open`, and a `kharon_open` tab, which
+  `openclaw browser tabs` listed like any other.
 - **Fills do not work on** tabs a session dashboard opens. OpenClaw
   puts those in its own isolated context, and kharon refuses them
   as `target_not_owned`. Not run live; a stand-in (a tab in a
@@ -596,11 +650,17 @@ customer what stays open.
   ```
 
   OpenClaw then refuses those actions with a 403
-  (`routes/agent.act.ts`). This is read from source; the setting is
-  **not run yet** on a kharon host.
+  (`routes/agent.act.ts`). With the setting off, the canary (#336)
+  saw `openclaw browser evaluate` refused with
+  `act:evaluate is disabled by config`. The default-on behaviour is
+  read from source.
 - **Snapshots.** On OpenClaw 2026.11.3, `openclaw browser snapshot`
   returned a filled password in clear in the live run
-  (`textbox "Password": <value>`). OpenClaw's `main` masks
+  (`textbox "Password": <value>`). The canary (#336) counted
+  matches in a snapshot written to a file: the default `ai` format
+  contained the filled password, and the `aria` format did not in
+  that run. Do not treat `aria` as a mitigation on one sample.
+  OpenClaw's `main` masks
   password-type and credential `autocomplete` fields in snapshots
   as `[redacted]` (`da41e7de`, `browser/sensitive-field-values.ts`),
   but no release has it as of 2026-11-15 (checked through
@@ -629,11 +689,24 @@ with the fields holding the item's values.
 
 The canary is #336: an approved fill into the managed browser,
 then the connector stopped, OpenClaw still driving the same tab,
-and the next fill refused. The roadmap expects that refusal to be
-`no_browser`. A hand-provisioned agent with its connector stopped
-has so far shown up as `timeout` (see
-[Hermes discovery and the connector user](#hermes-discovery-and-the-connector-user)),
-so #336 records the wire result as seen.
+and the next fill refused. It ran on 2026-11-18. With the connector
+stopped, OpenClaw focused, navigated and snapshotted the same tab
+in the same Chromium process. The next `kharon_fill` returned
+`{"fields_filled":[],"status":"timeout"}` after about 10 seconds,
+and `kharon_context` returned `{"status":"timeout"}`. The roadmap
+expects that refusal to be `no_browser`. A hand-provisioned agent
+with its connector stopped shows up as `timeout` on OpenClaw and
+on Hermes (#339; see
+[Hermes discovery and the connector user](#hermes-discovery-and-the-connector-user)).
+
+**What to tell the agent.** In the canary's one model-driven turn,
+the model found `kharon_open` through OpenClaw's tool search before
+it found `kharon_search`, passed a URL, got `bad_request`, and
+stopped to ask the user for the item id. It finished the fill after
+one message naming `kharon_search` and `kharon_list`. A prompt for
+an OpenClaw agent should say: look the login up with
+`kharon_search`, open it with `kharon_open`, ask for the fill, wait
+for approval, and do not snapshot the page once it is filled.
 
 ### Known side effect: a stale context per kharond restart
 

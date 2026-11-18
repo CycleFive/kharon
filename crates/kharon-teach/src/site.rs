@@ -23,20 +23,22 @@ fn psl() -> Option<&'static List> {
         .as_ref()
 }
 
-/// The registrable domain of `host` (its eTLD+1), lowercased. An IP address, a single-label host
-/// such as `localhost`, or a host the list has no answer for is returned unchanged.
+/// The registrable domain of `host` (its eTLD+1), lowercased, without a trailing dot. An IP
+/// address, a single-label host such as `localhost`, or a host the list has no answer for is
+/// returned lowercased and otherwise unchanged.
 pub fn registrable_domain(host: &str) -> String {
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(&host);
     if bare.parse::<IpAddr>().is_ok() {
-        return host.to_owned();
+        return host;
     }
     psl()
         .and_then(|list| list.domain(host.as_bytes()))
         .map_or_else(
-            || host.to_owned(),
+            || host.clone(),
             |d| String::from_utf8_lossy(d.as_bytes()).into_owned(),
         )
 }
@@ -61,6 +63,9 @@ mod tests {
         assert_eq!(registrable_domain("127.0.0.1"), "127.0.0.1");
         assert_eq!(registrable_domain("localhost"), "localhost");
         assert_eq!(registrable_domain("[::1]"), "[::1]");
+        assert_eq!(registrable_domain("Login.Ex.Co.UK."), "ex.co.uk");
+        assert_eq!(registrable_domain("ex.test."), "ex.test");
+        assert_eq!(registrable_domain("LOCALHOST."), "localhost");
     }
 
     #[test]

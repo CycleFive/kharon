@@ -25,6 +25,7 @@ pub struct RawElement {
 #[derive(Clone)]
 pub struct RawForm {
     pub index: u32,
+    /// The resolved absolute `form.action` DOM property, not the attribute text.
     pub action: Option<String>,
     pub method: String,
 }

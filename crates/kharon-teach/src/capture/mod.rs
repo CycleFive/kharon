@@ -21,6 +21,9 @@ use crate::site::{is_captcha_host, registrable_domain};
 use build::{Ctx, Tally, describe, form_ref, frame_ref, reduce_request, stripped_url};
 use resolve::{Elem, resolve};
 
+/// Once this many body bytes are buffered, every further body is buffered as `Unavailable`.
+pub const MAX_BUFFERED_BODY_BYTES: usize = 32 << 20;
+
 /// A frame as it was when an event arrived.
 struct FrameInfo {
     main: bool,
@@ -84,6 +87,8 @@ pub struct Capture {
     cross_site: bool,
     framed_login: bool,
     body_unavailable: bool,
+    body_budget: usize,
+    buffered_body_bytes: usize,
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -138,6 +143,16 @@ impl Capture {
             cross_site: false,
             framed_login: false,
             body_unavailable: false,
+            body_budget: MAX_BUFFERED_BODY_BYTES,
+            buffered_body_bytes: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_body_budget(start_url: &str, tool_version: &str, budget: usize) -> Self {
+        Self {
+            body_budget: budget,
+            ..Self::new(start_url, tool_version)
         }
     }
 
@@ -268,6 +283,7 @@ impl Capture {
                             has_step: false,
                             first_seq: self.seq + 1,
                             last_seq: 0,
+                            seqs: Vec::new(),
                         });
                         let i = self.elems.len() - 1;
                         self.note_report(i, &element, &info);
@@ -276,6 +292,7 @@ impl Capture {
                 };
                 self.seq += 1;
                 self.elems[i].last_seq = self.seq;
+                self.elems[i].seqs.push(self.seq);
                 if let Some(v) = value {
                     self.elems[i].value = v;
                 }
@@ -317,8 +334,14 @@ impl Capture {
         if is_captcha_url(&b.url) {
             self.captcha = true;
         }
-        if matches!(&b.body, RawBody::Bytes(bytes) if bytes.len() > MAX_BODY_BYTES) {
-            b.body = RawBody::Unavailable;
+        if let RawBody::Bytes(bytes) = &b.body {
+            if bytes.len() > MAX_BODY_BYTES
+                || self.buffered_body_bytes.saturating_add(bytes.len()) > self.body_budget
+            {
+                b.body = RawBody::Unavailable;
+            } else {
+                self.buffered_body_bytes += bytes.len();
+            }
         }
         let to_login_site =
             host_of(&b.url).is_some_and(|h| registrable_domain(&h) == self.login_site);
@@ -1426,5 +1449,182 @@ mod tests {
         assert!(rec.flags.popup);
         assert_eq!(rec.stripped.requests_seen, 5);
         let _ = rec.to_json();
+    }
+
+    fn session_with_budget(budget: usize) -> Session {
+        let mut s = Session::unstarted(LOGIN);
+        s.cap = Capture::with_body_budget(LOGIN, "0.0.0", budget);
+        s.start();
+        s
+    }
+
+    #[test]
+    fn bodies_past_the_buffer_limit_are_unavailable() {
+        let big = |n: usize| RawBody::Bytes(Zeroizing::new(vec![b'a'; n]));
+        let rec = session_with_budget(100)
+            .type_into(&user_el(), USER)
+            .request(
+                "POST",
+                "https://ex.test/a",
+                ResourceKind::Fetch,
+                false,
+                Some("text/plain"),
+                big(80),
+            )
+            .request(
+                "POST",
+                "https://ex.test/b",
+                ResourceKind::Fetch,
+                false,
+                Some("text/plain"),
+                big(80),
+            )
+            .finish();
+        assert_eq!(rec.requests.len(), 2);
+        assert!(matches!(
+            rec.requests[0].body,
+            BodyShape::Opaque { len: 80, .. }
+        ));
+        assert_eq!(rec.requests[1].body, BodyShape::Unavailable);
+        assert!(rec.flags.body_unavailable);
+        assert_eq!(rec.stripped.request_bodies_reduced, 1);
+        assert_eq!(MAX_BUFFERED_BODY_BYTES, 32 << 20);
+    }
+
+    #[test]
+    fn a_combined_credential_alone_picks_the_username() {
+        let combined = Base64::encode_string(format!("{USER}:{PASS}").as_bytes());
+        let tenant = no_form(el(4, "tenant", "text"));
+        let rec = Session::new(LOGIN)
+            .type_into(&no_form(user_el()), USER)
+            .type_into(&tenant, TENANT)
+            .type_into(&no_form(pw_el()), PASS)
+            .post_json(
+                "https://ex.test/api/login",
+                &format!(r#"{{"auth":"{combined}"}}"#),
+            )
+            .finish();
+        assert_eq!(role_of(&rec, 1), Some(Role::Username));
+        assert_eq!(role_of(&rec, 4), Some(Role::None));
+        assert_holds_no_typed_value(&rec.to_json(), &ALL_VALUES);
+    }
+
+    #[test]
+    fn the_same_form_beats_a_later_typed_candidate() {
+        let tenant = no_form(el(4, "tenant", "text"));
+        let rec = Session::new(LOGIN)
+            .type_into(&user_el(), USER)
+            .type_into(&tenant, TENANT)
+            .type_into(&pw_el(), PASS)
+            .post_form("https://ex.test/login", &format!("t={TENANT}&p={PASS}"))
+            .finish();
+        assert_eq!(role_of(&rec, 1), Some(Role::Username));
+        assert_eq!(role_of(&rec, 4), Some(Role::None));
+    }
+
+    #[test]
+    fn a_value_found_in_any_request_beats_a_later_typed_one() {
+        let tenant = no_form(el(4, "tenant", "text"));
+        let rec = Session::new(LOGIN)
+            .type_into(&no_form(user_el()), USER)
+            .type_into(&tenant, TENANT)
+            .type_into(&no_form(pw_el()), PASS)
+            .post_form("https://ex.test/identify", &format!("u={USER}"))
+            .post_form("https://ex.test/login", &format!("p={PASS}"))
+            .finish();
+        assert_eq!(role_of(&rec, 1), Some(Role::Username));
+        assert_eq!(role_of(&rec, 4), Some(Role::None));
+    }
+
+    #[test]
+    fn with_no_other_evidence_the_last_typed_before_the_password_wins() {
+        let tenant = no_form(el(4, "tenant", "text"));
+        let rec = Session::new(LOGIN)
+            .type_into(&tenant, TENANT)
+            .type_into(&no_form(user_el()), USER)
+            .type_into(&no_form(pw_el()), PASS)
+            .finish();
+        assert_eq!(role_of(&rec, 1), Some(Role::Username));
+        assert_eq!(role_of(&rec, 4), Some(Role::None));
+    }
+
+    #[test]
+    fn an_edit_after_the_password_does_not_beat_the_last_field_typed_before_it() {
+        let first = no_form(el(4, "tenant", "text"));
+        let rec = Session::new(LOGIN)
+            .type_into(&first, TENANT)
+            .type_into(&no_form(user_el()), USER)
+            .type_into(&no_form(pw_el()), PASS)
+            .type_into(&first, TENANT)
+            .finish();
+        assert_eq!(role_of(&rec, 1), Some(Role::Username));
+        assert_eq!(role_of(&rec, 4), Some(Role::None));
+    }
+
+    #[test]
+    fn typed_values_in_every_kept_attribute_are_dropped() {
+        let mut e = user_el();
+        e.name = Some(format!("n-{USER}"));
+        e.autocomplete = Some(format!("x-{USER}"));
+        e.aria_label = Some(format!("for {USER}"));
+        e.form = Some(RawForm {
+            index: 0,
+            action: Some(format!("https://ex.test/login?who={USER}&{USER}=1")),
+            method: "post".into(),
+        });
+        let mut clicked = button();
+        clicked.id = Some(format!("go-{USER}"));
+        clicked.selectors = vec![format!("#go-{USER}"), "button[type=submit]".into()];
+        let rec = Session::new(LOGIN)
+            .type_into(&e, USER)
+            .click(&clicked)
+            .finish();
+        let (d, _, _) = inputs(&rec)[0];
+        assert_eq!(
+            (&d.name, &d.autocomplete, &d.aria_label),
+            (&None, &None, &None)
+        );
+        let action = d.form.as_ref().and_then(|f| f.action.as_ref());
+        assert!(action.is_some_and(|a| a.query_keys.iter().all(|k| k != USER)));
+        match &rec.steps[2] {
+            Step::Click { element, .. } => {
+                assert_eq!(element.id, None);
+                assert_eq!(element.selectors, vec!["button[type=submit]".to_owned()]);
+            }
+            other => panic!("expected a click, got {other:?}"),
+        }
+        assert_holds_no_typed_value(&rec.to_json(), &[USER]);
+    }
+
+    #[test]
+    fn page_derived_tag_and_type_are_checked() {
+        let mut odd = user_el();
+        odd.tag = "x.weird".into();
+        odd.input_type = Some("weird".into());
+        let mut custom = el(6, "c", "TEL");
+        custom.tag = "My-Widget".into();
+        let mut typed = el(7, "d", "text");
+        typed.tag = format!("x-{USER}");
+        let rec = Session::new(LOGIN)
+            .type_into(&odd, USER)
+            .type_into(&custom, "1")
+            .type_into(&typed, "2")
+            .finish();
+        let ins = inputs(&rec);
+        assert_eq!(ins[0].0.tag, "{other}");
+        assert_eq!(ins[0].0.input_type.as_deref(), Some("{other}"));
+        assert_eq!(ins[1].0.tag, "my-widget");
+        assert_eq!(ins[1].0.input_type.as_deref(), Some("tel"));
+        assert_eq!(ins[2].0.tag, "{other}");
+    }
+
+    #[test]
+    fn the_show_password_scenario_keeps_both_lengths() {
+        let rec = scenario("show_toggle");
+        let lens: Vec<(u32, u32)> = inputs(&rec)
+            .into_iter()
+            .map(|(e, len, _)| (e.element_id, len))
+            .collect();
+        assert_eq!(lens, vec![(1, 13), (2, 12)]);
     }
 }

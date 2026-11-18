@@ -86,6 +86,55 @@ fn selector_is_clean(selector: &str, ctx: Ctx<'_>) -> bool {
     !ctx.holds_typed(selector) && !ctx.holds_typed(&unescaped)
 }
 
+const INPUT_TYPES: [&str; 22] = [
+    "text",
+    "password",
+    "email",
+    "tel",
+    "number",
+    "search",
+    "url",
+    "hidden",
+    "checkbox",
+    "radio",
+    "submit",
+    "button",
+    "reset",
+    "file",
+    "date",
+    "datetime-local",
+    "month",
+    "week",
+    "time",
+    "color",
+    "range",
+    "image",
+];
+
+/// An HTML input type keyword, lowercased; anything else is `{other}`.
+fn input_type_keyword(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if INPUT_TYPES.contains(&lower.as_str()) {
+        lower
+    } else {
+        "{other}".to_owned()
+    }
+}
+
+/// A tag name, lowercased, when it is ASCII letters, digits and `-` and holds no typed value.
+fn tag_name(raw: &str, ctx: Ctx<'_>) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let plain = !lower.is_empty()
+        && lower
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if plain && !ctx.holds_typed(&lower) {
+        lower
+    } else {
+        "{other}".to_owned()
+    }
+}
+
 fn known_method(method: &str, lowercase: bool) -> String {
     let upper = method.to_ascii_uppercase();
     let known = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -122,8 +171,8 @@ pub(super) fn describe(
 ) -> ElementDescriptor {
     ElementDescriptor {
         element_id: raw.element_id,
-        tag: raw.tag.to_lowercase(),
-        input_type: raw.input_type.as_deref().map(str::to_lowercase),
+        tag: tag_name(&raw.tag, ctx),
+        input_type: raw.input_type.as_deref().map(input_type_keyword),
         id: clean(raw.id.as_ref(), ctx),
         name: clean(raw.name.as_ref(), ctx),
         autocomplete: clean(raw.autocomplete.as_ref(), ctx),

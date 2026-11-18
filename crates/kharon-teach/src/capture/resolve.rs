@@ -17,6 +17,8 @@ pub(super) struct Elem {
     /// Sequence numbers of the first and the latest value-bearing event.
     pub first_seq: u64,
     pub last_seq: u64,
+    /// Sequence numbers of every value-bearing event.
+    pub seqs: Vec<u64>,
 }
 
 impl Elem {
@@ -50,24 +52,37 @@ fn plain_marker(value: &str, role: Role) -> Marker {
     Marker::new(Zeroizing::new(value.to_owned()), role)
 }
 
-/// Whether `marker` occurs in the request's URL, authorization header or body, under any encoding.
-fn carries(req: &Buffered, marker: &Marker) -> bool {
+/// Whether `marker` (or, with `pair`, the combined credential) occurs in the request's URL,
+/// authorization header or body, under any encoding.
+fn carries_with(req: &Buffered, marker: &Marker, pair: Option<(&Marker, &Marker)>) -> bool {
     let one = std::slice::from_ref(marker);
-    any_hit(req.url.as_bytes(), one, None)
+    any_hit(req.url.as_bytes(), one, pair)
         || req
             .authorization
             .as_ref()
-            .is_some_and(|a| any_hit(a, one, None))
-        || matches!(&req.body, RawBody::Bytes(b) if any_hit(b, one, None))
+            .is_some_and(|a| any_hit(a, one, pair))
+        || matches!(&req.body, RawBody::Bytes(b) if any_hit(b, one, pair))
 }
 
-/// The candidate typed in most recently before the first password input; failing that, the latest.
+fn carries(req: &Buffered, marker: &Marker) -> bool {
+    carries_with(req, marker, None)
+}
+
+/// The candidate whose last input event before the first password input is the latest; failing
+/// that (none typed before it), the one with the latest input of any kind.
 fn pick(cands: &[usize], elems: &[Elem], first_password_seq: Option<u64>) -> Option<usize> {
+    let last_before = |i: usize| -> Option<u64> {
+        match first_password_seq {
+            None => Some(elems[i].last_seq),
+            Some(s) => elems[i].seqs.iter().copied().filter(|q| *q < s).max(),
+        }
+    };
     cands
         .iter()
         .copied()
-        .filter(|&i| first_password_seq.is_none_or(|s| elems[i].first_seq < s))
-        .max_by_key(|&i| elems[i].last_seq)
+        .filter_map(|i| last_before(i).map(|q| (q, i)))
+        .max()
+        .map(|(_, i)| i)
         .or_else(|| cands.iter().copied().max_by_key(|&i| elems[i].last_seq))
 }
 
@@ -116,11 +131,18 @@ pub(super) fn resolve(elems: &[Elem], reqs: &[Buffered]) -> Resolved {
                 .any(|p| p.was_password && p.form_key() == Some(k))
         })
     });
+    // A login that sends only a combined credential matches when probed with the pair.
+    let combined = |r: &Buffered, m: &Marker| {
+        password_markers
+            .iter()
+            .any(|p| carries_with(r, m, Some((m, p))))
+    };
     let with_password = narrowed(&|_, m| {
-        reqs.iter()
-            .any(|r| carries(r, m) && password_markers.iter().any(|p| carries(r, p)))
+        reqs.iter().any(|r| {
+            (carries(r, m) && password_markers.iter().any(|p| carries(r, p))) || combined(r, m)
+        })
     });
-    let in_any_request = narrowed(&|_, m| reqs.iter().any(|r| carries(r, m)));
+    let in_any_request = narrowed(&|_, m| reqs.iter().any(|r| carries(r, m) || combined(r, m)));
 
     let username_elem = [same_form, with_password, in_any_request, cands]
         .iter()

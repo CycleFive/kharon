@@ -108,11 +108,15 @@ impl Profile {
     /// between the mkdir and the rename leaves a `.kharon-teach-new-*`
     /// directory that nothing sweeps; the window is microseconds.
     pub fn create() -> std::io::Result<Self> {
+        Self::create_in(&std::env::temp_dir())
+    }
+
+    /// [`Profile::create`] in `temp`.
+    pub(crate) fn create_in(temp: &Path) -> std::io::Result<Self> {
         use rand::Rng;
         use rand::distributions::Alphanumeric;
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let temp = std::env::temp_dir();
         for _ in 0..16 {
             let suffix: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
@@ -173,11 +177,16 @@ impl Profile {
 
     /// Removes leftover PROFILE_PREFIX directories in the temp location owned by this user. Returns how many.
     pub fn sweep_stale() -> std::io::Result<usize> {
+        Self::sweep_stale_in(&std::env::temp_dir())
+    }
+
+    /// [`Profile::sweep_stale`] over `dir`.
+    pub(crate) fn sweep_stale_in(dir: &Path) -> std::io::Result<usize> {
         use std::os::unix::fs::MetadataExt;
         // /proc/self is owned by this process's effective uid.
         let me = std::fs::metadata("/proc/self")?.uid();
         let mut n = 0;
-        for entry in std::fs::read_dir(std::env::temp_dir())? {
+        for entry in std::fs::read_dir(dir)? {
             let Ok(entry) = entry else { continue };
             if !entry
                 .file_name()
@@ -209,6 +218,14 @@ impl Drop for Profile {
     fn drop(&mut self) {
         let _ = remove_tree(&self.path);
     }
+}
+
+/// `<profile>/Default/Preferences`: password manager and autofill off.
+fn write_preferences(profile: &Path) -> std::io::Result<()> {
+    let default = profile.join("Default");
+    private_dir(&default)?;
+    let prefs = serde_json::to_string(&PREFERENCES).map_err(std::io::Error::other)?;
+    std::fs::write(default.join("Preferences"), prefs)
 }
 
 /// `remove_dir_all` does not follow symlinks. A just-killed browser's helper
@@ -282,15 +299,19 @@ impl Browser {
     pub async fn launch(l: Launch<'_>) -> Result<(Browser, DevTools), BrowserError> {
         use std::process::Stdio;
         let launch_err = |e: std::io::Error| BrowserError::Launch(e.to_string());
+        if l.first_url.starts_with('-') {
+            // It would be read as a browser switch. Do not echo the value.
+            return Err(BrowserError::Launch(
+                "the first URL must not start with '-'".to_owned(),
+            ));
+        }
         let profile = l.profile.path();
-        let default = profile.join("Default");
-        private_dir(&default).map_err(launch_err)?;
-        let prefs =
-            serde_json::to_string(&PREFERENCES).map_err(|e| BrowserError::Launch(e.to_string()))?;
-        std::fs::write(default.join("Preferences"), prefs).map_err(launch_err)?;
+        write_preferences(profile).map_err(launch_err)?;
 
+        let mut user_data_dir = std::ffi::OsString::from("--user-data-dir=");
+        user_data_dir.push(profile.as_os_str());
         let mut cmd = tokio::process::Command::new(l.browser);
-        cmd.arg(format!("--user-data-dir={}", profile.display()))
+        cmd.arg(user_data_dir)
             .arg("--remote-debugging-port=0")
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
@@ -311,8 +332,13 @@ impl Browser {
         let file = profile.join("DevToolsActivePort");
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         loop {
-            if let Some(status) = child.try_wait().map_err(launch_err)? {
-                return Err(BrowserError::Launch(status.to_string()));
+            match child.try_wait() {
+                Ok(Some(status)) => return Err(BrowserError::Launch(status.to_string())),
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = child.kill().await;
+                    return Err(launch_err(e));
+                }
             }
             if let Some(dt) = std::fs::read_to_string(&file)
                 .ok()
@@ -379,18 +405,42 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    fn unique(tag: &str) -> String {
-        format!(
-            "{PROFILE_PREFIX}{tag}-{}-{:08x}",
-            std::process::id(),
-            rand::random::<u32>()
-        )
+    /// A private directory for one test, removed when dropped. Its name does
+    /// not start with the profile prefix, and nothing else sweeps it.
+    struct Sandbox(PathBuf);
+
+    impl Sandbox {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "kharon-sandbox-{tag}-{}-{:08x}",
+                std::process::id(),
+                rand::random::<u32>()
+            ));
+            std::fs::create_dir(&d).unwrap();
+            Sandbox(d)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn mkdir(&self, name: &str) -> PathBuf {
+            let d = self.0.join(name);
+            std::fs::create_dir(&d).unwrap();
+            d
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn profile_is_private_and_removed() {
-        let p = Profile::create().unwrap();
+        let sb = Sandbox::new("create");
+        let p = Profile::create_in(sb.path()).unwrap();
         let path = p.path().to_owned();
+        assert_eq!(path.parent().unwrap(), sb.path());
         assert!(
             path.file_name()
                 .unwrap()
@@ -403,13 +453,16 @@ mod tests {
             std::fs::read_to_string(path.join(OWNER_FILE)).unwrap(),
             std::process::id().to_string()
         );
+        // No staging directory is left behind.
+        assert_eq!(std::fs::read_dir(sb.path()).unwrap().count(), 1);
         p.remove().unwrap();
         assert!(!path.exists());
     }
 
     #[test]
     fn profile_is_removed_on_drop() {
-        let p = Profile::create().unwrap();
+        let sb = Sandbox::new("drop");
+        let p = Profile::create_in(sb.path()).unwrap();
         let path = p.path().to_owned();
         std::fs::write(path.join("f"), b"x").unwrap();
         drop(p);
@@ -418,50 +471,47 @@ mod tests {
 
     #[test]
     fn sweep_removes_a_leftover_and_counts_it() {
-        let d = std::env::temp_dir().join(unique("stale"));
-        std::fs::create_dir(&d).unwrap();
+        let sb = Sandbox::new("stale");
+        let d = sb.mkdir("kharon-teach-stale");
         std::fs::write(d.join("f"), b"x").unwrap();
-        assert!(Profile::sweep_stale().unwrap() >= 1);
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 1);
         assert!(!d.exists());
     }
 
     #[test]
     fn sweep_leaves_other_directories() {
-        let d = std::env::temp_dir().join(format!("other-{}", unique("keep")));
-        std::fs::create_dir(&d).unwrap();
-        Profile::sweep_stale().unwrap();
-        assert!(d.exists());
-        std::fs::remove_dir(&d).unwrap();
+        let sb = Sandbox::new("other");
+        let d = sb.mkdir("other-keep");
+        let staging = sb.mkdir(".kharon-teach-new-x");
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
+        assert!(d.exists() && staging.exists());
     }
 
     #[test]
     fn sweep_leaves_a_symlink_and_its_target() {
-        let target = std::env::temp_dir().join(format!("other-{}", unique("tgt")));
-        std::fs::create_dir(&target).unwrap();
+        let sb = Sandbox::new("link");
+        let target = sb.mkdir("other-tgt");
         std::fs::write(target.join("f"), b"x").unwrap();
-        let link = std::env::temp_dir().join(unique("link"));
+        let link = sb.path().join("kharon-teach-link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        Profile::sweep_stale().unwrap();
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
         assert!(target.join("f").exists());
         assert!(std::fs::symlink_metadata(&link).is_ok());
-        std::fs::remove_file(&link).unwrap();
-        std::fs::remove_dir_all(&target).unwrap();
     }
 
     // An addition to the brief: a profile whose SingletonLock names a live
     // process is a running recorder's profile and must survive a sweep.
     #[test]
     fn sweep_skips_a_profile_whose_browser_is_alive() {
-        let d = std::env::temp_dir().join(unique("live"));
-        std::fs::create_dir(&d).unwrap();
+        let sb = Sandbox::new("live");
+        let d = sb.mkdir("kharon-teach-live");
         std::os::unix::fs::symlink(
             format!("host-{}", std::process::id()),
             d.join("SingletonLock"),
         )
         .unwrap();
-        Profile::sweep_stale().unwrap();
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
         assert!(d.exists());
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     fn dead_pid() -> u32 {
@@ -471,45 +521,82 @@ mod tests {
         pid
     }
 
-    fn dir_with_owner(tag: &str, owner: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(unique(tag));
-        std::fs::create_dir(&d).unwrap();
+    fn dir_with_owner(sb: &Sandbox, name: &str, owner: &str) -> PathBuf {
+        let d = sb.mkdir(name);
         std::fs::write(d.join(OWNER_FILE), owner).unwrap();
         d
     }
 
     #[test]
     fn sweep_skips_a_profile_owned_by_this_process() {
-        let d = dir_with_owner("mine", &std::process::id().to_string());
-        Profile::sweep_stale().unwrap();
+        let sb = Sandbox::new("mine");
+        let d = dir_with_owner(&sb, "kharon-teach-mine", &std::process::id().to_string());
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
         assert!(d.exists());
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
     fn sweep_removes_a_profile_owned_by_a_dead_process() {
-        let d = dir_with_owner("dead", &dead_pid().to_string());
-        assert!(Profile::sweep_stale().unwrap() >= 1);
+        let sb = Sandbox::new("dead");
+        let d = dir_with_owner(&sb, "kharon-teach-dead", &dead_pid().to_string());
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 1);
         assert!(!d.exists());
     }
 
     #[test]
     fn sweep_treats_an_owner_symlink_as_no_owner() {
-        let d = std::env::temp_dir().join(unique("ownlink"));
-        std::fs::create_dir(&d).unwrap();
+        let sb = Sandbox::new("ownlink");
+        let d = sb.mkdir("kharon-teach-ownlink");
         let real = d.join("real");
         std::fs::write(&real, std::process::id().to_string()).unwrap();
         std::os::unix::fs::symlink(&real, d.join(OWNER_FILE)).unwrap();
-        assert!(Profile::sweep_stale().unwrap() >= 1);
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 1);
         assert!(!d.exists());
     }
 
     #[test]
     fn sweep_treats_a_junk_or_oversized_owner_as_no_owner() {
-        let a = dir_with_owner("junk", "not a pid");
-        let b = dir_with_owner("big", &format!("{}{}", std::process::id(), " ".repeat(40)));
-        assert!(Profile::sweep_stale().unwrap() >= 2);
+        let sb = Sandbox::new("junk");
+        let a = dir_with_owner(&sb, "kharon-teach-junk", "not a pid");
+        let big = format!("{}{}", std::process::id(), " ".repeat(40));
+        let b = dir_with_owner(&sb, "kharon-teach-big", &big);
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 2);
         assert!(!a.exists() && !b.exists());
+    }
+
+    #[test]
+    fn preferences_turn_off_the_password_manager_and_autofill() {
+        let sb = Sandbox::new("prefs");
+        write_preferences(sb.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(sb.path().join("Default")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read_to_string(sb.path().join("Default/Preferences")).unwrap(),
+            r#"{"credentials_enable_service":false,"profile":{"password_manager_enabled":false},"autofill":{"profile_enabled":false,"credit_card_enabled":false}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_url_that_looks_like_a_switch_is_refused() {
+        let sb = Sandbox::new("url");
+        let profile = Profile::create_in(sb.path()).unwrap();
+        let err = match Browser::launch(Launch {
+            browser: Path::new("/nonexistent/chrome"),
+            profile: &profile,
+            first_url: "--secret-switch",
+            headless: true,
+        })
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("launched"),
+        };
+        let BrowserError::Launch(msg) = err else {
+            panic!("wrong error");
+        };
+        assert_eq!(msg, "the first URL must not start with '-'");
     }
 
     #[test]
@@ -522,8 +609,8 @@ mod tests {
 
     #[test]
     fn finds_the_first_name_in_search_order() {
-        let dir = std::env::temp_dir().join(unique("bin"));
-        std::fs::create_dir(&dir).unwrap();
+        let sb = Sandbox::new("bin");
+        let dir = sb.path().to_owned();
         for n in ["google-chrome", "chromium"] {
             let f = dir.join(n);
             std::fs::write(&f, b"#!/bin/sh\n").unwrap();
@@ -531,7 +618,6 @@ mod tests {
         }
         let found = find_browser_in(None, dir.as_os_str()).unwrap();
         assert_eq!(found, dir.join("chromium"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -547,6 +633,17 @@ mod tests {
         let d = parse_devtools_active_port("45123\n/devtools/browser/abc-123\n").unwrap();
         assert_eq!(d.port, 45123);
         assert_eq!(d.ws_path, "/devtools/browser/abc-123");
+    }
+
+    #[test]
+    fn accepts_a_bom_and_rejects_a_port_over_u16() {
+        assert_eq!(
+            parse_devtools_active_port("\u{feff}45123\n/devtools/browser/abc\n")
+                .unwrap()
+                .port,
+            45123
+        );
+        assert!(parse_devtools_active_port("99999\n/devtools/browser/abc\n").is_none());
     }
 
     #[test]

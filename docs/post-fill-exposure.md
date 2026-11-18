@@ -3,6 +3,8 @@
 > Design record for #354, 2026-11-15. Checked against the code and
 > the live runs cited per row. Lothrop has final say on any scope
 > cut; this page proposes none beyond the cuts SPEC already makes.
+> The "tested" column was updated on 2026-11-18 with the results of
+> the OpenClaw (#336) and Hermes (#339) canaries.
 
 kharon's guarantee ends at delivery: the right secret, typed into
 the right field, on the right origin, with approval. This page
@@ -93,22 +95,22 @@ names the evidence, or says unverified.
 
 | # | Path | Class | Tested |
 |---|---|---|---|
-| C1 | Password-save prompt and saved logins in the profile | **host** — managed policy disables the password manager and autofill save ([`agent-runtime-setup.md`](agent-runtime-setup.md) step 2; for Hermes's Chrome for Testing the policy directory is the non-obvious `/etc/opt/chrome_for_testing/policies/managed/`, [`hermes-end-to-end.md`](hermes-end-to-end.md) §1). kharon's own acceptance rig holds the same line as REQ-ARCH-004 | Yes: #201 sweep (`Login Data` 0 rows); #353 run (policy visible in `chrome://policy`) |
-| C2 | Autofill form-data memory in a persistent profile | **host** — the same policy, plus profile lifetime. Hermes deletes its throwaway profile at session exit; OpenClaw's managed profile persists, so policy is the whole mitigation there | Hermes: yes (#353). OpenClaw: unverified until its canary (#336) |
+| C1 | Password-save prompt and saved logins in the profile | **host** — managed policy disables the password manager and autofill save ([`agent-runtime-setup.md`](agent-runtime-setup.md) step 2; for Hermes's Chrome for Testing the policy directory is the non-obvious `/etc/opt/chrome_for_testing/policies/managed/`, [`hermes-end-to-end.md`](hermes-end-to-end.md) §1). kharon's own acceptance rig holds the same line as REQ-ARCH-004 | Yes: #201 sweep (`Login Data` 0 rows); #353 run (policy visible in `chrome://policy`). Both canaries, with the form filled and not submitted: `Login Data` 0 rows on Hermes (#339) and on OpenClaw (#336). A submitted fill, which is when a browser offers to save, was not part of either canary |
+| C2 | Autofill form-data memory in a persistent profile | **host** — the same policy, plus profile lifetime. Hermes deletes its throwaway profile at session exit; OpenClaw's managed profile persists, so policy is the whole mitigation there | Hermes: yes (#353). OpenClaw: partly (#336). After three fills that were not submitted, `Web Data` held 0 autofill rows. Browsers record form data on submit, and no submitted fill was run |
 | C3 | Back/forward cache and form restore re-presenting a filled form | **scope** — browser behaviour after navigation; kharon has no post-navigation control of the page | Unverified |
-| C4 | The profile folder on disk | **host** — a value reaches disk only through C1/C2; Hermes profile dirs are mode `0700` and deleted at exit (#353) | Hermes: yes. OpenClaw: unverified |
+| C4 | The profile folder on disk | **host** — a value reaches disk only through C1/C2; Hermes profile dirs are mode `0700` and deleted at exit (#353) | Hermes: yes (#353; #339 swept the live profile with the form filled, 0 files). OpenClaw: yes for fills that were not submitted (#336: a whole-filesystem sweep with two forms filled found 0 files, the persistent profile included) |
 | C5 | Browser crash dumps | **host** — the browser is the platform's process. (kharond's own memory hygiene is REQ-MEM-* and covers the broker, not the browser) | Unverified |
 
 ### D. What the agent can watch (shared CDP)
 
 | # | Path | Class | Tested |
 |---|---|---|---|
-| D1 | Agent reads `input.value` via `js()` / `Runtime.evaluate` / `callFunctionOn` after a fill | **host** — kharon cannot mitigate this: the plaintext must exist in the renderer for the form to submit (SPEC §2.4). The mitigation is the agent harness policy (SPEC OQ-3, [`deployment.md`](deployment.md#agent-harness-policy-spec-oq-3)): no JavaScript evaluation in pages | Yes, negatively: stock Hermes does **not** meet the policy — its agent read the filled fields' lengths and could read the values (#353). OpenClaw: unverified |
-| D2 | DOM or accessibility-tree snapshots that include field values | **host** — same policy: the harness returns text and structure, never `value` attributes or form data | Hermes: the exposure is via `js()` (D1); snapshot tooling itself unverified. OpenClaw: yes, negatively: on 2026.11.3, `openclaw browser snapshot` returned a filled password in clear (#334). OpenClaw `main` masks password-type fields in snapshots (`da41e7de`), in no release as of 2026-11-15 ([agent-runtime-setup.md](agent-runtime-setup.md#harness-policy-on-stock-openclaw)) |
+| D1 | Agent reads `input.value` via `js()` / `Runtime.evaluate` / `callFunctionOn` after a fill | **host** — kharon cannot mitigate this: the plaintext must exist in the renderer for the form to submit (SPEC §2.4). The mitigation is the agent harness policy (SPEC OQ-3, [`deployment.md`](deployment.md#agent-harness-policy-spec-oq-3)): no JavaScript evaluation in pages | Yes, negatively: stock Hermes does **not** meet the policy — its agent read the filled fields' lengths and could read the values (#353). In #339 the agent was told not to read the fields and did not; nothing in the harness enforces that. OpenClaw: with `browser.evaluateEnabled = false`, `act:evaluate` is refused (#336). The default is on (read from source), so stock OpenClaw does not meet the policy until the operator sets it |
+| D2 | DOM or accessibility-tree snapshots that include field values | **host** — same policy: the harness returns text and structure, never `value` attributes or form data | Hermes: the exposure is via `js()` (D1); snapshot tooling itself unverified. OpenClaw: yes, negatively: on 2026.11.3, `openclaw browser snapshot` returned a filled password in clear (#334). #336 repeated it by match count: the default `ai` format contained the canary, and the `aria` format did not in that run. OpenClaw `main` masks password-type fields in snapshots (`da41e7de`), in no release as of 2026-11-15 ([agent-runtime-setup.md](agent-runtime-setup.md#harness-policy-on-stock-openclaw)) |
 | D3 | Screenshots while a login form is on screen | **host** — password inputs render masked by the browser, so the residual is the username and any show-password state (A6); the harness policy still recommends masking or none during login | Unverified |
 | D4 | Agent enables the Network domain and captures the login POST body | **host** — the POST goes to the bound origin by design; watching it needs raw CDP, the same capability as D1, and is a harness question. kharon's own client never enables Network | Unverified |
 | D5 | Observation *during* the fill window, before submit | **kharon**, in part — fill-and-submit is one in-page call on a millisecond budget, so with `submit: true` the readable window is the page's own submit handling. With `submit: false` there is no window to shrink (A4) | The budget is tested (REQ-API-009); a concurrent-observer race test does not exist — unverified as a race |
-| D6 | kharon's own outputs: tool results, audit log, broker/connector journals, agent transcripts | **kharon** — status and names only, no values anywhere (above) | Yes: #201 filesystem sweep (0 hits) and the #353 leak check (canary absent from audit, journals, transcripts, sessions) |
+| D6 | kharon's own outputs: tool results, audit log, broker/connector journals, agent transcripts | **kharon** — status and names only, no values anywhere (above) | Yes: #201 filesystem sweep (0 hits) and the #353 leak check (canary absent from audit, journals, transcripts, sessions). Both canaries on master `13b2d53`: 0 files on the agent host and on the broker host, 0 journal lines, 0 in the audit logs, 0 in the agents' transcripts and session stores (#339, #336) |
 
 ## Per-host notes
 
@@ -120,9 +122,10 @@ names the evidence, or says unverified.
   Testing policy directory (C1).
 - **OpenClaw** ([#346](https://github.com/CycleFive/kharon/issues/346)):
   the persistent managed profile puts C1/C2 entirely on managed
-  policy. Whether its model-facing tools can read field values
-  (D1) is unverified until the OpenClaw canary (#336); stock
-  2026.11.3 snapshots expose a filled password (D2, #334); fills
+  policy. Its page-JavaScript action (D1) is on by default and is
+  refused once `browser.evaluateEnabled` is `false` (#336); stock
+  2026.11.3 snapshots expose a filled password in the default
+  format (D2, #334 and #336); fills
   there use the platform's own tab under `allow_default_context`
   (one agent, #334), which is A4 by design.
 
@@ -135,9 +138,10 @@ names the evidence, or says unverified.
   field on failure") closes by verification: one-step submit and
   clear-on-failure are both in the code and tested (A1, and
   "What kharon does at the boundary").
-- **Already filed** — the per-host "tested" column fills in via
-  the OpenClaw canary (#336) and the Hermes canary (#339); this
-  page's unverified cells name them.
+- **Canaries run** — the OpenClaw canary (#336) and the Hermes
+  canary (#339) ran on 2026-11-18, and the "tested" column above
+  carries what they showed. Neither submitted a form, so the
+  save-on-submit half of C1 and C2 is still open on both hosts.
 - **No new scope cuts proposed.** The scope rows above restate
   cuts SPEC §2.4 already makes. Anything further is Lothrop's
   call, per the issue.

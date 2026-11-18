@@ -6,6 +6,7 @@ members = [
     "crates/kharon-cli",
     "crates/kharon-connector",
     "crates/kharon-agent-connector",
+    "crates/kharon-recording",
 ]
 
 # SPEC §8 process hardening: a release build aborts on panic instead of

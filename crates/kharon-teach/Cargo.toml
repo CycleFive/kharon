@@ -1,0 +1,26 @@
+[package]
+name = "kharon-teach"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Teach-mode recorder for kharon (#361)"
+
+[lib]
+name = "kharon_teach"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kharon-teach"
+path = "src/main.rs"
+
+[dependencies]
+kharon-recording = { path = "../kharon-recording" }
+zeroize = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+base64ct = { version = "1", features = ["alloc"] }
+hex = "0.4"
+percent-encoding = "2"

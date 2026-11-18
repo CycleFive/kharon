@@ -56,7 +56,7 @@ impl Encoding {
 pub struct MarkerHit {
     pub role: Role,
     pub encoding: Encoding,
-    /// True when the match is weak (short value, or a common substring), so a reader treats it as a hint.
+    /// True when the match is weak (the marker is shorter than `LOW_CONFIDENCE_BELOW` characters), so a reader treats it as a hint.
     pub low_confidence: bool,
 }
 

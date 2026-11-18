@@ -220,7 +220,7 @@ fn hits_walks_url_authorization_and_nested_json() {
 pub struct Flags { pub captcha: bool, pub otp_step: bool, pub cross_site: bool, pub popup: bool,
     pub framed_login: bool, pub shadow_dom: bool, pub multiple_passwords: bool, pub body_unavailable: bool }
 #[serde(rename_all = "snake_case")] pub enum PasswordLeg { FormPost, ScriptPost, Transformed }
-#[serde(tag = "shape", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")] // on the wire: "shape": {"kind": "two_step", "password_leg": "form_post"}
 pub enum Shape { FormPost, ScriptPost, TwoStep { password_leg: PasswordLeg },
     Transformed { digest: Option<String> }, Unrecognized }
 #[serde(rename_all = "snake_case")] pub enum RungCeiling { Milliseconds, AgentContinues, NeedsPerson }

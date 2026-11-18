@@ -11,8 +11,9 @@ use crate::cdp::{Cdp, CdpError, Event, parse_quiet};
 use crate::events::{
     AddBinding, AddScriptToEvaluateOnNewDocument, AttachedToTarget, BindingCalled, Empty,
     FrameNavigated, GetRequestPostData, Hello, LayoutMetrics, ListenerReport, Navigate, PostData,
-    RemoveScript, ReportKind, RequestWillBeSent, ResponseReceived, ResponseReceivedExtraInfo,
-    ScriptId, SetAutoAttach, SetDiscoverTargets, TargetDestroyed, VersionInfo,
+    RemoveBinding, RemoveScript, ReportKind, RequestWillBeSent, ResponseReceived,
+    ResponseReceivedExtraInfo, ScriptId, SetAutoAttach, SetDiscoverTargets, TargetDestroyed,
+    VersionInfo,
 };
 use crate::notice::notice_page_url;
 use kharon_recording::{BrowserInfo, EndedBy, ListenerWorld, Recording, ResourceKind, Viewport};
@@ -20,6 +21,7 @@ use serde::Serialize;
 use serde::de::IgnoredAny;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use zeroize::Zeroizing;
@@ -29,11 +31,27 @@ pub const LISTENER_JS: &str = include_str!("listener.js");
 const BINDING: &str = "__kharonTeach";
 const WORLD: &str = "kharon-teach";
 /// How long the listener may take to announce itself on the notice page.
-const HELLO_WAIT: Duration = Duration::from_secs(3);
+const HELLO_WAIT: Duration = Duration::from_secs(5);
+/// The same, when a test has made the isolated world unable to answer.
+const HELLO_WAIT_SKIPPED: Duration = Duration::from_millis(300);
 /// How long to keep taking events after the person confirms.
 const LATE_WAIT: Duration = Duration::from_millis(300);
+/// How long `Network.getRequestPostData` may take.
+const POST_DATA_WAIT: Duration = Duration::from_secs(5);
+/// How many times the recorder had to ask the browser for a request body that was not inline.
+#[doc(hidden)]
+pub static POST_DATA_FETCHES: AtomicUsize = AtomicUsize::new(0);
 /// How long the browser may take to show its first page.
 const FIRST_PAGE_WAIT: Duration = Duration::from_secs(10);
+
+/// Which world the listener is tried in first. `SkipIsolated` is for tests of the fallback.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WorldProbe {
+    Normal,
+    /// The isolated world gets its binding but never the script, so the fallback runs.
+    SkipIsolated,
+}
 
 pub enum End {
     Confirmed,
@@ -115,6 +133,19 @@ struct Rec {
     clock: Option<(Instant, SystemTime)>,
     hops: HashMap<String, Vec<Hop>>,
     hello: bool,
+    /// This attempt's value in the script; only a hello carrying it counts.
+    nonce: String,
+    probe: WorldProbe,
+}
+
+fn fresh_nonce() -> String {
+    use rand::Rng;
+    use rand::distributions::Alphanumeric;
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect()
 }
 
 async fn send<P: Serialize>(
@@ -135,6 +166,17 @@ pub async fn record(
     opts: RecordOptions<'_>,
     ready: oneshot::Sender<Ready>,
     end: oneshot::Receiver<End>,
+) -> Result<Outcome, SessionError> {
+    record_with(opts, ready, end, WorldProbe::Normal).await
+}
+
+/// [`record`], with a way for a test to make the isolated world fail.
+#[doc(hidden)]
+pub async fn record_with(
+    opts: RecordOptions<'_>,
+    ready: oneshot::Sender<Ready>,
+    end: oneshot::Receiver<End>,
+    probe: WorldProbe,
 ) -> Result<Outcome, SessionError> {
     let stale = Profile::sweep_stale().unwrap_or(0);
     let profile = Profile::create()?;
@@ -159,13 +201,16 @@ pub async fn record(
         &dev,
         &opts,
         &notice,
-        Ready {
-            devtools_port: dev.port,
-            profile_dir,
-            stale_profiles_removed: stale,
-        },
-        ready,
+        (
+            Ready {
+                devtools_port: dev.port,
+                profile_dir,
+                stale_profiles_removed: stale,
+            },
+            ready,
+        ),
         end,
+        probe,
     )
     .await;
     guard.finish().await;
@@ -179,7 +224,7 @@ struct Cleanup {
     profile: Option<Profile>,
 }
 
-/// A just-killed browser's helper processes can still be writing into the profile for a moment.
+/// Removal retries: the group is empty by now, but a filesystem can still be busy for a moment.
 const REMOVE_TRIES: u32 = 60;
 const REMOVE_PAUSE: Duration = Duration::from_millis(50);
 
@@ -189,84 +234,12 @@ fn try_remove(path: &std::path::Path) -> bool {
     !path.exists()
 }
 
-/// The browser's process and everything below it. A killed browser's helper processes (the
-/// network service above all) outlive it for a moment and recreate files in a profile that was
-/// just removed, so the profile is removed only after they are gone.
-#[cfg(target_os = "linux")]
-fn family(root: u32) -> Vec<u32> {
-    let mut parent_of: Vec<(u32, u32)> = Vec::new();
-    if let Ok(procs) = std::fs::read_dir("/proc") {
-        for e in procs.flatten() {
-            let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            if let Some((_, ppid)) = stat_of(pid) {
-                parent_of.push((pid, ppid));
-            }
-        }
-    }
-    let mut out = vec![root];
-    let mut i = 0;
-    while i < out.len() {
-        let at = out[i];
-        out.extend(
-            parent_of
-                .iter()
-                .filter(|(_, pp)| *pp == at)
-                .map(|(p, _)| *p),
-        );
-        i += 1;
-    }
-    out
-}
-
-/// A process's state letter and parent pid, from `/proc/<pid>/stat`.
-#[cfg(target_os = "linux")]
-fn stat_of(pid: u32) -> Option<(char, u32)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The command name is in parentheses and may hold spaces and parentheses itself.
-    let rest = &text[text.rfind(')')? + 1..];
-    let mut f = rest.split_whitespace();
-    let state = f.next()?.chars().next()?;
-    let ppid = f.next()?.parse().ok()?;
-    Some((state, ppid))
-}
-
-#[cfg(target_os = "linux")]
-fn any_alive(pids: &[u32]) -> bool {
-    pids.iter()
-        .any(|p| stat_of(*p).is_some_and(|(state, _)| state != 'Z' && state != 'X'))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn family(root: u32) -> Vec<u32> {
-    vec![root]
-}
-
-#[cfg(not(target_os = "linux"))]
-fn any_alive(_pids: &[u32]) -> bool {
-    false
-}
-
 impl Cleanup {
-    fn family(&self) -> Vec<u32> {
-        self.browser
-            .as_ref()
-            .map(|b| family(b.pid()))
-            .unwrap_or_default()
-    }
-
-    /// The normal end: wait for the browser to be gone, then remove the profile.
+    /// The normal end: kill the browser's whole group, wait for it to be empty (at most 3 s),
+    /// then remove the profile.
     async fn finish(&mut self) {
-        let procs = self.family();
         if let Some(b) = self.browser.take() {
             let _ = b.close().await;
-        }
-        for _ in 0..REMOVE_TRIES {
-            if !any_alive(&procs) {
-                break;
-            }
-            tokio::time::sleep(REMOVE_PAUSE).await;
         }
         if let Some(p) = self.profile.take() {
             let path = p.path().to_owned();
@@ -281,15 +254,11 @@ impl Cleanup {
 }
 
 impl Drop for Cleanup {
+    /// A drop cannot await, so this blocks its thread: up to 3 s for the browser's group to be
+    /// empty, then up to 3 s for the removal. It is the Ctrl-C path, and it cannot hang.
     fn drop(&mut self) {
-        let procs = self.family();
-        // Dropping the browser kills it.
-        drop(self.browser.take());
-        for _ in 0..REMOVE_TRIES {
-            if !any_alive(&procs) {
-                break;
-            }
-            std::thread::sleep(REMOVE_PAUSE);
+        if let Some(mut b) = self.browser.take() {
+            b.close_blocking();
         }
         if let Some(p) = self.profile.take() {
             let path = p.path().to_owned();
@@ -308,9 +277,9 @@ async fn run(
     dev: &crate::browser::DevTools,
     opts: &RecordOptions<'_>,
     notice: &str,
-    info: Ready,
-    ready: oneshot::Sender<Ready>,
+    (info, ready): (Ready, oneshot::Sender<Ready>),
     mut end: oneshot::Receiver<End>,
+    probe: WorldProbe,
 ) -> Result<Outcome, SessionError> {
     let (cdp, mut rx) = Cdp::connect(dev).await?;
     let mut rec = Rec {
@@ -325,6 +294,8 @@ async fn run(
         clock: None,
         hops: HashMap::new(),
         hello: false,
+        nonce: fresh_nonce(),
+        probe,
     };
 
     send(
@@ -441,7 +412,8 @@ impl Rec {
             Wait::Closed => return Ok(Choice::Closed),
             Wait::Timeout => {}
         }
-        // The isolated world did not deliver: install in the main world instead.
+        // The isolated world did not deliver: install in the main world instead, under a new
+        // nonce, so that a late hello from the isolated attempt cannot pass for the new one.
         if let Some(id) = self
             .sessions
             .get_mut(&first)
@@ -456,6 +428,7 @@ impl Rec {
             .await?;
         }
         self.world = ListenerWorld::Main;
+        self.nonce = fresh_nonce();
         self.install(&first).await?;
         send(
             &self.cdp,
@@ -473,7 +446,13 @@ impl Rec {
 
     async fn wait_hello(&mut self, rx: &mut UnboundedReceiver<Event>) -> Wait {
         self.hello = false;
-        let deadline = tokio::time::Instant::now() + HELLO_WAIT;
+        let wait =
+            if self.world == ListenerWorld::Isolated && self.probe == WorldProbe::SkipIsolated {
+                HELLO_WAIT_SKIPPED
+            } else {
+                HELLO_WAIT
+            };
+        let deadline = tokio::time::Instant::now() + wait;
         while !self.hello {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(ev)) => {
@@ -491,6 +470,16 @@ impl Rec {
     /// The binding and the script, in the world chosen now.
     async fn install(&mut self, session: &str) -> Result<(), CdpError> {
         let isolated = self.world == ListenerWorld::Isolated;
+        if !isolated {
+            // The isolated attempt's binding may still exist under the same name.
+            let _ = send(
+                &self.cdp,
+                "Runtime.removeBinding",
+                &RemoveBinding { name: BINDING },
+                Some(session),
+            )
+            .await;
+        }
         send(
             &self.cdp,
             "Runtime.addBinding",
@@ -501,12 +490,16 @@ impl Rec {
             Some(session),
         )
         .await?;
+        if isolated && self.probe == WorldProbe::SkipIsolated {
+            return Ok(());
+        }
+        let source = LISTENER_JS.replacen("__NONCE__", &self.nonce, 1);
         let id: ScriptId = self
             .cdp
             .call(
                 "Page.addScriptToEvaluateOnNewDocument",
                 &AddScriptToEvaluateOnNewDocument {
-                    source: LISTENER_JS,
+                    source: &source,
                     world_name: isolated.then_some(WORLD),
                 },
                 Some(session),
@@ -722,8 +715,10 @@ impl Rec {
         if p.name != BINDING {
             return;
         }
-        if parse_quiet::<Hello>(&p.payload).is_ok_and(|h| h.hello) {
-            self.hello = true;
+        if let Ok(h) = parse_quiet::<Hello>(&p.payload) {
+            if h.hello && h.nonce == self.nonce {
+                self.hello = true;
+            }
             return;
         }
         let Ok(r) = parse_quiet::<ListenerReport>(&p.payload) else {
@@ -825,17 +820,17 @@ impl Rec {
         let body = match (&p.request.post_data, p.request.has_post_data) {
             (Some(d), _) => RawBody::Bytes(Zeroizing::new(d.as_bytes().to_vec())),
             (None, Some(true)) => {
-                match self
-                    .cdp
-                    .call::<_, PostData>(
-                        "Network.getRequestPostData",
-                        &GetRequestPostData { request_id: &id },
-                        Some(session),
-                    )
-                    .await
-                {
-                    Ok(d) => RawBody::Bytes(Zeroizing::new(d.post_data.as_bytes().to_vec())),
-                    Err(_) => RawBody::Unavailable,
+                POST_DATA_FETCHES.fetch_add(1, Ordering::Relaxed);
+                // A target that dies mid-call must not stall event handling for CALL_TIMEOUT.
+                let params = GetRequestPostData { request_id: &id };
+                let call = self.cdp.call::<_, PostData>(
+                    "Network.getRequestPostData",
+                    &params,
+                    Some(session),
+                );
+                match tokio::time::timeout(POST_DATA_WAIT, call).await {
+                    Ok(Ok(d)) => RawBody::Bytes(Zeroizing::new(d.post_data.as_bytes().to_vec())),
+                    Ok(Err(_)) | Err(_) => RawBody::Unavailable,
                 }
             }
             _ => RawBody::None,

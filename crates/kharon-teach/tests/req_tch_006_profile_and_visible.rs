@@ -19,6 +19,21 @@ fn row_counts(db: &Path, tables: &[&str]) -> Option<Vec<u64>> {
     ));
     let _ = std::fs::remove_file(&copy);
     std::fs::copy(db, &copy).unwrap();
+    // A write-ahead log or journal beside the database holds rows the main file does not yet.
+    let siblings: Vec<PathBuf> = ["-wal", "-journal"]
+        .iter()
+        .map(|suffix| {
+            let mut from = db.as_os_str().to_owned();
+            from.push(suffix);
+            let mut to = copy.as_os_str().to_owned();
+            to.push(suffix);
+            let (from, to) = (PathBuf::from(from), PathBuf::from(to));
+            if from.exists() {
+                let _ = std::fs::copy(&from, &to);
+            }
+            to
+        })
+        .collect();
     let script = [
         "import sqlite3,sys",
         "c=sqlite3.connect(sys.argv[1])",
@@ -35,6 +50,9 @@ fn row_counts(db: &Path, tables: &[&str]) -> Option<Vec<u64>> {
         .args(tables)
         .output();
     let _ = std::fs::remove_file(&copy);
+    for sib in &siblings {
+        let _ = std::fs::remove_file(sib);
+    }
     let out = match out {
         Ok(o) if o.status.success() => o,
         Ok(o) => panic!(
@@ -56,10 +74,13 @@ fn row_counts(db: &Path, tables: &[&str]) -> Option<Vec<u64>> {
     )
 }
 
+/// True when `path` goes away and stays away: a second look a second later, because a helper
+/// process of a killed browser can recreate files in a directory that was just removed.
 async fn gone(path: &Path) -> bool {
     for _ in 0..100 {
         if !path.exists() {
-            return true;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            return !path.exists();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -82,22 +103,41 @@ async fn nothing_is_saved_in_the_profile_during_a_login() {
     run.person.wait_for_path("/home").await;
     let profile = run.ready.profile_dir.clone();
     assert!(profile.is_dir(), "the profile directory exists");
-    for (file, tables) in [
-        ("Login Data", &["logins"][..]),
-        (
-            "Web Data",
-            &["autofill", "autofill_profiles", "credit_cards"][..],
-        ),
-    ] {
-        let db = profile.join("Default").join(file);
+    // At least one of the two databases is there to be looked at (Chromium makes them lazily).
+    let dbs = ["Login Data", "Web Data"].map(|f| profile.join("Default").join(f));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !dbs.iter().any(|d| d.exists()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "neither Login Data nor Web Data appeared in the profile"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for (db, tables) in dbs.iter().zip([
+        &["logins"][..],
+        &["autofill", "autofill_profiles", "credit_cards"][..],
+    ]) {
         if !db.exists() {
-            eprintln!("no {file} in the profile: nothing was saved");
             continue;
         }
-        if let Some(counts) = row_counts(&db, tables) {
-            assert!(counts.iter().all(|n| *n == 0), "{file}: {counts:?}");
+        if let Some(counts) = row_counts(db, tables) {
+            assert!(
+                counts.iter().all(|n| *n == 0),
+                "{}: {counts:?}",
+                db.display()
+            );
         }
     }
+    // The preferences the recorder wrote are still in force after the login.
+    #[derive(serde::Deserialize)]
+    struct Prefs {
+        credentials_enable_service: bool,
+    }
+    let prefs: Prefs = serde_json::from_str(
+        &std::fs::read_to_string(profile.join("Default").join("Preferences")).unwrap(),
+    )
+    .unwrap();
+    assert!(!prefs.credentials_enable_service);
     let _ = run.finish(End::Discard).await;
 }
 
@@ -317,4 +357,44 @@ fn sigint_exits_1_and_removes_the_profile() {
 #[test]
 fn sigterm_exits_1_and_removes_the_profile() {
     interrupted_by("TERM");
+}
+
+async fn outcome_is_unconfirmed_or_never_started(outcome: Outcome) {
+    match outcome {
+        Outcome::Recorded(r) => {
+            assert_eq!(r.ended_by, EndedBy::WindowClosed);
+            assert!(!r.success_confirmed);
+        }
+        Outcome::NeverStarted => {}
+        Outcome::Discarded => panic!("a dead browser is not a discard"),
+    }
+}
+
+#[tokio::test]
+async fn a_browser_killed_from_outside_ends_the_session_and_the_profile_stays_gone() {
+    let Some(mut run) = Run::start("killed_outside", "/form").await else {
+        return;
+    };
+    let profile = run.ready.profile_dir.clone();
+    type_a_login(&run).await;
+    let pid = support::Person::browser_pid(&profile).expect("the browser process");
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    outcome_is_unconfirmed_or_never_started(run.wait().await).await;
+    assert!(gone(&profile).await, "the profile is still there");
+}
+
+#[tokio::test]
+async fn a_browser_that_quits_by_itself_ends_the_session_and_the_profile_stays_gone() {
+    let Some(mut run) = Run::start("quits_itself", "/form").await else {
+        return;
+    };
+    let profile = run.ready.profile_dir.clone();
+    type_a_login(&run).await;
+    run.person.close_browser().await;
+    outcome_is_unconfirmed_or_never_started(run.wait().await).await;
+    assert!(gone(&profile).await, "the profile is still there");
 }

@@ -36,7 +36,9 @@ pub fn chromium_or_skip(test: &str) -> Option<PathBuf> {
 
 use kharon_teach::browser::DevTools;
 use kharon_teach::cdp::Cdp;
-use kharon_teach::session::{End, Outcome, Ready, RecordOptions, SessionError, record};
+use kharon_teach::session::{
+    End, Outcome, Ready, RecordOptions, SessionError, WorldProbe, record_with,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,7 +54,8 @@ pub const COOKIE_VALUE: &str = "COOKIEVALUE123";
 static GATE: Semaphore = Semaphore::const_new(2);
 
 const FORM: &str = "<!doctype html><title>form</title><form method=post action=/form-login>\
-<input name=user><input name=pass type=password><button type=submit id=go>Sign in</button></form>";
+<input name=user><input name=pass type=password><input type=checkbox name=remember id=rem>\
+<button type=submit id=go>Sign in</button></form>";
 
 const SCRIPT: &str = "<!doctype html><title>script</title><input name=user><input name=pass type=password>\
 <button type=button id=go>Sign in</button><script>\
@@ -80,6 +83,45 @@ const TWO_STEP: &str = "<!doctype html><title>step one</title><form method=post 
 const TWO_STEP_PASSWORD: &str = "<!doctype html><title>step two</title><form method=post action=/form-login>\
 <input name=pass type=password><button type=submit id=go>Sign in</button></form>";
 
+const SCRIPT_FORMDATA: &str = "<!doctype html><title>formdata</title><input name=user><input name=pass type=password>\
+<button type=button id=go>Sign in</button><script>\
+document.getElementById('go').addEventListener('click', async () => {\
+ const fd = new FormData();\
+ fd.append('user', document.querySelector('[name=user]').value);\
+ fd.append('pass', document.querySelector('[name=pass]').value);\
+ await fetch('/api/login-form', {method:'POST', body: fd});\
+ location = '/home';\
+});</script>";
+
+const SCRIPT_BLOB: &str = "<!doctype html><title>blob</title><input name=user><input name=pass type=password>\
+<button type=button id=go>Sign in</button><script>\
+document.getElementById('go').addEventListener('click', async () => {\
+ const user = document.querySelector('[name=user]').value;\
+ const pass = document.querySelector('[name=pass]').value;\
+ const body = new Blob([JSON.stringify({user, pass})], {type:'application/json'});\
+ await fetch('/api/login-blob', {method:'POST', headers:{'content-type':'application/json'}, body});\
+ location = '/home';\
+});</script>";
+
+/// A form that copies what is typed into the user field into the field's own `id`.
+const MIRROR: &str = "<!doctype html><title>mirror</title><form method=post action=/form-login>\
+<input name=user><input name=pass type=password><button type=submit id=go>Sign in</button></form>\
+<script>for (const f of document.querySelectorAll('input')) {\
+ f.addEventListener('input', () => { f.id = f.value; });\
+}</script>";
+
+/// A form whose children replace `action`, `method`, `id` and `tagName` on the form element.
+const CLOBBER: &str = "<!doctype html><title>clobber</title><form id=f method=post action=/form-login>\
+<input name=action><input name=method><input name=id><input name=tagName><input name=getAttribute>\
+<input name=user><input name=pass type=password><button type=submit id=go>Sign in</button></form>";
+
+const POPUP: &str = "<!doctype html><title>popup</title>\
+<button type=button id=go onclick=\"window.open('/form')\">Sign in elsewhere</button>";
+
+/// `{HOST}` is the same server under another host name, so it is another origin.
+const FRAME_OUTER: &str = "<!doctype html><title>outer</title>\
+<iframe id=fr width=600 height=300 src=\"http://{HOST}/form\"></iframe>";
+
 const HOME: &str = "<!doctype html><title>home</title><p>signed in</p>";
 
 fn response(status: &str, extra: &str, body: &str, ctype: &str) -> String {
@@ -89,7 +131,7 @@ fn response(status: &str, extra: &str, body: &str, ctype: &str) -> String {
     )
 }
 
-fn route(method: &str, path: &str) -> String {
+fn route(method: &str, path: &str, host: &str) -> String {
     let html = "text/html; charset=utf-8";
     match (method, path) {
         ("GET", "/form") => response("200 OK", "", FORM, html),
@@ -103,6 +145,18 @@ fn route(method: &str, path: &str) -> String {
         ("POST", "/api/login") => response("200 OK", "", "{\"ok\":true}", "application/json"),
         ("GET", "/two-step") => response("200 OK", "", TWO_STEP, html),
         ("POST", "/two-step/password") => response("200 OK", "", TWO_STEP_PASSWORD, html),
+        ("GET", "/script-formdata") => response("200 OK", "", SCRIPT_FORMDATA, html),
+        ("POST", "/api/login-form") => response("200 OK", "", "{\"ok\":true}", "application/json"),
+        ("GET", "/script-blob") => response("200 OK", "", SCRIPT_BLOB, html),
+        ("POST", "/api/login-blob") => response("200 OK", "", "{\"ok\":true}", "application/json"),
+        ("GET", "/mirror") => response("200 OK", "", MIRROR, html),
+        ("GET", "/clobber") => response("200 OK", "", CLOBBER, html),
+        ("GET", "/popup") => response("200 OK", "", POPUP, html),
+        ("GET", "/frame-outer") => {
+            // Same server, another host name: a different origin.
+            let other = host.replace("127.0.0.1", "localhost");
+            response("200 OK", "", &FRAME_OUTER.replace("{HOST}", &other), html)
+        }
         ("GET", "/hashed") => response("200 OK", "", HASHED, html),
         ("GET", "/home") => response("200 OK", "", HOME, html),
         _ => response("404 Not Found", "", "not found", "text/plain"),
@@ -139,7 +193,15 @@ async fn serve_one(mut sock: tokio::net::TcpStream) {
         }
     }
     let path = path.split('?').next().unwrap_or("");
-    let _ = sock.write_all(route(method, path).as_bytes()).await;
+    let host = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .starts_with("host:")
+                .then(|| l[5..].trim().to_owned())
+        })
+        .unwrap_or_default();
+    let _ = sock.write_all(route(method, path, &host).as_bytes()).await;
     let _ = sock.shutdown().await;
 }
 
@@ -191,6 +253,8 @@ struct TargetRow {
     id: String,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    url: String,
 }
 
 #[derive(Serialize)]
@@ -331,7 +395,7 @@ impl Person {
         t.infos.into_iter().find(|t| t.kind == "page").map(|t| t.id)
     }
 
-    async fn eval(&self, expression: &str) -> Option<String> {
+    pub async fn eval(&self, expression: &str) -> Option<String> {
         let r: EvalResult = self
             .cdp
             .call(
@@ -469,6 +533,11 @@ impl Run {
     /// Starts `record` headless on the fixture's `login_path` and waits until the notice page is
     /// showing. `None` when there is no browser and the run does not require one.
     pub async fn start(test: &str, login_path: &str) -> Option<Run> {
+        Self::start_with(test, login_path, WorldProbe::Normal).await
+    }
+
+    /// [`Run::start`] with a way to make the isolated world fail.
+    pub async fn start_with(test: &str, login_path: &str, probe: WorldProbe) -> Option<Run> {
         let bin = chromium_or_skip(test)?;
         let permit = GATE.acquire().await.unwrap();
         let fixture = Fixture::start().await;
@@ -476,7 +545,7 @@ impl Run {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (end_tx, end_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            record(
+            record_with(
                 RecordOptions {
                     login_url: &login,
                     browser: &bin,
@@ -485,6 +554,7 @@ impl Run {
                 },
                 ready_tx,
                 end_rx,
+                probe,
             )
             .await
         });
@@ -547,6 +617,10 @@ pub enum Login {
     Script,
     TwoStep,
     Hashed,
+    ScriptFormData,
+    ScriptBlob,
+    Mirror,
+    Clobber,
 }
 
 impl Login {
@@ -556,6 +630,10 @@ impl Login {
             Login::Script => "/script",
             Login::TwoStep => "/two-step",
             Login::Hashed => "/hashed",
+            Login::ScriptFormData => "/script-formdata",
+            Login::ScriptBlob => "/script-blob",
+            Login::Mirror => "/mirror",
+            Login::Clobber => "/clobber",
         }
     }
 }
@@ -567,7 +645,17 @@ pub async fn record_login(test: &str, which: Login) -> Option<kharon_recording::
     run.begin(which.path()).await;
     let p = &run.person;
     match which {
-        Login::Form | Login::Script | Login::Hashed => {
+        Login::Mirror => {
+            p.type_into("input[name=user]", USER).await;
+            p.type_into("input[name=pass]", PASS).await;
+            p.press_enter().await;
+        }
+        Login::Form
+        | Login::Script
+        | Login::Hashed
+        | Login::ScriptFormData
+        | Login::ScriptBlob
+        | Login::Clobber => {
             p.type_into("input[name=user]", USER).await;
             p.type_into("input[name=pass]", PASS).await;
             p.click("#go").await;
@@ -710,4 +798,144 @@ pub async fn run_program(test: &str, form_path_and_query: &str) -> Option<Progra
 
 fn path_of(path_and_query: &str) -> &str {
     path_and_query.split('?').next().unwrap_or("")
+}
+
+#[derive(Serialize)]
+struct FlattenAttach<'a> {
+    #[serde(rename = "targetId")]
+    target_id: &'a str,
+    flatten: bool,
+}
+
+impl Person {
+    /// How many page targets the browser has.
+    pub async fn page_count(&self) -> usize {
+        let t: Targets = self
+            .cdp
+            .call("Target.getTargets", &Ignored2 {}, None)
+            .await
+            .unwrap();
+        t.infos.iter().filter(|t| t.kind == "page").count()
+    }
+
+    pub async fn wait_for_pages(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while self.page_count().await < n {
+            assert!(tokio::time::Instant::now() < deadline, "no page number {n}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The browser closes itself, as when someone quits it from its menu.
+    pub async fn close_browser(&self) {
+        let _: Result<Ignored, _> = self.cdp.call("Browser.close", &Ignored2 {}, None).await;
+    }
+
+    /// A session on the page's embedded frame whose URL is on `host`, waiting for it to exist.
+    /// The frame is in another process, so the page's own session cannot reach into it.
+    pub async fn attach_frame(&self, host: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let t: Targets = self
+                .cdp
+                .call("Target.getTargets", &Ignored2 {}, None)
+                .await
+                .unwrap();
+            if let Some(f) = t
+                .infos
+                .iter()
+                .find(|t| t.kind == "iframe" && t.url.contains(host))
+            {
+                let a: Attached = self
+                    .cdp
+                    .call(
+                        "Target.attachToTarget",
+                        &FlattenAttach {
+                            target_id: &f.id,
+                            flatten: true,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                return a.session_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no frame target for {host}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn eval_in(&self, session: &str, expression: &str) -> Option<String> {
+        let r: EvalResult = self
+            .cdp
+            .call(
+                "Runtime.evaluate",
+                &EvalParam {
+                    expression,
+                    return_by_value: true,
+                },
+                Some(session),
+            )
+            .await
+            .ok()?;
+        r.result.value
+    }
+
+    /// Focus `css` inside the frame, then type into it.
+    pub async fn type_into_frame(&self, frame: &str, css: &str, text: &str) {
+        let sel = serde_json::to_string(css).unwrap();
+        let focus = format!(
+            "(()=>{{const e=document.querySelector({sel});if(!e)return 'no';e.focus();return 'ok'}})()"
+        );
+        // The frame's document may not be there yet when its target first appears.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while self.eval_in(frame, &focus).await.as_deref() != Some("ok") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the field {css} never appeared in the frame"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _: Ignored = self
+            .cdp
+            .call("Input.insertText", &TextParam { text }, Some(frame))
+            .await
+            .unwrap();
+    }
+
+    pub async fn wait_for_frame_path(&self, frame: &str, path: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if self.eval_in(frame, "location.pathname").await.as_deref() == Some(path) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the frame never reached {path}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The pid of the main browser process of the profile at `profile`, found through `/proc`.
+    pub fn browser_pid(profile: &std::path::Path) -> Option<u32> {
+        let want = format!("--user-data-dir={}", profile.display());
+        for e in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(cmd) = std::fs::read(e.path().join("cmdline")) else {
+                continue;
+            };
+            // Chrome rewrites its own argv into one space-separated string; no path here has a space.
+            let args: Vec<&[u8]> = cmd.split(|b| *b == 0 || *b == b' ').collect();
+            if args.contains(&want.as_bytes()) && !args.iter().any(|a| a.starts_with(b"--type=")) {
+                return Some(pid);
+            }
+        }
+        None
+    }
 }

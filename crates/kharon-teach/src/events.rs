@@ -340,6 +340,14 @@ pub struct Empty {}
 #[derive(Deserialize)]
 pub struct Hello {
     pub hello: bool,
+    /// The nonce this install of the script was given: a hello from an earlier install is not
+    /// the current one's.
+    pub nonce: String,
+}
+
+#[derive(Serialize)]
+pub struct RemoveBinding<'a> {
+    pub name: &'a str,
 }
 
 const MAX_FIELD_CHARS: usize = 4096;
@@ -634,7 +642,11 @@ mod tests {
 
     #[test]
     fn hello_is_not_a_report() {
-        assert!(parse_quiet::<Hello>(r#"{"hello":true}"#).is_ok_and(|h| h.hello));
+        assert!(
+            parse_quiet::<Hello>(r#"{"hello":true,"nonce":"n1"}"#)
+                .is_ok_and(|h| h.hello && h.nonce == "n1")
+        );
+        assert!(parse_quiet::<Hello>(r#"{"hello":true}"#).is_err());
         assert!(parse_quiet::<Hello>(REPORT).is_err());
         assert!(parse_quiet::<ListenerReport>(r#"{"hello":true}"#).is_err());
     }

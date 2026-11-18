@@ -280,10 +280,18 @@ pub struct Launch<'a> {
     pub headless: bool,
 }
 
-/// The browser process. Killed when dropped.
+/// The browser process and the process group it leads. Killing it kills the whole group, and a
+/// drop kills it.
 pub struct Browser {
     child: tokio::process::Child,
+    /// The group id (the browser's own pid: it is launched as a group leader).
+    #[cfg(unix)]
+    group: Option<rustix::process::Pid>,
 }
+
+/// How long to wait for a killed group to be empty.
+const GROUP_WAIT: Duration = Duration::from_secs(3);
+const GROUP_POLL: Duration = Duration::from_millis(20);
 
 pub struct DevTools {
     pub port: u16,
@@ -327,27 +335,37 @@ impl Browser {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(launch_err)?;
+        // Its own process group, so that "kill the browser" means the helpers too.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let child = cmd.spawn().map_err(launch_err)?;
+        #[cfg(unix)]
+        let group = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw);
+        // From here on a drop (including every early return) kills the group.
+        let mut browser = Browser {
+            child,
+            #[cfg(unix)]
+            group,
+        };
 
         let file = profile.join("DevToolsActivePort");
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         loop {
-            match child.try_wait() {
+            match browser.child.try_wait() {
                 Ok(Some(status)) => return Err(BrowserError::Launch(status.to_string())),
                 Ok(None) => {}
-                Err(e) => {
-                    let _ = child.kill().await;
-                    return Err(launch_err(e));
-                }
+                Err(e) => return Err(launch_err(e)),
             }
             if let Some(dt) = std::fs::read_to_string(&file)
                 .ok()
                 .and_then(|t| parse_devtools_active_port(&t))
             {
-                return Ok((Browser { child }, dt));
+                return Ok((browser, dt));
             }
             if tokio::time::Instant::now() >= deadline {
-                let _ = child.kill().await;
                 return Err(BrowserError::Launch(
                     "no DevTools port after 20 s".to_owned(),
                 ));
@@ -364,9 +382,57 @@ impl Browser {
         self.child.wait().await
     }
 
-    /// Kill the browser and wait until it is reaped.
+    /// SIGKILL to every process in the browser's group. Safe to repeat.
+    pub fn kill_group(&self) {
+        #[cfg(unix)]
+        if let Some(g) = self.group {
+            let _ = rustix::process::kill_process_group(g, rustix::process::Signal::KILL);
+        }
+    }
+
+    /// True once no process is left in the browser's group. A group that was never made counts
+    /// as empty.
+    pub fn group_is_empty(&self) -> bool {
+        #[cfg(unix)]
+        if let Some(g) = self.group {
+            return matches!(
+                rustix::process::test_kill_process_group(g),
+                Err(rustix::io::Errno::SRCH)
+            );
+        }
+        true
+    }
+
+    /// Kill the whole group, reap the browser, and wait up to 3 s for the group to be empty.
     pub async fn close(mut self) -> std::io::Result<()> {
-        self.child.kill().await
+        self.kill_group();
+        let reaped = self.child.wait().await.map(|_| ());
+        let deadline = tokio::time::Instant::now() + GROUP_WAIT;
+        while !self.group_is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(GROUP_POLL).await;
+        }
+        reaped
+    }
+
+    /// [`Browser::close`] for a place that cannot await (a `Drop`): it blocks the calling thread
+    /// for at most 3 s.
+    pub fn close_blocking(&mut self) {
+        self.kill_group();
+        let deadline = std::time::Instant::now() + GROUP_WAIT;
+        loop {
+            // Reaps the leader, which would otherwise stay a zombie and keep the group non-empty.
+            let _ = self.child.try_wait();
+            if self.group_is_empty() || std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(GROUP_POLL);
+        }
+    }
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        self.kill_group();
     }
 }
 

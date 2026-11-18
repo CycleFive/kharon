@@ -7,6 +7,8 @@
   "use strict";
   try {
     const BINDING = "__kharonTeach";
+    // Replaced by the recorder with a fresh value for each install of this script.
+    const NONCE = "__NONCE__";
     const GUARD = Symbol.for("kharon-teach.listener");
     if (Object.prototype.hasOwnProperty.call(document, GUARD)) return;
     Object.defineProperty(document, GUARD, { value: true, enumerable: false });
@@ -27,6 +29,24 @@
     } catch (_) {
       documentId = String(Math.random()).slice(2) + String(Date.now());
     }
+
+    // Reads go through the prototypes, never through the element: a form's child named
+    // "action", "method", "id", "tagName" or "getAttribute" replaces that property on the form.
+    const proto = Element.prototype;
+    const getAttr = proto.getAttribute;
+    const matchesFn = proto.matches;
+    const closestFn = proto.closest;
+    const getRoot = Node.prototype.getRootNode;
+    const getter = (obj, name) => {
+      const d = Object.getOwnPropertyDescriptor(obj, name);
+      return d && d.get ? d.get : () => undefined;
+    };
+    const tagGetter = getter(proto, "tagName");
+    const formActionGetter = getter(HTMLFormElement.prototype, "action");
+    const formMethodGetter = getter(HTMLFormElement.prototype, "method");
+    const docFormsGetter = getter(Document.prototype, "forms");
+    const attr = (el, name) => getAttr.call(el, name);
+    const tagOf = (el) => String(tagGetter.call(el)).toLowerCase();
 
     const send = (report) => {
       try {
@@ -60,11 +80,10 @@
       const parts = [];
       let node = el;
       for (let depth = 0; node && node.nodeType === 1 && depth < 6; depth++) {
-        const tag = node.tagName.toLowerCase();
-        let part = tag;
+        let part = tagOf(node);
         const parent = node.parentElement;
         if (parent) {
-          const same = Array.from(parent.children).filter((c) => c.tagName === node.tagName);
+          const same = Array.from(parent.children).filter((c) => tagOf(c) === part);
           if (same.length > 1) part += ":nth-of-type(" + (same.indexOf(node) + 1) + ")";
         }
         parts.unshift(part);
@@ -79,11 +98,36 @@
       return null;
     };
 
+    const textEntry = (el) => {
+      const tag = tagOf(el);
+      if (tag === "textarea") return true;
+      if (tag !== "input") return false;
+      return TEXTISH.includes(String(el.type || "text").toLowerCase());
+    };
+
+    // What the person has typed into the element now: used to keep it out of the descriptor
+    // and the selectors, whether or not this report sends it.
+    const typedValue = (el) => {
+      try {
+        return textEntry(el) ? String(el.value === undefined ? "" : el.value) : "";
+      } catch (_) {
+        return "";
+      }
+    };
+
+    // An attribute that holds the typed text (a page that mirrors the field into its own id or
+    // name) is not reported and builds no selector.
+    const clean = (typed, v) => {
+      if (v === null || v === undefined) return null;
+      const t = String(v);
+      return typed.length > 0 && t.includes(typed) ? null : t;
+    };
+
     const selectorsFor = (el, typed) => {
       const out = [];
       let root = null;
       try {
-        root = el.getRootNode();
+        root = getRoot.call(el);
       } catch (_) {
         root = document;
       }
@@ -91,8 +135,6 @@
       const scope = inShadow ? root : document;
       const add = (s, unique) => {
         if (!s || s.length > MAX_STR || out.includes(s)) return;
-        // A value this short is contained in an ordinary selector by chance.
-        if (typed && typed.length >= 3 && s.includes(typed)) return;
         try {
           if (scope.querySelector(s) !== el) return;
           if (unique && scope.querySelectorAll(s).length !== 1) return;
@@ -101,13 +143,14 @@
           /* an invalid candidate is dropped */
         }
       };
-      const tag = el.tagName.toLowerCase();
-      if (el.id) add("#" + CSS.escape(el.id));
-      const name = el.getAttribute("name");
+      const tag = tagOf(el);
+      const id = clean(typed, attr(el, "id"));
+      if (id) add("#" + CSS.escape(id));
+      const name = clean(typed, attr(el, "name"));
       if (name) add(tag + '[name="' + attrEscape(name) + '"]');
-      const auto = el.getAttribute("autocomplete");
+      const auto = clean(typed, attr(el, "autocomplete"));
       if (auto) add(tag + '[autocomplete="' + attrEscape(auto) + '"]');
-      const type = el.getAttribute("type");
+      const type = clean(typed, attr(el, "type"));
       if (type) add(tag + '[type="' + attrEscape(type) + '"]', true);
       add(structural(el, scope));
       return { selectors: out.slice(0, MAX_SELECTORS), inShadow };
@@ -117,39 +160,36 @@
       if (!form) return null;
       let index = 0;
       try {
-        index = Math.max(0, Array.prototype.indexOf.call(document.forms, form));
+        index = Math.max(0, Array.prototype.indexOf.call(docFormsGetter.call(document), form));
       } catch (_) {
         index = 0;
       }
-      return {
-        index,
-        action: cut(form.action),
-        method: String(form.method || "get").toLowerCase(),
-      };
+      let action = null;
+      let method = "get";
+      try {
+        action = cut(formActionGetter.call(form));
+        method = String(formMethodGetter.call(form) || "get").toLowerCase();
+      } catch (_) {
+        /* leave the defaults */
+      }
+      return { index, action, method };
     };
 
-    const textEntry = (el) => {
-      const tag = el.tagName.toLowerCase();
-      if (tag === "textarea") return true;
-      if (tag !== "input") return false;
-      const type = String(el.type || "text").toLowerCase();
-      return TEXTISH.includes(type);
-    };
-
-    const describe = (el, typed) => {
-      const tag = el.tagName.toLowerCase();
+    const describe = (el) => {
+      const tag = tagOf(el);
       const isInput = tag === "input";
+      const typed = typedValue(el);
       const sel = selectorsFor(el, typed);
       const form = tag === "form" ? el : el.form || null;
       return {
         element_id: elementId(el),
         tag,
         input_type: isInput ? String(el.type || "text").toLowerCase() : null,
-        id: cut(el.id || null),
-        name: cut(el.getAttribute("name")),
-        autocomplete: cut(el.getAttribute("autocomplete")),
-        placeholder: cut(el.getAttribute("placeholder")),
-        aria_label: cut(el.getAttribute("aria-label")),
+        id: cut(clean(typed, attr(el, "id"))),
+        name: cut(clean(typed, attr(el, "name"))),
+        autocomplete: cut(clean(typed, attr(el, "autocomplete"))),
+        placeholder: cut(clean(typed, attr(el, "placeholder"))),
+        aria_label: cut(clean(typed, attr(el, "aria-label"))),
         is_password_now: isInput && String(el.type).toLowerCase() === "password",
         form: formInfo(form),
         selectors: sel.selectors,
@@ -179,7 +219,7 @@
         document_id: documentId,
         frame_url: cut(location.href) || "",
         is_top: isTop(),
-        element: describe(el, value),
+        element: describe(el),
       };
       if (value !== null) body.value = value;
       send(body);
@@ -190,25 +230,25 @@
     const handlers = {
       input: (e) => {
         const el = originOf(e);
-        if (el && el.matches("input, textarea, select")) report("input", el, true);
+        if (el && matchesFn.call(el, "input, textarea, select")) report("input", el, true);
       },
       change: (e) => {
         const el = originOf(e);
-        if (el && el.matches("input, textarea, select")) report("change", el, true);
+        if (el && matchesFn.call(el, "input, textarea, select")) report("change", el, true);
       },
       click: (e) => {
         const el = originOf(e);
-        const hit = el && el.closest ? el.closest(CLICKABLE) : null;
+        const hit = el ? closestFn.call(el, CLICKABLE) : null;
         if (hit) report("click", hit, false);
       },
       submit: (e) => {
         const el = originOf(e);
-        if (el && el.tagName.toLowerCase() === "form") report("submit", el, false);
+        if (el && tagOf(el) === "form") report("submit", el, false);
       },
       keydown: (e) => {
         if (e.key !== "Enter") return;
         const el = originOf(e);
-        if (el && el.tagName.toLowerCase() === "input") report("enter_key", el, false);
+        if (el && tagOf(el) === "input") report("enter_key", el, false);
       },
     };
 
@@ -227,7 +267,7 @@
       );
     }
 
-    if (isTop()) send({ hello: true });
+    if (isTop()) send({ hello: true, nonce: NONCE });
   } catch (_) {
     /* never throw into the page */
   }

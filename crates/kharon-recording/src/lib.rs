@@ -12,6 +12,6 @@ pub use format::{
     ListenerWorld, Recording, Step, StrippedCounts, StrippedUrl, Viewport,
 };
 pub use request::{
-    AuthShape, BodyShape, Encoding, FieldShape, JsonField, JsonShape, MarkerHit, ResourceKind,
-    ResponseShape, Role, StoredRequest, ValueKind, ValueShape,
+    AuthShape, BodyShape, Deciding, Encoding, FieldShape, JsonField, JsonShape, MarkerHit,
+    ResourceKind, ResponseShape, Role, StoredRequest, ValueKind, ValueShape,
 };

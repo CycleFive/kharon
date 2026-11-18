@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::format::{ElementDescriptor, Step};
-use crate::request::{ResourceKind, Role, StoredRequest};
+use crate::request::{Deciding, ResourceKind, Role, StoredRequest};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Flags {
@@ -51,14 +51,16 @@ pub struct Classification {
     pub notes: Vec<String>,
 }
 
-fn plain_hit(r: &StoredRequest) -> bool {
+/// A plain (not digest) password hit that decides anything: a weak one counts only when no
+/// confident password hit exists anywhere (see `Deciding`).
+fn plain_hit(r: &StoredRequest, d: &Deciding) -> bool {
     r.hits()
         .iter()
-        .any(|h| h.role == Role::Password && !h.encoding.is_digest())
+        .any(|h| h.role == Role::Password && !h.encoding.is_digest() && d.counts(h))
 }
 
-fn has_hit(r: &StoredRequest, role: Role) -> bool {
-    r.hits().iter().any(|h| h.role == role)
+fn has_hit(r: &StoredRequest, role: Role, d: &Deciding) -> bool {
+    r.hits().iter().any(|h| h.role == role && d.counts(h))
 }
 
 /// Restates the three TOTP tests in `resolveField` in
@@ -94,7 +96,8 @@ fn unrecognized(note: &str) -> Classification {
 
 /// Names the shape of a recorded login and the strongest rung it can take.
 pub fn classify(steps: &[Step], requests: &[StoredRequest], flags: &Flags) -> Classification {
-    let swap_candidate = requests.iter().filter(|r| plain_hit(r)).count() == 1;
+    let deciding = Deciding::from_hits(requests.iter().flat_map(|r| r.hits()));
+    let swap_candidate = requests.iter().filter(|r| plain_hit(r, &deciding)).count() == 1;
 
     // Rule 1.
     let blocking = [
@@ -157,16 +160,18 @@ pub fn classify(steps: &[Step], requests: &[StoredRequest], flags: &Flags) -> Cl
             matches!(s, Step::Navigation { frame, .. } if frame.main) && t_ms(s) > u && t_ms(s) < p
         })
     });
-    let username_only_request = requests
-        .iter()
-        .any(|r| r.t_ms < p && has_hit(r, Role::Username) && !has_hit(r, Role::Password));
+    let username_only_request = requests.iter().any(|r| {
+        r.t_ms < p
+            && has_hit(r, Role::Username, &deciding)
+            && !has_hit(r, Role::Password, &deciding)
+    });
     let two_step = navigated || username_only_request;
 
     // Rule 4.
     let mut notes = Vec::new();
     let earliest_plain = requests
         .iter()
-        .filter(|r| plain_hit(r))
+        .filter(|r| plain_hit(r, &deciding))
         .min_by_key(|r| r.t_ms);
     let leg = match earliest_plain {
         Some(r) => match r.resource {
@@ -194,7 +199,7 @@ pub fn classify(steps: &[Step], requests: &[StoredRequest], flags: &Flags) -> Cl
     let digest = requests
         .iter()
         .flat_map(|r| r.hits())
-        .find(|h| h.role == Role::Password && h.encoding.is_digest())
+        .find(|h| h.role == Role::Password && h.encoding.is_digest() && deciding.counts(h))
         .and_then(|h| h.encoding.digest_name())
         .map(str::to_string);
 
@@ -205,7 +210,9 @@ pub fn classify(steps: &[Step], requests: &[StoredRequest], flags: &Flags) -> Cl
         match leg {
             PasswordLeg::FormPost => Shape::FormPost,
             PasswordLeg::ScriptPost => Shape::ScriptPost,
-            PasswordLeg::Transformed => Shape::Transformed { digest },
+            PasswordLeg::Transformed => Shape::Transformed {
+                digest: digest.clone(),
+            },
         }
     };
 
@@ -222,6 +229,27 @@ pub fn classify(steps: &[Step], requests: &[StoredRequest], flags: &Flags) -> Cl
             RungCeiling::AgentContinues,
             "The username and password are entered on separate steps, so the agent has to carry on after the first.",
         );
+    }
+    if matches!(
+        shape,
+        Shape::TwoStep {
+            password_leg: PasswordLeg::Transformed
+        }
+    ) {
+        // The leg is the same uncertainty as a one-page transformed login: the password was
+        // found nowhere in plain form. Only a named digest lets the agent carry on.
+        match &digest {
+            Some(name) => lower(
+                RungCeiling::AgentContinues,
+                &format!(
+                    "The password is sent as a {name} digest, so the agent has to hash it the same way."
+                ),
+            ),
+            None => lower(
+                RungCeiling::NeedsPerson,
+                "The password is changed before it is sent in a way this tool cannot name, so a person has to look at it.",
+            ),
+        }
     }
     if flags.captcha {
         lower(
@@ -493,6 +521,104 @@ mod tests {
             }
         );
         assert_eq!(c.rung_ceiling, RungCeiling::AgentContinues);
+        assert!(
+            c.notes.iter().any(|n| n.contains("sha256 digest")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    #[test]
+    fn two_step_with_a_transformed_leg_and_no_named_digest_needs_a_person() {
+        let steps = vec![
+            nav(0),
+            input(10, Role::Username, true),
+            nav(50),
+            input(60, Role::Password, true),
+        ];
+        let c = classify(
+            &steps,
+            &[req(100, ResourceKind::Fetch, vec![])],
+            &Flags::default(),
+        );
+        assert_eq!(
+            c.shape,
+            Shape::TwoStep {
+                password_leg: PasswordLeg::Transformed
+            }
+        );
+        assert_eq!(c.rung_ceiling, RungCeiling::NeedsPerson);
+        assert!(
+            c.notes.iter().any(|n| n.contains("cannot name")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    fn weak(role: Role, encoding: Encoding) -> MarkerHit {
+        MarkerHit {
+            role,
+            encoding,
+            low_confidence: true,
+        }
+    }
+
+    #[test]
+    fn a_weak_password_hit_does_not_pick_the_leg_when_a_confident_one_exists() {
+        // A short password matched by chance in an earlier request of a kind no leg is made
+        // from; the request that really carried it is a form post.
+        let reqs = [
+            req(
+                30,
+                ResourceKind::Other,
+                vec![weak(Role::Password, Encoding::AsTyped)],
+            ),
+            req(100, ResourceKind::Document, vec![plain_pw()]),
+        ];
+        let c = classify(&one_page_steps(), &reqs, &Flags::default());
+        assert_eq!(c.shape, Shape::FormPost);
+        assert!(
+            c.network_swap_candidate,
+            "only the confident request counts"
+        );
+        // With no confident hit anywhere, the weak ones decide, as before.
+        let only_weak = [req(
+            100,
+            ResourceKind::Document,
+            vec![weak(Role::Password, Encoding::AsTyped)],
+        )];
+        let c = classify(&one_page_steps(), &only_weak, &Flags::default());
+        assert_eq!(c.shape, Shape::FormPost);
+        assert!(c.network_swap_candidate);
+    }
+
+    #[test]
+    fn a_weak_username_hit_does_not_make_a_two_step_when_a_confident_one_exists() {
+        let reqs = [
+            req(
+                15,
+                ResourceKind::Xhr,
+                vec![weak(Role::Username, Encoding::AsTyped)],
+            ),
+            req(
+                100,
+                ResourceKind::Document,
+                vec![hit(Role::Username, Encoding::AsTyped), plain_pw()],
+            ),
+        ];
+        let c = classify(&one_page_steps(), &reqs, &Flags::default());
+        assert_eq!(c.shape, Shape::FormPost);
+        // Alone, a weak username-only request still reads as a first step.
+        let alone = [
+            req(
+                15,
+                ResourceKind::Xhr,
+                vec![weak(Role::Username, Encoding::AsTyped)],
+            ),
+            req(100, ResourceKind::Document, vec![plain_pw()]),
+        ];
+        let c = classify(&one_page_steps(), &alone, &Flags::default());
+        assert!(matches!(c.shape, Shape::TwoStep { .. }));
     }
 
     #[test]

@@ -9,8 +9,8 @@ mod resolve;
 mod types;
 
 use kharon_recording::{
-    BrowserInfo, Flags, ListenerWorld, Recording, Role, Step, StoredRequest, StrippedCounts,
-    Viewport, classify, is_otp_descriptor,
+    BrowserInfo, Deciding, Flags, ListenerWorld, Recording, Role, Step, StoredRequest,
+    StrippedCounts, Viewport, classify, is_otp_descriptor,
 };
 pub use types::{CaptureEvent, EndInfo, PageEventKind, RawBody, RawElement, RawForm, RawFrame};
 use url::Url;
@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::body::MAX_BODY_BYTES;
 use crate::site::{is_captcha_host, registrable_domain};
-use build::{Ctx, Tally, describe, form_ref, frame_ref, reduce_request, stripped_url};
+use build::{Ctx, Tally, describe, form_ref, frame_ref, raw_hits, reduce_request, stripped_url};
 use resolve::{Elem, resolve};
 
 /// Once this many body bytes are buffered, every further body is buffered as `Unavailable`.
@@ -84,7 +84,8 @@ pub struct Capture {
     requests_seen: u64,
     popup: bool,
     captcha: bool,
-    cross_site: bool,
+    /// When the first main-frame navigation to another registrable domain happened.
+    first_cross_site_ms: Option<u64>,
     framed_login: bool,
     body_unavailable: bool,
     body_budget: usize,
@@ -140,7 +141,7 @@ impl Capture {
             requests_seen: 0,
             popup: false,
             captcha: false,
-            cross_site: false,
+            first_cross_site_ms: None,
             framed_login: false,
             body_unavailable: false,
             body_budget: MAX_BUFFERED_BODY_BYTES,
@@ -245,8 +246,14 @@ impl Capture {
         if frame.main {
             self.main_origin = raw_origin(&frame.url);
             self.final_url = Some(frame.url.clone());
-            if host_of(&frame.url).is_some_and(|h| registrable_domain(&h) != self.login_site) {
-                self.cross_site = true;
+            // Only web pages count: an error page (`chrome-error://`) is not another site.
+            let other_site = Url::parse(&frame.url).is_ok_and(|u| {
+                matches!(u.scheme(), "http" | "https")
+                    && u.host_str()
+                        .is_some_and(|h| registrable_domain(h) != self.login_site)
+            });
+            if other_site {
+                self.first_cross_site_ms.get_or_insert(t_ms);
             }
         }
         let info = self.frame_info(frame);
@@ -370,24 +377,57 @@ impl Capture {
             .map(|u| stripped_url(u, ctx, &mut tally));
         let steps = self.build_steps(&resolved, ctx, &mut tally);
 
+        // Which requests are kept is decided on the raw bytes, before any body is shaped. A weak
+        // (short-value) hit counts only when no confident hit of its role exists anywhere.
+        let hits: Vec<Vec<kharon_recording::MarkerHit>> =
+            self.reqs.iter().map(|b| raw_hits(b, ctx)).collect();
+        let deciding = Deciding::from_hits(hits.iter().flatten());
         let mut requests: Vec<StoredRequest> = Vec::new();
         let mut bodies_reduced = 0;
-        for b in &self.reqs {
-            let Some((stored, t, reduced, telling)) = reduce_request(b, ctx) else {
+        for (b, hs) in self.reqs.iter().zip(&hits) {
+            let telling = hs.iter().any(|h| deciding.counts(h));
+            if !(b.main_frame_navigation || telling || b.login_site_write) {
+                continue;
+            }
+            let Some((stored, t, reduced)) = reduce_request(b, ctx) else {
                 continue;
             };
-            if b.main_frame_navigation || telling || b.login_site_write {
-                tally.add(t);
-                bodies_reduced += u64::from(reduced);
-                requests.push(stored);
-            }
+            tally.add(t);
+            bodies_reduced += u64::from(reduced);
+            requests.push(stored);
         }
+
+        // The login is over once the password has been sent: the last request carrying it, or
+        // when none does, the last typing. A move to another site after that is not part of it.
+        let credentials_sent = self
+            .reqs
+            .iter()
+            .zip(&hits)
+            .filter(|(_, hs)| {
+                hs.iter()
+                    .any(|h| h.role == Role::Password && deciding.counts(h))
+            })
+            .map(|(b, _)| b.t_ms)
+            .max()
+            .or_else(|| {
+                steps
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::Input { t_ms, .. } => Some(*t_ms),
+                        _ => None,
+                    })
+                    .max()
+            });
+        let cross_site = self
+            .first_cross_site_ms
+            .is_some_and(|t| credentials_sent.is_none_or(|c| t < c));
+        let went_on_after_login = self.first_cross_site_ms.is_some() && !cross_site;
 
         let flags =
             Flags {
                 captcha: self.captcha,
                 otp_step: self.otp_step(),
-                cross_site: self.cross_site,
+                cross_site,
                 popup: self.popup,
                 framed_login: self.framed_login,
                 shadow_dom: self.elems.iter().enumerate().any(|(i, e)| {
@@ -396,7 +436,12 @@ impl Capture {
                 multiple_passwords: resolved.multiple_passwords,
                 body_unavailable: self.body_unavailable,
             };
-        let classification = classify(&steps, &requests, &flags);
+        let mut classification = classify(&steps, &requests, &flags);
+        if went_on_after_login {
+            classification
+                .notes
+                .push("After the login the browser went on to another site.".to_owned());
+        }
         Recording {
             format_version: kharon_recording::FORMAT_VERSION,
             tool_version: self.tool_version.clone(),
@@ -1171,6 +1216,69 @@ mod tests {
         assert!(scenario("cross_site").flags.cross_site);
     }
 
+    const WENT_ON: &str = "After the login the browser went on to another site.";
+
+    #[test]
+    fn a_move_to_another_site_after_the_login_is_a_note_and_no_flag() {
+        let rec = Session::new(LOGIN)
+            .type_into(&user_el(), USER)
+            .type_into(&pw_el(), PASS)
+            .click(&button())
+            .post_form(
+                "https://ex.test/login",
+                &format!("username={USER}&password={PASS}"),
+            )
+            .nav("https://app.other.test/home")
+            .finish();
+        assert!(!rec.flags.cross_site);
+        assert_eq!(rec.classification.shape, Shape::FormPost);
+        assert!(
+            rec.classification.notes.iter().any(|n| n == WENT_ON),
+            "{:?}",
+            rec.classification.notes
+        );
+    }
+
+    #[test]
+    fn a_move_to_another_site_before_the_password_is_sent_is_cross_site() {
+        let rec = scenario("cross_site");
+        assert!(rec.flags.cross_site);
+        assert_eq!(rec.classification.shape, Shape::Unrecognized);
+        assert!(!rec.classification.notes.iter().any(|n| n == WENT_ON));
+    }
+
+    #[test]
+    fn with_no_request_carrying_the_password_the_last_typing_is_the_mark() {
+        // Typing, then a move to another site, then nothing sent that holds the password.
+        let after = Session::new(LOGIN)
+            .type_into(&user_el(), USER)
+            .type_into(&pw_el(), PASS)
+            .nav("https://app.other.test/home")
+            .finish();
+        assert!(!after.flags.cross_site);
+        let before = Session::new(LOGIN)
+            .type_into(&user_el(), USER)
+            .nav("https://app.other.test/home")
+            .type_into(&pw_el(), PASS)
+            .finish();
+        assert!(before.flags.cross_site);
+    }
+
+    #[test]
+    fn a_browser_error_page_is_not_another_site() {
+        let rec = Session::new(LOGIN)
+            .type_into(&user_el(), USER)
+            .nav("chrome-error://chromewebdata/")
+            .type_into(&pw_el(), PASS)
+            .post_form(
+                "https://ex.test/login",
+                &format!("username={USER}&password={PASS}"),
+            )
+            .finish();
+        assert!(!rec.flags.cross_site);
+        assert!(!rec.classification.notes.iter().any(|n| n == WENT_ON));
+    }
+
     #[test]
     fn same_site_subdomain_is_not_cross_site() {
         assert!(!scenario("subdomain").flags.cross_site);
@@ -1236,6 +1344,35 @@ mod tests {
                 .iter()
                 .any(|h| h.role == Role::Password && !h.low_confidence)
         );
+    }
+
+    #[test]
+    fn a_weak_hit_does_not_store_a_request_or_pick_the_leg_when_a_confident_one_exists() {
+        // The password is five characters, so on its own it matches by chance. The combined
+        // credential is long enough to be a confident hit for both roles.
+        let (user, pass) = ("alice1", "abcde");
+        let combined = Base64::encode_string(format!("{user}:{pass}").as_bytes());
+        let rec = Session::new(LOGIN)
+            .type_into(&user_el(), user)
+            .type_into(&pw_el(), pass)
+            .post_json("https://ads.other.test/collect", r#"{"note":"abcde"}"#)
+            .post_json(
+                "https://ex.test/api/login",
+                &format!(r#"{{"auth":"{combined}"}}"#),
+            )
+            .nav("https://ex.test/home")
+            .finish();
+        let paths: Vec<&str> = rec.requests.iter().map(|r| r.url.path.as_str()).collect();
+        assert_eq!(paths, ["/api/login"], "the chance match was stored");
+        assert_eq!(rec.classification.shape, Shape::ScriptPost);
+        assert!(rec.classification.network_swap_candidate);
+        // With nothing confident anywhere, a weak hit still keeps its request.
+        let rec = Session::new(LOGIN)
+            .type_into(&user_el(), "bob")
+            .type_into(&pw_el(), "abcde")
+            .post_json("https://ads.other.test/collect", r#"{"note":"abcde"}"#)
+            .finish();
+        assert_eq!(rec.requests.len(), 1);
     }
 
     #[test]

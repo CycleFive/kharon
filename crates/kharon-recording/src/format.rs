@@ -53,7 +53,7 @@ pub struct ElementDescriptor {
 /// its `value_len` is updated in place as the value changes. `change` events
 /// add no step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Step {
     Navigation {
         t_ms: u64,
@@ -390,7 +390,7 @@ mod tests {
     fn wire_names_are_snake_case_and_tagged() {
         let j = sample().to_json();
         for needle in [
-            "\"type\": \"navigation\"",
+            "\"kind\": \"navigation\"",
             "\"role\": \"password\"",
             "\"kind\": \"urlencoded\"",
             "\"encoding\": \"as_typed\"",

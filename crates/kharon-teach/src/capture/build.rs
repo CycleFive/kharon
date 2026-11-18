@@ -1,14 +1,14 @@
 //! Turning buffered events into the value-free parts of a `Recording`.
 
 use kharon_recording::{
-    BodyShape, ElementDescriptor, FormRef, FrameRef, ResponseShape, Role, StoredRequest,
+    BodyShape, ElementDescriptor, FormRef, FrameRef, MarkerHit, ResponseShape, StoredRequest,
     StrippedUrl,
 };
 
 use super::{Buffered, FrameInfo, RawBody, RawElement, RawForm};
 use crate::body::shape_of_body;
 use crate::marker::Marker;
-use crate::strip::{TYPED, hits_in, holds_typed, reduce_authorization, strip_url};
+use crate::strip::{TYPED, dedup_hits, hits_in, holds_typed, reduce_authorization, strip_url};
 
 /// What is known while stripping: every typed value, and the credential pair once chosen.
 #[derive(Clone, Copy)]
@@ -214,21 +214,23 @@ pub(super) fn response_shape(r: &super::BufferedResponse, ctx: Ctx<'_>) -> Respo
     }
 }
 
-/// A hit that makes a request worth keeping: a credential, or another typed value that is not a
-/// weak (very short) match.
-fn is_telling(hit: &kharon_recording::MarkerHit) -> bool {
-    match hit.role {
-        Role::Username | Role::Password => true,
-        Role::None => !hit.low_confidence,
+/// Every marker hit in the request's raw bytes: its URL, its Authorization header and its whole
+/// body, with no shape built. What decides whether the request is kept.
+pub(super) fn raw_hits(b: &Buffered, ctx: Ctx<'_>) -> Vec<MarkerHit> {
+    let mut out = hits_in(b.url.as_bytes(), ctx.markers, ctx.pair);
+    if let Some(a) = &b.authorization {
+        out.extend(reduce_authorization(a, ctx.markers, ctx.pair).markers);
     }
+    if let RawBody::Bytes(bytes) = &b.body {
+        out.extend(hits_in(bytes, ctx.markers, ctx.pair));
+    }
+    dedup_hits(out)
 }
 
-/// The reduced request, with the counts of what stripping its URL removed. `None` when the URL
-/// does not parse. Whether to keep it is the caller's call.
-pub(super) fn reduce_request(
-    b: &Buffered,
-    ctx: Ctx<'_>,
-) -> Option<(StoredRequest, Tally, bool, bool)> {
+/// The reduced request, with the counts of what stripping its URL removed and whether its body
+/// was reduced to a shape. `None` when the URL does not parse. Whether to keep it is decided by
+/// the caller BEFORE this is called, so only kept requests are shaped.
+pub(super) fn reduce_request(b: &Buffered, ctx: Ctx<'_>) -> Option<(StoredRequest, Tally, bool)> {
     let (url, tally) = strip(&b.url, ctx)?;
     let reduced_body = matches!(b.body, RawBody::Bytes(_));
     let body = match &b.body {
@@ -253,6 +255,5 @@ pub(super) fn reduce_request(
         body,
         response: b.response.as_ref().map(|r| response_shape(r, ctx)),
     };
-    let telling = stored.hits().into_iter().any(is_telling);
-    Some((stored, tally, reduced_body, telling))
+    Some((stored, tally, reduced_body))
 }

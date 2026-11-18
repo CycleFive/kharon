@@ -1084,6 +1084,7 @@ name = "kharon-teach"
 version = "0.0.0"
 dependencies = [
  "base64ct",
+ "futures-util",
  "hex",
  "kharon-recording",
  "md-5",
@@ -1097,6 +1098,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "url",
  "zeroize",
 ]

@@ -6,6 +6,8 @@ pub mod capture;
 pub mod cdp;
 pub mod events;
 pub mod marker;
+pub mod notice;
+pub mod session;
 pub mod site;
 pub mod strip;
 #[doc(hidden)]

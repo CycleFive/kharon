@@ -78,6 +78,9 @@ pub struct RequestWillBeSent {
     pub request: Request,
     #[serde(rename = "type", default)]
     pub resource: Option<String>,
+    /// Set when this request is the next hop of a redirect: the previous hop's response.
+    #[serde(default)]
+    pub redirect_response: Option<Response>,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +117,23 @@ fn lenient_status<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
     let v = f64::deserialize(d)?;
     // `as` saturates and maps NaN to 0.
     Ok(v.clamp(0.0, f64::from(u16::MAX)) as u16)
+}
+
+/// The raw response headers, which Chromium reports apart from `Network.responseReceived` because
+/// some of them (`Set-Cookie`) are only in this event.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseReceivedExtraInfo {
+    pub request_id: String,
+    #[serde(default, deserialize_with = "lenient_opt_status")]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub headers: Headers,
+}
+
+fn lenient_opt_status<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+    let v = Option::<f64>::deserialize(d)?;
+    Ok(v.map(|v| v.clamp(0.0, f64::from(u16::MAX)) as u16))
 }
 
 // ---- results ----
@@ -288,11 +308,39 @@ pub struct GetRequestPostData<'a> {
     pub request_id: &'a str,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDiscoverTargets {
+    pub discover: bool,
+}
+
+#[derive(Serialize)]
+pub struct Navigate<'a> {
+    pub url: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct RemoveScript<'a> {
+    pub identifier: &'a str,
+}
+
+/// The result of `Page.addScriptToEvaluateOnNewDocument`.
+#[derive(Deserialize)]
+pub struct ScriptId {
+    pub identifier: String,
+}
+
 /// Parameters for a call that takes none: serializes as `{}`.
 #[derive(Serialize)]
 pub struct Empty {}
 
 // ---- the page script's report ----
+
+/// What the listener sends once when it starts in a top-level document.
+#[derive(Deserialize)]
+pub struct Hello {
+    pub hello: bool,
+}
 
 const MAX_FIELD_CHARS: usize = 4096;
 const MAX_SELECTORS: usize = 16;
@@ -553,5 +601,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s, r#"{"source":"1","worldName":"w"}"#);
+    }
+
+    #[test]
+    fn a_redirect_event_carries_the_previous_hops_response() {
+        let raw = r#"{"requestId":"r","loaderId":"r","documentURL":"https://a.test/",
+            "request":{"url":"https://a.test/home","method":"GET"},
+            "redirectResponse":{"status":302,"headers":{"Location":"/home"}},"type":"Document"}"#;
+        let e: RequestWillBeSent = parse_quiet(raw).unwrap();
+        assert_eq!(e.redirect_response.map(|r| r.status), Some(302));
+        let raw = r#"{"requestId":"r","loaderId":"r","documentURL":"https://a.test/",
+            "request":{"url":"https://a.test/","method":"GET"}}"#;
+        assert!(
+            parse_quiet::<RequestWillBeSent>(raw)
+                .unwrap()
+                .redirect_response
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn raw_response_headers_carry_set_cookie() {
+        let e: ResponseReceivedExtraInfo = parse_quiet(
+            r#"{"requestId":"r","statusCode":302,"headers":{"set-cookie":"sid=x"},"blockedCookies":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(e.status_code, Some(302));
+        assert!(e.headers.has_set_cookie());
+        let e: ResponseReceivedExtraInfo = parse_quiet(r#"{"requestId":"r"}"#).unwrap();
+        assert!(e.status_code.is_none() && !e.headers.has_set_cookie());
+    }
+
+    #[test]
+    fn hello_is_not_a_report() {
+        assert!(parse_quiet::<Hello>(r#"{"hello":true}"#).is_ok_and(|h| h.hello));
+        assert!(parse_quiet::<Hello>(REPORT).is_err());
+        assert!(parse_quiet::<ListenerReport>(r#"{"hello":true}"#).is_err());
     }
 }

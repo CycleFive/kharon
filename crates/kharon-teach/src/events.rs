@@ -148,6 +148,11 @@ pub struct PostData {
 // ---- headers ----
 
 /// Header map. Values are `Zeroizing` and there is no `Debug`.
+///
+/// ```compile_fail
+/// fn needs_debug<T: std::fmt::Debug>() {}
+/// needs_debug::<kharon_teach::events::Headers>();
+/// ```
 #[derive(Default)]
 pub struct Headers(HashMap<String, Zeroizing<String>>);
 
@@ -231,6 +236,12 @@ impl<'de> Deserialize<'de> for Headers {
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a header object")
             }
+            fn visit_unit<E>(self) -> Result<Headers, E> {
+                Ok(Headers::default())
+            }
+            fn visit_none<E>(self) -> Result<Headers, E> {
+                Ok(Headers::default())
+            }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Headers, A::Error> {
                 let mut out = HashMap::new();
                 while let Some((k, v)) = map.next_entry::<String, MaybeString>()? {
@@ -241,7 +252,7 @@ impl<'de> Deserialize<'de> for Headers {
                 Ok(Headers(out))
             }
         }
-        d.deserialize_map(V)
+        d.deserialize_any(V)
     }
 }
 
@@ -296,6 +307,12 @@ pub enum ReportKind {
     EnterKey,
 }
 
+/// What the page script reported. No `Debug`: `value` is what a person typed.
+///
+/// ```compile_fail
+/// fn needs_debug<T: std::fmt::Debug>() {}
+/// needs_debug::<kharon_teach::events::ListenerReport>();
+/// ```
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ListenerReport {
@@ -461,6 +478,14 @@ mod tests {
         assert_eq!(h.content_type(), Some("text/html"));
         assert_eq!(h.authorization(), None);
         assert!(!h.has_set_cookie());
+    }
+
+    #[test]
+    fn null_headers_are_empty_not_fatal() {
+        let r: ResponseReceived =
+            parse_quiet(r#"{"requestId":"1","response":{"status":200,"headers":null}}"#).unwrap();
+        assert!(r.response.headers.content_type().is_none());
+        assert!(!r.response.headers.has_set_cookie());
     }
 
     #[test]

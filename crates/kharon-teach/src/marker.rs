@@ -118,7 +118,9 @@ fn hex_value(b: u8) -> Option<u8> {
 }
 
 /// Decodes `%XX` (either hex case); a `%` not followed by two hex digits is copied unchanged.
-fn percent_decode(raw: &[u8], plus_is_space: bool) -> Needle {
+/// With `plus_is_space`, `+` becomes a space first. The one percent-decoder of this crate; the
+/// copy is zeroized.
+pub(crate) fn percent_decode(raw: &[u8], plus_is_space: bool) -> Needle {
     let mut out = Zeroizing::new(Vec::with_capacity(raw.len()));
     let mut i = 0;
     while i < raw.len() {
@@ -184,18 +186,8 @@ pub fn search_pair(haystack: &[u8], username: &Marker, password: &Marker) -> Vec
     if username.is_empty() || password.is_empty() {
         return Vec::new();
     }
-    let mut joined = Zeroizing::new(String::with_capacity(
-        username.value.len() + password.value.len() + 1,
-    ));
-    joined.push_str(&username.value);
-    joined.push(':');
-    joined.push_str(&password.value);
     let low_confidence = username.len().saturating_add(password.len()) < LOW_CONFIDENCE_BELOW;
-    let (standard, url_safe) = base64_forms(joined.as_bytes());
-    let url_safe = {
-        let seen: Vec<&[u8]> = standard.iter().map(|n| n.as_slice()).collect();
-        dedup(url_safe, &seen)
-    };
+    let (standard, url_safe) = pair_forms(username, password);
     let haystacks = Haystacks::new(haystack);
     let mut hits = Vec::new();
     for (encoding, forms) in [
@@ -213,6 +205,74 @@ pub fn search_pair(haystack: &[u8], username: &Marker, password: &Marker) -> Vec
         }
     }
     hits
+}
+
+/// Whether any of `forms` occurs in the raw bytes or a decoded copy as a whole token: the byte
+/// before it and the byte after it are not ASCII alphanumeric, or the text ends there.
+fn contains_whole_token(haystacks: &Haystacks, forms: &[Needle]) -> bool {
+    let bounded = |hay: &[u8], needle: &[u8]| {
+        let mut from = 0;
+        while let Some(i) = memmem::find(&hay[from..], needle) {
+            let (start, end) = (from + i, from + i + needle.len());
+            let before = start.checked_sub(1).map(|j| hay[j]);
+            let after = hay.get(end).copied();
+            if !before.is_some_and(|b| b.is_ascii_alphanumeric())
+                && !after.is_some_and(|b| b.is_ascii_alphanumeric())
+            {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    };
+    forms
+        .iter()
+        .filter(|n| !n.is_empty())
+        .any(|n| bounded(haystacks.raw, n) || haystacks.decoded.iter().any(|d| bounded(d, n)))
+}
+
+/// Whether `marker` occurs in `haystack` in ANY of its forms (as typed, escaped, base64, hex, and
+/// for a password the digests) as a whole token. For kept text, where a short marker's forms
+/// would otherwise match inside ordinary words.
+pub(crate) fn found_as_whole_token(haystack: &[u8], marker: &Marker) -> bool {
+    if marker.is_empty() {
+        return false;
+    }
+    let haystacks = Haystacks::new(haystack);
+    needles(marker)
+        .iter()
+        .any(|(_, forms)| contains_whole_token(&haystacks, forms))
+}
+
+/// [`found_as_whole_token`] for the base64 forms of `username:password`.
+pub(crate) fn pair_found_as_whole_token(
+    haystack: &[u8],
+    username: &Marker,
+    password: &Marker,
+) -> bool {
+    if username.is_empty() || password.is_empty() {
+        return false;
+    }
+    let (standard, url_safe) = pair_forms(username, password);
+    let haystacks = Haystacks::new(haystack);
+    contains_whole_token(&haystacks, &standard) || contains_whole_token(&haystacks, &url_safe)
+}
+
+/// The base64 forms of `username:password`: (standard, URL-safe), each padded then unpadded,
+/// the URL-safe ones without any that equal a standard one.
+fn pair_forms(username: &Marker, password: &Marker) -> (Vec<Needle>, Vec<Needle>) {
+    let mut joined = Zeroizing::new(String::with_capacity(
+        username.value.len() + password.value.len() + 1,
+    ));
+    joined.push_str(&username.value);
+    joined.push(':');
+    joined.push_str(&password.value);
+    let (standard, url_safe) = base64_forms(joined.as_bytes());
+    let url_safe = {
+        let seen: Vec<&[u8]> = standard.iter().map(|n| n.as_slice()).collect();
+        dedup(url_safe, &seen)
+    };
+    (standard, url_safe)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

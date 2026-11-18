@@ -8,17 +8,36 @@ use std::ops::Range;
 
 use base64ct::{Base64, Base64Unpadded, Base64Url, Base64UrlUnpadded, Encoding as B64};
 use kharon_recording::{AuthShape, Encoding, MarkerHit, StrippedUrl};
-use percent_encoding::percent_decode;
 use url::{Position, Url};
 use zeroize::Zeroizing;
 
-use crate::marker::{LOW_CONFIDENCE_BELOW, Marker, search, search_pair};
+use crate::marker::{
+    LOW_CONFIDENCE_BELOW, Marker, found_as_whole_token, pair_found_as_whole_token, percent_decode,
+    search, search_pair,
+};
 
 /// Written in place of a name (key, part name, host labels) that held a typed value.
 pub const TYPED: &str = "{typed}";
 /// Written in place of a path segment that is an identifier or held a typed value.
 pub const ID: &str = "{id}";
-const OTHER: &str = "{other}";
+/// Written in place of a name (key, part name, query key) that is not a typed value but does not
+/// look like a name either: it is long, or holds characters a name never holds, or is an
+/// identifier. Such text is more likely a value, so it is not kept.
+pub const OTHER: &str = "{other}";
+
+/// The longest key a kept name may have.
+const MAX_NAME_CHARS: usize = 64;
+/// The longest query piece with no `=` that is kept as a key.
+const MAX_BARE_KEY_CHARS: usize = 32;
+
+/// Whether `s` looks like the name of a field: at most 64 characters, each one of
+/// `A-Za-z0-9_.:-[]`, and not an identifier (all digits, a UUID, or 16 or more hex characters).
+pub(crate) fn looks_like_a_name(s: &str) -> bool {
+    s.chars().count() <= MAX_NAME_CHARS
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-' | '[' | ']'))
+        && !segment_is_id(s)
+}
 
 /// URL schemes that are kept; any other is written `{other}`.
 const URL_SCHEMES: [&str; 11] = [
@@ -98,19 +117,6 @@ pub(crate) fn any_hit(
     !hits_in(haystack, markers, pair).is_empty()
 }
 
-/// Percent-decodes `raw`, with `+` as a space first when `plus_is_space`. A lone `%` stays.
-pub(crate) fn decode_percent(raw: &[u8], plus_is_space: bool) -> Zeroizing<Vec<u8>> {
-    if plus_is_space {
-        let spaced: Zeroizing<Vec<u8>> = Zeroizing::new(
-            raw.iter()
-                .map(|b| if *b == b'+' { b' ' } else { *b })
-                .collect(),
-        );
-        return Zeroizing::new(percent_decode(&spaced).collect());
-    }
-    Zeroizing::new(percent_decode(raw).collect())
-}
-
 /// `bytes` as text of the SAME byte length: every invalid UTF-8 byte becomes `?`, so byte
 /// offsets in the text are offsets in `bytes`.
 fn text_same_len(bytes: &[u8]) -> Zeroizing<String> {
@@ -179,19 +185,24 @@ fn rebase(ranges: &[Range<usize>], start: usize, end: usize) -> Vec<Range<usize>
         .collect()
 }
 
-/// `search` over kept text, for the rule that applies to KEPT text only: a marker shorter than
-/// `LOW_CONFIDENCE_BELOW` characters (and a pair of that combined length) is left out, because
-/// its encoded forms would match inside ordinary words. Short markers are matched instead by
-/// `occurrences`, as the typed text with token boundaries. Rule chosen: the simple one.
+/// `search` over kept text. A marker shorter than `LOW_CONFIDENCE_BELOW` characters (and a pair
+/// of that combined length) is checked in ALL its forms too, but only as a whole token: the form
+/// must be bounded by characters that are not ASCII alphanumeric, or by the text's ends, because
+/// its encoded forms would otherwise match inside ordinary words.
 fn kept_hit(haystack: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> bool {
-    markers
-        .iter()
-        .filter(|m| !is_short(m))
-        .any(|m| !search(haystack, m).is_empty())
-        || pair.is_some_and(|(u, p)| {
-            u.len().saturating_add(p.len()) >= LOW_CONFIDENCE_BELOW
-                && !search_pair(haystack, u, p).is_empty()
-        })
+    markers.iter().any(|m| {
+        if is_short(m) {
+            found_as_whole_token(haystack, m)
+        } else {
+            !search(haystack, m).is_empty()
+        }
+    }) || pair.is_some_and(|(u, p)| {
+        if u.len().saturating_add(p.len()) >= LOW_CONFIDENCE_BELOW {
+            !search_pair(haystack, u, p).is_empty()
+        } else {
+            pair_found_as_whole_token(haystack, u, p)
+        }
+    })
 }
 
 /// Whether kept text `bytes` holds a typed value: `search` finds any hit (any encoding, the pair
@@ -206,7 +217,7 @@ pub(crate) fn holds_typed(
         return true;
     }
     [false, true].into_iter().any(|plus| {
-        let decoded = decode_percent(bytes, plus);
+        let decoded = percent_decode(bytes, plus);
         decoded.as_slice() != bytes && !occurrences(&text_same_len(&decoded), markers).is_empty()
     })
 }
@@ -266,7 +277,7 @@ pub fn strip_url(
     // them, so offsets of the host, path and query inside it are known. Its capacity covers the
     // text, so it is never reallocated (the copy is zeroized on drop).
     let host = &ser[host_start..host_end];
-    let decode = |s: &str| text_same_len(&decode_percent(s.as_bytes(), false));
+    let decode = |s: &str| text_same_len(&percent_decode(s.as_bytes(), false));
     let mut whole = Zeroizing::new(String::with_capacity(ser.len() + 2));
     whole.push_str(&decode(&ser[..host_start]));
     let d_host = whole.len()..whole.len() + host.len();
@@ -395,7 +406,7 @@ impl<'a> PathParts<'a> {
         let segments: Vec<&str> = path.split('/').collect();
         let decoded: Vec<Zeroizing<Vec<u8>>> = segments
             .iter()
-            .map(|s| decode_percent(s.as_bytes(), false))
+            .map(|s| percent_decode(s.as_bytes(), false))
             .collect();
         let texts: Vec<Zeroizing<String>> = decoded.iter().map(|d| text_same_len(d)).collect();
         let mut decoded_path = Zeroizing::new(String::with_capacity(path.len()));
@@ -489,6 +500,8 @@ fn is_uuid(seg: &str) -> bool {
 
 struct QueryPiece<'a> {
     raw_key: &'a str,
+    /// The piece had an `=`.
+    has_value: bool,
     raw_span: Range<usize>,
     key: Zeroizing<Vec<u8>>,
     decoded_span: Range<usize>,
@@ -517,7 +530,7 @@ impl<'a> QueryParts<'a> {
                 Some((k, v)) => (k, Some(v)),
                 None => (piece, None),
             };
-            let key = decode_percent(raw_key.as_bytes(), true);
+            let key = percent_decode(raw_key.as_bytes(), true);
             if !decoded_query.is_empty() {
                 decoded_query.push('&');
             }
@@ -526,10 +539,11 @@ impl<'a> QueryParts<'a> {
             let decoded_span = decoded_start..decoded_query.len();
             if let Some(v) = value {
                 decoded_query.push('=');
-                decoded_query.push_str(&text_same_len(&decode_percent(v.as_bytes(), true)));
+                decoded_query.push_str(&text_same_len(&percent_decode(v.as_bytes(), true)));
             }
             pieces.push(QueryPiece {
                 raw_key,
+                has_value: value.is_some(),
                 raw_span: start..start + raw_key.len(),
                 key,
                 decoded_span,
@@ -543,7 +557,8 @@ impl<'a> QueryParts<'a> {
     }
 }
 
-/// Query keys, in order, with a key a match touches written `{typed}`. The raw query string and a
+/// Query keys, in order, with a key a match touches written `{typed}` and a key that does not
+/// look like a name written `{other}` (a piece with no `=` must also be at most 32 characters). The raw query string and a
 /// decoded copy (`+` as space, `%XX`) are each searched whole, as are `raw_extra` and `dec_extra`
 /// (matches found over the whole URL, in raw and decoded query coordinates); a match touching a
 /// key's bytes (separators included) marks the key. A match inside a value alone costs nothing.
@@ -578,7 +593,13 @@ fn strip_query(
             {
                 TYPED.to_owned()
             } else {
-                String::from_utf8_lossy(&p.key).into_owned()
+                let key = String::from_utf8_lossy(&p.key);
+                let bare_too_long = !p.has_value && key.chars().count() > MAX_BARE_KEY_CHARS;
+                if looks_like_a_name(&key) && !bare_too_long {
+                    key.into_owned()
+                } else {
+                    OTHER.to_owned()
+                }
             }
         })
         .collect();
@@ -1017,5 +1038,76 @@ mod tests {
         assert_eq!(s.value.origin, "https://person.ex.test");
         let s = strip_url("https://on.ex.test/", &on, None).unwrap();
         assert_eq!(s.value.origin, "https://{typed}.ex.test");
+    }
+
+    #[test]
+    fn the_base64_of_a_short_password_is_found_as_a_whole_path_segment_only() {
+        // base64 of "abcde".
+        let m = [pw("abcde")];
+        for seg in ["YWJjZGU=", "YWJjZGU"] {
+            let s = strip_url(&format!("https://ex.test/x/{seg}/y"), &m, None).unwrap();
+            assert_eq!(s.value.path, "/x/{id}/y", "{seg}");
+        }
+        // The same letters inside a longer word are not a match.
+        let s = strip_url("https://ex.test/x/helloYWJjZGUworld/y", &m, None).unwrap();
+        assert_eq!(s.value.path, "/x/helloYWJjZGUworld/y");
+        // Nor in a query key.
+        let s = strip_url("https://ex.test/x?YWJjZGU=1&aYWJjZGUa=2", &m, None).unwrap();
+        assert_eq!(s.value.query_keys, ["{typed}", "aYWJjZGUa"]);
+    }
+
+    #[test]
+    fn a_name_is_kept_only_when_it_looks_like_one() {
+        for ok in [
+            "user",
+            "user_name",
+            "a.b:c-d",
+            "items[0]",
+            "x",
+            "",
+            &"g".repeat(64),
+        ] {
+            assert!(looks_like_a_name(ok), "{ok:?}");
+        }
+        for bad in [
+            "12345",
+            "3f2b8c1e-9a4d-4c1b-8e2f-0a1b2c3d4e5f",
+            "0123456789abcdef",
+            "has space",
+            "a@b.c",
+            "a=b",
+            "naïve",
+            &"g".repeat(65),
+        ] {
+            assert!(!looks_like_a_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_query_key_that_is_not_a_name_is_other() {
+        let token =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz0123456789";
+        let s = strip_url(
+            &format!("https://ex.test/x?{token}&ok=1&a%20b=2&{token}=3"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.value.query_keys, ["{other}", "ok", "{other}", "{other}"]);
+        // A bare piece of 33 characters is other; of 32 it is a key.
+        let s = strip_url(&format!("https://ex.test/x?{}", "k".repeat(33)), &[], None).unwrap();
+        assert_eq!(s.value.query_keys, ["{other}"]);
+        let s = strip_url(&format!("https://ex.test/x?{}", "k".repeat(32)), &[], None).unwrap();
+        assert_eq!(s.value.query_keys, ["k".repeat(32)]);
+        // With a value, 33 is still a name (up to 64).
+        let s = strip_url(
+            &format!("https://ex.test/x?{}=1", "k".repeat(33)),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.value.query_keys, ["k".repeat(33)]);
+        let s = strip_url("https://ex.test/x?12345=1", &[], None).unwrap();
+        assert_eq!(s.value.query_keys, ["{other}"]);
     }
 }

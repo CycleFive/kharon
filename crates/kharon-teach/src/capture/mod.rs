@@ -1207,6 +1207,38 @@ mod tests {
     }
 
     #[test]
+    fn a_json_login_under_a_urlencoded_header_is_a_script_post() {
+        // jQuery: $.post(url, JSON.stringify({user, pass})) sends JSON text under the default
+        // urlencoded content type. It must not read as a form whose one key is the JSON.
+        let rec = Session::new(LOGIN)
+            .type_into(&user_el(), USER)
+            .type_into(&pw_el(), PASS)
+            .click(&button())
+            .request(
+                "POST",
+                "https://ex.test/api/login",
+                ResourceKind::Xhr,
+                false,
+                Some(FORM),
+                RawBody::Bytes(Zeroizing::new(
+                    format!(r#"{{"user":"{USER}","pass":"{PASS}"}}"#).into_bytes(),
+                )),
+            )
+            .nav("https://ex.test/home")
+            .finish();
+        assert_eq!(rec.classification.shape, Shape::ScriptPost);
+        assert_eq!(rec.requests.len(), 1);
+        let login = &rec.requests[0];
+        assert!(matches!(&login.body, BodyShape::Opaque { .. }));
+        assert!(
+            login
+                .hits()
+                .iter()
+                .any(|h| h.role == Role::Password && !h.low_confidence)
+        );
+    }
+
+    #[test]
     fn only_the_three_kinds_of_request_are_stored() {
         let rec = scenario("which_requests");
         // The image GET and the third-party POST are counted, not stored.

@@ -4,12 +4,15 @@
 //! be, while its shape is extracted. Known limit: the parsed `Value` holds typed values in
 //! ordinary `String`s that serde_json does not zeroize.
 
-use kharon_recording::{BodyShape, FieldShape, JsonField, JsonShape, ValueKind, ValueShape};
+use kharon_recording::{
+    BodyShape, FieldShape, JsonField, JsonShape, MarkerHit, ValueKind, ValueShape,
+};
 use memchr::memmem;
 use zeroize::Zeroizing;
 
 use crate::marker::Marker;
-use crate::strip::{TYPED, decode_percent, hits_in, holds_typed};
+use crate::marker::percent_decode as decode_percent;
+use crate::strip::{OTHER, TYPED, dedup_hits, hits_in, holds_typed, looks_like_a_name};
 
 /// Bodies larger than this are not parsed: they are `Opaque`.
 pub const MAX_BODY_BYTES: usize = 1 << 20;
@@ -20,7 +23,10 @@ pub const MAX_BODY_BYTES: usize = 1 << 20;
 ///
 /// Values are searched after decoding (percent-decoded urlencoded value with `+` as space, a JSON
 /// string's content, a JSON number's text, a multipart text part's bytes). An `Opaque` body is
-/// searched as raw bytes. A name (key, part name) holding a typed value is written as `{typed}`.
+/// searched as raw bytes. A name (key, part name) holding a typed value is written as `{typed}`
+/// and its hits are added to its field; a name that does not look like a name (see
+/// `strip::looks_like_a_name`) is written as `{other}`. A urlencoded body with a piece that has
+/// no `=`, or whose names mostly do not look like names, is not urlencoded data and is `Opaque`.
 /// Never returns `None` or `Unavailable`.
 pub fn shape_of_body(
     content_type: Option<&str>,
@@ -30,9 +36,8 @@ pub fn shape_of_body(
 ) -> BodyShape {
     let parsed = match content_type.map(ContentType::parse) {
         Some(ct) if body.len() <= MAX_BODY_BYTES => match ct.essence.as_str() {
-            "application/x-www-form-urlencoded" => Some(BodyShape::Urlencoded {
-                fields: urlencoded_fields(body, markers, pair),
-            }),
+            "application/x-www-form-urlencoded" => urlencoded_fields(body, markers, pair)
+                .map(|fields| BodyShape::Urlencoded { fields }),
             "multipart/form-data" => ct
                 .boundary
                 .as_deref()
@@ -145,36 +150,88 @@ fn text_value(bytes: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>
     value_shape(ValueKind::String, char_len(bytes), bytes, markers, pair)
 }
 
-/// A name that is kept only when it holds no typed value (any encoding, or the text in any
-/// letter case, raw or percent-decoded; see `strip::holds_typed`).
-fn name(bytes: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> String {
+/// A name as it is written to the file, and the marker hits found in it. A name that holds a
+/// typed value (any encoding, or the text in any letter case, raw or percent-decoded; see
+/// `strip::holds_typed`) is `{typed}`, and its hits are returned so the caller can attach them
+/// to the field. A name that is not a typed value is kept only when it looks like a name, else
+/// it is `{other}`.
+fn name(
+    bytes: &[u8],
+    markers: &[Marker],
+    pair: Option<(&Marker, &Marker)>,
+) -> (String, Vec<MarkerHit>) {
     if holds_typed(bytes, markers, pair) {
-        TYPED.to_owned()
+        return (TYPED.to_owned(), hits_in(bytes, markers, pair));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    if looks_like_a_name(&text) {
+        (text.into_owned(), Vec::new())
     } else {
-        String::from_utf8_lossy(bytes).into_owned()
+        (OTHER.to_owned(), Vec::new())
     }
 }
 
+/// Adds `extra` to `value.markers` without repeating a (role, encoding).
+fn add_hits(value: &mut ValueShape, extra: Vec<MarkerHit>) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut all = std::mem::take(&mut value.markers);
+    all.extend(extra);
+    value.markers = dedup_hits(all);
+}
+
+/// The urlencoded fields, or `None` when the body is not urlencoded data: some piece has no `=`,
+/// or more than half of the keys do not look like names. (jQuery sends JSON text under a
+/// urlencoded content type; read as fields, the whole JSON would be one key.)
 fn urlencoded_fields(
     body: &[u8],
     markers: &[Marker],
     pair: Option<(&Marker, &Marker)>,
-) -> Vec<FieldShape> {
-    body.split(|b| *b == b'&')
-        .filter(|piece| !piece.is_empty())
-        .map(|piece| {
-            let (k, v) = match piece.iter().position(|b| *b == b'=') {
-                Some(i) => (&piece[..i], &piece[i + 1..]),
-                None => (piece, &piece[..0]),
-            };
-            let key = decode_percent(k, true);
-            let value = decode_percent(v, true);
-            FieldShape {
-                key: name(&key, markers, pair),
-                value: text_value(&value, markers, pair),
-            }
-        })
-        .collect()
+) -> Option<Vec<FieldShape>> {
+    let mut pieces = Vec::new();
+    for piece in body.split(|b| *b == b'&').filter(|p| !p.is_empty()) {
+        let i = piece.iter().position(|b| *b == b'=')?;
+        pieces.push((decode_percent(&piece[..i], true), &piece[i + 1..]));
+    }
+    let odd_keys = pieces
+        .iter()
+        .filter(|(k, _)| !looks_like_a_name(&String::from_utf8_lossy(k)))
+        .count();
+    if odd_keys * 2 > pieces.len() {
+        return None;
+    }
+    Some(
+        pieces
+            .into_iter()
+            .map(|(key, v)| {
+                let value = decode_percent(v, true);
+                let (key, key_hits) = name(&key, markers, pair);
+                let mut value = text_value(&value, markers, pair);
+                add_hits(&mut value, key_hits);
+                FieldShape { key, value }
+            })
+            .collect(),
+    )
+}
+
+/// Adds `extra` to the first scalar value under `shape`, depth first. The format gives a JSON
+/// object key no marker list of its own, so the hits of a typed value found in a key go to the
+/// value under it, or to the first value inside it when that is an object or an array. An empty
+/// object or array has nowhere to hold them; those hits are not recorded.
+fn add_hits_to_first_value(shape: &mut JsonShape, extra: Vec<MarkerHit>) -> bool {
+    match shape {
+        JsonShape::Value { value } => {
+            add_hits(value, extra);
+            true
+        }
+        JsonShape::Array { items } => items
+            .iter_mut()
+            .any(|i| add_hits_to_first_value(i, extra.clone())),
+        JsonShape::Object { fields } => fields
+            .iter_mut()
+            .any(|f| add_hits_to_first_value(&mut f.value, extra.clone())),
+    }
 }
 
 fn json_shape(
@@ -188,9 +245,11 @@ fn json_shape(
         Value::Object(map) => JsonShape::Object {
             fields: map
                 .iter()
-                .map(|(k, v)| JsonField {
-                    key: name(k.as_bytes(), markers, pair),
-                    value: json_shape(v, markers, pair),
+                .map(|(k, v)| {
+                    let (key, key_hits) = name(k.as_bytes(), markers, pair);
+                    let mut value = json_shape(v, markers, pair);
+                    add_hits_to_first_value(&mut value, key_hits);
+                    JsonField { key, value }
                 })
                 .collect(),
         },
@@ -310,10 +369,10 @@ fn part_shape(
     } else {
         text_value(content, markers, pair)
     };
-    FieldShape {
-        key: name(&part_name, markers, pair),
-        value,
-    }
+    let (key, key_hits) = name(&part_name, markers, pair);
+    let mut value = value;
+    add_hits(&mut value, key_hits);
+    FieldShape { key, value }
 }
 
 #[cfg(test)]
@@ -710,16 +769,29 @@ mod tests {
     #[test]
     fn a_site_cased_key_and_name_is_not_kept() {
         let m = [user("Bob.Smith@Ex.Test")];
+        // Two keys hold the value; two are ordinary, so the body is still urlencoded data.
         let s = shape_of_body(
             Some(URLENC),
-            b"bob.smith%40ex.test=1&BOB.SMITH@EX.TEST=2",
+            b"a=1&b=2&bob.smith%40ex.test=1&BOB.SMITH@EX.TEST=2",
             &m,
             None,
         );
         let BodyShape::Urlencoded { fields } = s else {
             panic!()
         };
-        assert!(fields.iter().all(|f| f.key == "{typed}"));
+        assert_eq!(
+            fields.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "{typed}", "{typed}"]
+        );
+        // Decision change: a body whose keys all fail to look like names is Opaque. (The match
+        // is case-sensitive, so a site-cased value gives no hit here: a known limit.)
+        let s = shape_of_body(
+            Some(URLENC),
+            b"bob.smith%40ex.test=1&BOB.SMITH@EX.TEST=2",
+            &m,
+            None,
+        );
+        assert!(matches!(s, BodyShape::Opaque { .. }), "not opaque");
         let s = shape_of_body(
             Some("application/json"),
             br#"{"bob.smith@ex.test":1}"#,
@@ -882,5 +954,121 @@ mod tests {
         for text in outputs {
             assert_holds_no_typed_value(&text, &values);
         }
+    }
+
+    const TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+    fn json_hits(s: &BodyShape) -> Vec<MarkerHit> {
+        fn walk(j: &JsonShape, out: &mut Vec<MarkerHit>) {
+            match j {
+                JsonShape::Object { fields } => fields.iter().for_each(|f| walk(&f.value, out)),
+                JsonShape::Array { items } => items.iter().for_each(|i| walk(i, out)),
+                JsonShape::Value { value } => out.extend(value.markers.clone()),
+            }
+        }
+        let mut out = Vec::new();
+        if let BodyShape::Json { root } = s {
+            walk(root, &mut out);
+        }
+        out
+    }
+
+    fn serialized(s: &BodyShape) -> String {
+        serde_json::to_string(s).unwrap()
+    }
+
+    #[test]
+    fn a_urlencoded_body_that_is_one_token_is_opaque_and_not_kept() {
+        let s = shape_of_body(Some(URLENC), TOKEN.as_bytes(), &[], None);
+        assert!(matches!(s, BodyShape::Opaque { .. }), "{s:?}");
+        assert!(!serialized(&s).contains("eyJhbGci"));
+        // One piece without `=` among ordinary ones does the same.
+        let body = format!("a=1&{TOKEN}&b=2");
+        let s = shape_of_body(Some(URLENC), body.as_bytes(), &[], None);
+        assert!(matches!(s, BodyShape::Opaque { .. }));
+        assert!(!serialized(&s).contains("eyJhbGci"));
+    }
+
+    #[test]
+    fn a_json_object_keyed_by_a_token_does_not_keep_it() {
+        let body = format!(r#"{{"{TOKEN}":1,"ok":2}}"#);
+        let s = shape_of_body(Some("application/json"), body.as_bytes(), &[], None);
+        let BodyShape::Json {
+            root: JsonShape::Object { fields },
+        } = &s
+        else {
+            panic!("{s:?}")
+        };
+        let mut keys: Vec<&str> = fields.iter().map(|f| f.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["ok", "{other}"]);
+        assert!(!serialized(&s).contains("eyJhbGci"));
+    }
+
+    #[test]
+    fn a_multipart_part_named_like_a_token_does_not_keep_it() {
+        let body =
+            format!("--b\r\nContent-Disposition: form-data; name=\"{TOKEN}\"\r\n\r\nx\r\n--b--");
+        let s = shape_of_body(
+            Some("multipart/form-data; boundary=b"),
+            body.as_bytes(),
+            &[],
+            None,
+        );
+        let BodyShape::Multipart { parts } = &s else {
+            panic!("{s:?}")
+        };
+        assert_eq!(parts[0].key, "{other}");
+        assert!(!serialized(&s).contains("eyJhbGci"));
+    }
+
+    #[test]
+    fn a_typed_value_found_in_a_name_keeps_its_hit() {
+        let m = [pw("Tr0ub4dor9x")];
+        let plain = Some(hit(Role::Password, Encoding::AsTyped));
+        // Urlencoded: the key is the password.
+        let s = shape_of_body(Some(URLENC), b"a=1&Tr0ub4dor9x=1", &m, None);
+        let BodyShape::Urlencoded { fields } = s else {
+            panic!()
+        };
+        assert_eq!(fields[1].key, "{typed}");
+        assert_eq!(
+            fields[1].value.markers,
+            plain.clone().into_iter().collect::<Vec<_>>()
+        );
+        assert!(fields[0].value.markers.is_empty());
+        // JSON: the hit lands on the value under the key, or the first value inside it.
+        for body in [
+            br#"{"Tr0ub4dor9x":"v"}"#.as_slice(),
+            br#"{"Tr0ub4dor9x":{"x":[1,2]}}"#.as_slice(),
+        ] {
+            let s = shape_of_body(Some("application/json"), body, &m, None);
+            assert_eq!(json_hits(&s), plain.clone().into_iter().collect::<Vec<_>>());
+        }
+        // Multipart.
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"Tr0ub4dor9x\"\r\n\r\nx\r\n--b--";
+        let s = shape_of_body(Some("multipart/form-data; boundary=b"), body, &m, None);
+        let BodyShape::Multipart { parts } = s else {
+            panic!()
+        };
+        assert_eq!(parts[0].key, "{typed}");
+        assert_eq!(
+            parts[0].value.markers,
+            plain.into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_json_login_under_a_urlencoded_header_keeps_its_password_hit() {
+        // jQuery: $.post(url, JSON.stringify({user, pass})) with the default content type.
+        let m = markers();
+        let body = br#"{"user":"kh.throwaway7","pass":"Tr0ub4dor-9x"}"#;
+        let s = shape_of_body(Some(URLENC), body, &m, None);
+        let BodyShape::Opaque { len, markers } = s else {
+            panic!("not opaque")
+        };
+        assert_eq!(usize::try_from(len).unwrap(), body.len());
+        assert!(markers.contains(&hit(Role::Password, Encoding::AsTyped)));
+        assert!(markers.contains(&hit(Role::Username, Encoding::AsTyped)));
     }
 }

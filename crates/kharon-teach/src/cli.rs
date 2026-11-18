@@ -218,14 +218,14 @@ pub fn summary(r: &Recording) -> String {
     out.push(format!(
         "How the login works: {}",
         match &r.classification.shape {
-            Shape::FormPost => "One page; the form sends the password to the site as typed.".to_owned(),
+            Shape::FormPost => "One page; the form sends the password to the site as typed or encoded.".to_owned(),
             Shape::ScriptPost =>
-                "One page; the page's script sends the password to the site as typed.".to_owned(),
+                "One page; the page's script sends the password to the site as typed or encoded.".to_owned(),
             Shape::TwoStep { password_leg } => format!(
                 "Two steps; the user name goes first, then the password, which {}.",
                 match password_leg {
-                    PasswordLeg::FormPost => "a form sends to the site as typed",
-                    PasswordLeg::ScriptPost => "the page's script sends to the site as typed",
+                    PasswordLeg::FormPost => "a form sends to the site as typed or encoded",
+                    PasswordLeg::ScriptPost => "the page's script sends to the site as typed or encoded",
                     PasswordLeg::Transformed => "the page changes before it sends it",
                 }
             ),
@@ -477,7 +477,9 @@ pub(crate) mod tests {
         r.listener_world = ListenerWorld::Main;
         let s = summary(&r);
         assert!(s.contains("https://ex.test/login"));
-        assert!(s.contains("One page; the form sends the password to the site as typed."));
+        assert!(
+            s.contains("One page; the form sends the password to the site as typed or encoded.")
+        );
         assert!(s.contains("password is in the page for milliseconds"));
         assert!(s.contains("A captcha"));
         assert!(s.contains("Network swap: this login looks like"));

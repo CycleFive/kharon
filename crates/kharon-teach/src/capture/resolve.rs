@@ -17,8 +17,12 @@ pub(super) struct Elem {
     /// Sequence numbers of the first and the latest value-bearing event.
     pub first_seq: u64,
     pub last_seq: u64,
-    /// Sequence numbers of every value-bearing event.
-    pub seqs: Vec<u64>,
+    /// The latest value-bearing event seen before any password element was known. Kept as a
+    /// running value so an element's bookkeeping has a fixed size however much a page types.
+    /// If an element only turns out to be a password after other fields were typed into, this
+    /// can be later than the first password input; the username choice then falls back on the
+    /// element's last input.
+    pub last_before_password: Option<u64>,
 }
 
 impl Elem {
@@ -74,7 +78,7 @@ fn pick(cands: &[usize], elems: &[Elem], first_password_seq: Option<u64>) -> Opt
     let last_before = |i: usize| -> Option<u64> {
         match first_password_seq {
             None => Some(elems[i].last_seq),
-            Some(s) => elems[i].seqs.iter().copied().filter(|q| *q < s).max(),
+            Some(s) => elems[i].last_before_password.filter(|q| *q < s),
         }
     };
     cands

@@ -278,6 +278,12 @@ pub fn summary(r: &Recording) -> String {
         s.requests_seen,
         s.request_bodies_reduced
     ));
+    if s.steps_dropped > 0 {
+        out.push(format!(
+            "Not recorded: {} step(s) past the recorder's limit.",
+            s.steps_dropped
+        ));
+    }
     let mut text = out.join("\n");
     text.push('\n');
     text
@@ -438,6 +444,7 @@ pub(crate) mod tests {
                 query_values_removed: 3,
                 path_segments_replaced: 1,
                 typed_values_removed: 5,
+                steps_dropped: 0,
             },
         }
     }
@@ -462,6 +469,10 @@ pub(crate) mod tests {
         assert!(!s.contains('{') && !s.contains('"'));
         let quiet = summary(&recording());
         assert!(!quiet.contains("Caution") && !quiet.contains("Flag:"));
+        assert!(!quiet.contains("Not recorded"));
+        let mut capped = recording();
+        capped.stripped.steps_dropped = 7;
+        assert!(summary(&capped).contains("Not recorded: 7 step(s) past the recorder's limit."));
         assert!(quiet.contains("does not look like a candidate"));
     }
 

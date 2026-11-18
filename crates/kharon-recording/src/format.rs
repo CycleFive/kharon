@@ -126,6 +126,9 @@ pub struct StrippedCounts {
     pub path_segments_replaced: u64,
     /// Typed input values discarded (only lengths are kept).
     pub typed_values_removed: u64,
+    /// Steps past the recorder's limit that were not written to `steps`.
+    #[serde(default)]
+    pub steps_dropped: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -314,6 +317,7 @@ mod tests {
                 query_values_removed: 0,
                 path_segments_replaced: 0,
                 typed_values_removed: 2,
+                steps_dropped: 0,
             },
         }
     }

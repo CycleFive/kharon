@@ -17,6 +17,26 @@ use crate::strip::{OTHER, TYPED, dedup_hits, hits_in, holds_typed, looks_like_a_
 /// Bodies larger than this are not parsed: they are `Opaque`.
 pub const MAX_BODY_BYTES: usize = 1 << 20;
 
+/// A body whose shape would hold more than this many values (JSON nodes, urlencoded fields,
+/// multipart parts) is `Opaque`: a page can send telemetry batches of any size, and a shape
+/// as large as the body helps nobody.
+pub const MAX_SHAPE_VALUES: usize = 2_000;
+
+/// What is left of the value budget for one body. Building stops as soon as it runs out.
+struct Budget(usize);
+
+impl Budget {
+    fn new() -> Self {
+        Self(MAX_SHAPE_VALUES)
+    }
+
+    /// Takes one value, or `None` when none is left.
+    fn take(&mut self) -> Option<()> {
+        self.0 = self.0.checked_sub(1)?;
+        Some(())
+    }
+}
+
 /// `content_type` picks the reader: application/x-www-form-urlencoded, application/json (and any +json),
 /// multipart/form-data; anything else, or a body that fails to parse as its declared type, is Opaque.
 /// `pair` is (username, password) once both are known; see below.
@@ -27,6 +47,7 @@ pub const MAX_BODY_BYTES: usize = 1 << 20;
 /// and its hits are added to its field; a name that does not look like a name (see
 /// `strip::looks_like_a_name`) is written as `{other}`. A urlencoded body with a piece that has
 /// no `=`, or whose names mostly do not look like names, is not urlencoded data and is `Opaque`.
+/// So is a body whose shape would hold more than `MAX_SHAPE_VALUES` values.
 /// Never returns `None` or `Unavailable`.
 pub fn shape_of_body(
     content_type: Option<&str>,
@@ -47,9 +68,8 @@ pub fn shape_of_body(
                 // The one permitted use of `serde_json::Value`: a site's JSON body while its shape is extracted.
                 serde_json::from_slice::<serde_json::Value>(body)
                     .ok()
-                    .map(|v| BodyShape::Json {
-                        root: json_shape(&v, markers, pair),
-                    })
+                    .and_then(|v| json_shape(&v, markers, pair, &mut Budget::new()))
+                    .map(|root| BodyShape::Json { root })
             }
             _ => None,
         },
@@ -189,8 +209,10 @@ fn urlencoded_fields(
     markers: &[Marker],
     pair: Option<(&Marker, &Marker)>,
 ) -> Option<Vec<FieldShape>> {
+    let mut budget = Budget::new();
     let mut pieces = Vec::new();
     for piece in body.split(|b| *b == b'&').filter(|p| !p.is_empty()) {
+        budget.take()?;
         let i = piece.iter().position(|b| *b == b'=')?;
         pieces.push((decode_percent(&piece[..i], true), &piece[i + 1..]));
     }
@@ -234,28 +256,34 @@ fn add_hits_to_first_value(shape: &mut JsonShape, extra: Vec<MarkerHit>) -> bool
     }
 }
 
+/// The shape of `v`, or `None` when it would hold more values than `budget` has left.
 fn json_shape(
     v: &serde_json::Value,
     markers: &[Marker],
     pair: Option<(&Marker, &Marker)>,
-) -> JsonShape {
+    budget: &mut Budget,
+) -> Option<JsonShape> {
     use serde_json::Value;
+    budget.take()?;
     // Depth is bounded by serde_json's own recursion limit (128) at parse time.
-    match v {
-        Value::Object(map) => JsonShape::Object {
-            fields: map
-                .iter()
-                .map(|(k, v)| {
-                    let (key, key_hits) = name(k.as_bytes(), markers, pair);
-                    let mut value = json_shape(v, markers, pair);
-                    add_hits_to_first_value(&mut value, key_hits);
-                    JsonField { key, value }
-                })
-                .collect(),
-        },
-        Value::Array(items) => JsonShape::Array {
-            items: items.iter().map(|i| json_shape(i, markers, pair)).collect(),
-        },
+    Some(match v {
+        Value::Object(map) => {
+            let mut fields = Vec::new();
+            for (k, v) in map {
+                let (key, key_hits) = name(k.as_bytes(), markers, pair);
+                let mut value = json_shape(v, markers, pair, budget)?;
+                add_hits_to_first_value(&mut value, key_hits);
+                fields.push(JsonField { key, value });
+            }
+            JsonShape::Object { fields }
+        }
+        Value::Array(items) => {
+            let mut shapes = Vec::new();
+            for i in items {
+                shapes.push(json_shape(i, markers, pair, budget)?);
+            }
+            JsonShape::Array { items: shapes }
+        }
         Value::String(s) => JsonShape::Value {
             value: text_value(s.as_bytes(), markers, pair),
         },
@@ -283,7 +311,7 @@ fn json_shape(
         Value::Null => JsonShape::Value {
             value: value_shape(ValueKind::Null, 0, b"null", markers, pair),
         },
-    }
+    })
 }
 
 fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -318,11 +346,13 @@ fn multipart_parts(
     // The delimiter that closes a part is preceded by a line break.
     let closing = [eol, delim.as_slice()].concat();
 
+    let mut budget = Budget::new();
     let mut parts = Vec::new();
     loop {
         if body[pos..].starts_with(b"--") {
             return Some(parts);
         }
+        budget.take()?;
         // Rest of the delimiter line (transport padding), then the headers.
         let headers_start = pos + body[pos..].iter().position(|b| *b == b'\n')? + 1;
         let headers_end = find(body, &blank_line, headers_start)?;
@@ -829,9 +859,11 @@ mod tests {
     #[test]
     fn many_crlf_parts_are_read_in_linear_time() {
         // The earlier quadratic parse (CRLF bodies never matched the LF-only terminator, so every
-        // part scanned the rest of the body) took minutes at this size; this one takes milliseconds.
+        // part scanned the rest of the body) took minutes at 20,000 parts. Decision change: a
+        // body of more parts than `MAX_SHAPE_VALUES` is now Opaque, so this is the most parts
+        // that are still read.
         let mut body = Vec::new();
-        for _ in 0..20_000 {
+        for _ in 0..MAX_SHAPE_VALUES {
             body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=f\r\n\r\nv\r\n");
         }
         body.extend_from_slice(b"--b--\r\n");
@@ -845,7 +877,7 @@ mod tests {
         let BodyShape::Multipart { parts } = s else {
             panic!("not multipart")
         };
-        assert_eq!(parts.len(), 20_000);
+        assert_eq!(parts.len(), MAX_SHAPE_VALUES);
         // LF-only bodies too.
         let lf = String::from_utf8_lossy(&body).replace("\r\n", "\n");
         let s = shape_of_body(
@@ -857,7 +889,7 @@ mod tests {
         let BodyShape::Multipart { parts } = s else {
             panic!("not multipart")
         };
-        assert_eq!(parts.len(), 20_000);
+        assert_eq!(parts.len(), MAX_SHAPE_VALUES);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "multipart parse is not linear"
@@ -1070,5 +1102,100 @@ mod tests {
         assert_eq!(usize::try_from(len).unwrap(), body.len());
         assert!(markers.contains(&hit(Role::Password, Encoding::AsTyped)));
         assert!(markers.contains(&hit(Role::Username, Encoding::AsTyped)));
+    }
+
+    #[test]
+    fn a_big_json_array_is_opaque_quickly_and_small() {
+        // About 1 MiB of small numbers: the case that made a 33 MB shape.
+        let mut body = String::from("[");
+        while body.len() < MAX_BODY_BYTES - 16 {
+            body.push_str("1,");
+        }
+        body.push_str("1]");
+        assert!(body.len() <= MAX_BODY_BYTES);
+        let started = std::time::Instant::now();
+        let s = shape_of_body(Some("application/json"), body.as_bytes(), &markers(), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+        let BodyShape::Opaque { len, .. } = &s else {
+            panic!("not opaque")
+        };
+        assert_eq!(usize::try_from(*len).unwrap(), body.len());
+        assert!(serialized(&s).len() < 1024);
+    }
+
+    #[test]
+    fn a_shape_of_exactly_the_cap_is_kept_and_one_more_value_is_opaque() {
+        // An array is one node and each item another.
+        let items = |n: usize| format!("[{}]", vec!["1"; n].join(","));
+        let ok = shape_of_body(
+            Some("application/json"),
+            items(MAX_SHAPE_VALUES - 1).as_bytes(),
+            &[],
+            None,
+        );
+        assert!(matches!(ok, BodyShape::Json { .. }));
+        let over = shape_of_body(
+            Some("application/json"),
+            items(MAX_SHAPE_VALUES).as_bytes(),
+            &[],
+            None,
+        );
+        assert!(matches!(over, BodyShape::Opaque { .. }));
+        // Urlencoded fields and multipart parts have the same cap.
+        let form = |n: usize| {
+            (0..n)
+                .map(|i| format!("k{i}=v"))
+                .collect::<Vec<_>>()
+                .join("&")
+        };
+        assert!(matches!(
+            shape_of_body(Some(URLENC), form(MAX_SHAPE_VALUES).as_bytes(), &[], None),
+            BodyShape::Urlencoded { .. }
+        ));
+        assert!(matches!(
+            shape_of_body(
+                Some(URLENC),
+                form(MAX_SHAPE_VALUES + 1).as_bytes(),
+                &[],
+                None
+            ),
+            BodyShape::Opaque { .. }
+        ));
+        let multipart = |n: usize| {
+            let mut b = Vec::new();
+            for _ in 0..n {
+                b.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=f\r\n\r\nv\r\n");
+            }
+            b.extend_from_slice(b"--b--\r\n");
+            b
+        };
+        assert!(matches!(
+            shape_of_body(
+                Some("multipart/form-data; boundary=b"),
+                &multipart(MAX_SHAPE_VALUES + 1),
+                &[],
+                None
+            ),
+            BodyShape::Opaque { .. }
+        ));
+    }
+
+    #[test]
+    fn a_capped_body_still_reports_whole_body_hits() {
+        let m = [pw("Tr0ub4dor-9x")];
+        let mut body = String::from("[\"Tr0ub4dor-9x\"");
+        for _ in 0..MAX_SHAPE_VALUES {
+            body.push_str(",1");
+        }
+        body.push(']');
+        let s = shape_of_body(Some("application/json"), body.as_bytes(), &m, None);
+        let BodyShape::Opaque { markers, .. } = s else {
+            panic!("not opaque")
+        };
+        assert!(markers.contains(&hit(Role::Password, Encoding::AsTyped)));
     }
 }

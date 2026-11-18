@@ -23,6 +23,11 @@ use resolve::{Elem, resolve};
 
 /// Once this many body bytes are buffered, every further body is buffered as `Unavailable`.
 pub const MAX_BUFFERED_BODY_BYTES: usize = 32 << 20;
+/// Steps kept. Later ones are counted in `StrippedCounts::steps_dropped` and not recorded. Typed
+/// values are still tracked: only the step list stops growing.
+pub const MAX_STEPS: usize = 10_000;
+/// Requests buffered. Later ones are counted in `requests_seen` and not buffered.
+pub const MAX_BUFFERED_REQUESTS: usize = 5_000;
 
 /// A frame as it was when an event arrived.
 struct FrameInfo {
@@ -77,6 +82,11 @@ pub struct Capture {
     main_origin: Option<String>,
     final_url: Option<String>,
     steps: Vec<Pending>,
+    steps_dropped: u64,
+    max_steps: usize,
+    max_requests: usize,
+    /// The first sequence number of the first element known to be a password.
+    first_password_seq: Option<u64>,
     elems: Vec<Elem>,
     reqs: Vec<Buffered>,
     seq: u64,
@@ -134,6 +144,10 @@ impl Capture {
             main_origin: raw_origin(start_url),
             final_url: None,
             steps: Vec::new(),
+            steps_dropped: 0,
+            max_steps: MAX_STEPS,
+            max_requests: MAX_BUFFERED_REQUESTS,
+            first_password_seq: None,
             elems: Vec::new(),
             reqs: Vec::new(),
             seq: 0,
@@ -257,11 +271,20 @@ impl Capture {
             }
         }
         let info = self.frame_info(frame);
-        self.steps.push(Pending {
+        self.add_step(Pending {
             t_ms,
             frame: info,
             what: What::Navigation(frame.url.clone()),
         });
+    }
+
+    /// Keeps the step, or counts it when the step list is full.
+    fn add_step(&mut self, step: Pending) {
+        if self.steps.len() < self.max_steps {
+            self.steps.push(step);
+        } else {
+            self.steps_dropped += 1;
+        }
     }
 
     fn page(
@@ -290,7 +313,7 @@ impl Capture {
                             has_step: false,
                             first_seq: self.seq + 1,
                             last_seq: 0,
-                            seqs: Vec::new(),
+                            last_before_password: None,
                         });
                         let i = self.elems.len() - 1;
                         self.note_report(i, &element, &info);
@@ -299,7 +322,9 @@ impl Capture {
                 };
                 self.seq += 1;
                 self.elems[i].last_seq = self.seq;
-                self.elems[i].seqs.push(self.seq);
+                if self.first_password_seq.is_none_or(|s| self.seq < s) {
+                    self.elems[i].last_before_password = Some(self.seq);
+                }
                 if let Some(v) = value {
                     self.elems[i].value = v;
                 }
@@ -320,7 +345,7 @@ impl Capture {
                 None => return,
             },
         };
-        self.steps.push(Pending {
+        self.add_step(Pending {
             t_ms,
             frame: info,
             what,
@@ -330,6 +355,11 @@ impl Capture {
     fn note_report(&mut self, i: usize, element: &RawElement, info: &FrameInfo) {
         let e = &mut self.elems[i];
         e.was_password |= element.is_password_now;
+        if e.was_password {
+            let first = e.first_seq;
+            self.first_password_seq = Some(self.first_password_seq.map_or(first, |s| s.min(first)));
+        }
+        let e = &mut self.elems[i];
         e.shadow |= element.in_shadow_root;
         if e.was_password && !info.main && info.cross_origin {
             self.framed_login = true;
@@ -340,6 +370,9 @@ impl Capture {
         self.requests_seen += 1;
         if is_captcha_url(&b.url) {
             self.captcha = true;
+        }
+        if self.reqs.len() >= self.max_requests {
+            return;
         }
         if let RawBody::Bytes(bytes) = &b.body {
             if bytes.len() > MAX_BODY_BYTES
@@ -470,6 +503,7 @@ impl Capture {
                 query_values_removed: tally.query_values_removed,
                 path_segments_replaced: tally.path_segments_replaced,
                 typed_values_removed: resolved.markers.len() as u64,
+                steps_dropped: self.steps_dropped,
             },
             requests,
         }
@@ -1618,6 +1652,87 @@ mod tests {
         assert!(rec.flags.popup);
         assert_eq!(rec.stripped.requests_seen, 5);
         let _ = rec.to_json();
+    }
+
+    impl Capture {
+        /// A capture with small step and request limits, for the tests of those limits.
+        fn with_limits(start_url: &str, max_steps: usize, max_requests: usize) -> Self {
+            Self {
+                max_steps,
+                max_requests,
+                ..Self::new(start_url, "0.0.0")
+            }
+        }
+    }
+
+    fn session_with_limits(max_steps: usize, max_requests: usize) -> Session {
+        let mut s = Session::unstarted(LOGIN);
+        s.cap = Capture::with_limits(LOGIN, max_steps, max_requests);
+        s.start();
+        s
+    }
+
+    #[test]
+    fn steps_past_the_limit_are_counted_but_their_values_still_count_as_typed() {
+        // Step 1 is the first navigation, step 2 the user name; the password input and the
+        // clicks after them do not fit.
+        let rec = session_with_limits(2, MAX_BUFFERED_REQUESTS)
+            .type_into(&user_el(), USER)
+            .type_into(&pw_el(), PASS)
+            .click(&button())
+            .click(&button())
+            .post_form(
+                "https://ex.test/login",
+                &format!("username={USER}&password={PASS}"),
+            )
+            .finish();
+        assert_eq!(rec.steps.len(), 2);
+        assert_eq!(rec.stripped.steps_dropped, 3);
+        // The dropped password input is still a typed value: it is found and never written.
+        assert_eq!(rec.stripped.typed_values_removed, 2);
+        assert!(
+            rec.requests
+                .iter()
+                .flat_map(StoredRequest::hits)
+                .any(|h| h.role == Role::Password)
+        );
+        assert_holds_no_typed_value(&rec.to_json(), &[USER, PASS]);
+        // Below the limit nothing is dropped.
+        assert_eq!(scenario("form_post").stripped.steps_dropped, 0);
+        assert_eq!(MAX_STEPS, 10_000);
+    }
+
+    #[test]
+    fn requests_past_the_limit_are_counted_and_not_buffered() {
+        let mut s = session_with_limits(MAX_STEPS, 3).type_into(&user_el(), USER);
+        for i in 0..6 {
+            s = s.post_form(&format!("https://ex.test/p{i}"), "a=1");
+        }
+        let rec = s.finish();
+        assert_eq!(rec.stripped.requests_seen, 6);
+        // Main-frame navigations are always stored, so what is stored is what was buffered.
+        let paths: Vec<&str> = rec.requests.iter().map(|r| r.url.path.as_str()).collect();
+        assert_eq!(paths, ["/p0", "/p1", "/p2"]);
+        assert_eq!(MAX_BUFFERED_REQUESTS, 5_000);
+    }
+
+    #[test]
+    fn an_element_typed_into_endlessly_keeps_its_place_in_the_username_choice() {
+        // Thousands of events on one field, then the password: the user name is still found
+        // from the last thing typed before the password, with no per-event record kept.
+        let mut s = Session::new(LOGIN);
+        for _ in 0..5_000 {
+            s = s.type_into(&user_el(), USER);
+        }
+        let rec = s
+            .type_into(&pw_el(), PASS)
+            .post_form(
+                "https://ex.test/login",
+                &format!("username={USER}&password={PASS}"),
+            )
+            .finish();
+        assert_eq!(role_of(&rec, 1), Some(Role::Username));
+        assert_eq!(rec.classification.shape, Shape::FormPost);
     }
 
     fn session_with_budget(budget: usize) -> Session {

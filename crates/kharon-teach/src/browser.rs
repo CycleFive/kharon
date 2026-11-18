@@ -17,6 +17,8 @@ pub enum BrowserError {
 }
 
 pub const PROFILE_PREFIX: &str = "kharon-teach-";
+/// Written into every profile: the pid of the recorder that owns it.
+pub const OWNER_FILE: &str = "kharon-teach.owner";
 
 const SEARCH_ORDER: [&str; 6] = [
     "chromium",
@@ -100,10 +102,16 @@ fn private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 impl Profile {
-    /// `<temp>/kharon-teach-<random>`, created atomically with mode 0700.
+    /// `<temp>/kharon-teach-<random>`, mode 0700, holding an owner file with
+    /// this process's pid. It is built under a name the sweep never matches
+    /// and renamed into place, so a sweep cannot see it half-made. A crash
+    /// between the mkdir and the rename leaves a `.kharon-teach-new-*`
+    /// directory that nothing sweeps; the window is microseconds.
     pub fn create() -> std::io::Result<Self> {
         use rand::Rng;
         use rand::distributions::Alphanumeric;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let temp = std::env::temp_dir();
         for _ in 0..16 {
             let suffix: String = rand::thread_rng()
@@ -111,11 +119,40 @@ impl Profile {
                 .take(20)
                 .map(char::from)
                 .collect();
-            let path = temp.join(format!("{PROFILE_PREFIX}{suffix}"));
-            match private_dir(&path) {
-                Ok(()) => return Ok(Profile { path }),
+            let staging = temp.join(format!(".{PROFILE_PREFIX}new-{suffix}"));
+            match private_dir(&staging) {
+                Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
+            }
+            let made = (|| {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(staging.join(OWNER_FILE))?;
+                f.write_all(std::process::id().to_string().as_bytes())
+            })();
+            if let Err(e) = made {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(e);
+            }
+            let path = temp.join(format!("{PROFILE_PREFIX}{suffix}"));
+            // rename onto an existing non-empty directory fails; an existing
+            // empty one would be replaced, so check first.
+            if std::fs::symlink_metadata(&path).is_ok() {
+                let _ = std::fs::remove_dir_all(&staging);
+                continue;
+            }
+            match std::fs::rename(&staging, &path) {
+                Ok(()) => return Ok(Profile { path }),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    if path.exists() {
+                        continue;
+                    }
+                    return Err(e);
+                }
             }
         }
         Err(std::io::Error::new(
@@ -153,7 +190,11 @@ impl Profile {
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            if !meta.file_type().is_dir() || meta.uid() != me || browser_is_alive(&path) {
+            if !meta.file_type().is_dir()
+                || meta.uid() != me
+                || owner_is_alive(&path)
+                || browser_is_alive(&path)
+            {
                 continue;
             }
             if remove_tree(&path).is_ok() {
@@ -183,6 +224,22 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
     last
+}
+
+/// The owner file names a live pid. A missing, symlinked, non-regular,
+/// over-32-byte or unparseable owner file counts as no live owner.
+fn owner_is_alive(dir: &Path) -> bool {
+    let file = dir.join(OWNER_FILE);
+    let Ok(meta) = std::fs::symlink_metadata(&file) else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() > 32 {
+        return false;
+    }
+    std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
 }
 
 /// Chromium's `SingletonLock` is a symlink whose target text is
@@ -342,6 +399,10 @@ mod tests {
                 .starts_with(PROFILE_PREFIX)
         );
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::read_to_string(path.join(OWNER_FILE)).unwrap(),
+            std::process::id().to_string()
+        );
         p.remove().unwrap();
         assert!(!path.exists());
     }
@@ -401,6 +462,54 @@ mod tests {
         Profile::sweep_stale().unwrap();
         assert!(d.exists());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
+    fn dir_with_owner(tag: &str, owner: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(unique(tag));
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join(OWNER_FILE), owner).unwrap();
+        d
+    }
+
+    #[test]
+    fn sweep_skips_a_profile_owned_by_this_process() {
+        let d = dir_with_owner("mine", &std::process::id().to_string());
+        Profile::sweep_stale().unwrap();
+        assert!(d.exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn sweep_removes_a_profile_owned_by_a_dead_process() {
+        let d = dir_with_owner("dead", &dead_pid().to_string());
+        assert!(Profile::sweep_stale().unwrap() >= 1);
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn sweep_treats_an_owner_symlink_as_no_owner() {
+        let d = std::env::temp_dir().join(unique("ownlink"));
+        std::fs::create_dir(&d).unwrap();
+        let real = d.join("real");
+        std::fs::write(&real, std::process::id().to_string()).unwrap();
+        std::os::unix::fs::symlink(&real, d.join(OWNER_FILE)).unwrap();
+        assert!(Profile::sweep_stale().unwrap() >= 1);
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn sweep_treats_a_junk_or_oversized_owner_as_no_owner() {
+        let a = dir_with_owner("junk", "not a pid");
+        let b = dir_with_owner("big", &format!("{}{}", std::process::id(), " ".repeat(40)));
+        assert!(Profile::sweep_stale().unwrap() >= 2);
+        assert!(!a.exists() && !b.exists());
     }
 
     #[test]

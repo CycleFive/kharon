@@ -49,6 +49,12 @@ async fn script_page_classifies_as_script_post() {
         "{:?}",
         r.classification.notes
     );
+    assert_eq!(
+        r.classification.rung_ceiling,
+        RungCeiling::Milliseconds,
+        "{:?}",
+        r.classification.notes
+    );
 }
 
 #[tokio::test]
@@ -82,6 +88,7 @@ async fn hashed_page_classifies_as_transformed() {
         "{:?}",
         c.notes
     );
+    assert_eq!(c.rung_ceiling, RungCeiling::Milliseconds, "{:?}", c.notes);
     assert!(!c.network_swap_candidate);
 }
 

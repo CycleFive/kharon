@@ -1087,6 +1087,7 @@ dependencies = [
  "hex",
  "kharon-recording",
  "md-5",
+ "memchr",
  "percent-encoding",
  "serde_json",
  "sha1",

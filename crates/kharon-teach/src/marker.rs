@@ -4,7 +4,7 @@
 use base64ct::{Base64, Base64Unpadded, Base64Url, Base64UrlUnpadded, Encoding as B64};
 use kharon_recording::{Encoding, MarkerHit, Role};
 use md5::Md5;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
+use memchr::memmem;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use zeroize::Zeroizing;
@@ -17,6 +17,16 @@ pub const LOW_CONFIDENCE_BELOW: u32 = 6;
 /// ```compile_fail
 /// let m = kharon_teach::marker::Marker::new(zeroize::Zeroizing::new(String::from("x")), kharon_recording::Role::Password);
 /// println!("{:?}", m);
+/// ```
+///
+/// ```compile_fail
+/// let m = kharon_teach::marker::Marker::new(zeroize::Zeroizing::new(String::from("x")), kharon_recording::Role::Password);
+/// println!("{}", m);
+/// ```
+///
+/// ```compile_fail
+/// let m = kharon_teach::marker::Marker::new(zeroize::Zeroizing::new(String::from("x")), kharon_recording::Role::Password);
+/// let _ = m.clone();
 /// ```
 pub struct Marker {
     value: Zeroizing<String>,
@@ -71,37 +81,104 @@ impl Marker {
 
 type Needle = Zeroizing<Vec<u8>>;
 
-/// RFC 3986 unreserved characters stay as they are; every other byte is percent-encoded.
-const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
+/// The request bytes as sent, plus up to two percent-decoded copies: `%XX` only, and `+` as a
+/// space then `%XX`. A copy identical to the raw bytes is left out. The copies are zeroized.
+struct Haystacks<'a> {
+    raw: &'a [u8],
+    decoded: Vec<Needle>,
+}
+
+impl<'a> Haystacks<'a> {
+    fn new(raw: &'a [u8]) -> Self {
+        let mut decoded: Vec<Needle> = Vec::new();
+        for plus_is_space in [false, true] {
+            let copy = percent_decode(raw, plus_is_space);
+            if copy.as_slice() != raw && !decoded.iter().any(|d| d.as_slice() == copy.as_slice()) {
+                decoded.push(copy);
+            }
+        }
+        Self { raw, decoded }
+    }
+
+    fn in_raw(&self, forms: &[Needle]) -> bool {
+        forms.iter().any(|n| contains(self.raw, n))
+    }
+
+    fn in_decoded(&self, forms: &[Needle]) -> bool {
+        forms
+            .iter()
+            .any(|n| self.decoded.iter().any(|d| contains(d, n)))
+    }
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    char::from(b)
+        .to_digit(16)
+        .and_then(|d| u8::try_from(d).ok())
+}
+
+/// Decodes `%XX` (either hex case); a `%` not followed by two hex digits is copied unchanged.
+fn percent_decode(raw: &[u8], plus_is_space: bool) -> Needle {
+    let mut out = Zeroizing::new(Vec::with_capacity(raw.len()));
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b == b'%'
+            && let (Some(hi), Some(lo)) = (
+                raw.get(i + 1).copied().and_then(hex_value),
+                raw.get(i + 2).copied().and_then(hex_value),
+            )
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        out.push(if plus_is_space && b == b'+' { b' ' } else { b });
+        i += 1;
+    }
+    out
+}
 
 /// Every way `marker` occurs in `haystack`. Digests are searched only for Role::Password.
 ///
 /// At most one hit per `Encoding`, in the order of the enum's variants. An encoded form that is
 /// byte-identical to the as-typed form is not searched, so a plain value reports only `AsTyped`.
+///
+/// Percent encoding is found by decoding the haystack (see `Haystacks`) and searching the raw
+/// bytes and both decoded copies. `Percent` is reported when the typed value is found only in a
+/// decoded copy; every other encoding is reported when its form is found in any of the three.
 pub fn search(haystack: &[u8], marker: &Marker) -> Vec<MarkerHit> {
     if marker.is_empty() {
         return Vec::new();
     }
     let low_confidence = marker.len() < LOW_CONFIDENCE_BELOW;
-    needles(marker)
-        .into_iter()
-        .filter(|(_, forms)| forms.iter().any(|n| contains(haystack, n)))
-        .map(|(encoding, _)| MarkerHit {
+    let haystacks = Haystacks::new(haystack);
+    let mut hits = Vec::new();
+    let mut hit = |encoding| {
+        hits.push(MarkerHit {
             role: marker.role,
             encoding,
             low_confidence,
-        })
-        .collect()
+        });
+    };
+    for (encoding, forms) in needles(marker) {
+        if encoding == Encoding::AsTyped {
+            if haystacks.in_raw(&forms) {
+                hit(Encoding::AsTyped);
+            } else if haystacks.in_decoded(&forms) {
+                hit(Encoding::Percent);
+            }
+        } else if haystacks.in_raw(&forms) || haystacks.in_decoded(&forms) {
+            hit(encoding);
+        }
+    }
+    hits
 }
 
 /// The base64 and base64url (padded or not) of `username:password`. A match returns two hits,
 /// one per role, both `Encoding::Base64` (or `Base64Url`).
 ///
-/// Nothing is returned when either marker is empty. `low_confidence` is set when the combined
+/// Searches the same three haystacks as `search`. Nothing is returned when either marker is empty. `low_confidence` is set when the combined
 /// length of both values is under `LOW_CONFIDENCE_BELOW` characters.
 pub fn search_pair(haystack: &[u8], username: &Marker, password: &Marker) -> Vec<MarkerHit> {
     if username.is_empty() || password.is_empty() {
@@ -119,12 +196,13 @@ pub fn search_pair(haystack: &[u8], username: &Marker, password: &Marker) -> Vec
         let seen: Vec<&[u8]> = standard.iter().map(|n| n.as_slice()).collect();
         dedup(url_safe, &seen)
     };
+    let haystacks = Haystacks::new(haystack);
     let mut hits = Vec::new();
     for (encoding, forms) in [
         (Encoding::Base64, standard),
         (Encoding::Base64Url, url_safe),
     ] {
-        if forms.iter().any(|n| contains(haystack, n)) {
+        if haystacks.in_raw(&forms) || haystacks.in_decoded(&forms) {
             for role in [username.role, password.role] {
                 hits.push(MarkerHit {
                     role,
@@ -138,7 +216,7 @@ pub fn search_pair(haystack: &[u8], username: &Marker, password: &Marker) -> Vec
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    !needle.is_empty() && memmem::find(haystack, needle).is_some()
 }
 
 /// The search forms per encoding, in `Encoding` order.
@@ -153,7 +231,6 @@ fn needles(marker: &Marker) -> Vec<(Encoding, Vec<Needle>)> {
     };
     let mut out = vec![
         (Encoding::AsTyped, vec![Zeroizing::new(value.to_vec())]),
-        (Encoding::Percent, dedup(percent_forms(value), &[value])),
         (
             Encoding::JsonEscaped,
             dedup(json_forms(&marker.value), &[value]),
@@ -238,28 +315,7 @@ fn hex_forms(bytes: &[u8]) -> Vec<Needle> {
     }
     let mut upper = lower.clone();
     upper.make_ascii_uppercase();
-    vec![lower, upper]
-}
-
-/// Uppercase and lowercase percent hex, each with space as `%20` and as `+`.
-fn percent_forms(bytes: &[u8]) -> Vec<Needle> {
-    let mut forms = Vec::new();
-    for plus in [false, true] {
-        for lower in [false, true] {
-            let mut out = Zeroizing::new(Vec::with_capacity(bytes.len() * 3));
-            for chunk in percent_encode(bytes, UNRESERVED) {
-                if plus && chunk == "%20" {
-                    out.push(b'+');
-                } else if lower && chunk.starts_with('%') {
-                    out.extend(chunk.bytes().map(|b| b.to_ascii_lowercase()));
-                } else {
-                    out.extend_from_slice(chunk.as_bytes());
-                }
-            }
-            forms.push(out);
-        }
-    }
-    forms
+    dedup(vec![lower, upper], &[])
 }
 
 #[derive(Clone, Copy)]
@@ -526,6 +582,121 @@ mod tests {
     fn pair_absent_gives_nothing() {
         assert!(
             search_pair(b"nothing here", &user("kh.throwaway7"), &pw("Tr0ub4dor-9x")).is_empty()
+        );
+    }
+
+    #[test]
+    fn component_encoding_leaves_punctuation_literal() {
+        let m = pw("my pass!x*9");
+        assert_eq!(encodings(b"p=my%20pass!x*9", &m), [Encoding::Percent]);
+        assert_eq!(encodings(b"p=my+pass%21x*9", &m), [Encoding::Percent]);
+    }
+
+    #[test]
+    fn percent_hex_digits_in_mixed_case() {
+        assert_eq!(
+            encodings(b"p=p%c3%A4ssw%C3%b6rd12", &pw("p\u{e4}ssw\u{f6}rd12")),
+            [Encoding::Percent]
+        );
+    }
+
+    #[test]
+    fn stray_percent_does_not_panic_or_match() {
+        let m = pw("abcdef12");
+        assert!(search(b"p=abc%", &m).is_empty());
+        assert!(search(b"p=abc%zzdef12", &m).is_empty());
+        assert!(search(b"%", &m).is_empty());
+        assert!(search(b"%4", &m).is_empty());
+        assert_eq!(encodings(b"p=%zz%61bcdef12", &m), [Encoding::Percent]);
+    }
+
+    #[test]
+    fn base64_with_percent_encoded_symbols() {
+        assert_eq!(
+            encodings(b"x=Pj4%2BPz8%2FMTI%3D", &pw(">>>???12")),
+            [Encoding::Base64]
+        );
+    }
+
+    #[test]
+    fn raw_match_reports_only_as_typed() {
+        assert_eq!(
+            encodings(b"a=my%20pass!x*9&b=my pass!x*9", &pw("my pass!x*9")),
+            [Encoding::AsTyped]
+        );
+    }
+
+    #[test]
+    fn every_digest_in_hex_and_base64() {
+        let value = "Tr0ub4dor-9x";
+        let digests: [(Encoding, Encoding, Vec<u8>); 4] = [
+            (
+                Encoding::Md5Hex,
+                Encoding::Md5Base64,
+                Md5::digest(value).to_vec(),
+            ),
+            (
+                Encoding::Sha1Hex,
+                Encoding::Sha1Base64,
+                Sha1::digest(value).to_vec(),
+            ),
+            (
+                Encoding::Sha256Hex,
+                Encoding::Sha256Base64,
+                Sha256::digest(value).to_vec(),
+            ),
+            (
+                Encoding::Sha512Hex,
+                Encoding::Sha512Base64,
+                Sha512::digest(value).to_vec(),
+            ),
+        ];
+        for (hex_enc, b64_enc, digest) in digests {
+            for (expected, text) in [
+                (hex_enc, hex::encode(&digest)),
+                (hex_enc, hex::encode(&digest).to_uppercase()),
+                (b64_enc, Base64::encode_string(&digest)),
+                (b64_enc, Base64Unpadded::encode_string(&digest)),
+            ] {
+                let haystack = format!("h={text}&z=1");
+                assert_eq!(encodings(haystack.as_bytes(), &pw(value)), [expected]);
+                assert!(search(haystack.as_bytes(), &user(value)).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn pair_in_url_safe_base64() {
+        let joined = b"kh>>>user:pa??w0rd-9";
+        let std = Base64::encode_string(joined);
+        assert!(std.contains('+'));
+        let url = Base64UrlUnpadded::encode_string(joined);
+        let haystack = format!("auth={url}");
+        let hits = search_pair(haystack.as_bytes(), &user("kh>>>user"), &pw("pa??w0rd-9"));
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.role, h.encoding))
+                .collect::<Vec<_>>(),
+            [
+                (Role::Username, Encoding::Base64Url),
+                (Role::Password, Encoding::Base64Url)
+            ]
+        );
+    }
+
+    #[test]
+    fn pair_with_percent_encoded_base64() {
+        let joined = b"kh>>>user:pa??w0rd-9";
+        let haystack = format!(
+            "auth={}",
+            Base64::encode_string(joined)
+                .replace('+', "%2B")
+                .replace('/', "%2F")
+                .replace('=', "%3D")
+        );
+        assert_eq!(
+            search_pair(haystack.as_bytes(), &user("kh>>>user"), &pw("pa??w0rd-9")).len(),
+            2
         );
     }
 

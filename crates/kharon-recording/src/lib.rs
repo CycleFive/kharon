@@ -4,7 +4,9 @@ pub mod classify;
 pub mod format;
 pub mod request;
 
-pub use classify::{Classification, Flags, PasswordLeg, RungCeiling, Shape};
+pub use classify::{
+    Classification, Flags, PasswordLeg, RungCeiling, Shape, classify, is_otp_descriptor,
+};
 pub use format::{
     BrowserInfo, ElementDescriptor, EndedBy, FORMAT_VERSION, FormRef, FormatError, FrameRef,
     ListenerWorld, Recording, Step, StrippedCounts, StrippedUrl, Viewport,

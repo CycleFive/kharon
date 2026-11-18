@@ -121,6 +121,7 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs)
   function resolveField(kind, selector) {
     if (selector) return document.querySelector(selector);
     if (kind === "password") return document.querySelector('input[type="password"]');
+    // Keep in step with is_otp_descriptor in crates/kharon-recording/src/classify.rs.
     if (kind === "totp") {
       return document.querySelector(
         'input[autocomplete*="one-time"], input[name*="otp" i], input[type="tel"]'
@@ -234,6 +235,7 @@ function clearInPage(fields) {
   function resolveField(kind, selector) {
     if (selector) return document.querySelector(selector);
     if (kind === "password") return document.querySelector('input[type="password"]');
+    // Keep in step with is_otp_descriptor in crates/kharon-recording/src/classify.rs.
     if (kind === "totp") {
       return document.querySelector(
         'input[autocomplete*="one-time"], input[name*="otp" i], input[type="tel"]'

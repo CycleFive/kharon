@@ -1088,8 +1088,10 @@ dependencies = [
  "kharon-recording",
  "md-5",
  "percent-encoding",
+ "serde_json",
  "sha1",
  "sha2",
+ "url",
  "zeroize",
 ]
 

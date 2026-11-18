@@ -16,7 +16,7 @@ name = "kharon-teach"
 path = "src/main.rs"
 
 [dependencies]
-kharon-recording = { path = "../kharon-recording" }
+kharon-recording = { version = "0.0.0", path = "../kharon-recording" }
 zeroize = { version = "1", features = ["serde"] }
 sha1 = "0.10"
 sha2 = "0.10"

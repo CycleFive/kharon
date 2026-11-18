@@ -9,10 +9,10 @@ use std::ops::Range;
 use base64ct::{Base64, Base64Unpadded, Base64Url, Base64UrlUnpadded, Encoding as B64};
 use kharon_recording::{AuthShape, Encoding, MarkerHit, StrippedUrl};
 use percent_encoding::percent_decode;
-use url::Url;
+use url::{Position, Url};
 use zeroize::Zeroizing;
 
-use crate::marker::{Marker, search, search_pair};
+use crate::marker::{LOW_CONFIDENCE_BELOW, Marker, search, search_pair};
 
 /// Written in place of a name (key, part name, host labels) that held a typed value.
 pub const TYPED: &str = "{typed}";
@@ -122,8 +122,25 @@ fn text_same_len(bytes: &[u8]) -> Zeroizing<String> {
     out
 }
 
+/// A marker shorter than this many characters matches kept text only as a whole token.
+fn is_short(m: &Marker) -> bool {
+    m.len() < LOW_CONFIDENCE_BELOW
+}
+
+/// Whether `range` in `text` is bounded on each side by the text's edge or by a character that
+/// is not ASCII alphanumeric.
+fn is_whole_token(text: &str, range: &Range<usize>) -> bool {
+    let not_alnum = |c: char| !c.is_ascii_alphanumeric();
+    text[..range.start]
+        .chars()
+        .next_back()
+        .is_none_or(not_alnum)
+        && text[range.end..].chars().next().is_none_or(not_alnum)
+}
+
 /// Byte ranges of every occurrence (overlapping ones too) of every marker in `text`, ignoring
-/// ASCII letter case.
+/// ASCII letter case. A marker shorter than `LOW_CONFIDENCE_BELOW` characters counts only where
+/// it is a whole token (see `is_whole_token`): `on` is not found inside `session`.
 fn occurrences(text: &str, markers: &[Marker]) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     for m in markers {
@@ -133,7 +150,9 @@ fn occurrences(text: &str, markers: &[Marker]) -> Vec<Range<usize>> {
             .and_then(|rest| m.find_ignore_ascii_case(rest))
         {
             let (start, end) = (from + r.start, from + r.end);
-            out.push(start..end);
+            if !is_short(m) || is_whole_token(text, &(start..end)) {
+                out.push(start..end);
+            }
             // Resume one character after the start so overlapping occurrences are found.
             from = start + text[start..].chars().next().map_or(1, char::len_utf8);
         }
@@ -149,14 +168,41 @@ fn touched(ranges: &[Range<usize>], spans: &[Range<usize>]) -> Vec<bool> {
         .collect()
 }
 
+/// The part of each range inside `start..end`, in coordinates relative to `start`.
+fn rebase(ranges: &[Range<usize>], start: usize, end: usize) -> Vec<Range<usize>> {
+    ranges
+        .iter()
+        .filter_map(|r| {
+            let (s, e) = (r.start.max(start), r.end.min(end));
+            (s < e).then(|| s - start..e - start)
+        })
+        .collect()
+}
+
+/// `search` over kept text, for the rule that applies to KEPT text only: a marker shorter than
+/// `LOW_CONFIDENCE_BELOW` characters (and a pair of that combined length) is left out, because
+/// its encoded forms would match inside ordinary words. Short markers are matched instead by
+/// `occurrences`, as the typed text with token boundaries. Rule chosen: the simple one.
+fn kept_hit(haystack: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> bool {
+    markers
+        .iter()
+        .filter(|m| !is_short(m))
+        .any(|m| !search(haystack, m).is_empty())
+        || pair.is_some_and(|(u, p)| {
+            u.len().saturating_add(p.len()) >= LOW_CONFIDENCE_BELOW
+                && !search_pair(haystack, u, p).is_empty()
+        })
+}
+
 /// Whether kept text `bytes` holds a typed value: `search` finds any hit (any encoding, the pair
-/// too), or the value occurs ignoring ASCII case in the text or in its percent-decoded forms.
+/// too) for a marker of `LOW_CONFIDENCE_BELOW` characters or more, or the value occurs ignoring
+/// ASCII case in the text or in its percent-decoded forms (a shorter marker only as a whole token).
 pub(crate) fn holds_typed(
     bytes: &[u8],
     markers: &[Marker],
     pair: Option<(&Marker, &Marker)>,
 ) -> bool {
-    if any_hit(bytes, markers, pair) || !occurrences(&text_same_len(bytes), markers).is_empty() {
+    if kept_hit(bytes, markers, pair) || !occurrences(&text_same_len(bytes), markers).is_empty() {
         return true;
     }
     [false, true].into_iter().any(|plus| {
@@ -169,10 +215,14 @@ pub(crate) fn holds_typed(
 /// a UUID, 16 or more hex characters, or any match of a marker (see below) touches it.
 ///
 /// Userinfo and fragment are dropped. A query key or host label holding a typed value is written
-/// as "{typed}". Matching is over the WHOLE path, query and host (raw and percent-decoded, ASCII
-/// case ignored; the path also with `/` read as `\`, which the parser rewrites), and every
-/// segment, key or label a match touches is replaced, so a typed value holding a separator
-/// leaves no piece behind. A combined credential (`pair`) found in a segment or key replaces it.
+/// as "{typed}". Matching is over WHOLE strings: the path, the query and the host each, and also
+/// the whole URL as the parser serialises it (`Url::as_str`, with component offsets from
+/// `url::Position`) and a percent-decoded copy built piece by piece, so a typed value holding
+/// `?`, `#`, `@` or `/` that the parser split into components is still found. All of them ignore
+/// ASCII case, and the path also reads `/` as `\` (the parser rewrites it). Every segment, key or
+/// label a match touches is replaced. A combined credential (`pair`) found in a segment or key
+/// replaces it. A marker shorter than `LOW_CONFIDENCE_BELOW` characters matches only as a whole
+/// token (see `occurrences`).
 ///
 /// A URL that cannot be a base (`data:`, `blob:`, `about:`, `mailto:`) keeps only its scheme.
 /// The scheme is kept only when it is in a short known list, else it is `{other}`.
@@ -200,16 +250,84 @@ pub fn strip_url(
             path_segments_replaced: 0,
         });
     }
+
+    // Component offsets in the serialisation.
+    let ser = parsed.as_str();
+    let at = |p: Position| ser.len() - parsed[p..].len();
+    let (host_start, host_end) = (at(Position::BeforeHost), at(Position::AfterHost));
+    let (path_start, path_end) = (at(Position::BeforePath), at(Position::AfterPath));
+    let query = parsed.query();
+    let query_start = path_end + 1;
+
+    let path_parts = PathParts::new(parsed.path());
+    let query_parts = QueryParts::new(query.unwrap_or(""));
+
+    // The decoded whole URL: the pieces decoded one by one, in order, with the delimiters between
+    // them, so offsets of the host, path and query inside it are known. Its capacity covers the
+    // text, so it is never reallocated (the copy is zeroized on drop).
+    let host = &ser[host_start..host_end];
+    let decode = |s: &str| text_same_len(&decode_percent(s.as_bytes(), false));
+    let mut whole = Zeroizing::new(String::with_capacity(ser.len() + 2));
+    whole.push_str(&decode(&ser[..host_start]));
+    let d_host = whole.len()..whole.len() + host.len();
+    whole.push_str(host);
+    whole.push_str(&decode(&ser[host_end..path_start]));
+    let d_path = whole.len()..whole.len() + path_parts.decoded_path.len();
+    whole.push_str(&path_parts.decoded_path);
+    let mut d_query = whole.len()..whole.len();
+    if query.is_some() {
+        whole.push('?');
+        d_query = whole.len()..whole.len() + query_parts.decoded_query.len();
+        whole.push_str(&query_parts.decoded_query);
+    }
+    if let Some(fragment) = parsed.fragment() {
+        whole.push('#');
+        whole.push_str(&decode(fragment));
+    }
+
+    let ranges_in = |text: &str| {
+        let mut ranges = occurrences(text, markers);
+        ranges.extend(occurrences(
+            &Zeroizing::new(text.replace('/', "\\")),
+            markers,
+        ));
+        ranges
+    };
+    let raw_all = ranges_in(ser);
+    let dec_all = ranges_in(&whole);
+
+    let host_ranges: Vec<Range<usize>> = rebase(&raw_all, host_start, host_end)
+        .into_iter()
+        .chain(rebase(&dec_all, d_host.start, d_host.end))
+        .collect();
     let origin = match parsed.host_str() {
         Some(host) => {
             let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-            format!("{scheme}://{}{port}", strip_host(host, markers))
+            format!(
+                "{scheme}://{}{port}",
+                strip_host(host, markers, &host_ranges)
+            )
         }
         None => format!("{scheme}:"),
     };
-    let (path, path_segments_replaced) = strip_path(parsed.path(), markers, pair);
-    let (query_keys, query_values_removed) =
-        strip_query(parsed.query().unwrap_or(""), markers, pair);
+    let (path, path_segments_replaced) = strip_path(
+        &path_parts,
+        markers,
+        pair,
+        &rebase(&raw_all, path_start, path_end),
+        &rebase(&dec_all, d_path.start, d_path.end),
+    );
+    let (query_keys, query_values_removed) = strip_query(
+        &query_parts,
+        markers,
+        pair,
+        &rebase(
+            &raw_all,
+            query_start,
+            query_start + query.map_or(0, str::len),
+        ),
+        &rebase(&dec_all, d_query.start, d_query.end),
+    );
     Some(Stripped {
         value: StrippedUrl {
             origin,
@@ -222,11 +340,13 @@ pub fn strip_url(
 }
 
 /// Replaces host labels that hold a typed value. Every occurrence of every marker is located
-/// (ASCII case-insensitively: the parser lowercases hosts) and every label the occurrence touches is
-/// replaced. Adjacent replaced labels become ONE `{typed}` label, so a value that spans labels
-/// (`kh.throwaway7`) leaves no part of itself behind.
-fn strip_host(host: &str, markers: &[Marker]) -> String {
-    let ranges = occurrences(host, markers);
+/// (ASCII case-insensitively: the parser lowercases hosts) and every label an occurrence touches
+/// is replaced; `extra` holds matches found over the whole URL, in host coordinates. Adjacent
+/// replaced labels become ONE `{typed}` label, so a value that spans labels (`kh.throwaway7`)
+/// leaves no part of itself behind.
+fn strip_host(host: &str, markers: &[Marker], extra: &[Range<usize>]) -> String {
+    let mut ranges = occurrences(host, markers);
+    ranges.extend_from_slice(extra);
     let mut spans = Vec::new();
     let mut offset = 0;
     for label in host.split('.') {
@@ -249,53 +369,88 @@ fn strip_host(host: &str, markers: &[Marker]) -> String {
     labels.join(".")
 }
 
-/// Segments of `path` are replaced when they look like an identifier or a match touches them.
-fn strip_path(path: &str, markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> (String, u64) {
-    let segments: Vec<&str> = path.split('/').collect();
-    let decoded: Vec<Zeroizing<Vec<u8>>> = segments
-        .iter()
-        .map(|s| decode_percent(s.as_bytes(), false))
-        .collect();
-    let decoded_text: Vec<Zeroizing<String>> = decoded.iter().map(|d| text_same_len(d)).collect();
+/// The pieces of a URL path that matching needs: raw and decoded segments with their spans.
+struct PathParts<'a> {
+    path: &'a str,
+    segments: Vec<&'a str>,
+    decoded: Vec<Zeroizing<Vec<u8>>>,
+    raw_spans: Vec<Range<usize>>,
+    decoded_spans: Vec<Range<usize>>,
+    /// The decoded segments joined with `/`.
+    decoded_path: Zeroizing<String>,
+}
 
-    let spans_of = |lens: Vec<usize>| -> Vec<Range<usize>> {
-        let mut offset = 0;
-        lens.into_iter()
-            .map(|len| {
-                let span = offset..offset + len;
-                offset += len + 1;
-                span
-            })
-            .collect()
-    };
-    let raw_spans = spans_of(segments.iter().map(|s| s.len()).collect());
-    let decoded_spans = spans_of(decoded_text.iter().map(|t| t.len()).collect());
-    let mut decoded_path = Zeroizing::new(String::with_capacity(path.len()));
-    for (i, t) in decoded_text.iter().enumerate() {
-        if i > 0 {
-            decoded_path.push('/');
+fn spans_of(lens: impl Iterator<Item = usize>) -> Vec<Range<usize>> {
+    let mut offset = 0;
+    lens.map(|len| {
+        let span = offset..offset + len;
+        offset += len + 1;
+        span
+    })
+    .collect()
+}
+
+impl<'a> PathParts<'a> {
+    fn new(path: &'a str) -> Self {
+        let segments: Vec<&str> = path.split('/').collect();
+        let decoded: Vec<Zeroizing<Vec<u8>>> = segments
+            .iter()
+            .map(|s| decode_percent(s.as_bytes(), false))
+            .collect();
+        let texts: Vec<Zeroizing<String>> = decoded.iter().map(|d| text_same_len(d)).collect();
+        let mut decoded_path = Zeroizing::new(String::with_capacity(path.len()));
+        for (i, t) in texts.iter().enumerate() {
+            if i > 0 {
+                decoded_path.push('/');
+            }
+            decoded_path.push_str(t);
         }
-        decoded_path.push_str(t);
+        Self {
+            path,
+            raw_spans: spans_of(segments.iter().map(|s| s.len())),
+            decoded_spans: spans_of(texts.iter().map(|t| t.len())),
+            segments,
+            decoded,
+            decoded_path,
+        }
     }
+}
 
+/// Segments are replaced when they look like an identifier or a match touches them. `raw_extra`
+/// and `dec_extra` are matches found over the whole URL, in raw and decoded path coordinates.
+fn strip_path(
+    parts: &PathParts,
+    markers: &[Marker],
+    pair: Option<(&Marker, &Marker)>,
+    raw_extra: &[Range<usize>],
+    dec_extra: &[Range<usize>],
+) -> (String, u64) {
+    let segments = &parts.segments;
+    let mut typed = vec![false; segments.len()];
+    let mut mark = |hit: Vec<bool>| typed.iter_mut().zip(hit).for_each(|(t, h)| *t |= h);
+
+    mark(touched(raw_extra, &parts.raw_spans));
+    mark(touched(dec_extra, &parts.decoded_spans));
     // The raw and decoded whole path, each also with `/` read as `\` (same byte length, so the
     // same spans apply).
-    let mut typed = vec![false; segments.len()];
-    for (text, spans) in [(path, &raw_spans), (decoded_path.as_str(), &decoded_spans)] {
+    for (text, spans) in [
+        (parts.path, &parts.raw_spans),
+        (parts.decoded_path.as_str(), &parts.decoded_spans),
+    ] {
         let backslashed = Zeroizing::new(text.replace('/', "\\"));
         for variant in [text, backslashed.as_str()] {
-            let hit = touched(&occurrences(variant, markers), spans);
-            typed.iter_mut().zip(hit).for_each(|(t, h)| *t |= h);
+            mark(touched(&occurrences(variant, markers), spans));
         }
     }
     for (i, seg) in segments.iter().enumerate() {
-        typed[i] |= any_hit(seg.as_bytes(), markers, pair) || any_hit(&decoded[i], markers, pair);
+        typed[i] |=
+            kept_hit(seg.as_bytes(), markers, pair) || kept_hit(&parts.decoded[i], markers, pair);
     }
     // A hit over the whole path that no segment explains (an encoded value that spans a `/`):
     // every non-empty segment goes.
     if !typed.iter().any(|t| *t)
-        && (any_hit(path.as_bytes(), markers, pair)
-            || any_hit(decoded_path.as_bytes(), markers, pair))
+        && (kept_hit(parts.path.as_bytes(), markers, pair)
+            || kept_hit(parts.decoded_path.as_bytes(), markers, pair))
     {
         typed = segments.iter().map(|s| !s.is_empty()).collect();
     }
@@ -332,64 +487,94 @@ fn is_uuid(seg: &str) -> bool {
         })
 }
 
+struct QueryPiece<'a> {
+    raw_key: &'a str,
+    raw_span: Range<usize>,
+    key: Zeroizing<Vec<u8>>,
+    decoded_span: Range<usize>,
+}
+
+/// The pieces of a query string that matching needs.
+struct QueryParts<'a> {
+    query: &'a str,
+    pieces: Vec<QueryPiece<'a>>,
+    /// `key=value` pieces decoded (`+` as space, `%XX`) and joined with `&`.
+    decoded_query: Zeroizing<String>,
+}
+
+impl<'a> QueryParts<'a> {
+    fn new(query: &'a str) -> Self {
+        let mut pieces = Vec::new();
+        let mut decoded_query = Zeroizing::new(String::with_capacity(query.len()));
+        let mut offset = 0;
+        for piece in query.split('&') {
+            let start = offset;
+            offset += piece.len() + 1;
+            if piece.is_empty() {
+                continue;
+            }
+            let (raw_key, value) = match piece.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (piece, None),
+            };
+            let key = decode_percent(raw_key.as_bytes(), true);
+            if !decoded_query.is_empty() {
+                decoded_query.push('&');
+            }
+            let decoded_start = decoded_query.len();
+            decoded_query.push_str(&text_same_len(&key));
+            let decoded_span = decoded_start..decoded_query.len();
+            if let Some(v) = value {
+                decoded_query.push('=');
+                decoded_query.push_str(&text_same_len(&decode_percent(v.as_bytes(), true)));
+            }
+            pieces.push(QueryPiece {
+                raw_key,
+                raw_span: start..start + raw_key.len(),
+                key,
+                decoded_span,
+            });
+        }
+        Self {
+            query,
+            pieces,
+            decoded_query,
+        }
+    }
+}
+
 /// Query keys, in order, with a key a match touches written `{typed}`. The raw query string and a
-/// decoded copy (`+` as space, `%XX`) are each searched whole; a match touching a key's bytes
-/// (separators included) marks the key. A match inside a value alone costs nothing.
+/// decoded copy (`+` as space, `%XX`) are each searched whole, as are `raw_extra` and `dec_extra`
+/// (matches found over the whole URL, in raw and decoded query coordinates); a match touching a
+/// key's bytes (separators included) marks the key. A match inside a value alone costs nothing.
 fn strip_query(
-    query: &str,
+    parts: &QueryParts,
     markers: &[Marker],
     pair: Option<(&Marker, &Marker)>,
+    raw_extra: &[Range<usize>],
+    dec_extra: &[Range<usize>],
 ) -> (Vec<String>, u64) {
-    struct Piece<'a> {
-        raw_key: &'a str,
-        raw_span: Range<usize>,
-        key: Zeroizing<Vec<u8>>,
-        decoded_span: Range<usize>,
-    }
-    let mut pieces: Vec<Piece> = Vec::new();
-    let mut decoded_query = Zeroizing::new(String::with_capacity(query.len()));
-    let mut offset = 0;
-    for piece in query.split('&') {
-        let start = offset;
-        offset += piece.len() + 1;
-        if piece.is_empty() {
-            continue;
-        }
-        let (raw_key, value) = match piece.split_once('=') {
-            Some((k, v)) => (k, Some(v)),
-            None => (piece, None),
-        };
-        let key = decode_percent(raw_key.as_bytes(), true);
-        let key_text = text_same_len(&key);
-        if !decoded_query.is_empty() {
-            decoded_query.push('&');
-        }
-        let decoded_start = decoded_query.len();
-        decoded_query.push_str(&key_text);
-        let decoded_span = decoded_start..decoded_query.len();
-        if let Some(v) = value {
-            decoded_query.push('=');
-            decoded_query.push_str(&text_same_len(&decode_percent(v.as_bytes(), true)));
-        }
-        pieces.push(Piece {
-            raw_key,
-            raw_span: start..start + raw_key.len(),
-            key,
-            decoded_span,
-        });
-    }
-    let raw_spans: Vec<Range<usize>> = pieces.iter().map(|p| p.raw_span.clone()).collect();
-    let decoded_spans: Vec<Range<usize>> = pieces.iter().map(|p| p.decoded_span.clone()).collect();
-    let by_raw = touched(&occurrences(query, markers), &raw_spans);
-    let by_decoded = touched(&occurrences(&decoded_query, markers), &decoded_spans);
-    let keys = pieces
+    let raw_spans: Vec<Range<usize>> = parts.pieces.iter().map(|p| p.raw_span.clone()).collect();
+    let decoded_spans: Vec<Range<usize>> = parts
+        .pieces
+        .iter()
+        .map(|p| p.decoded_span.clone())
+        .collect();
+    let mut raw_ranges = occurrences(parts.query, markers);
+    raw_ranges.extend_from_slice(raw_extra);
+    let mut dec_ranges = occurrences(&parts.decoded_query, markers);
+    dec_ranges.extend_from_slice(dec_extra);
+    let by_raw = touched(&raw_ranges, &raw_spans);
+    let by_decoded = touched(&dec_ranges, &decoded_spans);
+    let keys = parts
+        .pieces
         .iter()
         .enumerate()
         .map(|(i, p)| {
             if by_raw[i]
                 || by_decoded[i]
-                || any_hit(p.raw_key.as_bytes(), markers, pair)
-                || any_hit(&p.key, markers, pair)
+                || kept_hit(p.raw_key.as_bytes(), markers, pair)
+                || kept_hit(&p.key, markers, pair)
             {
                 TYPED.to_owned()
             } else {
@@ -397,7 +582,7 @@ fn strip_query(
             }
         })
         .collect();
-    (keys, u64::try_from(pieces.len()).unwrap_or(u64::MAX))
+    (keys, u64::try_from(parts.pieces.len()).unwrap_or(u64::MAX))
 }
 
 /// scheme = first token, lowercased. For `basic`, the credentials are base64-decoded and the decoded bytes
@@ -756,5 +941,81 @@ mod tests {
         };
         assert_eq!(dedup_hits(vec![h(true), h(false)]), [h(false)]);
         assert_eq!(dedup_hits(vec![h(false), h(true)]), [h(false)]);
+    }
+
+    #[test]
+    fn a_value_holding_a_url_delimiter_is_not_split_across_components() {
+        // `?`: the value is cut into a path segment and a query key.
+        let m = [user("ab?cd")];
+        let s = strip_url("https://ex.test/a/ab?cd=1", &m, None).unwrap();
+        assert_eq!(s.value.path, "/a/{id}");
+        assert_eq!(s.value.query_keys, ["{typed}"]);
+        // `#`: the tail is a fragment, which is dropped; the head must not stay.
+        let m = [user("ab#cd")];
+        let s = strip_url("https://ex.test/a/ab#cd", &m, None).unwrap();
+        assert_eq!(s.value.path, "/a/{id}");
+        // `@`: userinfo and host.
+        let m = [user("ab@cd")];
+        let s = strip_url("https://ab@cd.ex.test/x", &m, None).unwrap();
+        assert_eq!(s.value.origin, "https://{typed}.ex.test");
+        let s = strip_url("https://ex.test/x/ab@cd", &m, None).unwrap();
+        assert_eq!(s.value.path, "/x/{id}");
+        let m = [pw("Tr0ub4dor?9x")];
+        let s = strip_url("https://ex.test/login/Tr0ub4dor?9x", &m, None).unwrap();
+        assert_eq!(s.value.path, "/login/{id}");
+        assert_eq!(s.value.query_keys, ["{typed}"]);
+    }
+
+    #[test]
+    fn a_match_across_a_delimiter_is_found_in_the_decoded_url_too() {
+        let m = [user("ab?cd")];
+        // Fully encoded: one segment.
+        let s = strip_url("https://ex.test/a/ab%3Fcd?x=1", &m, None).unwrap();
+        assert_eq!(s.value.path, "/a/{id}");
+        assert_eq!(s.value.query_keys, ["x"]);
+        // Only the key is encoded: the decoded URL holds `ab?cd` across path and query.
+        let s = strip_url("https://ex.test/a/ab?c%64=1", &m, None).unwrap();
+        assert_eq!(s.value.path, "/a/{id}");
+        assert_eq!(s.value.query_keys, ["{typed}"]);
+        let m = [user("ab#cd")];
+        let s = strip_url("https://ex.test/a/ab#%63d", &m, None).unwrap();
+        assert_eq!(s.value.path, "/a/{id}");
+    }
+
+    #[test]
+    fn a_short_marker_matches_kept_text_only_as_a_whole_token() {
+        let on = [user("on")];
+        let s = strip_url("https://ex.test/login/session?json=1", &on, None).unwrap();
+        assert_eq!(s.value.path, "/login/session");
+        assert_eq!(s.value.query_keys, ["json"]);
+        assert!(!holds_typed(b"application/json", &on, None));
+        let s = strip_url("https://ex.test/u/on/x?on=1", &on, None).unwrap();
+        assert_eq!(s.value.path, "/u/{id}/x");
+        assert_eq!(s.value.query_keys, ["{typed}"]);
+        let one = [user("1")];
+        let s = strip_url("https://ex.test/v1/login", &one, None).unwrap();
+        assert_eq!(s.value.path, "/v1/login");
+        let s = strip_url("https://ex.test/item/1", &one, None).unwrap();
+        assert_eq!(s.value.path, "/item/{id}");
+        let bob = [user("bob")];
+        for (url, path, keys) in [
+            ("https://ex.test/u/bob/x", "/u/{id}/x", vec![]),
+            ("https://ex.test/user-bob", "/{id}", vec![]),
+            ("https://ex.test/bob@ex.test", "/{id}", vec![]),
+            ("https://ex.test/x?bob=1", "/x", vec!["{typed}"]),
+            ("https://ex.test/bobby/x?bobby=1", "/bobby/x", vec!["bobby"]),
+        ] {
+            let s = strip_url(url, &bob, None).unwrap();
+            assert_eq!(s.value.path, path, "{url}");
+            assert_eq!(s.value.query_keys, keys, "{url}");
+        }
+        // Six characters or more still match as a substring.
+        let s = strip_url("https://ex.test/x/zzabcdefzz", &[user("abcdef")], None).unwrap();
+        assert_eq!(s.value.path, "/x/{id}");
+        // Hosts follow the same rule.
+        let s = strip_url("https://person.ex.test/", &on, None).unwrap();
+        assert_eq!(s.value.origin, "https://person.ex.test");
+        let s = strip_url("https://on.ex.test/", &on, None).unwrap();
+        assert_eq!(s.value.origin, "https://{typed}.ex.test");
     }
 }

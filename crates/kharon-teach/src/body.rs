@@ -756,26 +756,40 @@ mod tests {
 
     #[test]
     fn many_crlf_parts_are_read_in_linear_time() {
+        // The earlier quadratic parse (CRLF bodies never matched the LF-only terminator, so every
+        // part scanned the rest of the body) took minutes at this size; this one takes milliseconds.
         let mut body = Vec::new();
-        for i in 0..5000 {
-            body.extend_from_slice(
-                format!("--b\r\nContent-Disposition: form-data; name=\"f{i}\"\r\n\r\nv\r\n")
-                    .as_bytes(),
-            );
+        for _ in 0..20_000 {
+            body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=f\r\n\r\nv\r\n");
         }
         body.extend_from_slice(b"--b--\r\n");
-        let s = shape("multipart/form-data; boundary=b", &body);
+        assert!(
+            body.len() <= MAX_BODY_BYTES,
+            "the body must be parsed, not Opaque"
+        );
+        // No markers: this measures the parse, not the per-value search.
+        let started = std::time::Instant::now();
+        let s = shape_of_body(Some("multipart/form-data; boundary=b"), &body, &[], None);
         let BodyShape::Multipart { parts } = s else {
             panic!("not multipart")
         };
-        assert_eq!(parts.len(), 5000);
+        assert_eq!(parts.len(), 20_000);
         // LF-only bodies too.
         let lf = String::from_utf8_lossy(&body).replace("\r\n", "\n");
-        let s = shape("multipart/form-data; boundary=b", lf.as_bytes());
+        let s = shape_of_body(
+            Some("multipart/form-data; boundary=b"),
+            lf.as_bytes(),
+            &[],
+            None,
+        );
         let BodyShape::Multipart { parts } = s else {
             panic!("not multipart")
         };
-        assert_eq!(parts.len(), 5000);
+        assert_eq!(parts.len(), 20_000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "multipart parse is not linear"
+        );
     }
 
     #[test]
@@ -786,12 +800,16 @@ mod tests {
             "Tr0ub4dor-9x",
             "Tr0ub4/dor",
             "Bob.Smith@Ex.Test",
+            "Zed.Quincy9",
+            "ab?cd#ef@gh",
         ];
         let m: Vec<Marker> = vec![
             user(values[0]),
             pw(values[1]),
             pw(values[2]),
             user(values[3]),
+            user(values[4]),
+            pw(values[5]),
         ];
         let (u, p) = (user(values[0]), pw(values[1]));
         let pair = Some((&u, &p));
@@ -827,7 +845,12 @@ mod tests {
             .collect();
         let urls = [
             "https://kh.throwaway7.ex.test/login",
-            "https://Bob.Smith@Ex.Test.ex.test/login",
+            // The HOST holds the value in a different case from the marker.
+            "https://zed.quincy9.ex.test/login",
+            "https://x-zed.quincy9-y.ex.test:81/login",
+            "https://ab?cd#ef@gh/x",
+            "https://ex.test/a/ab?cd#ef@gh",
+            "https://ab@gh.ex.test/ab?cd=1#ef",
             "https://a.kh.throwaway7.ex.kh.throwaway7.test/",
             "https://ex.test/u/kh.throwaway7/dash?kh.throwaway7=1&password=Tr0ub4dor-9x",
             "https://ex.test/u/kh%2Ethrow%61way7/x?kh%2Ethrowaway7=1",

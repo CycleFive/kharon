@@ -379,6 +379,126 @@ async fn connect_context_and_fills_answer_no_browser_without_a_backend() {
     );
 }
 
+#[tokio::test]
+async fn req_oau_007_mcp_no_browser_wire_name_preserves_scope_and_lock_gates() {
+    // #365: pin the actual MCP envelope, not just ApiError's helper.
+    // Every browser tool refuses before lock/backend work; scope
+    // refusals still take precedence and retain their step-up challenge.
+    let fill_args = |kind| {
+        serde_json::json!({
+            "item_id": ITEM_A,
+            "target": {
+                "cdp_target_id": canaries()[0],
+                "expected_origin": "https://example.com"
+            },
+            "fields": [{ "kind": kind }]
+        })
+        .to_string()
+    };
+    let calls = [
+        ("kharon_context", "{}".to_owned()),
+        ("kharon_fill", fill_args("password")),
+        ("kharon_fill_totp", fill_args("totp")),
+        (
+            "kharon_open",
+            serde_json::json!({ "item_id": ITEM_A }).to_string(),
+        ),
+    ];
+    for locked in [false, true] {
+        let store = empty_store();
+        let (full, _) = add_connect(&store, "full", &ALL_SCOPES);
+        let (read, _) = add_connect(&store, "read", &["kharon:read"]);
+        let fake = FakeFill::new(FakeAnswer::Filled);
+        let probe = fake.clone();
+        let discovery = Discovery::new("https://kharon-owner.example".to_owned(), "kharon.example");
+        let h = Harness::with(locked, |b| {
+            b.with_oauth_store(store)
+                .with_fill_backend(Box::new(fake))
+                .with_oauth(discovery.clone())
+        });
+        let addr = serve_http(h.broker.clone()).await;
+        // None uses the modern helper; exercise every supported legacy
+        // protocol too, since dashboard clients may negotiate either.
+        for version in std::iter::once(None).chain(
+            kharond::api::mcp::LEGACY_PROTOCOL_VERSIONS
+                .into_iter()
+                .map(Some),
+        ) {
+            for (token, name, detail) in [
+                (
+                    &full,
+                    "no_browser",
+                    "this connection has no browser attached yet",
+                ),
+                (
+                    &read,
+                    "insufficient_scope",
+                    "token does not have the scope this tool needs",
+                ),
+            ] {
+                for (tool, arguments) in &calls {
+                    let r = match version {
+                        None => mcp_call(addr, Some(token), tool, arguments).await,
+                        Some(version) => {
+                            let body = serde_json::json!({
+                                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                "params": {
+                                    "name": tool,
+                                    "arguments": serde_json::from_str::<Value>(arguments).unwrap()
+                                }
+                            });
+                            post_mcp_raw(
+                                addr,
+                                Some(token),
+                                &[
+                                    ("Content-Type", "application/json"),
+                                    ("MCP-Protocol-Version", version),
+                                ],
+                                &body.to_string(),
+                            )
+                            .await
+                        }
+                    };
+                    assert_no_canary(&r.body);
+                    assert!(
+                        !r.body.contains(token),
+                        "reply must not echo the access token"
+                    );
+                    let scope_refusal = name == "insufficient_scope";
+                    assert_eq!(
+                        r.status,
+                        if scope_refusal { 403 } else { 200 },
+                        "{tool}: {}",
+                        r.body
+                    );
+                    let expected_challenge = scope_refusal.then(|| {
+                        discovery.step_up_challenge(&["kharon:read".to_owned()], "kharon:fill")
+                    });
+                    assert_eq!(
+                        r.header("www-authenticate"),
+                        expected_challenge.as_deref(),
+                        "{tool}"
+                    );
+                    let reply = r.json();
+                    assert_eq!(reply["jsonrpc"], "2.0");
+                    assert_eq!(reply["id"], 1);
+                    assert!(reply.get("error").is_none(), "{reply}");
+                    assert_eq!(reply["result"]["content"].as_array().unwrap().len(), 1);
+                    assert_eq!(reply["result"]["content"][0]["type"], "text");
+                    assert_eq!(
+                        tool_error(&reply),
+                        serde_json::json!({ "error": name, "detail": detail }),
+                        "{tool}, locked={locked}, version={version:?}"
+                    );
+                }
+            }
+        }
+        assert!(probe.seen().is_empty());
+        assert!(probe.context_calls.lock().unwrap().is_empty());
+        assert!(probe.opened.lock().unwrap().is_empty());
+    }
+}
+
 #[test]
 fn connect_list_calls_draw_on_the_list_budget() {
     let (store, access, _) = live_connect(&ALL_SCOPES);

@@ -262,9 +262,14 @@ pub async fn run_with(
             Exit::Failed,
         );
     }
-    let (Ok(mut sigint), Ok(mut sigterm)) = (
+    // Ctrl-C, a stop request, the terminal going away, and Ctrl-\: every way the program can be
+    // told to stop. The browser is in its own process group, so none of them reaches it by
+    // itself.
+    let (Ok(mut sigint), Ok(mut sigterm), Ok(mut sighup), Ok(mut sigquit)) = (
         signal(SignalKind::interrupt()),
         signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+        signal(SignalKind::quit()),
     ) else {
         return fail(&mut stderr, &"cannot watch for Ctrl-C", Exit::Failed);
     };
@@ -330,6 +335,8 @@ pub async fn run_with(
             }
             _ = sigint.recv() => break Ended::Interrupted,
             _ = sigterm.recv() => break Ended::Interrupted,
+            _ = sighup.recv() => break Ended::Interrupted,
+            _ = sigquit.recv() => break Ended::Interrupted,
         }
     };
     let outcome = match ended {

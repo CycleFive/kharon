@@ -17,6 +17,8 @@ pub enum BrowserError {
 }
 
 pub const PROFILE_PREFIX: &str = "kharon-teach-";
+/// The random part of a profile's name: this many ASCII alphanumerics.
+const SUFFIX_LEN: usize = 20;
 /// Written into every profile: the pid of the recorder that owns it.
 pub const OWNER_FILE: &str = "kharon-teach.owner";
 
@@ -120,7 +122,7 @@ impl Profile {
         for _ in 0..16 {
             let suffix: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
-                .take(20)
+                .take(SUFFIX_LEN)
                 .map(char::from)
                 .collect();
             let staging = temp.join(format!(".{PROFILE_PREFIX}new-{suffix}"));
@@ -175,7 +177,11 @@ impl Profile {
         remove_tree(&self.path)
     }
 
-    /// Removes leftover PROFILE_PREFIX directories in the temp location owned by this user. Returns how many.
+    /// Removes profiles an earlier run of this program left in the temp location. A directory is
+    /// removed only when ALL hold: its name is exactly what [`Profile::create`] makes, it is a
+    /// real directory owned by this user, its owner file names a pid, that pid is gone, and its
+    /// browser is gone. Anything else, such as a folder someone made by hand, is left alone.
+    /// Returns how many were removed.
     pub fn sweep_stale() -> std::io::Result<usize> {
         Self::sweep_stale_in(&std::env::temp_dir())
     }
@@ -188,22 +194,21 @@ impl Profile {
         let mut n = 0;
         for entry in std::fs::read_dir(dir)? {
             let Ok(entry) = entry else { continue };
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(PROFILE_PREFIX)
-            {
+            if !is_profile_name(&entry.file_name().to_string_lossy()) {
                 continue;
             }
             let path = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            if !meta.file_type().is_dir()
-                || meta.uid() != me
-                || owner_is_alive(&path)
-                || browser_is_alive(&path)
-            {
+            if !meta.file_type().is_dir() || meta.uid() != me {
+                continue;
+            }
+            // No owner file, or one that does not parse, means this program did not make it.
+            let Some(owner) = owner_pid(&path) else {
+                continue;
+            };
+            if pid_is_alive(owner) || browser_is_alive(&path) {
                 continue;
             }
             if remove_tree(&path).is_ok() {
@@ -243,20 +248,29 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
     last
 }
 
-/// The owner file names a live pid. A missing, symlinked, non-regular,
-/// over-32-byte or unparseable owner file counts as no live owner.
-fn owner_is_alive(dir: &Path) -> bool {
+/// `kharon-teach-` and exactly the random suffix `Profile::create` makes.
+fn is_profile_name(name: &str) -> bool {
+    name.strip_prefix(PROFILE_PREFIX)
+        .is_some_and(|s| s.len() == SUFFIX_LEN && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// The pid in the owner file. A missing, symlinked, non-regular, over-32-byte or unparseable
+/// owner file gives `None`.
+fn owner_pid(dir: &Path) -> Option<u32> {
     let file = dir.join(OWNER_FILE);
-    let Ok(meta) = std::fs::symlink_metadata(&file) else {
-        return false;
-    };
+    let meta = std::fs::symlink_metadata(&file).ok()?;
     if !meta.file_type().is_file() || meta.len() > 32 {
-        return false;
+        return None;
     }
     std::fs::read_to_string(&file)
+        .ok()?
+        .trim()
+        .parse::<u32>()
         .ok()
-        .and_then(|t| t.trim().parse::<u32>().ok())
-        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Chromium's `SingletonLock` is a symlink whose target text is
@@ -270,7 +284,7 @@ fn browser_is_alive(dir: &Path) -> bool {
         .rsplit('-')
         .next()
         .and_then(|p| p.parse::<u32>().ok())
-        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        .is_some_and(pid_is_alive)
 }
 
 pub struct Launch<'a> {
@@ -391,20 +405,30 @@ impl Browser {
     }
 
     /// True once no process is left in the browser's group. A group that was never made counts
-    /// as empty.
-    pub fn group_is_empty(&self) -> bool {
+    /// as empty. Once the group has been seen empty the id is forgotten, so that no later signal
+    /// can reach a group id the system has given to something else.
+    pub fn group_is_empty(&mut self) -> bool {
         #[cfg(unix)]
         if let Some(g) = self.group {
-            return matches!(
+            let empty = matches!(
                 rustix::process::test_kill_process_group(g),
                 Err(rustix::io::Errno::SRCH)
             );
+            if empty {
+                self.group = None;
+            }
+            return empty;
         }
         true
     }
 
     /// Kill the whole group, reap the browser, and wait up to 3 s for the group to be empty.
     pub async fn close(mut self) -> std::io::Result<()> {
+        self.shut().await
+    }
+
+    /// The body of [`Browser::close`], on a borrow so a test can look at the browser afterwards.
+    async fn shut(&mut self) -> std::io::Result<()> {
         self.kill_group();
         let reaped = self.child.wait().await.map(|_| ());
         let deadline = tokio::time::Instant::now() + GROUP_WAIT;
@@ -535,13 +559,54 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// A name of the shape `Profile::create` makes.
+    const A: &str = "kharon-teach-aaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "kharon-teach-bbbbbbbbbbbbbbbbbbbb";
+    const DEAD: &str = "4294967295";
+
     #[test]
     fn sweep_removes_a_leftover_and_counts_it() {
         let sb = Sandbox::new("stale");
-        let d = sb.mkdir("kharon-teach-stale");
+        let d = dir_with_owner(&sb, A, DEAD);
         std::fs::write(d.join("f"), b"x").unwrap();
         assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 1);
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn sweep_leaves_a_directory_this_program_did_not_make() {
+        let sb = Sandbox::new("foreign");
+        // Owner-less, whatever the name.
+        let foo = sb.mkdir("kharon-teach-foo");
+        std::fs::write(foo.join("f"), b"x").unwrap();
+        let versioned = sb.mkdir("kharon-teach-0.1.0-x86_64-linux");
+        // The right name shape, but no owner file.
+        let shaped = sb.mkdir(A);
+        // The right shape and a junk owner file.
+        let junk = dir_with_owner(&sb, B, "hello");
+        // An owner file with a dead pid but a name this program never makes.
+        let odd = dir_with_owner(&sb, "kharon-teach-scratch", DEAD);
+        let short = dir_with_owner(&sb, "kharon-teach-aaaaaaaaaaaaaaaaaaa", DEAD);
+        let punct = dir_with_owner(&sb, "kharon-teach-aaaaaaaaaaaaaaaaaa_-", DEAD);
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
+        for d in [foo, versioned, shaped, junk, odd, short, punct] {
+            assert!(d.exists(), "{} was removed", d.display());
+        }
+    }
+
+    #[test]
+    fn profile_name_shape() {
+        assert!(is_profile_name(A));
+        assert!(!is_profile_name("kharon-teach-"));
+        assert!(!is_profile_name("kharon-teach-aaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!is_profile_name(".kharon-teach-new-aaaaaaaaaaaaaaaaaaaa"));
+        assert!(!is_profile_name("other-aaaaaaaaaaaaaaaaaaaa"));
+        // Whatever `create` makes passes.
+        let sb = Sandbox::new("shape");
+        let p = Profile::create_in(sb.path()).unwrap();
+        assert!(is_profile_name(
+            &p.path().file_name().unwrap().to_string_lossy()
+        ));
     }
 
     #[test]
@@ -558,7 +623,7 @@ mod tests {
         let sb = Sandbox::new("link");
         let target = sb.mkdir("other-tgt");
         std::fs::write(target.join("f"), b"x").unwrap();
-        let link = sb.path().join("kharon-teach-link");
+        let link = sb.path().join(A);
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
         assert!(target.join("f").exists());
@@ -570,7 +635,7 @@ mod tests {
     #[test]
     fn sweep_skips_a_profile_whose_browser_is_alive() {
         let sb = Sandbox::new("live");
-        let d = sb.mkdir("kharon-teach-live");
+        let d = dir_with_owner(&sb, A, DEAD);
         std::os::unix::fs::symlink(
             format!("host-{}", std::process::id()),
             d.join("SingletonLock"),
@@ -596,7 +661,7 @@ mod tests {
     #[test]
     fn sweep_skips_a_profile_owned_by_this_process() {
         let sb = Sandbox::new("mine");
-        let d = dir_with_owner(&sb, "kharon-teach-mine", &std::process::id().to_string());
+        let d = dir_with_owner(&sb, A, &std::process::id().to_string());
         assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
         assert!(d.exists());
     }
@@ -604,7 +669,7 @@ mod tests {
     #[test]
     fn sweep_removes_a_profile_owned_by_a_dead_process() {
         let sb = Sandbox::new("dead");
-        let d = dir_with_owner(&sb, "kharon-teach-dead", &dead_pid().to_string());
+        let d = dir_with_owner(&sb, A, &dead_pid().to_string());
         assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 1);
         assert!(!d.exists());
     }
@@ -612,22 +677,23 @@ mod tests {
     #[test]
     fn sweep_treats_an_owner_symlink_as_no_owner() {
         let sb = Sandbox::new("ownlink");
-        let d = sb.mkdir("kharon-teach-ownlink");
+        let d = sb.mkdir(A);
         let real = d.join("real");
-        std::fs::write(&real, std::process::id().to_string()).unwrap();
+        std::fs::write(&real, DEAD).unwrap();
         std::os::unix::fs::symlink(&real, d.join(OWNER_FILE)).unwrap();
-        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 1);
-        assert!(!d.exists());
+        // No owner is not a stale owner: it is a directory this program cannot vouch for.
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
+        assert!(d.exists());
     }
 
     #[test]
-    fn sweep_treats_a_junk_or_oversized_owner_as_no_owner() {
+    fn sweep_leaves_a_junk_or_oversized_owner_alone() {
         let sb = Sandbox::new("junk");
-        let a = dir_with_owner(&sb, "kharon-teach-junk", "not a pid");
-        let big = format!("{}{}", std::process::id(), " ".repeat(40));
-        let b = dir_with_owner(&sb, "kharon-teach-big", &big);
-        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 2);
-        assert!(!a.exists() && !b.exists());
+        let a = dir_with_owner(&sb, A, "not a pid");
+        let big = format!("{DEAD}{}", " ".repeat(40));
+        let b = dir_with_owner(&sb, B, &big);
+        assert_eq!(Profile::sweep_stale_in(sb.path()).unwrap(), 0);
+        assert!(a.exists() && b.exists());
     }
 
     /// A non-dumpable process's `/proc/self` belongs to root, so a sweep that learned its uid
@@ -646,7 +712,7 @@ mod tests {
             return;
         }
         let sb = Sandbox::new("nondump");
-        let d = sb.mkdir("kharon-teach-leftover");
+        let d = dir_with_owner(&sb, A, DEAD);
         std::fs::write(d.join("f"), b"x").unwrap();
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -663,6 +729,40 @@ mod tests {
             String::from_utf8_lossy(&out.stdout)
         );
         assert!(!d.exists());
+    }
+
+    /// A browser stand-in: a `sleep` that leads its own process group.
+    fn fake_browser() -> Browser {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        cmd.process_group(0);
+        let child = cmd.spawn().unwrap();
+        let group = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw);
+        assert!(group.is_some());
+        Browser { child, group }
+    }
+
+    #[tokio::test]
+    async fn the_group_id_is_forgotten_once_the_group_is_closed_and_empty() {
+        let mut b = fake_browser();
+        assert!(b.group.is_some());
+        assert!(!b.group_is_empty(), "a live group is not empty");
+        assert!(b.group.is_some(), "a live group's id is kept");
+        b.shut().await.unwrap();
+        assert!(b.group.is_none(), "the id of an empty group is dropped");
+        // Nothing is signalled any more: kill_group has no id to signal.
+        b.kill_group();
+        assert!(b.group_is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_blocking_also_forgets_the_group_id() {
+        let mut b = fake_browser();
+        b.close_blocking();
+        assert!(b.group.is_none());
     }
 
     #[test]

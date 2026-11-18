@@ -227,10 +227,13 @@ async fn dropping_the_future_removes_the_profile() {
 
 #[tokio::test]
 async fn a_stale_profile_is_swept_at_the_next_start() {
+    // What an earlier, killed run leaves: the name this program makes, and an owner file naming
+    // a pid that is gone.
     let stale: PathBuf =
-        std::env::temp_dir().join(format!("kharon-teach-stale-test-{}", std::process::id()));
+        std::env::temp_dir().join(format!("kharon-teach-{:020}", std::process::id()));
     std::fs::create_dir_all(stale.join("Default")).unwrap();
     std::fs::write(stale.join("Default").join("Preferences"), "{}").unwrap();
+    std::fs::write(stale.join("kharon-teach.owner"), "4294967295").unwrap();
     let Some(run) = Run::start("stale_swept", "/form").await else {
         let _ = std::fs::remove_dir_all(&stale);
         return;
@@ -238,6 +241,42 @@ async fn a_stale_profile_is_swept_at_the_next_start() {
     // Tests in this file start at the same time, and any of them may have done the sweep.
     assert!(!stale.exists(), "the stale profile was not swept");
     let _ = run.finish(End::Discard).await;
+}
+
+#[tokio::test]
+async fn a_directory_the_program_did_not_make_survives_the_sweep() {
+    // Same prefix, but no owner file, a junk owner file, or a name of another shape.
+    let id = std::process::id();
+    let base = std::env::temp_dir();
+    let ownerless = base.join(format!("kharon-teach-foo-{id}"));
+    let shaped = base.join(format!(
+        "kharon-teach-{:020}",
+        u64::from(id) + 1_000_000_000_000
+    ));
+    let junk = base.join(format!(
+        "kharon-teach-{:020}",
+        u64::from(id) + 2_000_000_000_000
+    ));
+    for d in [&ownerless, &shaped, &junk] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("keep"), "x").unwrap();
+    }
+    std::fs::write(junk.join("kharon-teach.owner"), "not a pid").unwrap();
+    let kept = |d: &Path| d.join("keep").exists();
+    let ran = match Run::start("sweep_keeps_foreign", "/form").await {
+        Some(run) => {
+            let _ = run.finish(End::Discard).await;
+            true
+        }
+        None => false,
+    };
+    let all_kept = [&ownerless, &shaped, &junk].iter().all(|d| kept(d));
+    for d in [&ownerless, &shaped, &junk] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    if ran {
+        assert!(all_kept, "a directory the program did not make was swept");
+    }
 }
 
 #[test]
@@ -312,7 +351,12 @@ fn interrupted_by(signal: &str) {
     ));
     std::fs::create_dir(&dir).unwrap();
     let fake = dir.join("fake-browser");
-    std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    // The shell stays, with the switches on its command line, as a real browser's would be.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nexec sh -c 'sleep 30; true' fake-browser \"$@\"\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = dir.join("login.kharon-recording.json");
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kharon-teach"))
@@ -358,7 +402,30 @@ fn interrupted_by(signal: &str) {
     assert!(err.contains("Interrupted. Nothing was saved."), "{err}");
     assert!(!profile.exists(), "the profile is still there");
     assert!(!out.exists(), "a file was written");
+    assert!(
+        no_process_on(&profile),
+        "a process on the profile is still running after {signal}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// True when no process has `--user-data-dir=<profile>` on its command line. Polls up to 5 s.
+fn no_process_on(profile: &Path) -> bool {
+    let needle = format!("--user-data-dir={}", profile.display());
+    let limit = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let any = std::fs::read_dir("/proc").unwrap().flatten().any(|e| {
+            std::fs::read(e.path().join("cmdline"))
+                .is_ok_and(|c| c.split(|b| *b == 0).any(|arg| arg == needle.as_bytes()))
+        });
+        if !any {
+            return true;
+        }
+        if std::time::Instant::now() >= limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -369,6 +436,16 @@ fn sigint_exits_1_and_removes_the_profile() {
 #[test]
 fn sigterm_exits_1_and_removes_the_profile() {
     interrupted_by("TERM");
+}
+
+#[test]
+fn sighup_exits_1_and_removes_the_profile() {
+    interrupted_by("HUP");
+}
+
+#[test]
+fn sigquit_exits_1_and_removes_the_profile() {
+    interrupted_by("QUIT");
 }
 
 async fn outcome_is_unconfirmed_or_never_started(outcome: Outcome) {
@@ -528,15 +605,16 @@ impl Drop for Live {
     }
 }
 
-#[tokio::test]
-async fn sigint_after_the_prompt_exits_1_without_enter() {
-    let Some(mut live) = Live::start("sigint_after_prompt").await else {
+/// After the prompt: send `signal`, expect exit 1 without Enter, no file, no profile and no
+/// browser process left.
+async fn signal_after_the_prompt(signal: &str, test: &str) {
+    let Some(mut live) = Live::start(test).await else {
         return;
     };
     let pid = live.child.id().to_string();
     assert!(
         std::process::Command::new("kill")
-            .args(["-INT", &pid])
+            .args([&format!("-{signal}"), &pid])
             .status()
             .unwrap()
             .success()
@@ -544,10 +622,29 @@ async fn sigint_after_the_prompt_exits_1_without_enter() {
     assert_eq!(
         live.exit_within(10).await,
         Some(Some(1)),
-        "the program did not exit on SIGINT without Enter"
+        "the program did not exit on SIG{signal} without Enter"
     );
     assert!(!live.out.exists(), "a file was written");
     assert!(gone(&live.profile).await, "the profile is still there");
+    assert!(
+        no_process_on(&live.profile),
+        "a browser process is still running after SIG{signal}"
+    );
+}
+
+#[tokio::test]
+async fn sigint_after_the_prompt_exits_1_without_enter() {
+    signal_after_the_prompt("INT", "sigint_after_prompt").await;
+}
+
+#[tokio::test]
+async fn sighup_after_the_prompt_exits_1_and_leaves_no_browser() {
+    signal_after_the_prompt("HUP", "sighup_after_prompt").await;
+}
+
+#[tokio::test]
+async fn sigquit_after_the_prompt_exits_1_and_leaves_no_browser() {
+    signal_after_the_prompt("QUIT", "sigquit_after_prompt").await;
 }
 
 #[tokio::test]

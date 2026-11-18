@@ -49,6 +49,24 @@ impl Marker {
     pub fn with_role(self, role: Role) -> Self {
         Self { role, ..self }
     }
+
+    /// Byte range of the first place this marker's value occurs in `haystack`, comparing ASCII letters
+    /// without regard to case. `None` for an empty marker. Used for host names, which arrive lowercased.
+    ///
+    /// Compares byte windows in place, so no lowercase copy of the value is ever made. Non-ASCII
+    /// bytes must match exactly. The range starts and ends on character boundaries: a match
+    /// begins with an ASCII byte or a UTF-8 lead byte, and ends with a complete character.
+    pub fn find_ignore_ascii_case(&self, haystack: &str) -> Option<std::ops::Range<usize>> {
+        let needle = self.value.as_bytes();
+        if needle.is_empty() {
+            return None;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .position(|w| w.eq_ignore_ascii_case(needle))
+            .map(|start| start..start + needle.len())
+    }
 }
 
 type Needle = Zeroizing<Vec<u8>>;
@@ -518,5 +536,34 @@ mod tests {
         assert!(a.same_value(&b));
         assert_eq!(a.with_role(Role::None).role(), Role::None);
         assert_eq!(pw("h\u{e4}").len(), 2);
+    }
+
+    #[test]
+    fn find_ignore_ascii_case_in_a_lowercased_host() {
+        let m = user("Kh.Throwaway7");
+        assert_eq!(
+            m.find_ignore_ascii_case("a.kh.throwaway7.ex.test"),
+            Some(2..15)
+        );
+    }
+
+    #[test]
+    fn find_ignore_ascii_case_no_match_and_empty() {
+        assert_eq!(
+            user("kh.throwaway7").find_ignore_ascii_case("ex.test"),
+            None
+        );
+        assert_eq!(user("longer-than-host").find_ignore_ascii_case("a"), None);
+        assert_eq!(user("").find_ignore_ascii_case("ex.test"), None);
+    }
+
+    #[test]
+    fn find_ignore_ascii_case_non_ascii_is_byte_exact() {
+        let m = user("M\u{fc}ller1");
+        assert_eq!(m.find_ignore_ascii_case("x-m\u{fc}ller1"), Some(2..10));
+        assert_eq!(
+            user("\u{c9}t\u{e9}12").find_ignore_ascii_case("\u{e9}t\u{e9}12"),
+            None
+        );
     }
 }

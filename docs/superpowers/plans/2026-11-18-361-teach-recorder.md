@@ -358,8 +358,10 @@ Also add this doc test on `Marker`, which is the compile-time guard:
 // strip.rs
 pub struct Stripped<T> { pub value: T, pub query_values_removed: u64, pub path_segments_replaced: u64 }
 /// Origin, path and query keys of `url`. A path segment becomes "{id}" when it is all ASCII digits,
-/// a UUID, 16 or more hex characters, or contains any marker (as typed or percent-encoded).
-pub fn strip_url(url: &str, markers: &[Marker]) -> Option<Stripped<StrippedUrl>>; // None when `url` does not parse
+/// a UUID, 16 or more hex characters, or is touched by a marker match anywhere in the path (any encoding `search`
+/// knows, any letter case, with or without `pair`). A query key or host label a marker touches is written `{typed}`.
+/// A URL that cannot be a base (`data:`, `blob:`, `about:`) keeps its scheme only.
+pub fn strip_url(url: &str, markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> Option<Stripped<StrippedUrl>>; // None when `url` does not parse
 /// scheme = first token, lowercased. For `basic`, the credentials are base64-decoded and the decoded bytes
 /// are searched; a marker found there is reported with `Encoding::Base64`. Other schemes are searched as sent.
 /// When `pair` is given the value is also searched with `search_pair`. No (role, encoding) is listed twice.
@@ -407,7 +409,7 @@ A multipart part with a `filename` is `ValueKind::File` with its length and no m
 ```
 
 - [ ] **Step 2: Run** `cargo test -p kharon-teach -- strip body` (cargo takes one filter before `--`; several go after it). Expected: FAIL.
-- [ ] **Step 3: Implement.** Add `url = "2"`, `serde_json`. The JSON body is the one place a site payload is read as `serde_json::Value`; say so in a comment. Urlencoded keys and JSON keys are kept as they are; values never are.
+- [ ] **Step 3: Implement.** Add `url = "2"`, `serde_json`. The JSON body is the one place a site payload is read as `serde_json::Value`; say so in a comment. Urlencoded keys, JSON keys and multipart part names are kept unless a typed value is found in one, in which case it is written `{typed}`; values never are. An `Authorization` scheme is kept only when it is a known scheme name. `kharon_teach::testing` (doc-hidden) holds the needle list and the "holds no typed value" assertion that this task's tests, Task 5's and Task 8's all use.
 - [ ] **Step 4: Run** tests, clippy, fmt. Expected: pass.
 - [ ] **Step 5: Commit** `feat(teach): strip URLs and reduce request bodies to shapes (#361)`
 
@@ -492,7 +494,7 @@ Decisions `finish` implements, beyond the spec's text:
 #[test] fn events_before_started_are_ignored_for_steps()
 #[test] fn the_serialized_recording_holds_no_typed_value() {
     // for every scenario above: recording.to_json() contains neither marker in any encoding
-    // (as typed, percent, base64, hex, sha256 hex). Share the needle list with Task 8's test via a pub(crate) helper.
+    // (as typed, percent, base64, hex, sha256 hex): `kharon_teach::testing::assert_holds_no_typed_value`, from Task 4.
 }
 // site.rs
 #[test] fn registrable_domains() { /* login.ex.co.uk -> ex.co.uk; 127.0.0.1 and localhost unchanged */ }
@@ -686,7 +688,7 @@ Wiring, in order: `Profile::sweep_stale`; `Profile::create`; `Browser::launch` w
 // req_tch_002_no_typed_value.rs
 #[tokio::test] async fn no_typed_value_in_the_recording_for_any_fixture() {
     // username "kh.throwaway7", password "Tr0ub4dor-9x": recording.to_json() contains neither, in none of the
-    // encodings marker::search knows (reuse the needle helper from Task 5).
+    // encodings marker::search knows (`kharon_teach::testing::assert_holds_no_typed_value`).
 }
 
 // req_tch_006_profile_and_visible.rs

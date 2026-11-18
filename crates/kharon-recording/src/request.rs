@@ -42,7 +42,12 @@ impl Encoding {
             Self::Sha1Hex | Self::Sha1Base64 => Some("sha1"),
             Self::Sha256Hex | Self::Sha256Base64 => Some("sha256"),
             Self::Sha512Hex | Self::Sha512Base64 => Some("sha512"),
-            _ => None,
+            Self::AsTyped
+            | Self::Percent
+            | Self::JsonEscaped
+            | Self::Base64
+            | Self::Base64Url
+            | Self::Hex => None,
         }
     }
 }
@@ -51,6 +56,7 @@ impl Encoding {
 pub struct MarkerHit {
     pub role: Role,
     pub encoding: Encoding,
+    /// True when the match is weak (short value, or a common substring), so a reader treats it as a hint.
     pub low_confidence: bool,
 }
 
@@ -67,6 +73,7 @@ pub enum ValueKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValueShape {
     pub kind: ValueKind,
+    /// Characters for a string value, bytes for a file.
     pub len: u32,
     pub markers: Vec<MarkerHit>,
 }
@@ -96,10 +103,20 @@ pub struct JsonField {
 pub enum BodyShape {
     None,
     Unavailable,
-    Urlencoded { fields: Vec<FieldShape> },
-    Json { root: JsonShape },
-    Multipart { parts: Vec<FieldShape> },
-    Opaque { len: u64, markers: Vec<MarkerHit> },
+    Urlencoded {
+        fields: Vec<FieldShape>,
+    },
+    Json {
+        root: JsonShape,
+    },
+    Multipart {
+        parts: Vec<FieldShape>,
+    },
+    Opaque {
+        /// Bytes.
+        len: u64,
+        markers: Vec<MarkerHit>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,6 +143,7 @@ pub struct ResponseShape {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredRequest {
+    /// Milliseconds since the recording started.
     pub t_ms: u64,
     pub method: String,
     pub url: StrippedUrl,

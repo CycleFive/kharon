@@ -9,6 +9,7 @@ pub const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrippedUrl {
+    /// scheme://host[:port]
     pub origin: String,
     pub path: String,
     pub query_keys: Vec<String>,
@@ -38,12 +39,16 @@ pub struct ElementDescriptor {
     pub autocomplete: Option<String>,
     pub placeholder: Option<String>,
     pub aria_label: Option<String>,
+    /// True when the element was a password input (type=password) when recorded.
     pub was_password: bool,
     pub form: Option<FormRef>,
+    /// Candidate CSS selectors, most stable first.
     pub selectors: Vec<String>,
     pub in_shadow_root: bool,
 }
 
+/// Every `t_ms` is milliseconds since the recording started.
+///
 /// An `Input` step is recorded once per element, at its first input event, and
 /// its `value_len` is updated in place as the value changes. `change` events
 /// add no step.
@@ -59,6 +64,7 @@ pub enum Step {
         t_ms: u64,
         frame: FrameRef,
         element: ElementDescriptor,
+        /// Characters typed so far.
         value_len: u32,
         role: Role,
     },
@@ -108,21 +114,30 @@ pub struct BrowserInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrippedCounts {
+    /// Requests observed on the wire.
     pub requests_seen: u64,
+    /// Requests kept in the file.
     pub requests_stored: u64,
+    /// Request bodies replaced by a value-free shape.
     pub request_bodies_reduced: u64,
+    /// URL query values dropped (keys are kept).
     pub query_values_removed: u64,
+    /// URL path segments replaced by a placeholder.
     pub path_segments_replaced: u64,
+    /// Typed input values discarded (only lengths are kept).
     pub typed_values_removed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recording {
+    /// `to_json` always writes `FORMAT_VERSION`, whatever this field holds.
     pub format_version: u32,
     pub tool_version: String,
     pub browser: BrowserInfo,
     pub listener_world: ListenerWorld,
+    /// RFC 3339, UTC.
     pub started_at: String,
+    /// RFC 3339, UTC.
     pub ended_at: String,
     pub ended_by: EndedBy,
     pub success_confirmed: bool,
@@ -151,7 +166,9 @@ struct VersionProbe {
 impl Recording {
     /// Pretty JSON with a trailing newline.
     pub fn to_json(&self) -> String {
-        let mut text = serde_json::to_string_pretty(self)
+        let mut copy = self.clone();
+        copy.format_version = FORMAT_VERSION;
+        let mut text = serde_json::to_string_pretty(&copy)
             .expect("a Recording is plain data and always serializes");
         text.push('\n');
         text
@@ -344,7 +361,7 @@ mod tests {
         };
         let text = serde_json::to_string(&c).unwrap();
         assert!(
-            text.contains("\"shape\":{\"shape\":\"transformed\""),
+            text.contains("\"shape\":{\"kind\":\"transformed\""),
             "{text}"
         );
         assert_eq!(serde_json::from_str::<Classification>(&text).unwrap(), c);
@@ -393,5 +410,114 @@ mod tests {
         assert!(Encoding::Sha256Hex.is_digest());
         assert_eq!(Encoding::Md5Base64.digest_name(), Some("md5"));
         assert!(!Encoding::Hex.is_digest());
+    }
+
+    #[test]
+    fn to_json_always_writes_the_current_version() {
+        let mut r = sample();
+        r.format_version = 99;
+        let back = Recording::from_json(&r.to_json()).unwrap();
+        assert_eq!(back.format_version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        let mut r = sample();
+        let Step::Input { element, .. } = r.steps[1].clone() else {
+            unreachable!()
+        };
+        let form = element.form.clone().unwrap();
+        r.steps.extend([
+            Step::Click {
+                t_ms: 60,
+                frame: frame(),
+                element: element.clone(),
+            },
+            Step::Submit {
+                t_ms: 70,
+                frame: frame(),
+                form,
+            },
+            Step::EnterKey {
+                t_ms: 80,
+                frame: frame(),
+                element,
+            },
+        ]);
+        let json_root = JsonShape::Object {
+            fields: vec![JsonField {
+                key: "p".into(),
+                value: JsonShape::Value {
+                    value: value(vec![hit(Role::Password)]),
+                },
+            }],
+        };
+        let bodies = [
+            BodyShape::None,
+            BodyShape::Unavailable,
+            BodyShape::Json { root: json_root },
+            BodyShape::Multipart {
+                parts: vec![FieldShape {
+                    key: "f".into(),
+                    value: value(vec![hit(Role::Username)]),
+                }],
+            },
+            BodyShape::Opaque {
+                len: 9,
+                markers: vec![hit(Role::Password)],
+            },
+        ];
+        r.requests = bodies.into_iter().map(request).collect();
+        let shapes = [
+            Shape::FormPost,
+            Shape::ScriptPost,
+            Shape::TwoStep {
+                password_leg: PasswordLeg::ScriptPost,
+            },
+            Shape::TwoStep {
+                password_leg: PasswordLeg::Transformed,
+            },
+            Shape::Transformed { digest: None },
+            Shape::Transformed {
+                digest: Some("md5".into()),
+            },
+            Shape::Unrecognized,
+        ];
+        for shape in shapes {
+            r.classification.shape = shape;
+            assert_eq!(Recording::from_json(&r.to_json()).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn two_step_wire_form() {
+        let c = sample().classification;
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(
+            text.contains(r#""shape":{"kind":"two_step","password_leg":"form_post"}"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn hits_covers_multipart_and_opaque() {
+        let m = request(BodyShape::Multipart {
+            parts: vec![
+                FieldShape {
+                    key: "a".into(),
+                    value: value(vec![hit(Role::Username)]),
+                },
+                FieldShape {
+                    key: "b".into(),
+                    value: value(vec![hit(Role::Password)]),
+                },
+            ],
+        });
+        assert_eq!(m.hits().len(), 2);
+        let o = request(BodyShape::Opaque {
+            len: 4,
+            markers: vec![hit(Role::Password)],
+        });
+        assert_eq!(o.hits().len(), 1);
     }
 }

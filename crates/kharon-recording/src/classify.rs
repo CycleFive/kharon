@@ -23,7 +23,7 @@ pub enum PasswordLeg {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "shape", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Shape {
     FormPost,
     ScriptPost,

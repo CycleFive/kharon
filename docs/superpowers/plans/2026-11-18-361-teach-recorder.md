@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work in the worktree `~/projects/kharon-361-teach`, on a branch named `duet/361-teach-recorder` cut from `duet/361-teach-recorder-design` (the branch that holds the spec and this plan, PR #362). The implementation PR is opened with that branch as its base; when #362 merges, its base moves to `master` and master is merged in. No rebase, no force-push. Set `CARGO_TARGET_DIR=$PWD/target` in every cargo command; the machine's default target dir is shared between checkouts.
+- Work in the worktree `~/projects/kharon-361-teach`, on branch `duet/361-teach-recorder`, cut from `master` at `947a457` (the merge of #362, which holds the spec and this plan). No rebase, no force-push. Set `CARGO_TARGET_DIR=$PWD/target` in every cargo command; the machine's default target dir is shared between checkouts.
 - Every commit message ends with these two lines and no other `Co-Authored-By` line:
   ```
   Claude-Session: https://claude.ai/code/session_017zqkEAhTEMgVMZCGQw2mT8
@@ -136,11 +136,13 @@ pub enum Step {
     EnterKey { t_ms: u64, frame: FrameRef, element: ElementDescriptor },
 }
 pub enum EndedBy { Confirmed, WindowClosed }
+pub enum ListenerWorld { Isolated, Main }
 pub struct Viewport { pub width: u32, pub height: u32 }
 pub struct BrowserInfo { pub product: String, pub user_agent: String, pub viewport: Viewport }
 pub struct StrippedCounts { pub requests_seen: u64, pub requests_stored: u64, pub request_bodies_reduced: u64,
     pub query_values_removed: u64, pub path_segments_replaced: u64, pub typed_values_removed: u64 }
 pub struct Recording { pub format_version: u32, pub tool_version: String, pub browser: BrowserInfo,
+    pub listener_world: ListenerWorld,
     pub started_at: String, pub ended_at: String, pub ended_by: EndedBy, pub success_confirmed: bool,
     pub start_url: StrippedUrl, pub final_url: Option<StrippedUrl>, pub steps: Vec<Step>,
     pub requests: Vec<StoredRequest>, pub flags: Flags, pub classification: Classification,
@@ -288,6 +290,9 @@ impl Marker {
 }
 /// Every way `marker` occurs in `haystack`. Digests are searched only for Role::Password.
 pub fn search(haystack: &[u8], marker: &Marker) -> Vec<MarkerHit>;
+/// The base64 and base64url (padded or not) of `username:password`. A match returns two hits,
+/// one per role, both `Encoding::Base64` (or `Base64Url`).
+pub fn search_pair(haystack: &[u8], username: &Marker, password: &Marker) -> Vec<MarkerHit>;
 pub const LOW_CONFIDENCE_BELOW: u32 = 6;
 ```
 
@@ -315,6 +320,10 @@ fn encodings(h: &[u8], m: &Marker) -> Vec<Encoding> { search(h, m).into_iter().m
 #[test] fn non_ascii_percent_encoded() { /* "pässwörd✓12" as UTF-8 percent-encoded -> [Percent] */ }
 #[test] fn non_ascii_json_escaped_both_forms() { /* raw UTF-8 inside quotes -> [AsTyped]; ä-style escapes -> [JsonEscaped] */ }
 #[test] fn two_hundred_characters() { /* a 200-char value is found as typed */ }
+#[test] fn pair_is_found_where_neither_value_alone_is() {
+    // haystack: {"auth":"<base64("kh.throwaway7:Tr0ub4dor-9x")>"}; search() finds nothing for either marker;
+    // search_pair() returns [Username Base64, Password Base64]
+}
 ```
 
 Also add this doc test on `Marker`, which is the compile-time guard:
@@ -423,7 +432,7 @@ pub struct RawFrame { pub main: bool, pub url: String }
 pub enum PageEventKind { Input, Change, Click, Submit, EnterKey }
 pub enum RawBody { None, Unavailable, Bytes(zeroize::Zeroizing<Vec<u8>>) }
 pub enum CaptureEvent {
-    Started { browser: BrowserInfo },                       // the main frame left the notice page
+    Started { browser: BrowserInfo, listener_world: ListenerWorld }, // the main frame left the notice page
     Navigation { t_ms: u64, frame: RawFrame },              // main and child frames alike
     Page { t_ms: u64, kind: PageEventKind, frame: RawFrame, element: RawElement,
            value: Option<zeroize::Zeroizing<String>> },      // value only for Input and Change
@@ -446,6 +455,7 @@ impl Capture {
 
 Decisions `finish` implements, beyond the spec's text:
 
+- Once the username is resolved, every buffered request's URL, `Authorization` header and body are also searched with `search_pair`; its hits are added to that request's hits (at whole-body level for a body).
 - Elements are keyed by `(document_id, element_id)`. One `Marker` per element holds its latest value. An element is a password element if any of its reports had `is_password_now`.
 - Password markers: the latest values of password elements, with equal values merged. More than one distinct value sets `multiple_passwords`.
 - Username: among non-password elements with a non-empty value, prefer one in the same form as a password element; else one whose value is found in a request that also carries the password; else one whose value is found in any request; else the last one typed in before the first password input. Other typed values are dropped.
@@ -471,6 +481,7 @@ Decisions `finish` implements, beyond the spec's text:
 #[test] fn captcha_frame_sets_the_flag()
 #[test] fn otp_input_after_the_password_sets_the_flag()
 #[test] fn oversized_body_is_unavailable_and_flagged() // a MAX_BODY_BYTES + 1 body on a POST to the login site
+#[test] fn a_combined_base64_credential_in_a_json_body_is_a_plain_hit() // classifies as ScriptPost, not Transformed
 #[test] fn only_the_three_kinds_of_request_are_stored() // a GET image and a third-party POST are counted, not stored
 #[test] fn events_before_started_are_ignored_for_steps()
 #[test] fn the_serialized_recording_holds_no_typed_value() {
@@ -641,7 +652,7 @@ pub async fn record(opts: RecordOptions<'_>, ready: tokio::sync::oneshot::Sender
     end: tokio::sync::oneshot::Receiver<End>) -> Result<Outcome, SessionError>;
 ```
 
-Wiring, in order: `Profile::sweep_stale`; `Profile::create`; `Browser::launch` with `first_url = notice_page_url(..)`; `Cdp::connect`; `Target.setAutoAttach { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }` on the browser session and again on each attached page session; for each attached target of type `page` or `iframe`: `Page.enable`, `Network.enable`, `Runtime.addBinding { name: "__kharonTeach", executionContextName: "kharon-teach" }`, `Page.addScriptToEvaluateOnNewDocument { source: LISTENER_JS, worldName: "kharon-teach" }`, then `Runtime.runIfWaitingForDebugger`. If the binding is not visible in the isolated world on the CI browser, install script and binding in the main world instead and record that in the commit message. Other target types are released without attaching streams. A second `page` target after the first sends `CaptureEvent::Popup`. `CaptureEvent::Started` is sent when the main frame first navigates to a URL that is not the notice page; its `BrowserInfo` comes from `Browser.getVersion` (product, user agent) and `Page.getLayoutMetrics` (the CSS viewport). A request with `hasPostData` and no inline body is completed with `Network.getRequestPostData`; an error there is `RawBody::Unavailable`. The window counts as closed when the last `page` target is destroyed or the browser process exits; that ends as `EndedBy::WindowClosed` with `success_confirmed: false`, or `Outcome::NeverStarted` if `Started` never fired.
+Wiring, in order: `Profile::sweep_stale`; `Profile::create`; `Browser::launch` with `first_url = notice_page_url(..)`; `Cdp::connect`; `Target.setAutoAttach { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }` on the browser session and again on each attached page session; for each attached target of type `page` or `iframe`: `Page.enable`, `Network.enable`, `Runtime.addBinding { name: "__kharonTeach", executionContextName: "kharon-teach" }`, `Page.addScriptToEvaluateOnNewDocument { source: LISTENER_JS, worldName: "kharon-teach" }`, then `Runtime.runIfWaitingForDebugger`. If the binding is not visible in the isolated world, install script and binding in the main world instead. Which world was used goes into `CaptureEvent::Started` as `listener_world`, and so into the file; say in the commit message which one the CI browser needed. Other target types are released without attaching streams. A second `page` target after the first sends `CaptureEvent::Popup`. `CaptureEvent::Started` is sent when the main frame first navigates to a URL that is not the notice page; its `BrowserInfo` comes from `Browser.getVersion` (product, user agent) and `Page.getLayoutMetrics` (the CSS viewport). A request with `hasPostData` and no inline body is completed with `Network.getRequestPostData`; an error there is `RawBody::Unavailable`. The window counts as closed when the last `page` target is destroyed or the browser process exits; that ends as `EndedBy::WindowClosed` with `success_confirmed: false`, or `Outcome::NeverStarted` if `Started` never fired.
 
 `listener.js` reports, in the capture phase on `document`: `input` and `change` on `input`, `textarea`, `select`; `click` on `button`, `a`, `input[type=submit]`, `input[type=button]`, `[role=button]`; `submit` on forms; `keydown` with `key === "Enter"` on an `input`. It numbers elements with a `WeakMap` counter, gives each document a random `document_id`, uses `event.composedPath()[0]` to see into open shadow roots, and builds `selectors` (how is the builder's call; the first entry must match the element with `document.querySelector` at the time of the event when the element is not in a shadow root). It sends `value` only for `input` and `change`. It keeps no state other than the counter.
 

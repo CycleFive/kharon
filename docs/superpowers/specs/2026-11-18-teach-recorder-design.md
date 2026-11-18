@@ -41,7 +41,8 @@ The work is three pieces, in this order (Duet's call, accepted):
    that names the login's shape.
 2. The login-method format, a player that replays a method with a
    real secret at rung 2, importing a recording into a broker, and the
-   per-site registry.
+   per-site registry. Rung 2 includes the post-submit scrub, so the
+   player needs #355 to land first.
 3. The never-in-the-page rung.
 
 The recorder goes first because pieces 2 and 3 need real recordings to
@@ -288,6 +289,12 @@ password it is also searched for the hex and base64 of its MD5, SHA-1,
 SHA-256 and SHA-512. A marker shorter than six characters is searched
 but its matches are marked low-confidence.
 
+Some logins encode the two values together, as HTTP Basic does with
+`username:password`. Neither value's own base64 appears in that. So
+once the username is known, each request is also searched for the
+base64 and base64url of `username:password`, and a match counts as a
+hit for both (Muse's review of #362).
+
 What is recorded is the **role** and the place: "the `password` key of
 this urlencoded body is the password, as typed". The value is not.
 
@@ -323,6 +330,10 @@ directory unless `--out` says otherwise. It holds:
 - the tool version, the browser's product string and user agent, the
   viewport size, start and end times, how it ended, and
   `success_confirmed`
+- `listener_world`: `isolated` or `main`, the script world the page
+  listener ran in. In the main world a page's own scripts can see and
+  fake the listener's reports, so a reader should trust such a
+  recording less
 - the start URL and the last main-frame URL, stripped as above
 - the ordered steps: navigations and the person's events
 - the stored requests, as shapes with roles
@@ -457,3 +468,7 @@ For the implementation PR, wording to be reviewed there:
   recorder still writes it nowhere, but the program read it and the
   browser held it until the profile was deleted.
 - Passkey logins are not detected in this piece.
+- `transformed` with no named digest will mostly be sites that encrypt
+  the password in the page with a key the site supplies, which banks
+  often do. It is the expected common case of `needs_person`, not an
+  oddity, and piece 2 should be designed with that in mind.

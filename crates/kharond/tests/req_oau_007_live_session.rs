@@ -232,6 +232,7 @@ fn fill_req() -> FillRequest {
         expected_origin: "https://example.com".to_owned(),
         fields: vec![(FieldKind::Password, None)],
         submit: false,
+        post_submit_scrub: None,
         grant_id: None,
     }
 }

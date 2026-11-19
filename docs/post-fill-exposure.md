@@ -4,7 +4,9 @@
 > the live runs cited per row. Lothrop has final say on any scope
 > cut; this page proposes none beyond the cuts SPEC already makes.
 > The "tested" column was updated on 2026-11-18 with the results of
-> the OpenClaw (#336) and Hermes (#339) canaries.
+> the OpenClaw (#336) and Hermes (#339) canaries. A3 was updated
+> on 2026-11-19 when the opt-in post-submit scrub landed (#355,
+> REQ-API-013).
 
 kharon's guarantee ends at delivery: the right secret, typed into
 the right field, on the right origin, with approval. This page
@@ -46,6 +48,22 @@ in the code today (`crates/kharond/src/cdp/fill.rs`,
   A navigation that commits after the re-read is not caught at
   all (row A2). A navigation the fill's own submit caused is
   not scrubbed (#102): the page consumed the value.
+- **Post-submit scrub (REQ-API-013, #355), opt-in, default off.**
+  After a `submit: true` fill that returned `filled`, if the
+  deploy (`[policy] post_submit_scrub`) or that fill
+  (`post_submit_scrub`) turned it on, the broker waits
+  `post_submit_scrub_delay` (default 500 ms) and re-reads the
+  loader once. If it is unchanged, a second in-page call clears
+  only the elements that fill wrote, and only where the field
+  still holds exactly the value written, using the native setter
+  and `input`/`change` — the clear-on-failure shape, not
+  `CLEAR_IN_PAGE`'s re-resolve. The comparison is in the page:
+  the broker sends the written values once more and the call
+  returns a count, never a value. The fill reply stays `filled`.
+  This is one check, not a watch. A loader that already changed,
+  or that changes at the re-read, is left alone. The scrub is
+  not started when the remaining fill deadline cannot cover the
+  delay, and it never runs after a `timeout` (A7).
 - **Password values go to password fields.** By default
   resolution a `password` field is `input[type="password"]`.
   Username resolution is weaker: its hint query
@@ -77,11 +95,11 @@ names the evidence, or says unverified.
 |---|---|---|---|
 | A1 | Fill fails partway (field miss, origin recheck, budget expiry): earlier fields already written | **kharon** — clear-on-failure blanks every written field before the error propagates; submit never dispatched | Yes: `req_api_008` suite and `page_js` tests |
 | A2 | Non-submit fill, then the page navigates by itself | **kharon**, narrowly — the loader recheck catches only a navigation committed before the immediate post-call read (a few-ms window); a later navigation is A4, or C3 if the cache keeps the form. The scrub itself can miss a fallback-written username and cannot clear framework-held state (see "What kharon does at the boundary") | Yes: daemon-CDP tests, for the committed-before-read case |
-| A3 | Submit dispatched, page stays: rejected login, MFA step, SPA keeps the form mounted. The value sits in the field indefinitely | **gap** — no mitigation today; kharon reports `filled` and never looks again. Filed as #355 (post-submit scrub, with the mid-flow-clearing tension stated on the issue) | The behaviour is the current code's, read directly; no test asserts a scrub because none exists |
+| A3 | Submit dispatched, page stays: rejected login, MFA step, SPA keeps the form mounted | **kharon, opt-in** — off unless `[policy] post_submit_scrub` or that fill's `post_submit_scrub` is true (default off, so a retry-in-place form or a streaming MFA step is not cleared under the user). When on: one re-read after the delay; if the loader is unchanged and a field still holds exactly the value this fill wrote, that recorded element is cleared and `input`/`change` are dispatched. A later navigation, a replaced node, or a value the page or the user has since changed is not cleared. The reply stays `filled` | Yes: the `req_api_013` suite (daemon CDP stub) and the `page_js` scrub harness |
 | A4 | `submit: false`: the value stays in the field because the agent's flow continues from there | **scope** — by design; the agent owns the page after delivery. What the agent can then read is row D1 | n/a |
 | A5 | Multi-step login (username page, then password page) | Each step is its own fill; the secret is only ever written on its own step. The final step inherits A3/A4 | n/a |
 | A6 | "Show password" toggle | **scope** — cosmetic; the value is in the DOM either way (D1) | n/a |
-| A7 | Broker timeout after the fill frame was dispatched (#46): the in-page call runs to completion and may have filled *and submitted*; the step-4 scrub never runs after a drop | **scope** — inherent to one-way dispatch; the page-side budget narrows the window for an honest-but-slow page. Agents must treat a timed-out fill as *possibly delivered*, never as "nothing happened" | Documented in `fill.rs`; the budget half is covered by the REQ-API-009 tests |
+| A7 | Broker timeout after the fill frame was dispatched (#46): the in-page call runs to completion and may have filled *and submitted*; the step-4 scrub never runs after a drop, and neither does the post-submit scrub (it is the same future, so a drop sends no clear) | **scope** — inherent to one-way dispatch; the page-side budget narrows the window for an honest-but-slow page. Agents must treat a timed-out fill as *possibly delivered*, never as "nothing happened" | Documented in `fill.rs`; the budget half is covered by the REQ-API-009 tests, and the scrub-not-sent half by `req_api_013` |
 
 ### B. The page's own scripts
 
@@ -132,8 +150,9 @@ names the evidence, or says unverified.
 
 ## Follow-ups
 
-- **#355** — the one kharon-owned gap (A3): post-submit leftover
-  scrub, filed as `type:feat` with its design tension stated.
+- **#355** — implemented (REQ-API-013). Opt-in, default off.
+  The mid-flow tension is why a deploy or a fill has to turn it
+  on. A timeout still does not scrub (A7).
 - **Verified, no issue needed** — this issue's first candidate
   ("verify the fill path submits in one step and scrubs the
   field on failure") closes by verification: one-step submit and

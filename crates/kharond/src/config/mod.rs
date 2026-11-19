@@ -101,6 +101,9 @@ pub const DEFAULT_IDLE_LOCK: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_MAX_UNLOCKED: Duration = Duration::from_secs(12 * 60 * 60);
 /// REQ-API-009: end-to-end fill deadline (same constant the fill engine uses).
 pub const DEFAULT_FILL_DEADLINE: Duration = crate::cdp::fill::DEFAULT_FILL_DEADLINE;
+/// #355: one re-read this long after a submitted fill, when the scrub is on.
+pub const DEFAULT_POST_SUBMIT_SCRUB_DELAY: Duration =
+    crate::cdp::fill::DEFAULT_POST_SUBMIT_SCRUB_DELAY;
 /// REQ-API-007: clock skew above this warns.
 pub const DEFAULT_CLOCK_SKEW_WARN: Duration = Duration::from_secs(30);
 /// REQ-API-007: clock skew above this refuses `fill_totp`.
@@ -859,6 +862,12 @@ pub struct PolicyConfig {
     pub allow_standing: bool,
     /// End-to-end fill deadline (REQ-API-009). Default 10s.
     pub fill_deadline: Duration,
+    /// Post-submit scrub (#355, REQ-API-013). Default false: a
+    /// retry-in-place form is not cleared unless a deploy or a fill
+    /// turns it on.
+    pub post_submit_scrub: bool,
+    /// How long the scrub waits before its one re-read. Default 500ms.
+    pub post_submit_scrub_delay: Duration,
     /// SPEC §6 http exception. Default false.
     pub allow_http: bool,
     /// Named IdP iframe hosts (REQ-ORG-004). Default empty.
@@ -893,6 +902,8 @@ impl Default for PolicyConfig {
             default_grant: GrantKind::Once,
             allow_standing: false,
             fill_deadline: DEFAULT_FILL_DEADLINE,
+            post_submit_scrub: false,
+            post_submit_scrub_delay: DEFAULT_POST_SUBMIT_SCRUB_DELAY,
             allow_http: false,
             allow_cross_origin_iframe_hosts: Vec::new(),
             allow_default_context: false,

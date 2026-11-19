@@ -28,10 +28,10 @@ use api_support::{
 };
 use futures_util::{SinkExt, StreamExt};
 use kharond::api::token::{TokenStore, generate_with};
-use kharond::api::{Broker, CdpFillBackend};
+use kharond::api::{Broker, CdpFillBackend, FillPolicy};
 use kharond::cdp::{
     Browser, CdpClient, CdpEndpoint, FieldFill, FieldKind, FillEngine, FillPlan, LiveOrigin,
-    Tunnel, ValuesSent,
+    ScrubNote, Tunnel, ValuesSent,
 };
 use kharond::export::{ExportFile, ExportSession};
 use kharond::lock::{LockController, LockPolicy, ManualClock, StaticHardening};
@@ -190,6 +190,79 @@ async fn cdp_stub_loader_changes_after_fill() -> (String, Received) {
     (format!("ws://{addr}/devtools/browser"), received)
 }
 
+/// A CDP peer for the post-submit scrub (#355). The first
+/// `stable_loaders` `Page.getFrameTree` replies keep `loaderId` `l1`;
+/// later replies use `l2`. `stall_fill` never answers the in-page fill
+/// call. A `scrubWritten` call reports `scrub_cleared` when set, and
+/// otherwise the number of expected values it was given.
+async fn cdp_stub_for_scrub(
+    stable_loaders: usize,
+    stall_fill: bool,
+    scrub_cleared: Option<u64>,
+) -> (String, Received) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received: Received = Arc::default();
+    let rec = Arc::clone(&received);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let trees = AtomicUsize::new(0);
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let msg: Value = serde_json::from_str(&text).unwrap();
+            rec.lock().unwrap().push(msg.clone());
+            let method = msg["method"].as_str().unwrap_or_default();
+            if stall_fill && method == "Runtime.callFunctionOn" {
+                continue;
+            }
+            let result = match method {
+                "Target.createBrowserContext" => json!({ "browserContextId": "ctx-A" }),
+                "Target.getTargetInfo" => json!({ "targetInfo": {
+                    "targetId": "t1", "browserContextId": "ctx-A",
+                    "url": URL, "title": "", "type": "page",
+                } }),
+                "Target.attachToTarget" => json!({ "sessionId": "sess-1" }),
+                "Page.createIsolatedWorld" => json!({ "executionContextId": 7 }),
+                "Page.getFrameTree" => {
+                    let n = trees.fetch_add(1, Ordering::SeqCst);
+                    let loader = if n < stable_loaders { "l1" } else { "l2" };
+                    json!({ "frameTree": { "frame": {
+                        "id": "f1", "loaderId": loader, "url": URL,
+                    }, "childFrames": [] } })
+                }
+                "Runtime.callFunctionOn" => {
+                    let decl = msg["params"]["functionDeclaration"]
+                        .as_str()
+                        .unwrap_or_default();
+                    if decl.contains("scrubWritten") {
+                        let echoed = msg["params"]["arguments"][0]["value"]
+                            .as_array()
+                            .map(|a| a.len() as u64)
+                            .unwrap_or(0);
+                        let cleared = scrub_cleared.unwrap_or(echoed);
+                        json!({ "result": { "type": "object", "value": { "cleared": cleared } } })
+                    } else if decl.contains("clearInPage") {
+                        json!({ "result": { "type": "object", "value": { "cleared": true } } })
+                    } else {
+                        let kinds: Vec<Value> = msg["params"]["arguments"][1]["value"]
+                            .as_array()
+                            .map(|fs| fs.iter().map(|f| json!({ "kind": f["kind"] })).collect())
+                            .unwrap_or_default();
+                        json!({ "result": { "type": "object", "value": { "results": kinds } } })
+                    }
+                }
+                _ => json!({}),
+            };
+            let mut reply = json!({ "id": msg["id"], "result": result });
+            if let Some(s) = msg.get("sessionId") {
+                reply["sessionId"] = s.clone();
+            }
+            ws.send(Message::Text(reply.to_string())).await.unwrap();
+        }
+    });
+    (format!("ws://{addr}/devtools/browser"), received)
+}
+
 struct E2e {
     addr: std::net::SocketAddr,
     token: String,
@@ -203,6 +276,10 @@ async fn e2e() -> E2e {
 }
 
 async fn e2e_with((url, received): (String, Received)) -> E2e {
+    e2e_policy((url, received), FillPolicy::default()).await
+}
+
+async fn e2e_policy((url, received): (String, Received), policy: FillPolicy) -> E2e {
     let endpoint = CdpEndpoint::validate(&url, Tunnel::Direct, None).unwrap();
     let browser = Browser::new(CdpClient::connect(&endpoint).await.unwrap());
     let ctx = browser.create_agent_context("alpha").await.unwrap();
@@ -235,7 +312,8 @@ async fn e2e_with((url, received): (String, Received)) -> E2e {
         Box::new(audit.clone()),
         OriginConfig::default(),
     )
-    .with_fill_backend(Box::new(backend));
+    .with_fill_backend(Box::new(backend))
+    .with_fill_policy(policy);
     // #20: fills need a grant; the export item has no collections, so
     // seed item-scope grants for both actions.
     {
@@ -725,6 +803,9 @@ async fn req_apr_008_engine_marks_values_sent_only_with_the_fill_call() {
         live_origin: LiveOrigin::new(),
         deadline: None,
         values_sent: ValuesSent::new(),
+        post_submit_scrub: false,
+        post_submit_scrub_delay: std::time::Duration::from_millis(500),
+        scrub: ScrubNote::new(),
     };
     let fill_calls = || {
         received
@@ -773,6 +854,9 @@ async fn req_apr_008_dropped_socket_on_the_fill_call_counts_as_sent() {
         live_origin: LiveOrigin::new(),
         deadline: None,
         values_sent: ValuesSent::new(),
+        post_submit_scrub: false,
+        post_submit_scrub_delay: std::time::Duration::from_millis(500),
+        scrub: ScrubNote::new(),
     };
     let out = FillEngine::new(browser).fill(&plan, &ctx, false).await;
     assert_ne!(out.status(), "filled", "{out:?}");
@@ -785,4 +869,307 @@ async fn req_apr_008_dropped_socket_on_the_fill_call_counts_as_sent() {
         "the fill call reached the stub before the drop"
     );
     assert!(plan.values_sent.get(), "an unknown send counts as sent");
+}
+
+fn scrub_policy(on: bool, delay: std::time::Duration, deadline: std::time::Duration) -> FillPolicy {
+    FillPolicy {
+        post_submit_scrub: on,
+        post_submit_scrub_delay: delay,
+        deadline,
+        ..FillPolicy::default()
+    }
+}
+
+fn audit_values(e: &E2e) -> Vec<Value> {
+    e.audit
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|en| serde_json::to_value(en).unwrap())
+        .collect()
+}
+
+fn password_body(e: &E2e, submit: bool) -> Value {
+    body(
+        &e.item_id,
+        json!([{"kind": "username"}, {"kind": "password"}]),
+        submit,
+        "https://example.com",
+    )
+}
+
+/// #355: off unless the deploy or the fill turns it on. A submitted
+/// fill that stays on the form then gets one clear of the values it
+/// wrote, and the reply stays `filled`.
+#[tokio::test]
+async fn req_api_013_scrub_is_off_unless_asked() {
+    let e = e2e().await;
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json(),
+        json!({"status": "filled", "fields_filled": ["username", "password"]})
+    );
+    let calls = e.fill_calls();
+    assert_eq!(calls.len(), 1, "default off: no scrub call");
+    assert_eq!(calls[0]["params"]["arguments"][5]["value"], json!(false));
+    assert!(
+        audit_values(&e).iter().all(|v| v["event"] != "fill_scrub"),
+        "no fill_scrub when the scrub is off"
+    );
+}
+
+#[tokio::test]
+async fn req_api_013_scrub_clears_a_form_that_stays() {
+    let delay = std::time::Duration::from_millis(50);
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, false, None).await,
+        scrub_policy(true, delay, std::time::Duration::from_secs(10)),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    let took = started.elapsed();
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json(),
+        json!({"status": "filled", "fields_filled": ["username", "password"]})
+    );
+    assert!(took >= delay, "the one delay ran: {took:?}");
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    let calls = e.fill_calls();
+    assert_eq!(calls.len(), 2, "fill, then one scrub");
+    assert!(
+        calls[0]["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("fillInPage")
+    );
+    assert_eq!(calls[0]["params"]["arguments"][3]["value"], json!(true));
+    assert_eq!(calls[0]["params"]["arguments"][5]["value"], json!(true));
+    assert!(
+        calls[1]["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("scrubWritten")
+    );
+    assert!(
+        calls[1]["params"]["arguments"][1].is_null(),
+        "the scrub is not a field re-resolve"
+    );
+    assert_eq!(
+        calls[1]["params"]["arguments"][0]["value"],
+        json!(["fixture@example.net", CANARY_PASSWORD])
+    );
+    assert_secret_free(&r.body, &[]);
+    assert_secret_free(&e.audit_text(), &[]);
+    let entries = audit_values(&e);
+    let fill = entries.iter().find(|v| v["event"] == "fill").unwrap();
+    let scrub = entries.iter().find(|v| v["event"] == "fill_scrub").unwrap();
+    assert_eq!(fill["result"], "filled");
+    assert_eq!(scrub["result"], "cleared");
+    assert_eq!(scrub["field_count"], 2);
+    assert_eq!(scrub["live_origin"], "https://example.com");
+    assert_eq!(scrub["request_id"], fill["request_id"]);
+    assert!(scrub.get("detail").is_none() || scrub["detail"].is_null());
+}
+
+#[tokio::test]
+async fn req_api_013_per_fill_flag_overrides_the_deploy() {
+    let delay = std::time::Duration::from_millis(20);
+    let deadline = std::time::Duration::from_secs(10);
+    // Deploy off, this fill asks.
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, false, None).await,
+        scrub_policy(false, delay, deadline),
+    )
+    .await;
+    let mut ask = password_body(&e, true);
+    ask["post_submit_scrub"] = json!(true);
+    let r = e.fill("/v1/fill", ask).await;
+    assert_eq!(r.json()["status"], "filled");
+    assert_eq!(e.fill_calls().len(), 2, "per-fill true scrubs");
+    assert_eq!(
+        audit_values(&e)
+            .iter()
+            .find(|v| v["event"] == "fill_scrub")
+            .unwrap()["result"],
+        "cleared"
+    );
+
+    // Deploy on, this fill refuses.
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, false, None).await,
+        scrub_policy(true, delay, deadline),
+    )
+    .await;
+    let mut refuse = password_body(&e, true);
+    refuse["post_submit_scrub"] = json!(false);
+    let r = e.fill("/v1/fill", refuse).await;
+    assert_eq!(r.json()["status"], "filled");
+    assert_eq!(e.fill_calls().len(), 1, "per-fill false does not scrub");
+    assert!(
+        audit_values(&e).iter().all(|v| v["event"] != "fill_scrub"),
+        "no scrub entry when the fill turned it off"
+    );
+}
+
+#[tokio::test]
+async fn req_api_013_submit_false_does_not_scrub() {
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, false, None).await,
+        scrub_policy(
+            true,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(10),
+        ),
+    )
+    .await;
+    let mut body = password_body(&e, false);
+    body["post_submit_scrub"] = json!(true);
+    let r = e.fill("/v1/fill", body).await;
+    assert_eq!(r.json()["status"], "filled");
+    let calls = e.fill_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["params"]["arguments"][3]["value"], json!(false));
+    assert_eq!(calls[0]["params"]["arguments"][5]["value"], json!(false));
+    assert!(audit_values(&e).iter().all(|v| v["event"] != "fill_scrub"));
+}
+
+#[tokio::test]
+async fn req_api_013_a_navigation_is_not_cleared() {
+    let delay = std::time::Duration::from_millis(40);
+    let policy = scrub_policy(true, delay, std::time::Duration::from_secs(10));
+    // The loader changed before the post-call read: the submit's own
+    // navigation. No wait, no clear.
+    let e = e2e_policy(cdp_stub_for_scrub(1, false, None).await, policy.clone()).await;
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    assert_eq!(r.json()["status"], "filled");
+    assert_eq!(e.fill_calls().len(), 1, "no clear on the new document");
+    assert_eq!(
+        e.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m["method"] == "Page.getFrameTree")
+            .count(),
+        2,
+        "no third read once the page has already left"
+    );
+    assert_eq!(
+        audit_values(&e)
+            .iter()
+            .find(|v| v["event"] == "fill_scrub")
+            .unwrap()["result"],
+        "navigated"
+    );
+
+    // Still on the form at the post-call read, gone at the re-read.
+    let e = e2e_policy(cdp_stub_for_scrub(2, false, None).await, policy).await;
+    let started = std::time::Instant::now();
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    assert!(started.elapsed() >= delay, "the re-read waited");
+    assert_eq!(r.json()["status"], "filled");
+    assert_eq!(
+        e.fill_calls().len(),
+        1,
+        "navigated: values are not sent again"
+    );
+    assert_eq!(
+        audit_values(&e)
+            .iter()
+            .find(|v| v["event"] == "fill_scrub")
+            .unwrap()["result"],
+        "navigated"
+    );
+    assert_secret_free(&e.audit_text(), &[]);
+}
+
+#[tokio::test]
+async fn req_api_013_a_changed_value_is_left_and_the_count_is_capped() {
+    let policy = scrub_policy(
+        true,
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_secs(10),
+    );
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, false, Some(0)).await,
+        policy.clone(),
+    )
+    .await;
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    assert_eq!(r.json()["status"], "filled");
+    let scrub = audit_values(&e)
+        .into_iter()
+        .find(|v| v["event"] == "fill_scrub")
+        .unwrap();
+    assert_eq!(scrub["result"], "nothing");
+    assert!(scrub.get("field_count").is_none());
+
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, false, Some(99)).await,
+        policy,
+    )
+    .await;
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    assert_eq!(r.json()["status"], "filled");
+    let scrub = audit_values(&e)
+        .into_iter()
+        .find(|v| v["event"] == "fill_scrub")
+        .unwrap();
+    assert_eq!(scrub["result"], "cleared");
+    assert_eq!(
+        scrub["field_count"], 2,
+        "capped at the fields this fill wrote"
+    );
+}
+
+#[tokio::test]
+async fn req_api_013_a_timeout_never_scrubs() {
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, true, None).await,
+        scrub_policy(
+            true,
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(400),
+        ),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    let took = started.elapsed();
+    assert_eq!(r.json()["status"], "timeout", "{}", r.body);
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    assert_eq!(e.fill_calls().len(), 1, "the stalled fill only");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(e.fill_calls().len(), 1, "nothing after the timeout");
+    let entries = audit_values(&e);
+    assert!(entries.iter().any(|v| v["event"] == "fill_timeout"));
+    assert!(entries.iter().all(|v| v["event"] != "fill_scrub"));
+    assert_secret_free(&r.body, &[]);
+    assert_secret_free(&e.audit_text(), &[]);
+}
+
+#[tokio::test]
+async fn req_api_013_a_delay_the_deadline_cannot_cover_is_skipped() {
+    let e = e2e_policy(
+        cdp_stub_for_scrub(usize::MAX, false, None).await,
+        scrub_policy(
+            true,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(800),
+        ),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    let took = started.elapsed();
+    assert_eq!(r.json()["status"], "filled", "{}", r.body);
+    assert!(
+        took < std::time::Duration::from_millis(600),
+        "did not wait out the deadline or the delay: {took:?}"
+    );
+    assert_eq!(e.fill_calls().len(), 1);
+    assert!(audit_values(&e).iter().all(|v| v["event"] != "fill_scrub"));
 }

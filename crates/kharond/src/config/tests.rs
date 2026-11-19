@@ -67,6 +67,8 @@ fn req_dep_003_spec_defaults() {
     assert_eq!(p.idle_lock, Duration::from_secs(30 * 60));
     assert_eq!(p.max_unlocked, Duration::from_secs(12 * 3600));
     assert_eq!(p.fill_deadline, Duration::from_secs(10));
+    assert!(!p.post_submit_scrub);
+    assert_eq!(p.post_submit_scrub_delay, Duration::from_millis(500));
     assert_eq!(p.clock_skew_warn, Duration::from_secs(30));
     assert_eq!(p.clock_skew_refuse, Duration::from_secs(90));
     assert_eq!(p.default_grant, GrantKind::Once);
@@ -86,6 +88,7 @@ fn req_dep_003_overrides_apply() {
     let cfg = Config::from_toml_str(&text).unwrap();
     assert_eq!(cfg.policy.fill_deadline, Duration::from_secs(2));
     assert!(cfg.policy.origin_config().allow_http);
+    assert!(!cfg.policy.post_submit_scrub);
     assert_eq!(
         cfg.warnings(),
         vec![
@@ -93,6 +96,27 @@ fn req_dep_003_overrides_apply() {
             ConfigWarning::HttpAllowed
         ]
     );
+}
+
+/// #355: the scrub is off unless the deploy turns it on, and the
+/// delay is a normal duration (zero is refused, like the others).
+#[test]
+fn req_api_013_post_submit_scrub_is_opt_in() {
+    let text = spec_example().replace(
+        "allow_standing = false",
+        "allow_standing = false\npost_submit_scrub = true\npost_submit_scrub_delay = \"250ms\"",
+    );
+    let cfg = Config::from_toml_str(&text).unwrap();
+    assert!(cfg.policy.post_submit_scrub);
+    assert_eq!(
+        cfg.policy.post_submit_scrub_delay,
+        Duration::from_millis(250)
+    );
+    let text = spec_example().replace(
+        "allow_standing = false",
+        "allow_standing = false\npost_submit_scrub_delay = \"0ms\"",
+    );
+    assert!(Config::from_toml_str(&text).is_err());
 }
 
 #[test]

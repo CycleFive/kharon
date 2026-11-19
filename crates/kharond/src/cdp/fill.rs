@@ -17,6 +17,10 @@
 //!    in the old world (best effort) and report `navigated`. A loader
 //!    change after a successful `submit: true` call is that submit's own
 //!    navigation: report `filled` with `fields_filled` (REQ-API-008, #102).
+//!    When the post-submit scrub is on (#355) and that navigation has
+//!    not happened, the engine waits and clears the elements this fill
+//!    wrote if they still hold its values. The wait and the clear are
+//!    inside this future, so a drop sends no clear.
 //!
 //! Ownership (REQ-ARCH-005) gates step 1: the target must live in the
 //! requesting agent's browser context, or the default context when
@@ -42,7 +46,7 @@ use crate::origin::{MismatchReason, OriginConfig, OriginMatcher};
 
 use super::browser::{AgentContext, Browser, OwnershipError};
 use super::client::CdpError;
-use super::page_js::{CLEAR_IN_PAGE, FILL_IN_PAGE};
+use super::page_js::{CLEAR_IN_PAGE, FILL_IN_PAGE, SCRUB_WRITTEN_IN_PAGE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
@@ -113,6 +117,18 @@ pub struct FillPlan {
     /// broker gives the grant use back when a fill ends with this
     /// still unset: no value ever left the broker.
     pub values_sent: ValuesSent,
+    /// Opt-in post-submit scrub (#355, REQ-API-013). The broker sets
+    /// the effective value: the per-fill override if the fill named
+    /// one, otherwise `[policy] post_submit_scrub` (default false).
+    /// Ignored unless [`Self::submit`] is set. When it runs, the
+    /// engine records the outcome on [`Self::scrub`].
+    pub post_submit_scrub: bool,
+    /// How long to wait before the one re-read. `[policy]
+    /// post_submit_scrub_delay`, default [`DEFAULT_POST_SUBMIT_SCRUB_DELAY`].
+    pub post_submit_scrub_delay: Duration,
+    /// What the post-submit scrub observed, if it was attempted.
+    /// Shared by every clone of the plan, like [`LiveOrigin`].
+    pub scrub: ScrubNote,
 }
 
 /// The live origin one fill observed (REQ-AUD-003†, #67): the
@@ -171,6 +187,67 @@ impl ValuesSent {
     /// Whether [`Self::mark`] ran.
     pub fn get(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// What one post-submit scrub did (#355). Counts only: a value never
+/// fits in here. `Cleared`'s number is how many recorded elements the
+/// in-page call reported blanking, already capped at the field count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubObservation {
+    /// At least one recorded element was blanked.
+    Cleared(u64),
+    /// The page was still the filled document, and nothing was blanked
+    /// (the values had changed, the nodes were gone, or the clear
+    /// could not be confirmed).
+    Nothing,
+    /// The loader changed, or the filled world was gone. Nothing was
+    /// cleared: the page had left the form.
+    Navigated,
+}
+
+impl ScrubObservation {
+    /// Audit `result` for a `fill_scrub` entry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cleared(_) => "cleared",
+            Self::Nothing => "nothing",
+            Self::Navigated => "navigated",
+        }
+    }
+
+    /// How many elements were blanked, when that number is worth
+    /// recording. `None` for a scrub that blanked nothing.
+    pub fn cleared(self) -> Option<u64> {
+        match self {
+            Self::Cleared(n) if n > 0 => Some(n),
+            _ => None,
+        }
+    }
+}
+
+/// The scrub observation for one fill (REQ-API-013, #355). Write-once,
+/// shared by every clone of the [`FillPlan`] that carries it, so the
+/// broker can read it after the engine returns. Empty when the scrub
+/// was not attempted: it is off, the deadline could not cover the
+/// delay, or this future was dropped before the check finished.
+#[derive(Debug, Clone, Default)]
+pub struct ScrubNote(Arc<OnceLock<ScrubObservation>>);
+
+impl ScrubNote {
+    /// An empty slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the observation (first write wins).
+    pub fn record(&self, obs: ScrubObservation) {
+        let _ = self.0.set(obs);
+    }
+
+    /// The recorded observation, if the scrub was attempted.
+    pub fn get(&self) -> Option<ScrubObservation> {
+        self.0.get().copied()
     }
 }
 
@@ -369,8 +446,10 @@ impl FillEngine {
     /// vacuous here because submit rides inside the one in-page call
     /// (REQ-ORG-003's atomic check-and-set). The `timeout` reply is thus
     /// "the broker could not confirm the fill in time", not "nothing
-    /// happened in the page". Likewise the post-fill loader re-check and
-    /// the `CLEAR_IN_PAGE` scrub (step 4) never run after a drop.
+    /// happened in the page". Likewise the post-fill loader re-check,
+    /// the `CLEAR_IN_PAGE` scrub (step 4), and the post-submit scrub
+    /// (#355) never run after a drop: the delay and the clear sit in
+    /// this future, and a drop sends no clear.
     ///
     /// "Dispatched" has a crisp boundary (#76): a frame is on the wire
     /// once its `send` returned. If the future is dropped while the fill
@@ -478,6 +557,9 @@ impl FillEngine {
             Err(e) => return FillOutcome::Error(e.to_string()),
         };
 
+        let scrub = plan
+            .post_submit_scrub
+            .then_some((&plan.scrub, plan.post_submit_scrub_delay));
         let outcome = self
             .fill_attached(
                 &session,
@@ -488,6 +570,7 @@ impl FillEngine {
                 plan.submit,
                 plan.deadline,
                 &plan.values_sent,
+                scrub,
             )
             .await;
 
@@ -522,6 +605,7 @@ impl FillEngine {
         submit: bool,
         deadline: Option<Instant>,
         values_sent: &ValuesSent,
+        scrub: Option<(&ScrubNote, Duration)>,
     ) -> FillOutcome {
         // Step 1's frame-tree read: the loader id we'll re-check against.
         let tree = match session.request("Page.getFrameTree", json!({})).await {
@@ -589,6 +673,7 @@ impl FillEngine {
                         { "value": expected_top_origin },
                         { "value": submit },
                         { "value": budget_ms },
+                        { "value": scrub.is_some() },
                     ],
                     "returnByValue": true,
                     "awaitPromise": false,
@@ -635,7 +720,14 @@ impl FillEngine {
                 // change after `submit: false`, or any failure path, is
                 // still `Navigated` / the failure.
                 if submit {
-                    return parse_fill_results(&result);
+                    let outcome = parse_fill_results(&result);
+                    // The page already left. The delayed re-read would
+                    // see the same thing and must not clear a new
+                    // document, so record it and do not wait (#355).
+                    if let (Some((note, _)), FillOutcome::Filled { .. }) = (scrub, &outcome) {
+                        note.record(ScrubObservation::Navigated);
+                    }
+                    return outcome;
                 }
                 // Best-effort scrub in the old world (SPEC step 4).
                 let _ = session
@@ -652,9 +744,87 @@ impl FillEngine {
                     .await;
                 FillOutcome::Navigated
             }
-            (Some(_), Some(_)) => parse_fill_results(&result),
+            (Some(before), Some(_)) => {
+                let outcome = parse_fill_results(&result);
+                if let (Some((note, delay)), FillOutcome::Filled { .. }) = (scrub, &outcome) {
+                    self.post_submit_scrub(
+                        session, context_id, field_args, before, deadline, delay, note,
+                    )
+                    .await;
+                }
+                outcome
+            }
             _ => FillOutcome::Error("frame tree loader id missing after fill".into()),
         }
+    }
+
+    /// One re-read after `delay`, then a clear of the recorded elements
+    /// whose values are unchanged (#355). No-op — and no audit note —
+    /// when the remaining deadline cannot cover the delay plus
+    /// [`RETURN_MARGIN`], so a successful fill is not turned into a
+    /// timeout and a clear is never sent once the deadline is too
+    /// close. A drop during the wait sends nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_submit_scrub(
+        &self,
+        session: &super::client::CdpSession,
+        context_id: u64,
+        field_args: &[Value],
+        loader_before: &str,
+        deadline: Option<Instant>,
+        delay: Duration,
+        note: &ScrubNote,
+    ) {
+        if !scrub_room(deadline, delay, Instant::now()) {
+            return;
+        }
+        tokio::time::sleep(delay).await;
+        if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
+            return;
+        }
+        let tree = match session.request("Page.getFrameTree", json!({})).await {
+            Ok(t) => t,
+            Err(_) => {
+                note.record(ScrubObservation::Navigated);
+                return;
+            }
+        };
+        let loader_now = tree_frame(&tree)
+            .and_then(|f| f.get("loaderId"))
+            .and_then(Value::as_str);
+        if loader_now != Some(loader_before) {
+            note.record(ScrubObservation::Navigated);
+            return;
+        }
+        // The re-read can take the margin we had. Recheck before the
+        // call that carries the values.
+        if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
+            return;
+        }
+        let Some(mut values) = field_values(field_args) else {
+            note.record(ScrubObservation::Nothing);
+            return;
+        };
+        let n_fields = values.len() as u64;
+        let timeout = scrub_call_timeout(deadline, Instant::now());
+        let params = json!({
+            "functionDeclaration": SCRUB_WRITTEN_IN_PAGE,
+            "executionContextId": context_id,
+            "arguments": [ { "value": values } ],
+            "returnByValue": true,
+            "awaitPromise": false,
+        });
+        for s in &mut values {
+            s.zeroize();
+        }
+        let call = session
+            .request_with_timeout("Runtime.callFunctionOn", params, timeout)
+            .await;
+        note.record(match call {
+            Ok(result) => scrub_observation(&result, n_fields),
+            Err(e) if context_gone(&e.to_string()) => ScrubObservation::Navigated,
+            Err(_) => ScrubObservation::Nothing,
+        });
     }
 }
 
@@ -723,14 +893,84 @@ fn classify_exception(description: &str) -> FillOutcome {
 
 fn map_context_error(code: i64, message: &str) -> FillOutcome {
     let _ = code;
-    if message.contains("Cannot find context")
-        || message.contains("context was destroyed")
-        || message.contains("Inspected target navigated")
-        || message.contains("No execution context")
-    {
+    if context_gone(message) {
         FillOutcome::Navigated
     } else {
         FillOutcome::Error(format!("cdp: {message}"))
+    }
+}
+
+/// A CDP error that means the filled world is gone (navigation).
+fn context_gone(message: &str) -> bool {
+    message.contains("Cannot find context")
+        || message.contains("context was destroyed")
+        || message.contains("Inspected target navigated")
+        || message.contains("No execution context")
+}
+
+/// The field values, in write order. `None` if a value is missing:
+/// the scrub then sends nothing rather than a partial list.
+fn field_values(fields: &[Value]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(fields.len());
+    for f in fields {
+        out.push(f.get("value").and_then(Value::as_str)?.to_owned());
+    }
+    Some(out)
+}
+
+/// Whether `deadline` still has room for `delay` plus the return
+/// margin. No deadline (an engine caller) always has room. A delay
+/// that cannot be added to the margin does not.
+fn scrub_room(deadline: Option<Instant>, delay: Duration, now: Instant) -> bool {
+    let Some(deadline) = deadline else {
+        return true;
+    };
+    let Some(need) = delay.checked_add(RETURN_MARGIN) else {
+        return false;
+    };
+    deadline.saturating_duration_since(now) > need
+}
+
+/// How long the clear call may take. Short of the broker's deadline
+/// so the reply lands while the broker is still waiting; five seconds
+/// when the plan has no deadline.
+fn scrub_call_timeout(deadline: Option<Instant>, now: Instant) -> Duration {
+    match deadline {
+        Some(deadline) => deadline
+            .saturating_duration_since(now)
+            .saturating_sub(Duration::from_millis(50))
+            .min(Duration::from_secs(5)),
+        None => Duration::from_secs(5),
+    }
+}
+
+/// The scrub observation from one in-page reply. The reported count
+/// is capped at `max` (the number of fields this fill wrote). A
+/// destroyed world is `navigated`; any other failure is `nothing`,
+/// and the fill stays `filled`.
+fn scrub_observation(result: &Value, max: u64) -> ScrubObservation {
+    if let Some(exception) = result.get("exceptionDetails") {
+        let description = exception
+            .get("exception")
+            .and_then(|e| e.get("description"))
+            .and_then(Value::as_str)
+            .or_else(|| exception.get("text").and_then(Value::as_str))
+            .unwrap_or("");
+        return if context_gone(description) {
+            ScrubObservation::Navigated
+        } else {
+            ScrubObservation::Nothing
+        };
+    }
+    let n = result
+        .pointer("/result/value/cleared")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(max);
+    if n > 0 {
+        ScrubObservation::Cleared(n)
+    } else {
+        ScrubObservation::Nothing
     }
 }
 
@@ -766,6 +1006,12 @@ fn expected_origin(href: &str) -> String {
 /// to the final CDP result. Configurable (`[policy] fill_deadline`);
 /// enforced by [`crate::api::Broker::fill`], not by the engine.
 pub const DEFAULT_FILL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// #355: how long a post-submit scrub waits before its one re-read.
+/// Configurable (`[policy] post_submit_scrub_delay`). Short on purpose:
+/// the wait sits inside the fill deadline, and the scrub is skipped
+/// when the remainder cannot cover this plus [`RETURN_MARGIN`].
+pub const DEFAULT_POST_SUBMIT_SCRUB_DELAY: Duration = Duration::from_millis(500);
 
 /// #118: the fixed slice of the remaining deadline the broker keeps
 /// for the fill call's return trip when it converts the remainder
@@ -875,6 +1121,55 @@ mod tests {
             PageBudget::Exhausted
         );
         assert_eq!(RETURN_MARGIN, Duration::from_millis(250));
+    }
+
+    /// #355: the scrub waits only when the remainder covers the delay
+    /// and the return margin. Equal to that sum is not enough — the
+    /// clear call needs the margin after the wait.
+    #[test]
+    fn req_api_013_scrub_room_needs_the_delay_and_the_margin() {
+        let now = Instant::now();
+        let delay = DEFAULT_POST_SUBMIT_SCRUB_DELAY;
+        assert!(scrub_room(None, delay, now));
+        assert!(scrub_room(Some(now + Duration::from_secs(10)), delay, now));
+        assert!(!scrub_room(Some(now + delay + RETURN_MARGIN), delay, now));
+        assert!(scrub_room(
+            Some(now + delay + RETURN_MARGIN + Duration::from_millis(1)),
+            delay,
+            now
+        ));
+        assert!(!scrub_room(
+            Some(now + Duration::from_millis(100)),
+            delay,
+            now
+        ));
+        assert!(!scrub_room(Some(now + RETURN_MARGIN), Duration::ZERO, now));
+        assert!(scrub_room(
+            Some(now + RETURN_MARGIN + Duration::from_millis(1)),
+            Duration::ZERO,
+            now
+        ));
+        assert_eq!(
+            scrub_observation(
+                &json!({"result": {"type": "object", "value": {"cleared": 99}}}),
+                2
+            ),
+            ScrubObservation::Cleared(2)
+        );
+        assert_eq!(
+            scrub_observation(
+                &json!({"result": {"type": "object", "value": {"cleared": 0}}}),
+                2
+            ),
+            ScrubObservation::Nothing
+        );
+        assert_eq!(
+            scrub_observation(
+                &json!({"exceptionDetails": {"text": "Cannot find context with given id"}}),
+                2
+            ),
+            ScrubObservation::Navigated
+        );
     }
 
     #[test]

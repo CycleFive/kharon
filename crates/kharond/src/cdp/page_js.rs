@@ -45,6 +45,12 @@
 ///    `kharon:deadline`, which the broker maps to `timeout`. One
 ///    step's overshoot is the residual: a single field write whose
 ///    synchronous page handlers never return cannot be preempted.
+/// 6. `scrubRequested` — #355: when this fill will submit and the
+///    post-submit scrub is on, remember the elements this call wrote
+///    (`globalThis.__kharonWritten`, this isolated world only) so a
+///    later [`SCRUB_WRITTEN_IN_PAGE`] can clear those nodes. Element
+///    references only; the values are not copied. Absent or false
+///    leaves nothing behind.
 ///
 /// Clear-on-failure (SPEC §2, #101): when a field fails after earlier
 /// fields were written, every element this call wrote is blanked
@@ -54,7 +60,7 @@
 ///
 /// Returns `{ results: [{ kind, filled: true }] }` by value.
 pub const FILL_IN_PAGE: &str = r#"
-function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs) {
+function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs, scrubRequested) {
   "use strict";
 
   function fail(code) {
@@ -219,6 +225,12 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs)
       }
     }
   }
+  // #355: the elements this call wrote, for one later scrub in this
+  // same isolated world. The page's main world cannot see this
+  // global. References only — the values stay in the fields.
+  if (submitRequested && scrubRequested) {
+    globalThis.__kharonWritten = written.slice();
+  }
   return { results };
 }
 "#;
@@ -257,6 +269,56 @@ function clearInPage(fields) {
     Object.getOwnPropertyDescriptor(proto, "value").set.call(el, "");
   }
   return { cleared: true };
+}
+"#;
+
+/// One post-submit clear of the elements [`FILL_IN_PAGE`] recorded
+/// (#355, REQ-API-013). Runs in the same isolated world, once, after
+/// the broker's delay.
+///
+/// Argument: `expected`, the values this fill wrote, in write order.
+/// An element is cleared only when it is still connected and its
+/// current value is still exactly `expected[i]` — a value the page or
+/// the user has changed is left alone. The clear is the native setter
+/// plus `input` and `change`, the same shape as clear-on-failure, so a
+/// framework that listened to the write also sees the clear. The
+/// recorded list is dropped, so a second call clears nothing.
+///
+/// Returns `{ cleared, checked }`. `cleared` is how many elements were
+/// blanked; `checked` is how many were recorded. Neither is a value.
+pub const SCRUB_WRITTEN_IN_PAGE: &str = r#"
+function scrubWritten(expected) {
+  "use strict";
+  const written = Array.isArray(globalThis.__kharonWritten) ? globalThis.__kharonWritten : [];
+  try { delete globalThis.__kharonWritten; } catch (_) { /* already gone */ }
+
+  function setNativeValue(el, value) {
+    const proto = el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+    if (!descriptor || typeof descriptor.set !== "function") return false;
+    descriptor.set.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+
+  const list = Array.isArray(expected) ? expected : [];
+  let cleared = 0;
+  for (let i = 0; i < written.length; i++) {
+    const el = written[i];
+    if (!el || el.isConnected === false) continue;
+    if (typeof el.value !== "string" || typeof list[i] !== "string") continue;
+    if (el.value !== list[i]) continue;
+    try {
+      if (setNativeValue(el, "")) cleared++;
+    } catch (_) {
+      /* best effort: keep clearing the others */
+    }
+  }
+  for (let i = 0; i < list.length; i++) list[i] = "";
+  return { cleared: cleared, checked: written.length };
 }
 "#;
 
@@ -663,6 +725,178 @@ console.log("ok");
             Ok(o) => o,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("node not on PATH; skipping budget harness test");
+                return;
+            }
+            Err(e) => panic!("spawn node: {e}"),
+        };
+        assert!(
+            output.status.success(),
+            "harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for case in ["case A ok", "case B ok", "case C ok", "case D ok"] {
+            assert!(stdout.contains(case), "missing {case} in {stdout}");
+        }
+    }
+
+    /// #355: the scrub clears only the elements this fill recorded,
+    /// only while they still hold the written value, and dispatches
+    /// `input` and `change`. A second call is a no-op (the list is
+    /// dropped). A fill that did not ask to record leaves the fields.
+    #[test]
+    fn req_api_013_scrub_clears_recorded_elements_only() {
+        let mut script = String::new();
+        script.push_str(
+            r#"
+class HTMLInputElement {
+  constructor(name) {
+    this._v = "";
+    this.name = name;
+    this.events = [];
+    this.form = null;
+    this.isConnected = true;
+  }
+  dispatchEvent(ev) { this.events.push(ev.type); return true; }
+  closest() { return null; }
+}
+Object.defineProperty(HTMLInputElement.prototype, "value", {
+  get() { return this._v; },
+  set(v) { this._v = v; },
+});
+class HTMLTextAreaElement extends HTMLInputElement {}
+class Event { constructor(type, opts) { this.type = type; this.bubbles = !!(opts && opts.bubbles); } }
+class KeyboardEvent extends Event {
+  constructor(type, opts) { super(type, opts); this.key = opts.key; this.keyCode = opts.keyCode; }
+}
+"#,
+        );
+        script.push_str(FILL_IN_PAGE);
+        script.push_str(SCRUB_WRITTEN_IN_PAGE);
+        script.push_str(
+            r#"
+const specs = [{ kind: "host", scheme: "https", origin: "https://accounts.example.com" }];
+const origin = "https://accounts.example.com";
+function originEnv() {
+  globalThis.window = { isSecureContext: true, top: { location: { origin } } };
+  globalThis.location = {
+    protocol: "https:", hostname: "accounts.example.com", origin, href: origin + "/login",
+  };
+}
+function eventsOf(el) { return el.events.join(","); }
+
+// A. Both written fields still hold the value: both clear, with
+//    input+change. A decoy password the fill did not write stays.
+{
+  originEnv();
+  delete globalThis.__kharonWritten;
+  const userEl = new HTMLInputElement("user");
+  const passEl = new HTMLInputElement("pass");
+  const decoy = new HTMLInputElement("decoy");
+  decoy._v = "s3cret";
+  const form = { requestSubmit() {} };
+  userEl.form = form;
+  passEl.form = form;
+  globalThis.document = {
+    querySelector: (sel) => {
+      if (sel.includes("password")) return passEl;
+      if (sel.includes("email") || sel.includes("username")) return userEl;
+      return null;
+    },
+  };
+  fillInPage(specs, [
+    { kind: "username", selector: null, value: "alice" },
+    { kind: "password", selector: null, value: "s3cret" },
+  ], origin, true, 0, true);
+  const before = eventsOf(passEl);
+  const r = scrubWritten(["alice", "s3cret"]);
+  if (r.cleared !== 2 || r.checked !== 2) throw new Error("A: " + JSON.stringify(r));
+  if (userEl._v !== "" || passEl._v !== "") throw new Error("A: values left");
+  if (decoy._v !== "s3cret") throw new Error("A: decoy was cleared");
+  if (eventsOf(userEl) !== "input,change,input,change") throw new Error("A user events: " + eventsOf(userEl));
+  if (eventsOf(passEl) !== before + ",input,change") throw new Error("A pass events: " + eventsOf(passEl));
+  // The user types the password back. A second scrub must not clear it.
+  passEl._v = "s3cret";
+  const again = scrubWritten(["alice", "s3cret"]);
+  if (again.cleared !== 0 || again.checked !== 0) throw new Error("A second: " + JSON.stringify(again));
+  if (passEl._v !== "s3cret") throw new Error("A: second scrub cleared");
+  console.log("case A ok");
+}
+
+// B. The password was edited after the fill: leave it, clear the
+//    username that still matches. No events on the edited field.
+{
+  originEnv();
+  delete globalThis.__kharonWritten;
+  const userEl = new HTMLInputElement("user");
+  const passEl = new HTMLInputElement("pass");
+  const form = { requestSubmit() {} };
+  userEl.form = form;
+  passEl.form = form;
+  globalThis.document = {
+    querySelector: (sel) => {
+      if (sel.includes("password")) return passEl;
+      if (sel.includes("email") || sel.includes("username")) return userEl;
+      return null;
+    },
+  };
+  fillInPage(specs, [
+    { kind: "username", selector: null, value: "alice" },
+    { kind: "password", selector: null, value: "s3cret" },
+  ], origin, true, 0, true);
+  passEl._v = "s3cret-edited";
+  passEl.events = [];
+  const r = scrubWritten(["alice", "s3cret"]);
+  if (r.cleared !== 1) throw new Error("B: " + JSON.stringify(r));
+  if (userEl._v !== "") throw new Error("B: username left");
+  if (passEl._v !== "s3cret-edited") throw new Error("B: edited password cleared");
+  if (passEl.events.length !== 0) throw new Error("B: events on the edited field");
+  console.log("case B ok");
+}
+
+// C. A disconnected node is not cleared (the page replaced it).
+{
+  originEnv();
+  delete globalThis.__kharonWritten;
+  const passEl = new HTMLInputElement("pass");
+  const form = { requestSubmit() {} };
+  passEl.form = form;
+  globalThis.document = { querySelector: (sel) => (sel.includes("password") ? passEl : null) };
+  fillInPage(specs, [{ kind: "password", selector: null, value: "s3cret" }], origin, true, 0, true);
+  passEl.isConnected = false;
+  const r = scrubWritten(["s3cret"]);
+  if (r.cleared !== 0) throw new Error("C: " + JSON.stringify(r));
+  if (passEl._v !== "s3cret") throw new Error("C: detached node cleared");
+  console.log("case C ok");
+}
+
+// D. scrubRequested false: nothing is recorded, so the scrub clears nothing.
+{
+  originEnv();
+  delete globalThis.__kharonWritten;
+  const passEl = new HTMLInputElement("pass");
+  const form = { requestSubmit() {} };
+  passEl.form = form;
+  globalThis.document = { querySelector: (sel) => (sel.includes("password") ? passEl : null) };
+  fillInPage(specs, [{ kind: "password", selector: null, value: "s3cret" }], origin, true, 0, false);
+  const r = scrubWritten(["s3cret"]);
+  if (r.cleared !== 0 || r.checked !== 0) throw new Error("D: " + JSON.stringify(r));
+  if (passEl._v !== "s3cret") throw new Error("D: unrecorded field cleared");
+  console.log("case D ok");
+}
+console.log("ok");
+"#,
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kharon_fill_scrub_{}.js", std::process::id()));
+        std::fs::write(&path, &script).expect("write harness");
+        let output = std::process::Command::new("node").arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        let output = match output {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node not on PATH; skipping scrub harness test");
                 return;
             }
             Err(e) => panic!("spawn node: {e}"),

@@ -42,6 +42,16 @@ pub enum Event {
     /// end-to-end deadline. Written before the timeout response is
     /// returned, after the plaintext buffers are zeroized.
     FillTimeout,
+    /// REQ-API-013 (#355): a post-submit scrub ran after a submitted
+    /// fill that returned `filled`. Result `cleared`, `nothing`, or
+    /// `navigated`. Same `request_id` as the fill; `field_count` is
+    /// how many recorded elements were blanked, when that is more
+    /// than zero. Never a value. Not an outcome entry: the fill's own
+    /// outcome is still exactly one. Best effort, written after that
+    /// outcome. Absent when the scrub was off, skipped because the
+    /// deadline could not cover the delay, or the fill was dropped
+    /// (a `timeout` never scrubs).
+    FillScrub,
     /// REQ-AUD-003†: a fill is about to make its first CDP write. Appended
     /// before anything touches the page; if the append fails the fill is
     /// refused and no CDP write occurs. Carries the request id, item ref,
@@ -173,6 +183,7 @@ impl Event {
             Event::ExportLoaded => "export_loaded",
             Event::Abandoned => "abandoned",
             Event::FillTimeout => "fill_timeout",
+            Event::FillScrub => "fill_scrub",
             Event::FillDispatch => "fill_dispatch",
             Event::FillAborted => "fill_aborted",
             Event::ContextOpen => "context_open",
@@ -227,6 +238,7 @@ impl<'de> Deserialize<'de> for Event {
             "export_loaded" => Event::ExportLoaded,
             "abandoned" => Event::Abandoned,
             "fill_timeout" => Event::FillTimeout,
+            "fill_scrub" => Event::FillScrub,
             "fill_dispatch" => Event::FillDispatch,
             "fill_aborted" => Event::FillAborted,
             "context_open" => Event::ContextOpen,

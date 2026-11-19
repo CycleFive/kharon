@@ -179,6 +179,10 @@ struct RawPolicy {
     #[serde(default)]
     allow_standing: bool,
     fill_deadline: Option<String>,
+    /// #355: opt-in. Default false.
+    #[serde(default)]
+    post_submit_scrub: bool,
+    post_submit_scrub_delay: Option<String>,
     #[serde(default)]
     allow_http: bool,
     #[serde(default)]
@@ -939,6 +943,12 @@ fn validate_policy(p: RawPolicy) -> Result<PolicyConfig, ConfigError> {
         default_grant: p.default_grant.unwrap_or(d.default_grant),
         allow_standing: p.allow_standing,
         fill_deadline: duration("policy.fill_deadline", p.fill_deadline, d.fill_deadline)?,
+        post_submit_scrub: p.post_submit_scrub,
+        post_submit_scrub_delay: duration(
+            "policy.post_submit_scrub_delay",
+            p.post_submit_scrub_delay,
+            d.post_submit_scrub_delay,
+        )?,
         allow_http: p.allow_http,
         allow_cross_origin_iframe_hosts: p.allow_cross_origin_iframe_hosts,
         allow_default_context: p.allow_default_context,

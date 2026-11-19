@@ -748,7 +748,12 @@ async fn req_api_009_page_deadline_exception_is_timeout() {
     assert_eq!(stub.methods("Runtime.callFunctionOn"), 1);
     let args = stub.fill_arguments().expect("the fill call was sent");
     let args = args.as_array().expect("arguments array");
-    assert_eq!(args.len(), 5, "specs, fields, top origin, submit, budget");
+    assert_eq!(
+        args.len(),
+        6,
+        "specs, fields, top origin, submit, budget, scrub"
+    );
+    assert_eq!(args[5]["value"], json!(false), "scrub is off by default");
     let budget = args[4]["value"].as_u64().expect("budgetMs is a number");
     assert!(
         budget > 0 && budget <= 9750,

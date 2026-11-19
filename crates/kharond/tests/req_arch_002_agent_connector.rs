@@ -15,7 +15,7 @@ use kharon_connector::Transport as Dial;
 use kharond::api::token::{ParamFloor, TUNNEL_PREFIX, TokenStore, generate_tunnel_with};
 use kharond::cdp::{
     Browser, CdpClient, CdpDial, CdpEndpoint, FieldFill, FieldKind, FillEngine, FillPlan,
-    LiveOrigin, Tunnel, ValuesSent,
+    LiveOrigin, ScrubNote, Tunnel, ValuesSent,
 };
 use kharond::connector::{
     AgentParams, ClientError, Hub, accept, pin_of_der, run_agent_once, server_config_from_pem,
@@ -157,6 +157,9 @@ fn plan() -> FillPlan {
         live_origin: LiveOrigin::new(),
         deadline: None,
         values_sent: ValuesSent::new(),
+        post_submit_scrub: false,
+        post_submit_scrub_delay: Duration::from_millis(500),
+        scrub: ScrubNote::new(),
     }
 }
 

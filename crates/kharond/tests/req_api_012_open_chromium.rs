@@ -312,8 +312,7 @@ fn broker_for(
     )
     .with_fill_policy(FillPolicy {
         deadline: Duration::from_secs(45),
-        allow_default_context: false,
-        cross_origin_iframe_hosts: Vec::new(),
+        ..FillPolicy::default()
     })
     .with_fill_backend(Box::new(backend));
     (Arc::new(broker), alpha.expose_secret().clone(), audit)

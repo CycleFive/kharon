@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::error::{ApiError, Detail};
-use crate::cdp::fill::DEFAULT_FILL_DEADLINE;
+use crate::cdp::fill::{DEFAULT_FILL_DEADLINE, DEFAULT_POST_SUBMIT_SCRUB_DELAY};
 use crate::cdp::{
     AgentContext, Browser, CdpClient, CdpDial, CdpEndpoint, FieldKind, FillEngine, FillOutcome,
     FillPlan, Tunnel,
@@ -90,6 +90,12 @@ pub struct FillArgs {
     /// Never dispatched on any failure or timeout.
     #[serde(default)]
     pub submit: bool,
+    /// Override the deploy's post-submit scrub for this fill (#355,
+    /// REQ-API-013). Omitted: the deploy setting. `true` scrubs even
+    /// when the deploy is off; `false` does not, even when the deploy
+    /// is on. Ignored unless `submit` is true. The reply stays `filled`.
+    #[serde(default)]
+    pub post_submit_scrub: Option<bool>,
     /// An approved grant to fill under (REQ-APR-*; issue #20).
     #[serde(default)]
     #[schemars(length(max = MAX_GRANT_ID_LEN))]
@@ -113,6 +119,11 @@ pub struct FillTotpArgs {
     /// Submit the form after the code filled.
     #[serde(default)]
     pub submit: bool,
+    /// Override the deploy's post-submit scrub for this fill (#355,
+    /// REQ-API-013). Omitted: the deploy setting. Same as `fill`.
+    /// Ignored unless `submit` is true. The reply stays `filled`.
+    #[serde(default)]
+    pub post_submit_scrub: Option<bool>,
     /// An approved grant to fill under (issue #20).
     #[serde(default)]
     #[schemars(length(max = MAX_GRANT_ID_LEN))]
@@ -207,6 +218,9 @@ pub struct FillRequest {
     pub fields: Vec<(FieldKind, Option<String>)>,
     /// `fill_and_submit`.
     pub submit: bool,
+    /// Per-fill override of `[policy] post_submit_scrub` (#355).
+    /// `None` uses the deploy setting. Ignored unless `submit` is set.
+    pub post_submit_scrub: Option<bool>,
     /// An approved grant to fill under (issue #20): enforced by the
     /// broker's grant gate before anything is decrypted.
     pub grant_id: Option<String>,
@@ -215,7 +229,7 @@ pub struct FillRequest {
 /// Validate a `fill` / `fill_totp` JSON body (HTTP) or tool arguments
 /// (MCP). The single entry point for both transports.
 pub fn parse_fill(op: FillOperation, json: &[u8]) -> Result<FillRequest, ApiError> {
-    let (item_id, target, fields, submit, grant_id) = match op {
+    let (item_id, target, fields, submit, post_submit_scrub, grant_id) = match op {
         FillOperation::Fill => {
             let a: FillArgs = from_json(json)?;
             let fields: Vec<_> = a
@@ -223,7 +237,14 @@ pub fn parse_fill(op: FillOperation, json: &[u8]) -> Result<FillRequest, ApiErro
                 .into_iter()
                 .map(|f| (FieldKind::from(f.kind), f.selector))
                 .collect();
-            (a.item_id, a.target, fields, a.submit, a.grant_id)
+            (
+                a.item_id,
+                a.target,
+                fields,
+                a.submit,
+                a.post_submit_scrub,
+                a.grant_id,
+            )
         }
         FillOperation::FillTotp => {
             let a: FillTotpArgs = from_json(json)?;
@@ -238,7 +259,14 @@ pub fn parse_fill(op: FillOperation, json: &[u8]) -> Result<FillRequest, ApiErro
                 }
                 Some(_) => return Err(ApiError::bad_request(Detail::DuplicateFillField)),
             };
-            (a.item_id, a.target, fields, a.submit, a.grant_id)
+            (
+                a.item_id,
+                a.target,
+                fields,
+                a.submit,
+                a.post_submit_scrub,
+                a.grant_id,
+            )
         }
     };
 
@@ -283,6 +311,7 @@ pub fn parse_fill(op: FillOperation, json: &[u8]) -> Result<FillRequest, ApiErro
         expected_origin,
         fields,
         submit,
+        post_submit_scrub,
         grant_id,
     })
 }
@@ -1269,6 +1298,11 @@ pub struct FillPolicy {
     pub allow_default_context: bool,
     /// REQ-ORG-001 cross-origin iframe allow-list.
     pub cross_origin_iframe_hosts: Vec<String>,
+    /// #355: deploy default for the post-submit scrub. A fill's own
+    /// flag overrides it. Default false.
+    pub post_submit_scrub: bool,
+    /// #355: the one delay before the re-read. Default 500ms.
+    pub post_submit_scrub_delay: Duration,
 }
 
 impl Default for FillPolicy {
@@ -1277,6 +1311,8 @@ impl Default for FillPolicy {
             deadline: DEFAULT_FILL_DEADLINE,
             allow_default_context: false,
             cross_origin_iframe_hosts: Vec::new(),
+            post_submit_scrub: false,
+            post_submit_scrub_delay: DEFAULT_POST_SUBMIT_SCRUB_DELAY,
         }
     }
 }
@@ -1287,6 +1323,8 @@ impl From<&PolicyConfig> for FillPolicy {
             deadline: p.fill_deadline,
             allow_default_context: p.allow_default_context,
             cross_origin_iframe_hosts: p.allow_cross_origin_iframe_hosts.clone(),
+            post_submit_scrub: p.post_submit_scrub,
+            post_submit_scrub_delay: p.post_submit_scrub_delay,
         }
     }
 }
@@ -1330,6 +1368,7 @@ mod tests {
             ]
         );
         assert!(!r.submit);
+        assert_eq!(r.post_submit_scrub, None);
         assert_eq!(r.grant_id, None);
         let mut v = base();
         v["submit"] = true.into();
@@ -1337,6 +1376,26 @@ mod tests {
         let r = fill(v).unwrap();
         assert!(r.submit);
         assert_eq!(r.item_id, ID, "canonicalized");
+        // #355: omitted follows the deploy; true and false are overrides;
+        // null is the same as omitted. fill_totp carries the same flag.
+        let mut v = base();
+        v["post_submit_scrub"] = true.into();
+        assert_eq!(fill(v).unwrap().post_submit_scrub, Some(true));
+        let mut v = base();
+        v["post_submit_scrub"] = false.into();
+        assert_eq!(fill(v).unwrap().post_submit_scrub, Some(false));
+        let mut v = base();
+        v["post_submit_scrub"] = serde_json::Value::Null;
+        assert_eq!(fill(v).unwrap().post_submit_scrub, None);
+        let mut v = base();
+        v.as_object_mut().unwrap().remove("fields");
+        v["post_submit_scrub"] = true.into();
+        assert_eq!(
+            parse_fill(FillOperation::FillTotp, &body(v))
+                .unwrap()
+                .post_submit_scrub,
+            Some(true)
+        );
     }
 
     #[test]

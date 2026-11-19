@@ -1312,6 +1312,11 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // The live origin the engine read, if the fill got that far
         // (REQ-AUD-003†, #67); copied into the outcome entry.
         let mut live_origin = None;
+        // The post-submit scrub, when one was attempted (#355). Empty
+        // when it was off, skipped for lack of deadline, or the fill
+        // was dropped. Not an outcome: the fill's own entry is still
+        // exactly one.
+        let mut scrub_note = None;
         // The grant request a `pending_approval` outcome created
         // (#20), and the grant an admitted fill spent.
         let mut grant_request_id: Option<String> = None;
@@ -1427,6 +1432,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                         .await;
                     guard.abort_entry = None;
                     live_origin = guard.plan.live_origin.get();
+                    scrub_note = guard.plan.scrub.get();
                     drop(guard);
                     status
                 }
@@ -1443,8 +1449,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             }
             e
         };
-        let entry = match live_origin {
-            Some(o) => entry.live_origin(o),
+        let entry = match &live_origin {
+            Some(o) => entry.live_origin(o.clone()),
             None => entry,
         };
         let entry = match &admitted_grant {
@@ -1452,6 +1458,26 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             None => entry,
         };
         self.append(entry)?;
+        // #355: the scrub's own entry, after the fill outcome. Best
+        // effort — a failed append does not turn a filled reply into
+        // `audit_failed`, and the entry carries no value. A timeout
+        // never has one: the engine only records a note for a fill
+        // that returned `filled`, and a drop records nothing.
+        if matches!(&status, FillStatus::Engine(FillOutcome::Filled { .. }))
+            && let Some(obs) = scrub_note
+        {
+            let mut scrub_entry = base(Event::FillScrub).result(obs.as_str());
+            if let Some(o) = &live_origin {
+                scrub_entry = scrub_entry.live_origin(o.clone());
+            }
+            if let Some(g) = &admitted_grant {
+                scrub_entry = scrub_entry.grant_id(g.clone());
+            }
+            if let Some(n) = obs.cleared() {
+                scrub_entry = scrub_entry.field_count(n);
+            }
+            let _ = self.append(scrub_entry);
+        }
         // REQ-RL-002: consecutive origin_mismatch → suspend.
         match &status {
             // An iframe refused by the allowlist (#180) counts too: it is
@@ -3140,6 +3166,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             // the deadline); `resolve_fill` runs without one in scope.
             deadline: None,
             values_sent: ValuesSent::new(),
+            // A per-fill flag wins. Either way the scrub only runs for
+            // a submitted fill (the engine checks `submit` too).
+            post_submit_scrub: req.submit
+                && req
+                    .post_submit_scrub
+                    .unwrap_or(self.fill_policy.post_submit_scrub),
+            post_submit_scrub_delay: self.fill_policy.post_submit_scrub_delay,
+            scrub: crate::cdp::fill::ScrubNote::new(),
         };
         // `item` was the last borrow of the session. A spent grant
         // no longer defers the idle lock; an unlimited grant stays

@@ -126,6 +126,7 @@ fn fill_req(operation: FillOperation) -> FillRequest {
         expected_origin: "https://example.com".to_owned(),
         fields: vec![(kind, None)],
         submit: false,
+        post_submit_scrub: None,
         grant_id: None,
     }
 }

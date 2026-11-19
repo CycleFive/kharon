@@ -280,7 +280,14 @@ impl Tool {
             Self::List => &["origin"],
             Self::Search => &["q", "origin"],
             Self::Open => &["item_id"],
-            Self::Fill | Self::FillTotp => &["item_id", "target", "fields", "submit", "grant_id"],
+            Self::Fill | Self::FillTotp => &[
+                "item_id",
+                "target",
+                "fields",
+                "submit",
+                "post_submit_scrub",
+                "grant_id",
+            ],
             Self::RequestGrant => &["item_id", "target", "action"],
         }
     }

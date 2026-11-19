@@ -212,6 +212,14 @@
           "minLength": 36,
           "type": "string"
         },
+        "post_submit_scrub": {
+          "default": null,
+          "description": "Override the deploy's post-submit scrub for this fill (#355,\nREQ-API-013). Omitted: the deploy setting. `true` scrubs even\nwhen the deploy is off; `false` does not, even when the deploy\nis on. Ignored unless `submit` is true. The reply stays `filled`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "submit": {
           "default": false,
           "description": "Submit the form after every field filled (`fill_and_submit`).\nNever dispatched on any failure or timeout.",
@@ -337,6 +345,14 @@
           "maxLength": 36,
           "minLength": 36,
           "type": "string"
+        },
+        "post_submit_scrub": {
+          "default": null,
+          "description": "Override the deploy's post-submit scrub for this fill (#355,\nREQ-API-013). Omitted: the deploy setting. Same as `fill`.\nIgnored unless `submit` is true. The reply stays `filled`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "submit": {
           "default": false,

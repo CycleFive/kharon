@@ -222,7 +222,8 @@ browser when the connector lets go.
   does not cover.
 - One recorded canary on a managed OpenClaw browser: approved fill,
   then Disconnect, OpenClaw still driving that browser, and the next
-  fill refusing with `no_browser`.
+  fill refuses with `timeout` (static agent, connector detached);
+  `no_browser` is the Connect-session refusal, REQ-OAU-007.
 - No new transport. Path B stays as shipped.
 
 ### Proposed issues
@@ -344,7 +345,9 @@ approves one fill, and Hermes keeps that browser.
   (cloud providers, Lightpanda, `browser_vault`). Until that
   rewrite, #338's page leads with the explicit endpoint.
 - One recorded canary on that shared browser: approved fill,
-  Disconnect, Hermes still driving it, next fill `no_browser`.
+  Disconnect, Hermes still driving it, next fill refuses with
+  `timeout` (static agent, connector detached); `no_browser` is the
+  Connect-session refusal, REQ-OAU-007.
 - No new transport.
 
 ### Proposed issues

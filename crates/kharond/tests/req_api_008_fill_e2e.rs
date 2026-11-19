@@ -194,11 +194,26 @@ async fn cdp_stub_loader_changes_after_fill() -> (String, Received) {
 /// `stable_loaders` `Page.getFrameTree` replies keep `loaderId` `l1`;
 /// later replies use `l2`. `stall_fill` never answers the in-page fill
 /// call. A `scrubWritten` call reports `scrub_cleared` when set, and
-/// otherwise the number of expected values it was given.
+/// otherwise the number of expected values it was given. The value-free
+/// probe reports one field still held, so the clear proceeds.
 async fn cdp_stub_for_scrub(
     stable_loaders: usize,
     stall_fill: bool,
     scrub_cleared: Option<u64>,
+) -> (String, Received) {
+    cdp_stub_scrub_ext(stable_loaders, stall_fill, scrub_cleared, false, None).await
+}
+
+/// [`cdp_stub_for_scrub`], plus two review cases. `stall_reread` never
+/// answers the post-delay `Page.getFrameTree` (the third read).
+/// `probe_held` is what `probeWritten` reports; `None` means one field
+/// is still held.
+async fn cdp_stub_scrub_ext(
+    stable_loaders: usize,
+    stall_fill: bool,
+    scrub_cleared: Option<u64>,
+    stall_reread: bool,
+    probe_held: Option<u64>,
 ) -> (String, Received) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -215,6 +230,14 @@ async fn cdp_stub_for_scrub(
             if stall_fill && method == "Runtime.callFunctionOn" {
                 continue;
             }
+            if stall_reread && method == "Page.getFrameTree" {
+                let n = trees.fetch_add(1, Ordering::SeqCst);
+                // The third read is the post-delay re-read. The first
+                // two (before the fill, and the step-4 check) answer.
+                if n >= 2 {
+                    continue;
+                }
+            }
             let result = match method {
                 "Target.createBrowserContext" => json!({ "browserContextId": "ctx-A" }),
                 "Target.getTargetInfo" => json!({ "targetInfo": {
@@ -224,7 +247,11 @@ async fn cdp_stub_for_scrub(
                 "Target.attachToTarget" => json!({ "sessionId": "sess-1" }),
                 "Page.createIsolatedWorld" => json!({ "executionContextId": 7 }),
                 "Page.getFrameTree" => {
-                    let n = trees.fetch_add(1, Ordering::SeqCst);
+                    let n = if stall_reread {
+                        trees.load(Ordering::SeqCst).saturating_sub(1)
+                    } else {
+                        trees.fetch_add(1, Ordering::SeqCst)
+                    };
                     let loader = if n < stable_loaders { "l1" } else { "l2" };
                     json!({ "frameTree": { "frame": {
                         "id": "f1", "loaderId": loader, "url": URL,
@@ -234,7 +261,11 @@ async fn cdp_stub_for_scrub(
                     let decl = msg["params"]["functionDeclaration"]
                         .as_str()
                         .unwrap_or_default();
-                    if decl.contains("scrubWritten") {
+                    if decl.contains("probeWritten") {
+                        json!({ "result": { "type": "object", "value": {
+                            "held": probe_held.unwrap_or(1),
+                        } } })
+                    } else if decl.contains("scrubWritten") {
                         let echoed = msg["params"]["arguments"][0]["value"]
                             .as_array()
                             .map(|a| a.len() as u64)
@@ -939,7 +970,7 @@ async fn req_api_013_scrub_clears_a_form_that_stays() {
     assert!(took >= delay, "the one delay ran: {took:?}");
     assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     let calls = e.fill_calls();
-    assert_eq!(calls.len(), 2, "fill, then one scrub");
+    assert_eq!(calls.len(), 3, "fill, probe, then one scrub");
     assert!(
         calls[0]["params"]["functionDeclaration"]
             .as_str()
@@ -952,14 +983,24 @@ async fn req_api_013_scrub_clears_a_form_that_stays() {
         calls[1]["params"]["functionDeclaration"]
             .as_str()
             .unwrap()
+            .contains("probeWritten")
+    );
+    assert!(
+        !calls[1].to_string().contains(CANARY_PASSWORD),
+        "the probe carries no value"
+    );
+    assert!(
+        calls[2]["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
             .contains("scrubWritten")
     );
     assert!(
-        calls[1]["params"]["arguments"][1].is_null(),
+        calls[2]["params"]["arguments"][1].is_null(),
         "the scrub is not a field re-resolve"
     );
     assert_eq!(
-        calls[1]["params"]["arguments"][0]["value"],
+        calls[2]["params"]["arguments"][0]["value"],
         json!(["fixture@example.net", CANARY_PASSWORD])
     );
     assert_secret_free(&r.body, &[]);
@@ -989,7 +1030,7 @@ async fn req_api_013_per_fill_flag_overrides_the_deploy() {
     ask["post_submit_scrub"] = json!(true);
     let r = e.fill("/v1/fill", ask).await;
     assert_eq!(r.json()["status"], "filled");
-    assert_eq!(e.fill_calls().len(), 2, "per-fill true scrubs");
+    assert_eq!(e.fill_calls().len(), 3, "per-fill true scrubs");
     assert_eq!(
         audit_values(&e)
             .iter()
@@ -1220,4 +1261,87 @@ async fn req_api_013_a_delay_the_deadline_cannot_cover_is_skipped() {
     );
     assert_eq!(e.fill_calls().len(), 1);
     assert!(audit_values(&e).iter().all(|v| v["event"] != "fill_scrub"));
+}
+
+/// The post-delay loader re-read is bounded. A stall there leaves the
+/// reply `filled` and sends no scrub call.
+#[tokio::test]
+async fn req_api_013_a_stalled_reread_stays_filled() {
+    let e = e2e_policy(
+        cdp_stub_scrub_ext(usize::MAX, false, None, true, None).await,
+        scrub_policy(
+            true,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(2),
+        ),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    let took = started.elapsed();
+    assert_eq!(r.json()["status"], "filled", "{}", r.body);
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "the re-read timed out inside the deadline: {took:?}"
+    );
+    assert_eq!(e.fill_calls().len(), 1, "no probe and no clear");
+    assert_eq!(
+        audit_values(&e)
+            .iter()
+            .find(|v| v["event"] == "fill_scrub")
+            .unwrap()["result"],
+        "nothing"
+    );
+    assert_secret_free(&r.body, &[]);
+    assert_secret_free(&e.audit_text(), &[]);
+}
+
+/// A page that has already emptied the fields is not sent the values
+/// again: the value-free probe reports nothing held.
+#[tokio::test]
+async fn req_api_013_an_emptied_form_is_not_sent_the_values_again() {
+    let e = e2e_policy(
+        cdp_stub_scrub_ext(usize::MAX, false, None, false, Some(0)).await,
+        scrub_policy(
+            true,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(10),
+        ),
+    )
+    .await;
+    let r = e.fill("/v1/fill", password_body(&e, true)).await;
+    assert_eq!(r.json()["status"], "filled");
+    let calls = e.fill_calls();
+    assert_eq!(calls.len(), 2, "fill, then the probe only: {calls:?}");
+    assert!(
+        calls[1]["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("probeWritten")
+    );
+    let probe = calls[1].to_string();
+    assert!(
+        !probe.contains(CANARY_PASSWORD),
+        "probe carries the password"
+    );
+    assert!(
+        !probe.contains("fixture@example.net"),
+        "probe carries the username"
+    );
+    assert!(
+        calls.iter().all(|c| !c["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap_or("")
+            .contains("scrubWritten")),
+        "no value-bearing clear"
+    );
+    assert_eq!(
+        audit_values(&e)
+            .iter()
+            .find(|v| v["event"] == "fill_scrub")
+            .unwrap()["result"],
+        "nothing"
+    );
+    assert_secret_free(&r.body, &[]);
+    assert_secret_free(&e.audit_text(), &[]);
 }

@@ -53,13 +53,18 @@ in the code today (`crates/kharond/src/cdp/fill.rs`,
   deploy (`[policy] post_submit_scrub`) or that fill
   (`post_submit_scrub`) turned it on, the broker waits
   `post_submit_scrub_delay` (default 500 ms) and re-reads the
-  loader once. If it is unchanged, a second in-page call clears
-  only the elements that fill wrote, and only where the field
-  still holds exactly the value written, using the native setter
-  and `input`/`change` — the clear-on-failure shape, not
-  `CLEAR_IN_PAGE`'s re-resolve. The comparison is in the page:
-  the broker sends the written values once more and the call
-  returns a count, never a value. The fill reply stays `filled`.
+  loader once, bounded by the time left in the fill deadline. If
+  that read does not answer, the scrub records `nothing` and the
+  reply stays `filled`. If the loader is unchanged, a value-free
+  call counts recorded elements that are still connected and
+  non-empty. The written values are sent again only when that
+  count is above zero; otherwise the scrub records `nothing`.
+  The clear touches only the elements that fill wrote, and only
+  where the field still holds exactly the value written, using
+  the native setter and `input`/`change` — the clear-on-failure
+  shape, not `CLEAR_IN_PAGE`'s re-resolve. The comparison is in
+  the page and the call returns a count, never a value. The fill
+  reply stays `filled`.
   This is one check, not a watch. A loader that already changed,
   or that changes at the re-read, is left alone. The scrub is
   not started when the remaining fill deadline cannot cover the

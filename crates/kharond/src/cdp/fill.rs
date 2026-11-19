@@ -46,7 +46,7 @@ use crate::origin::{MismatchReason, OriginConfig, OriginMatcher};
 
 use super::browser::{AgentContext, Browser, OwnershipError};
 use super::client::CdpError;
-use super::page_js::{CLEAR_IN_PAGE, FILL_IN_PAGE, SCRUB_WRITTEN_IN_PAGE};
+use super::page_js::{CLEAR_IN_PAGE, FILL_IN_PAGE, PROBE_WRITTEN_IN_PAGE, SCRUB_WRITTEN_IN_PAGE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
@@ -784,8 +784,19 @@ impl FillEngine {
         if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
             return;
         }
-        let tree = match session.request("Page.getFrameTree", json!({})).await {
+        // Bounded: an unanswered re-read must not turn a `filled`
+        // reply into the broker's `timeout`, and an engine caller with
+        // no deadline must not wait forever (#355 review).
+        let timeout = scrub_call_timeout(deadline, Instant::now());
+        let tree = match session
+            .request_with_timeout("Page.getFrameTree", json!({}), timeout)
+            .await
+        {
             Ok(t) => t,
+            Err(CdpError::Timeout) => {
+                note.record(ScrubObservation::Nothing);
+                return;
+            }
             Err(_) => {
                 note.record(ScrubObservation::Navigated);
                 return;
@@ -798,7 +809,47 @@ impl FillEngine {
             note.record(ScrubObservation::Navigated);
             return;
         }
-        // The re-read can take the margin we had. Recheck before the
+        if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
+            return;
+        }
+        // Value-free probe. The written values go out only when a
+        // recorded element is still connected and non-empty. A site
+        // that already cleared its form does not see the secret again.
+        let probe = session
+            .request_with_timeout(
+                "Runtime.callFunctionOn",
+                json!({
+                    "functionDeclaration": PROBE_WRITTEN_IN_PAGE,
+                    "executionContextId": context_id,
+                    "arguments": [],
+                    "returnByValue": true,
+                    "awaitPromise": false,
+                }),
+                scrub_call_timeout(deadline, Instant::now()),
+            )
+            .await;
+        let held = match probe {
+            Ok(result) => match probe_held(&result) {
+                Ok(n) => n,
+                Err(obs) => {
+                    note.record(obs);
+                    return;
+                }
+            },
+            Err(e) if context_gone(&e.to_string()) => {
+                note.record(ScrubObservation::Navigated);
+                return;
+            }
+            Err(_) => {
+                note.record(ScrubObservation::Nothing);
+                return;
+            }
+        };
+        if held == 0 {
+            note.record(ScrubObservation::Nothing);
+            return;
+        }
+        // The probe can take the margin we had. Recheck before the
         // call that carries the values.
         if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
             return;
@@ -808,7 +859,6 @@ impl FillEngine {
             return;
         };
         let n_fields = values.len() as u64;
-        let timeout = scrub_call_timeout(deadline, Instant::now());
         let params = json!({
             "functionDeclaration": SCRUB_WRITTEN_IN_PAGE,
             "executionContextId": context_id,
@@ -820,7 +870,11 @@ impl FillEngine {
             s.zeroize();
         }
         let call = session
-            .request_with_timeout("Runtime.callFunctionOn", params, timeout)
+            .request_with_timeout(
+                "Runtime.callFunctionOn",
+                params,
+                scrub_call_timeout(deadline, Instant::now()),
+            )
             .await;
         note.record(match call {
             Ok(result) => scrub_observation(&result, n_fields),
@@ -944,6 +998,30 @@ fn scrub_call_timeout(deadline: Option<Instant>, now: Instant) -> Duration {
             .min(Duration::from_secs(5)),
         None => Duration::from_secs(5),
     }
+}
+
+/// How many recorded elements the value-free probe says are still
+/// connected and non-empty. `Err` is the observation to record when
+/// the call itself failed: a destroyed world is `navigated`, anything
+/// else is `nothing` (the values are not sent).
+fn probe_held(result: &Value) -> Result<u64, ScrubObservation> {
+    if let Some(exception) = result.get("exceptionDetails") {
+        let description = exception
+            .get("exception")
+            .and_then(|e| e.get("description"))
+            .and_then(Value::as_str)
+            .or_else(|| exception.get("text").and_then(Value::as_str))
+            .unwrap_or("");
+        return Err(if context_gone(description) {
+            ScrubObservation::Navigated
+        } else {
+            ScrubObservation::Nothing
+        });
+    }
+    Ok(result
+        .pointer("/result/value/held")
+        .and_then(Value::as_u64)
+        .unwrap_or(0))
 }
 
 /// The scrub observation from one in-page reply. The reported count

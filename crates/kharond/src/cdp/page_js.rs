@@ -322,6 +322,25 @@ function scrubWritten(expected) {
 }
 "#;
 
+/// Value-free count of recorded elements that are still connected and
+/// non-empty (#355 review). The broker sends the written values only
+/// when this count is above zero. Does not clear and does not drop the
+/// recorded list: [`SCRUB_WRITTEN_IN_PAGE`] still owns that.
+///
+/// Returns `{ held }`. No values in, no values out.
+pub const PROBE_WRITTEN_IN_PAGE: &str = r#"
+function probeWritten() {
+  "use strict";
+  const written = Array.isArray(globalThis.__kharonWritten) ? globalThis.__kharonWritten : [];
+  let held = 0;
+  for (const el of written) {
+    if (!el || el.isConnected === false) continue;
+    if (typeof el.value === "string" && el.value !== "") held++;
+  }
+  return { held: held };
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,6 +792,7 @@ class KeyboardEvent extends Event {
         );
         script.push_str(FILL_IN_PAGE);
         script.push_str(SCRUB_WRITTEN_IN_PAGE);
+        script.push_str(PROBE_WRITTEN_IN_PAGE);
         script.push_str(
             r#"
 const specs = [{ kind: "host", scheme: "https", origin: "https://accounts.example.com" }];
@@ -884,6 +904,41 @@ function eventsOf(el) { return el.events.join(","); }
   if (passEl._v !== "s3cret") throw new Error("D: unrecorded field cleared");
   console.log("case D ok");
 }
+
+// E. The probe counts connected non-empty fields and does not clear
+//    or drop the recorded list. An emptied form reports zero, so the
+//    broker need not send the values again.
+{
+  originEnv();
+  delete globalThis.__kharonWritten;
+  const userEl = new HTMLInputElement("user");
+  const passEl = new HTMLInputElement("pass");
+  const form = { requestSubmit() {} };
+  userEl.form = form;
+  passEl.form = form;
+  globalThis.document = {
+    querySelector: (sel) => {
+      if (sel.includes("password")) return passEl;
+      if (sel.includes("email") || sel.includes("username")) return userEl;
+      return null;
+    },
+  };
+  fillInPage(specs, [
+    { kind: "username", selector: null, value: "alice" },
+    { kind: "password", selector: null, value: "s3cret" },
+  ], origin, true, 0, true);
+  if (probeWritten().held !== 2) throw new Error("E: expected two held");
+  userEl._v = "";
+  passEl._v = "";
+  const events = passEl.events.length;
+  if (probeWritten().held !== 0) throw new Error("E: emptied form still held");
+  if (passEl.events.length !== events) throw new Error("E: probe dispatched an event");
+  if (userEl._v !== "" || passEl._v !== "") throw new Error("E: probe wrote a value");
+  passEl._v = "s3cret";
+  const r = scrubWritten(["alice", "s3cret"]);
+  if (r.cleared !== 1 || passEl._v !== "") throw new Error("E: list was dropped by the probe");
+  console.log("case E ok");
+}
 console.log("ok");
 "#,
         );
@@ -907,7 +962,13 @@ console.log("ok");
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for case in ["case A ok", "case B ok", "case C ok", "case D ok"] {
+        for case in [
+            "case A ok",
+            "case B ok",
+            "case C ok",
+            "case D ok",
+            "case E ok",
+        ] {
             assert!(stdout.contains(case), "missing {case} in {stdout}");
         }
     }

@@ -103,6 +103,68 @@ fn req_api_006_details_are_fixed_literals() {
     assert_eq!(codes.len(), ErrorCode::ALL.len());
 }
 
+#[test]
+fn req_api_006_mcp_typed_errors_keep_wire_names_and_fixed_details() {
+    // #365: clients match the typed refusal, not its shared HTTP class.
+    // Pin literals independently of the renderer, including no_browser.
+    let typed = [
+        (
+            ApiError::NO_BROWSER,
+            "no_browser",
+            "this connection has no browser attached yet",
+        ),
+        (
+            ApiError::NO_LOGIN_URL,
+            "no_login_url",
+            "this item has no verifiable https login URL",
+        ),
+        (
+            ApiError::TARGET_NOT_OWNED,
+            "target_not_owned",
+            "target is not in this agent's browser context",
+        ),
+        (ApiError::DEADLINE, "timeout", "the deadline expired"),
+        (
+            ApiError::BROWSER_FAILED,
+            "cdp_error",
+            "the browser command failed",
+        ),
+    ];
+    for (error, name, detail) in typed {
+        assert_eq!(error.tool_error(), name, "{error:?}");
+        assert_eq!(
+            error.tool_body(),
+            serde_json::json!({ "error": name, "detail": detail }),
+            "{error:?}"
+        );
+    }
+
+    // Sweep the closed error surface: overrides apply only to their
+    // exact typed pair. Authorization, scope and other errors retain
+    // their class; HTTP bodies and fixed details are unchanged.
+    for code in ErrorCode::ALL {
+        for detail in Detail::ALL {
+            let error = ApiError::new(code, detail);
+            let name = typed
+                .iter()
+                .find(|(candidate, _, _)| *candidate == error)
+                .map_or(code.as_str(), |(_, name, _)| *name);
+            assert_eq!(error.tool_error(), name, "{error:?}");
+            assert_eq!(
+                error.tool_body(),
+                serde_json::json!({ "error": name, "detail": detail.as_str() }),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.body(),
+                serde_json::json!({ "error": code.as_str(), "detail": detail.as_str() }),
+                "{error:?}"
+            );
+            assert_no_canary(&error.tool_body().to_string());
+        }
+    }
+}
+
 /// Every body an error can have.
 fn all_error_bodies() -> Vec<Value> {
     let mut v = Vec::new();
@@ -112,6 +174,14 @@ fn all_error_bodies() -> Vec<Value> {
         }
     }
     v
+}
+
+/// Every MCP tool-error body, including typed names distinct from HTTP.
+fn all_tool_error_bodies() -> Vec<Value> {
+    ErrorCode::ALL
+        .into_iter()
+        .flat_map(|code| Detail::ALL.map(|detail| ApiError::new(code, detail).tool_body()))
+        .collect()
 }
 
 fn fuzz_value(rng: &mut StdRng, canaries: &[String]) -> String {
@@ -237,6 +307,7 @@ async fn req_api_006_fuzz_mcp_no_canary_in_any_response() {
     let canaries = canaries();
     let mut rng = StdRng::seed_from_u64(0x006d_6370);
     let bodies = all_error_bodies();
+    let tool_bodies = all_tool_error_bodies();
     let messages: Vec<&str> = RpcError::ALL.iter().map(|e| e.message()).collect();
     let header_safe =
         |s: String| -> String { s.chars().filter(|c| (' '..='~').contains(c)).collect() };
@@ -306,7 +377,7 @@ async fn req_api_006_fuzz_mcp_no_canary_in_any_response() {
                     let inner: Value =
                         serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
                     assert!(
-                        bodies.contains(&inner),
+                        tool_bodies.contains(&inner),
                         "tool error not from the enum: {inner}"
                     );
                 }

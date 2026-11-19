@@ -9,6 +9,7 @@ use super::{Buffered, FrameInfo, RawBody, RawElement, RawForm};
 use crate::body::shape_of_body;
 use crate::marker::Marker;
 use crate::strip::{TYPED, dedup_hits, hits_in, holds_typed, reduce_authorization, strip_url};
+use zeroize::Zeroizing;
 
 /// What is known while stripping: every typed value, and the credential pair once chosen.
 #[derive(Clone, Copy)]
@@ -80,10 +81,55 @@ fn clean(attr: Option<&String>, ctx: Ctx<'_>) -> Option<String> {
     attr.filter(|a| !ctx.holds_typed(a)).cloned()
 }
 
-/// A selector holding a typed value, also once CSS escapes (`\.`) are undone, is removed.
+/// `s` with CSS escapes undone (CSS Syntax 3, 4.3.7): `\` + 1-6 hex digits (+ one optional
+/// whitespace) is that code point (0, a surrogate or past U+10FFFF is U+FFFD); `\` + any other
+/// char is that char. A `\` before a newline or at the end is dropped.
+fn css_unescape(s: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(s.len()));
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut hex = Zeroizing::new(String::new());
+        while hex.len() < 6 {
+            match it.peek() {
+                Some(h) if h.is_ascii_hexdigit() => {
+                    hex.push(*h);
+                    it.next();
+                }
+                _ => break,
+            }
+        }
+        if hex.is_empty() {
+            match it.next() {
+                Some('\n') | None => {}
+                Some(o) => out.push(o),
+            }
+            continue;
+        }
+        let cp = u32::from_str_radix(&hex, 16).unwrap_or(0);
+        out.push(char::from_u32(cp).filter(|_| cp != 0).unwrap_or('\u{FFFD}'));
+        match it.peek() {
+            Some('\r') => {
+                it.next();
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+            }
+            Some(' ' | '\t' | '\n' | '\u{c}') => {
+                it.next();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A selector holding a typed value, also once CSS escapes are undone, is removed.
 fn selector_is_clean(selector: &str, ctx: Ctx<'_>) -> bool {
-    let unescaped: String = selector.chars().filter(|c| *c != '\\').collect();
-    !ctx.holds_typed(selector) && !ctx.holds_typed(&unescaped)
+    !ctx.holds_typed(selector) && !ctx.holds_typed(&css_unescape(selector))
 }
 
 const INPUT_TYPES: [&str; 22] = [
@@ -256,4 +302,68 @@ pub(super) fn reduce_request(b: &Buffered, ctx: Ctx<'_>) -> Option<(StoredReques
         response: b.response.as_ref().map(|r| response_shape(r, ctx)),
     };
     Some((stored, tally, reduced_body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::pw;
+
+    fn un(s: &str) -> String {
+        css_unescape(s).to_string()
+    }
+
+    #[test]
+    fn a_hex_escape_is_its_code_point() {
+        assert_eq!(un(r"#\39 x"), "#9x");
+        assert_eq!(un(r"#\000039x"), "#9x");
+    }
+
+    #[test]
+    fn any_other_escaped_char_is_itself() {
+        assert_eq!(un(r"#a\.b"), "#a.b");
+        assert_eq!(un(r"#a\\b"), r"#a\b");
+    }
+
+    #[test]
+    fn zero_a_surrogate_or_past_the_last_code_point_is_the_replacement_char() {
+        assert_eq!(un(r"#\0 x"), "#\u{FFFD}x");
+        assert_eq!(un(r"#\D800 x"), "#\u{FFFD}x");
+        assert_eq!(un(r"#\110000 x"), "#\u{FFFD}x");
+    }
+
+    #[test]
+    fn a_trailing_backslash_is_dropped() {
+        assert_eq!(un(r"#a\"), "#a");
+    }
+
+    #[test]
+    fn a_selector_with_a_hex_escaped_typed_value_is_left_out() {
+        let m = [pw("9xTr0ub4dor")];
+        let ctx = Ctx {
+            markers: &m,
+            pair: None,
+        };
+        assert!(!selector_is_clean(r"#\39 xTr0ub4dor", ctx));
+    }
+
+    #[test]
+    fn a_selector_with_an_escaped_backslash_in_a_typed_value_is_left_out() {
+        let m = [pw(r"Tr0ub\4dor")];
+        let ctx = Ctx {
+            markers: &m,
+            pair: None,
+        };
+        assert!(!selector_is_clean(r"#Tr0ub\\4dor", ctx));
+    }
+
+    #[test]
+    fn a_selector_with_no_typed_value_is_kept() {
+        let m = [pw("9xTr0ub4dor")];
+        let ctx = Ctx {
+            markers: &m,
+            pair: None,
+        };
+        assert!(selector_is_clean(r"#login\.form > input:nth-child(2)", ctx));
+    }
 }

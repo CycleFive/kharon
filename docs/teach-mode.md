@@ -137,7 +137,7 @@ Flags, each printed as "Flag:" with a sentence:
 |---|---|
 | `captcha` | A captcha was on the page. The program knows five captcha hosts, plus Google's. |
 | `otp_step` | There was a field for a one-time code after the password. |
-| `cross_site` | The browser moved to another web site before the password was sent, as single sign-on does. Only a move to another web site (an `http` or `https` page of another registrable domain) counts; a browser error page does not. A move after the password was sent is not a flag. A login that lands on another site afterwards is still read normally, and the summary adds the note "After the login the browser went on to another site." |
+| `cross_site` | The browser moved to another web site before the password was last sent, as single sign-on does. Only a move to another web site (an `http` or `https` page of another registrable domain) counts; a browser error page does not. A move after the last request that carried the password is not a flag. A login that lands on another site afterwards is still read normally, and the summary adds the note "After the login the browser went on to another site." |
 | `popup` | The login opened another window. |
 | `framed_login` | A login field was inside a frame from another web address. |
 | `shadow_dom` | A login field was inside a shadow root, a part of the page that hides its fields from ordinary lookups. |

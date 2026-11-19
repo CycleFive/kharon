@@ -316,7 +316,7 @@ pub fn strip_url(
             let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
             format!(
                 "{scheme}://{}{port}",
-                strip_host(host, markers, &host_ranges)
+                strip_host(host, markers, pair, &host_ranges)
             )
         }
         None => format!("{scheme}:"),
@@ -354,8 +354,15 @@ pub fn strip_url(
 /// (ASCII case-insensitively: the parser lowercases hosts) and every label an occurrence touches
 /// is replaced; `extra` holds matches found over the whole URL, in host coordinates. Adjacent
 /// replaced labels become ONE `{typed}` label, so a value that spans labels (`kh.throwaway7`)
-/// leaves no part of itself behind.
-fn strip_host(host: &str, markers: &[Marker], extra: &[Range<usize>]) -> String {
+/// leaves no part of itself behind. A label that holds a typed value in an encoded form (hex,
+/// say; base64 cannot survive the lowercasing), or the combined credential, is replaced too, by
+/// `kept_hit`, the same as a path segment.
+fn strip_host(
+    host: &str,
+    markers: &[Marker],
+    pair: Option<(&Marker, &Marker)>,
+    extra: &[Range<usize>],
+) -> String {
     let mut ranges = occurrences(host, markers);
     ranges.extend_from_slice(extra);
     let mut spans = Vec::new();
@@ -364,7 +371,10 @@ fn strip_host(host: &str, markers: &[Marker], extra: &[Range<usize>]) -> String 
         spans.push(offset..offset + label.len());
         offset += label.len() + 1;
     }
-    let typed = touched(&ranges, &spans);
+    let mut typed = touched(&ranges, &spans);
+    for (t, label) in typed.iter_mut().zip(host.split('.')) {
+        *t |= kept_hit(label.as_bytes(), markers, pair);
+    }
     let mut labels: Vec<&str> = Vec::new();
     let mut previous_typed = false;
     for (label, is_typed) in host.split('.').zip(typed) {
@@ -746,6 +756,14 @@ mod tests {
         assert_eq!(s.value.query_keys, ["{typed}", "ok"]);
         let s = strip_url("https://ex.test/x?kh%2Ethrowaway7=1", &m, None).unwrap();
         assert_eq!(s.value.query_keys, ["{typed}"]);
+    }
+
+    #[test]
+    fn a_host_label_that_is_an_encoded_typed_value_is_replaced() {
+        let m = [user("kh.throwaway7")];
+        let label = hex::encode("kh.throwaway7");
+        let s = strip_url(&format!("https://{label}.ex.test/login"), &m, None).unwrap();
+        assert_eq!(s.value.origin, "https://{typed}.ex.test");
     }
 
     #[test]

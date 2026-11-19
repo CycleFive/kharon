@@ -1037,6 +1037,54 @@ async fn req_api_013_submit_false_does_not_scrub() {
     assert!(audit_values(&e).iter().all(|v| v["event"] != "fill_scrub"));
 }
 
+/// The engine itself refuses the scrub when `submit` is false, even if
+/// the plan's flag is set. The broker already clears the flag; this
+/// pins the engine so a later caller cannot wait and resend the values.
+#[tokio::test]
+async fn req_api_013_engine_ignores_scrub_without_submit() {
+    let (url, received) = cdp_stub_for_scrub(usize::MAX, false, None).await;
+    let endpoint = CdpEndpoint::validate(&url, Tunnel::Direct, None).unwrap();
+    let browser = Browser::new(CdpClient::connect(&endpoint).await.unwrap());
+    let ctx = browser.create_agent_context("alpha").await.unwrap();
+    let plan = FillPlan {
+        target_id: "t1".into(),
+        fields: vec![FieldFill {
+            kind: FieldKind::Password,
+            selector: None,
+            value: Zeroizing::new(CANARY_PASSWORD.into()),
+        }],
+        item_matchers: vec![OriginMatcher::new(URL, Some(0)).unwrap()],
+        origin_cfg: OriginConfig::default(),
+        cross_origin_iframe_hosts: Vec::new(),
+        submit: false,
+        expected_origin: Some("https://example.com".into()),
+        live_origin: LiveOrigin::new(),
+        deadline: None,
+        values_sent: ValuesSent::new(),
+        post_submit_scrub: true,
+        post_submit_scrub_delay: std::time::Duration::from_secs(30),
+        scrub: ScrubNote::new(),
+    };
+    let started = std::time::Instant::now();
+    let out = FillEngine::new(browser).fill(&plan, &ctx, false).await;
+    assert_eq!(out.status(), "filled", "{out:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a non-submit plan does not wait the scrub delay"
+    );
+    let calls: Vec<Value> = received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m["method"] == "Runtime.callFunctionOn")
+        .cloned()
+        .collect();
+    assert_eq!(calls.len(), 1, "no second call carrying the value");
+    assert_eq!(calls[0]["params"]["arguments"][3]["value"], json!(false));
+    assert_eq!(calls[0]["params"]["arguments"][5]["value"], json!(false));
+    assert!(plan.scrub.get().is_none());
+}
+
 #[tokio::test]
 async fn req_api_013_a_navigation_is_not_cleared() {
     let delay = std::time::Duration::from_millis(40);

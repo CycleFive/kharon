@@ -557,8 +557,10 @@ impl FillEngine {
             Err(e) => return FillOutcome::Error(e.to_string()),
         };
 
-        let scrub = plan
-            .post_submit_scrub
+        // `submit` is checked here, not only by the broker: a plan that
+        // sets the scrub flag on a non-submit fill must not wait or
+        // send the values again (#355 review).
+        let scrub = (plan.submit && plan.post_submit_scrub)
             .then_some((&plan.scrub, plan.post_submit_scrub_delay));
         let outcome = self
             .fill_attached(

@@ -1071,6 +1071,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "kharon-recording"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "kharon-teach"
+version = "0.0.0"
+dependencies = [
+ "base64ct",
+ "clap",
+ "futures-util",
+ "hex",
+ "idna",
+ "kharon-recording",
+ "md-5",
+ "memchr",
+ "percent-encoding",
+ "publicsuffix",
+ "rand",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "kharond"
 version = "0.0.0"
 dependencies = [
@@ -1165,6 +1202,16 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
 
 [[package]]
 name = "memchr"

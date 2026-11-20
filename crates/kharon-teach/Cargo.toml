@@ -1,0 +1,45 @@
+[package]
+name = "kharon-teach"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Teach-mode recorder for kharon (#361)"
+
+[lib]
+name = "kharon_teach"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kharon-teach"
+path = "src/main.rs"
+
+[dependencies]
+kharon-recording = { version = "0.0.0", path = "../kharon-recording" }
+zeroize = { version = "1", features = ["serde"] }
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+base64ct = { version = "1", features = ["alloc"] }
+hex = "0.4"
+percent-encoding = "2"
+memchr = "2"
+url = "2"
+idna = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+rand = "0.8"
+tokio = { version = "1", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "io-std", "io-util"] }
+publicsuffix = "2.3"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+time = { version = "0.3", features = ["formatting"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "process"] }

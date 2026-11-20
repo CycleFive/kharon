@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work in the worktree `~/projects/kharon-361-teach`, on a branch named `duet/361-teach-recorder` cut from `duet/361-teach-recorder-design` (the branch that holds the spec and this plan, PR #362). The implementation PR is opened with that branch as its base; when #362 merges, its base moves to `master` and master is merged in. No rebase, no force-push. Set `CARGO_TARGET_DIR=$PWD/target` in every cargo command; the machine's default target dir is shared between checkouts.
+- Work in the worktree `~/projects/kharon-361-teach`, on branch `duet/361-teach-recorder`, cut from `master` at `947a457` (the merge of #362, which holds the spec and this plan). No rebase, no force-push. Set `CARGO_TARGET_DIR=$PWD/target` in every cargo command; the machine's default target dir is shared between checkouts.
 - Every commit message ends with these two lines and no other `Co-Authored-By` line:
   ```
   Claude-Session: https://claude.ai/code/session_017zqkEAhTEMgVMZCGQw2mT8
@@ -27,6 +27,8 @@
 - The binary listens on no socket and opens no connection except loopback CDP to the browser it launched.
 - Real-browser tests follow the existing convention: find the binary with the same path list as `chromium_bin` in `crates/kharond/tests/req_arch_003_org_chromium.rs`, honor `KHARON_CHROMIUM`, skip when none is found unless `KHARON_REQUIRE_CHROMIUM` is set, in which case panic.
 - Test files that prove a SPEC row are named for it: `req_tch_00N_<what>.rs`.
+- A source scan in a test covers shipped code only: for each file under `crates/kharon-teach/src`, the text before its first `#[cfg(test)]`. Unit-test modules sit at the bottom of their file, so a test server or a test URL there does not trip a scan.
+- `cargo-deny` is not installed on the dev machine. Where a task says to run `cargo deny check`, CI runs it on the PR.
 - Linux only is built and tested. Platform-specific code sits behind `cfg`.
 
 ## Review Focus
@@ -136,11 +138,13 @@ pub enum Step {
     EnterKey { t_ms: u64, frame: FrameRef, element: ElementDescriptor },
 }
 pub enum EndedBy { Confirmed, WindowClosed }
+pub enum ListenerWorld { Isolated, Main }
 pub struct Viewport { pub width: u32, pub height: u32 }
 pub struct BrowserInfo { pub product: String, pub user_agent: String, pub viewport: Viewport }
 pub struct StrippedCounts { pub requests_seen: u64, pub requests_stored: u64, pub request_bodies_reduced: u64,
     pub query_values_removed: u64, pub path_segments_replaced: u64, pub typed_values_removed: u64 }
 pub struct Recording { pub format_version: u32, pub tool_version: String, pub browser: BrowserInfo,
+    pub listener_world: ListenerWorld,
     pub started_at: String, pub ended_at: String, pub ended_by: EndedBy, pub success_confirmed: bool,
     pub start_url: StrippedUrl, pub final_url: Option<StrippedUrl>, pub steps: Vec<Step>,
     pub requests: Vec<StoredRequest>, pub flags: Flags, pub classification: Classification,
@@ -216,7 +220,7 @@ fn hits_walks_url_authorization_and_nested_json() {
 pub struct Flags { pub captcha: bool, pub otp_step: bool, pub cross_site: bool, pub popup: bool,
     pub framed_login: bool, pub shadow_dom: bool, pub multiple_passwords: bool, pub body_unavailable: bool }
 #[serde(rename_all = "snake_case")] pub enum PasswordLeg { FormPost, ScriptPost, Transformed }
-#[serde(tag = "shape", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")] // on the wire: "shape": {"kind": "two_step", "password_leg": "form_post"}
 pub enum Shape { FormPost, ScriptPost, TwoStep { password_leg: PasswordLeg },
     Transformed { digest: Option<String> }, Unrecognized }
 #[serde(rename_all = "snake_case")] pub enum RungCeiling { Milliseconds, AgentContinues, NeedsPerson }
@@ -288,6 +292,9 @@ impl Marker {
 }
 /// Every way `marker` occurs in `haystack`. Digests are searched only for Role::Password.
 pub fn search(haystack: &[u8], marker: &Marker) -> Vec<MarkerHit>;
+/// The base64 and base64url (padded or not) of `username:password`. A match returns two hits,
+/// one per role, both `Encoding::Base64` (or `Base64Url`).
+pub fn search_pair(haystack: &[u8], username: &Marker, password: &Marker) -> Vec<MarkerHit>;
 pub const LOW_CONFIDENCE_BELOW: u32 = 6;
 ```
 
@@ -315,6 +322,10 @@ fn encodings(h: &[u8], m: &Marker) -> Vec<Encoding> { search(h, m).into_iter().m
 #[test] fn non_ascii_percent_encoded() { /* "pässwörd✓12" as UTF-8 percent-encoded -> [Percent] */ }
 #[test] fn non_ascii_json_escaped_both_forms() { /* raw UTF-8 inside quotes -> [AsTyped]; ä-style escapes -> [JsonEscaped] */ }
 #[test] fn two_hundred_characters() { /* a 200-char value is found as typed */ }
+#[test] fn pair_is_found_where_neither_value_alone_is() {
+    // haystack: {"auth":"<base64("kh.throwaway7:Tr0ub4dor-9x")>"}; search() finds nothing for either marker;
+    // search_pair() returns [Username Base64, Password Base64]
+}
 ```
 
 Also add this doc test on `Marker`, which is the compile-time guard:
@@ -347,19 +358,23 @@ Also add this doc test on `Marker`, which is the compile-time guard:
 // strip.rs
 pub struct Stripped<T> { pub value: T, pub query_values_removed: u64, pub path_segments_replaced: u64 }
 /// Origin, path and query keys of `url`. A path segment becomes "{id}" when it is all ASCII digits,
-/// a UUID, 16 or more hex characters, or contains any marker (as typed or percent-encoded).
-pub fn strip_url(url: &str, markers: &[Marker]) -> Option<Stripped<StrippedUrl>>; // None when `url` does not parse
+/// a UUID, 16 or more hex characters, or is touched by a marker match anywhere in the path (any encoding `search`
+/// knows, any letter case, with or without `pair`). A query key or host label a marker touches is written `{typed}`.
+/// A URL that cannot be a base (`data:`, `blob:`, `about:`) keeps its scheme only.
+pub fn strip_url(url: &str, markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> Option<Stripped<StrippedUrl>>; // None when `url` does not parse
 /// scheme = first token, lowercased. For `basic`, the credentials are base64-decoded and the decoded bytes
 /// are searched; a marker found there is reported with `Encoding::Base64`. Other schemes are searched as sent.
-pub fn reduce_authorization(header_value: &[u8], markers: &[Marker]) -> AuthShape;
+/// When `pair` is given the value is also searched with `search_pair`. No (role, encoding) is listed twice.
+pub fn reduce_authorization(header_value: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> AuthShape;
 // body.rs
 pub const MAX_BODY_BYTES: usize = 1 << 20;
 /// `content_type` picks the reader: application/x-www-form-urlencoded, application/json (and any +json),
 /// multipart/form-data; anything else, or a body that fails to parse as its declared type, is Opaque.
-pub fn shape_of_body(content_type: Option<&str>, body: &[u8], markers: &[Marker]) -> BodyShape;
+/// `pair` is (username, password) once both are known; see below.
+pub fn shape_of_body(content_type: Option<&str>, body: &[u8], markers: &[Marker], pair: Option<(&Marker, &Marker)>) -> BodyShape;
 ```
 
-A multipart part with a `filename` is `ValueKind::File` with its length and no marker search. Every other value is searched with every marker. `shape_of_body` never returns `None` or `Unavailable`; the caller (Task 5) chooses those.
+A multipart part with a `filename` is `ValueKind::File` with its length and no marker search. Every other value is searched with every marker and, when `pair` is given, with `search_pair`, so a combined credential is recorded on the value that holds it (an `Opaque` body holds it at whole-body level). A place never lists the same role and encoding twice. `shape_of_body` never returns `None` or `Unavailable`; the caller (Task 5) chooses those.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -388,11 +403,13 @@ A multipart part with a `filename` is `ValueKind::File` with its length and no m
 #[test] fn multipart_text_and_file() { /* a text part "password" with a hit, a file part kind File with no hits */ }
 #[test] fn unknown_type_is_opaque_with_whole_body_hit() { /* content type application/octet-stream holding the password bytes -> Opaque { len, markers: [AsTyped] } */ }
 #[test] fn bad_json_falls_back_to_opaque() {}
+#[test] fn a_combined_credential_lands_on_the_value_that_holds_it() { /* {"auth":"<base64("kh.throwaway7:Tr0ub4dor-9x")>","n":1} with pair -> the auth value has [Username Base64, Password Base64]; without pair -> no hits */ }
+#[test] fn basic_auth_with_the_pair_lists_each_hit_once() { /* reduce_authorization on a Basic header with pair given -> still exactly [Username Base64, Password Base64] */ }
 #[test] fn serialized_shapes_never_contain_a_marker() { /* for each case above: serde_json::to_string(&shape) contains neither "Tr0ub4dor-9x" nor "kh.throwaway7" */ }
 ```
 
-- [ ] **Step 2: Run** `cargo test -p kharon-teach strip body`. Expected: FAIL.
-- [ ] **Step 3: Implement.** Add `url = "2"`, `serde_json`. The JSON body is the one place a site payload is read as `serde_json::Value`; say so in a comment. Urlencoded keys and JSON keys are kept as they are; values never are.
+- [ ] **Step 2: Run** `cargo test -p kharon-teach -- strip body` (cargo takes one filter before `--`; several go after it). Expected: FAIL.
+- [ ] **Step 3: Implement.** Add `url = "2"`, `serde_json`. The JSON body is the one place a site payload is read as `serde_json::Value`; say so in a comment. Urlencoded keys, JSON keys and multipart part names are kept unless a typed value is found in one, in which case it is written `{typed}`; values never are. An `Authorization` scheme is kept only when it is a known scheme name. `kharon_teach::testing` (doc-hidden) holds the needle list and the "holds no typed value" assertion that this task's tests, Task 5's and Task 8's all use.
 - [ ] **Step 4: Run** tests, clippy, fmt. Expected: pass.
 - [ ] **Step 5: Commit** `feat(teach): strip URLs and reduce request bodies to shapes (#361)`
 
@@ -423,7 +440,7 @@ pub struct RawFrame { pub main: bool, pub url: String }
 pub enum PageEventKind { Input, Change, Click, Submit, EnterKey }
 pub enum RawBody { None, Unavailable, Bytes(zeroize::Zeroizing<Vec<u8>>) }
 pub enum CaptureEvent {
-    Started { browser: BrowserInfo },                       // the main frame left the notice page
+    Started { browser: BrowserInfo, listener_world: ListenerWorld }, // the main frame left the notice page
     Navigation { t_ms: u64, frame: RawFrame },              // main and child frames alike
     Page { t_ms: u64, kind: PageEventKind, frame: RawFrame, element: RawElement,
            value: Option<zeroize::Zeroizing<String>> },      // value only for Input and Change
@@ -446,6 +463,7 @@ impl Capture {
 
 Decisions `finish` implements, beyond the spec's text:
 
+- Username candidates are tried against the raw buffered bytes first. Once the username is resolved, every buffered request is reduced with the pair: `search_pair` over the URL bytes goes into `url_markers`, and `reduce_authorization` and `shape_of_body` are called with `pair = Some((username, password))`, so a combined credential is recorded where it sits.
 - Elements are keyed by `(document_id, element_id)`. One `Marker` per element holds its latest value. An element is a password element if any of its reports had `is_password_now`.
 - Password markers: the latest values of password elements, with equal values merged. More than one distinct value sets `multiple_passwords`.
 - Username: among non-password elements with a non-empty value, prefer one in the same form as a password element; else one whose value is found in a request that also carries the password; else one whose value is found in any request; else the last one typed in before the first password input. Other typed values are dropped.
@@ -471,18 +489,19 @@ Decisions `finish` implements, beyond the spec's text:
 #[test] fn captcha_frame_sets_the_flag()
 #[test] fn otp_input_after_the_password_sets_the_flag()
 #[test] fn oversized_body_is_unavailable_and_flagged() // a MAX_BODY_BYTES + 1 body on a POST to the login site
+#[test] fn a_combined_base64_credential_in_a_json_body_is_a_plain_hit() // classifies as ScriptPost, not Transformed
 #[test] fn only_the_three_kinds_of_request_are_stored() // a GET image and a third-party POST are counted, not stored
 #[test] fn events_before_started_are_ignored_for_steps()
 #[test] fn the_serialized_recording_holds_no_typed_value() {
     // for every scenario above: recording.to_json() contains neither marker in any encoding
-    // (as typed, percent, base64, hex, sha256 hex). Share the needle list with Task 8's test via a pub(crate) helper.
+    // (as typed, percent, base64, hex, sha256 hex): `kharon_teach::testing::assert_holds_no_typed_value`, from Task 4.
 }
 // site.rs
 #[test] fn registrable_domains() { /* login.ex.co.uk -> ex.co.uk; 127.0.0.1 and localhost unchanged */ }
 ```
 
-- [ ] **Step 2: Run** `cargo test -p kharon-teach capture site`. Expected: FAIL.
-- [ ] **Step 3: Implement.** Load the public suffix list the way `crates/kharond/src/origin.rs` does. Requests are buffered with their bodies in `Zeroizing` buffers and analyzed in `finish`, after the markers are known.
+- [ ] **Step 2: Run** `cargo test -p kharon-teach -- capture site`. Expected: FAIL.
+- [ ] **Step 3: Implement.** Load the public suffix list the way `crates/kharond/src/origin.rs` does: `include_bytes!` of the same vendored snapshot, `crates/kharond/data/public_suffix_list.dat`, by relative path. That is one data file shared, not a crate dependency; do not copy it. Requests are buffered with their bodies in `Zeroizing` buffers and analyzed in `finish`, after the markers are known.
 - [ ] **Step 4: Run** tests, clippy, fmt. Expected: pass.
 - [ ] **Step 5: Commit** `feat(teach): capture state machine from events to a stripped recording (#361)`
 
@@ -600,7 +619,7 @@ impl Cdp {
 #[test] fn headers_are_read_case_insensitively()
 ```
 
-- [ ] **Step 2: Run** `cargo test -p kharon-teach cdp events`. Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p kharon-teach -- cdp events`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Add `tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }`, `futures-util`. One reader task routes replies by `id` to `oneshot` senders and everything else to the event channel. Outgoing frames are typed structs, never `json!`.
 - [ ] **Step 4: Run** tests, clippy, fmt. Expected: pass.
 - [ ] **Step 5: Commit** `feat(teach): a CDP client that subscribes to events (#361)`
@@ -635,13 +654,15 @@ pub struct Ready { pub devtools_port: u16, pub profile_dir: std::path::PathBuf, 
 pub enum SessionError { #[error(transparent)] Browser(#[from] BrowserError), #[error(transparent)] Cdp(#[from] CdpError),
     #[error(transparent)] Io(#[from] std::io::Error) }
 pub enum Outcome { Recorded(Box<Recording>), Discarded, NeverStarted }
+/// RFC 3339 UTC, with the `time` crate as `crates/kharond/src/audit/log.rs` does. Fills `EndInfo`; Task 9 reuses it.
+pub fn utc_rfc3339(t: std::time::SystemTime) -> String;
 /// Sweeps stale profiles, launches, records until `end` fires or the window closes, cleans up.
 /// `ready` fires once the browser is up. Dropping the future (Ctrl-C) still removes the profile.
 pub async fn record(opts: RecordOptions<'_>, ready: tokio::sync::oneshot::Sender<Ready>,
     end: tokio::sync::oneshot::Receiver<End>) -> Result<Outcome, SessionError>;
 ```
 
-Wiring, in order: `Profile::sweep_stale`; `Profile::create`; `Browser::launch` with `first_url = notice_page_url(..)`; `Cdp::connect`; `Target.setAutoAttach { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }` on the browser session and again on each attached page session; for each attached target of type `page` or `iframe`: `Page.enable`, `Network.enable`, `Runtime.addBinding { name: "__kharonTeach", executionContextName: "kharon-teach" }`, `Page.addScriptToEvaluateOnNewDocument { source: LISTENER_JS, worldName: "kharon-teach" }`, then `Runtime.runIfWaitingForDebugger`. If the binding is not visible in the isolated world on the CI browser, install script and binding in the main world instead and record that in the commit message. Other target types are released without attaching streams. A second `page` target after the first sends `CaptureEvent::Popup`. `CaptureEvent::Started` is sent when the main frame first navigates to a URL that is not the notice page; its `BrowserInfo` comes from `Browser.getVersion` (product, user agent) and `Page.getLayoutMetrics` (the CSS viewport). A request with `hasPostData` and no inline body is completed with `Network.getRequestPostData`; an error there is `RawBody::Unavailable`. The window counts as closed when the last `page` target is destroyed or the browser process exits; that ends as `EndedBy::WindowClosed` with `success_confirmed: false`, or `Outcome::NeverStarted` if `Started` never fired.
+Wiring, in order: `Profile::sweep_stale`; `Profile::create`; `Browser::launch` with `first_url = notice_page_url(..)`; `Cdp::connect`; `Target.setAutoAttach { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }` on the browser session and again on each attached page session; for each attached target of type `page` or `iframe`: `Page.enable`, `Network.enable`, `Runtime.addBinding { name: "__kharonTeach", executionContextName: "kharon-teach" }`, `Page.addScriptToEvaluateOnNewDocument { source: LISTENER_JS, worldName: "kharon-teach" }`, then `Runtime.runIfWaitingForDebugger`. If the binding is not visible in the isolated world, install script and binding in the main world instead. Which world was used goes into `CaptureEvent::Started` as `listener_world`, and so into the file; say in the commit message which one the CI browser needed. Other target types are released without attaching streams. A second `page` target after the first sends `CaptureEvent::Popup`. `CaptureEvent::Started` is sent when the main frame first navigates to a URL that is not the notice page; its `BrowserInfo` comes from `Browser.getVersion` (product, user agent) and `Page.getLayoutMetrics` (the CSS viewport). A request with `hasPostData` and no inline body is completed with `Network.getRequestPostData`; an error there is `RawBody::Unavailable`. The window counts as closed when the last `page` target is destroyed or the browser process exits; that ends as `EndedBy::WindowClosed` with `success_confirmed: false`, or `Outcome::NeverStarted` if `Started` never fired.
 
 `listener.js` reports, in the capture phase on `document`: `input` and `change` on `input`, `textarea`, `select`; `click` on `button`, `a`, `input[type=submit]`, `input[type=button]`, `[role=button]`; `submit` on forms; `keydown` with `key === "Enter"` on an `input`. It numbers elements with a `WeakMap` counter, gives each document a random `document_id`, uses `event.composedPath()[0]` to see into open shadow roots, and builds `selectors` (how is the builder's call; the first entry must match the element with `document.querySelector` at the time of the event when the element is not in a shadow root). It sends `value` only for `input` and `change`. It keeps no state other than the counter.
 
@@ -667,7 +688,7 @@ Wiring, in order: `Profile::sweep_stale`; `Profile::create`; `Browser::launch` w
 // req_tch_002_no_typed_value.rs
 #[tokio::test] async fn no_typed_value_in_the_recording_for_any_fixture() {
     // username "kh.throwaway7", password "Tr0ub4dor-9x": recording.to_json() contains neither, in none of the
-    // encodings marker::search knows (reuse the needle helper from Task 5).
+    // encodings marker::search knows (`kharon_teach::testing::assert_holds_no_typed_value`).
 }
 
 // req_tch_006_profile_and_visible.rs
@@ -767,8 +788,8 @@ Exit codes: `0` a file was written, or the recording was discarded; `2` a refusa
 ```
 
 - [ ] **Step 2: Run** `cargo test -p kharon-teach`. Expected: the new tests FAIL.
-- [ ] **Step 3: Implement.** Add `clap` (derive) and, Linux only, `rustix` with the `process` feature. For the UTC timestamp use whatever `crates/kharond/src/audit/log.rs` uses for its `ts` field; do not add a second date crate.
-- [ ] **Step 4: Run** `KHARON_REQUIRE_CHROMIUM=1 cargo test -p kharon-teach`, clippy, fmt, `cargo deny check`. Then one manual run on this machine: `cargo run -p kharon-teach -- https://login.page.twkr.io/login.html`, log in with made-up values, press Enter, and read the file. Paste the printed summary into the commit body.
+- [ ] **Step 3: Implement.** Add `clap` (derive) and, Linux only, `rustix` with the `process` feature. For the file name's UTC timestamp use the `time` crate, already a dependency since Task 8's `utc_rfc3339`; do not add a second date crate.
+- [ ] **Step 4: Run** `KHARON_REQUIRE_CHROMIUM=1 cargo test -p kharon-teach`, clippy, fmt, `cargo deny check`. The manual run (`cargo run -p kharon-teach -- https://login.page.twkr.io/login.html`, log in with made-up values, press Enter, read the file) needs a person at a display. The implementer does not do it; the controller arranges it with Lothrop after this task and puts the printed summary in the PR body.
 - [ ] **Step 5: Commit** `feat(teach): kharon-teach command line, consent and the recording file (#361)`
 
 ---

@@ -25,6 +25,7 @@ Vaultwarden fill broker: lets AI agents fill credentials without ever seeing the
 - [`docs/broker-lifecycle.md`](docs/broker-lifecycle.md): host install of kharond, backup and restore of `/data`, upgrades, and the secrets inventory.
 - [`docs/vault-onboarding.md`](docs/vault-onboarding.md): the customer's Bitwarden organization, collection, dedicated account, and API key.
 - [`docs/agent-runtime-setup.md`](docs/agent-runtime-setup.md): the agent side on a hosted or root runtime, and handing over credentials.
+- [`docs/teach-mode.md`](docs/teach-mode.md): `kharon-teach`, a program that records how a login works while a person logs in by hand with a throwaway account, and writes a file with no typed value in it (#361).
 - [`docs/hermes-end-to-end.md`](docs/hermes-end-to-end.md): Hermes after the connector is installed: the MCP client, what the agent and the owner do in a fill, and what each failure looks like. A record of one live run.
 - [`docs/acceptance-checks.md`](docs/acceptance-checks.md): checks a new managed deploy must pass before it carries anyone but a pilot (edge, one real fill, REQ-GOAL-002 canaries).
 - [`deploy/compose/README.md`](deploy/compose/README.md): running kharond with Docker Compose.

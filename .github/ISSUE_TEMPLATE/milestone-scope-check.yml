@@ -1,28 +1,28 @@
 name: Milestone Scope Check
-description: Midpoint chore — compare open work in `next` to the cycle's exit criteria; cut or defer drift.
-title: "[scope] <version>: Scope check"
+description: Midpoint chore. Compare the open work to the exit criteria, and cut or defer anything that has drifted.
+title: "[scope] <milestone>: Scope check"
 labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        Midpoint chore. A chore cycle is one release train: the work in the rolling [`next`](https://github.com/CycleFive/kharon/milestone/12) milestone up to one version cut. See `docs/milestone-chores.md`.
-        After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
-        Labels are trusted only when applied by a collaborator with triage or higher.
-        Ping Lothrop in #needs-lothrop only when a decision is required (scope change, slip, or something the chore cannot cut or defer alone).
+        Midpoint chore, done around halfway to the milestone's due date. See `docs/milestone-chores.md`.
+        Put this issue in the milestone it checks. After opening it, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        A label counts only when a collaborator with triage access or higher applied it.
+        Ping Lothrop in #needs-lothrop only when a decision is required: a scope change, a slip, or something this chore can't cut or defer on its own.
   - type: input
     id: milestone
     attributes:
-      label: Version
-      description: The version this cycle will cut from `next`.
-      placeholder: v0.7.0
+      label: Milestone
+      description: The title of the milestone this chore belongs to.
+      placeholder: M6 — teach mode
     validations:
       required: true
   - type: dropdown
     id: agent
     attributes:
       label: Assigned agent
-      description: Must match the `assigned:<agent>` label you apply after opening.
+      description: This must match the `assigned:<agent>` label you apply after opening the issue.
       options:
         - nyx
         - muse
@@ -34,20 +34,20 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: List open issues in `next` against the exit criteria recorded in this cycle's Groom issue.
-        - label: Identify drift (out of scope, unneeded, or unbounded).
-        - label: Cut or defer drift (close it, or leave it in `next` explicitly marked for a later cycle).
-        - label: "Flag Lothrop in #needs-lothrop only if a decision is needed; otherwise finish the chore without a ping."
-        - label: Record midpoint status (on track / at risk / slipping) and what changed.
+        - label: Check the milestone's open issues against its exit criteria.
+        - label: Identify drift, meaning work that's out of scope, unneeded, or unbounded.
+        - label: Cut or defer the drift by closing it or moving it back to `next`.
+        - label: "Flag Lothrop in #needs-lothrop only if a decision is needed. Otherwise finish the chore without a ping."
+        - label: Record the midpoint status (on track, at risk, or slipping) and what changed, and adjust the due date only with a stated reason.
   - type: textarea
     id: status
     attributes:
       label: Midpoint status
-      description: "On track / at risk / slipping. What still maps to exit criteria, what was cut or deferred, and any decision needed."
+      description: "On track, at risk, or slipping. What still maps to the exit criteria, what was cut or deferred, and any decision needed."
     validations:
       required: true
   - type: textarea
     id: notes
     attributes:
       label: Notes
-      description: Links to issues deferred or closed, and any decision request for Lothrop.
+      description: Links to issues that were deferred or closed, and any decision request for Lothrop.

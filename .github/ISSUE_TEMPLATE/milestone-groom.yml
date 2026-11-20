@@ -1,5 +1,5 @@
 name: Milestone Groom
-description: Start-of-milestone chore. Create the milestone, set its goal, exit criteria, and due date, and groom its issues.
+description: Start-of-milestone chore. Set the milestone's goal, exit criteria, and due date, and groom its issues.
 title: "[groom] <milestone>: Groom"
 labels: []
 body:
@@ -33,7 +33,7 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: Create the milestone with its goal and exit criteria in the description and a due date.
+        - label: Fill in the milestone (the prior Close-out created it with a title only). Put its goal and exit criteria in the description and set a due date.
         - label: Pull issues from `next` (and from the prior milestone's leftovers) into this milestone, or write new ones, covering this scope and only this scope.
         - label: Size each issue, apply type and priority labels, and put the issues in delivery order.
         - label: Make sure this milestone's Scope check and Close-out issues exist and are in it.

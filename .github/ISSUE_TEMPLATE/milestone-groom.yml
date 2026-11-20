@@ -1,0 +1,52 @@
+name: Milestone Groom
+description: Start-of-milestone chore — write, size, label, and order work; set scope and exit criteria.
+title: "[groom] <milestone>: Groom"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start-of-milestone chore. After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        Labels are trusted only when applied by a collaborator with triage or higher.
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone
+      description: Milestone title or number this chore belongs to.
+      placeholder: v1.2
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Assigned agent
+      description: Must match the `assigned:<agent>` label you apply after opening.
+      options:
+        - nyx
+        - muse
+        - duet
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Write issues that cover the intended milestone scope (and only that scope).
+        - label: Size each issue.
+        - label: Apply type/priority labels and put issues in delivery order.
+        - label: Set the milestone description with scope and exit criteria.
+        - label: Move or close leftovers from the prior milestone so they are in or out on purpose.
+        - label: Apply `assigned:<agent>` for this chore (triage+ only). Do not use the label as a substitute for GitHub assignees.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and exit criteria
+      description: Paste or write the milestone scope and the conditions under which it is done.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Sizing questions, deferred items, links to the board or project.

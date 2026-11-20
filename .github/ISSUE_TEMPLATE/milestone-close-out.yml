@@ -35,7 +35,7 @@ body:
       label: Checklist
       options:
         - label: Verify that every exit criterion is met, or record an explicit waiver.
-        - label: List the versions the release train shipped during this milestone. If user-visible work landed and no version was cut, raise it in #kharon (or in #needs-lothrop if it needs Lothrop's call), and don't cut one here.
+        - label: "List the versions the release train shipped during this milestone. If user-visible work landed and no version was cut, raise it in #kharon (or in #needs-lothrop if it needs Lothrop's call), and don't cut one here."
         - label: Move every unfinished issue on purpose, either into the next milestone or back to `next`.
         - label: Write a short retro covering what to keep, drop, or change for the next milestone.
         - label: Create the next milestone with a title only (its Groom sets the goal, exit criteria, and due date). Then open its three chore issues (Groom, Scope check, and Close-out) from the issue forms and put them in it.

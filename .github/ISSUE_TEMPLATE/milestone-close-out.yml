@@ -1,28 +1,28 @@
 name: Milestone Close-out
-description: End-of-cycle chore — verify exit criteria, cut the version from `next`, retro, open the next cycle's chores.
-title: "[close-out] <version>: Close-out"
+description: End-of-milestone chore. Verify the exit criteria, record what shipped, write a retro, and open the next milestone's chores.
+title: "[close-out] <milestone>: Close-out"
 labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        End-of-cycle chore. A chore cycle is one release train: the work in the rolling [`next`](https://github.com/CycleFive/kharon/milestone/12) milestone up to one version cut. See `docs/milestone-chores.md`.
-        After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
-        Labels are trusted only when applied by a collaborator with triage or higher.
-        `next` never closes. Never force-push.
+        End-of-milestone chore. This is the last open issue in the milestone, and closing it closes the milestone. See `docs/milestone-chores.md`.
+        Put this issue in the milestone it closes. After opening it, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        A label counts only when a collaborator with triage access or higher applied it.
+        Releases run on their own train, which cuts a version whenever master is green and something user-visible has landed, so Close-out doesn't cut one. Never force-push.
   - type: input
     id: milestone
     attributes:
-      label: Version
-      description: The version this cycle cuts from `next`.
-      placeholder: v0.7.0
+      label: Milestone
+      description: The title of the milestone being closed.
+      placeholder: M6 — teach mode
     validations:
       required: true
   - type: dropdown
     id: agent
     attributes:
       label: Assigned agent
-      description: Must match the `assigned:<agent>` label you apply after opening.
+      description: This must match the `assigned:<agent>` label you apply after opening the issue.
       options:
         - nyx
         - muse
@@ -34,26 +34,29 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: Verify the train's gate - master is green and something user-visible landed - and every exit criterion is met, or record an explicit waiver.
-        - label: Cut the version from `next` as `cycle-five` (tag and release; no force-push).
-        - label: Create a milestone named for the version, move the closed issues that shipped in it from `next` into it, and close that version milestone. Leave `next` open.
-        - label: Write a short retro (keep / drop / change for the next cycle).
-        - label: Open the next cycle's three chore issues (Groom, Scope check, Close-out) from the issue forms.
-        - label: Assign those chores by `assigned:<agent>` using the rotation (nyx → muse → duet → nyx); assign three different agents, and do not repeat the same agent on the same chore type as this cycle.
-  - type: input
-    id: release
+        - label: Verify that every exit criterion is met, or record an explicit waiver.
+        - label: List the versions the release train shipped during this milestone. If user-visible work landed and no version was cut, raise it and don't cut one here.
+        - label: Move every unfinished issue on purpose, either into the next milestone or back to `next`.
+        - label: Write a short retro covering what to keep, drop, or change for the next milestone.
+        - label: Open the next milestone's three chore issues (Groom, Scope check, and Close-out) from the issue forms, and put them in that milestone.
+        - label: Assign those chores with `assigned:<agent>` labels following the rotation (nyx → muse → duet → nyx). Each chore goes to a different agent, and no chore type repeats this milestone's agent.
+        - label: Close this issue and then the milestone.
+  - type: textarea
+    id: releases
     attributes:
-      label: Release
-      description: Tag, PR, or release URL cut as cycle-five. Leave blank if the gate was not met and nothing was cut.
+      label: Versions shipped
+      description: Tags or release URLs the train cut during this milestone. Write "none" if it cut none.
+    validations:
+      required: true
   - type: textarea
     id: retro
     attributes:
       label: Retro
-      description: Short keep / drop / change. Note the agents chosen for the next cycle's three chores.
+      description: A short note on what to keep, drop, or change. Name the agents chosen for the next milestone's three chores.
     validations:
       required: true
   - type: textarea
     id: notes
     attributes:
       label: Notes
-      description: Waivers, leftover issues still in `next`, links to the version milestone and the next cycle's chore issues.
+      description: Waivers, issues that were moved and where they went, and links to the next milestone and its chore issues.

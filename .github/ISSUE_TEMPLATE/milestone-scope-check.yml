@@ -1,0 +1,52 @@
+name: Milestone Scope Check
+description: Midpoint chore — compare open work to exit criteria; cut or defer drift.
+title: "[scope] <milestone>: Scope check"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Midpoint chore. After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        Labels are trusted only when applied by a collaborator with triage or higher.
+        Ping Lothrop only when a decision is required (scope change, slip, or something the chore cannot cut or defer alone).
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone
+      description: Milestone title or number this chore belongs to.
+      placeholder: v1.2
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Assigned agent
+      description: Must match the `assigned:<agent>` label you apply after opening.
+      options:
+        - nyx
+        - muse
+        - duet
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: List open milestone issues against the recorded exit criteria.
+        - label: Identify drift (out of scope, unneeded, or unbounded).
+        - label: Cut or defer drift (drop from the milestone, close, or move to a later milestone).
+        - label: Flag Lothrop only if a decision is needed; otherwise finish the chore without a ping.
+        - label: Record midpoint status (on track / at risk / slipping) and what changed.
+  - type: textarea
+    id: status
+    attributes:
+      label: Midpoint status
+      description: "On track / at risk / slipping. What still maps to exit criteria, what was cut or deferred, and any decision needed."
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Links to issues moved or closed, and any decision request for Lothrop.

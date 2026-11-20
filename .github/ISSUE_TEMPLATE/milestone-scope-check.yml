@@ -1,20 +1,21 @@
 name: Milestone Scope Check
-description: Midpoint chore — compare open work to exit criteria; cut or defer drift.
-title: "[scope] <milestone>: Scope check"
+description: Midpoint chore — compare open work in `next` to the cycle's exit criteria; cut or defer drift.
+title: "[scope] <version>: Scope check"
 labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        Midpoint chore. After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        Midpoint chore. A chore cycle is one release train: the work in the rolling [`next`](https://github.com/CycleFive/kharon/milestone/12) milestone up to one version cut. See `docs/milestone-chores.md`.
+        After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
         Labels are trusted only when applied by a collaborator with triage or higher.
-        Ping Lothrop only when a decision is required (scope change, slip, or something the chore cannot cut or defer alone).
+        Ping Lothrop in #needs-lothrop only when a decision is required (scope change, slip, or something the chore cannot cut or defer alone).
   - type: input
     id: milestone
     attributes:
-      label: Milestone
-      description: Milestone title or number this chore belongs to.
-      placeholder: v1.2
+      label: Version
+      description: The version this cycle will cut from `next`.
+      placeholder: v0.7.0
     validations:
       required: true
   - type: dropdown
@@ -33,10 +34,10 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: List open milestone issues against the recorded exit criteria.
+        - label: List open issues in `next` against the exit criteria recorded in this cycle's Groom issue.
         - label: Identify drift (out of scope, unneeded, or unbounded).
-        - label: Cut or defer drift (drop from the milestone, close, or move to a later milestone).
-        - label: Flag Lothrop only if a decision is needed; otherwise finish the chore without a ping.
+        - label: Cut or defer drift (close it, or leave it in `next` explicitly marked for a later cycle).
+        - label: "Flag Lothrop in #needs-lothrop only if a decision is needed; otherwise finish the chore without a ping."
         - label: Record midpoint status (on track / at risk / slipping) and what changed.
   - type: textarea
     id: status
@@ -49,4 +50,4 @@ body:
     id: notes
     attributes:
       label: Notes
-      description: Links to issues moved or closed, and any decision request for Lothrop.
+      description: Links to issues deferred or closed, and any decision request for Lothrop.

@@ -1,20 +1,21 @@
 name: Milestone Close-out
-description: End-of-milestone chore — verify exit criteria, cut the release, retro, open the next milestone and its chores.
-title: "[close-out] <milestone>: Close-out"
+description: End-of-cycle chore — verify exit criteria, cut the version from `next`, retro, open the next cycle's chores.
+title: "[close-out] <version>: Close-out"
 labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        End-of-milestone chore. After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        End-of-cycle chore. A chore cycle is one release train: the work in the rolling [`next`](https://github.com/CycleFive/kharon/milestone/12) milestone up to one version cut. See `docs/milestone-chores.md`.
+        After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
         Labels are trusted only when applied by a collaborator with triage or higher.
-        Releases are cut as `cycle-five` per the release trains. Never force-push.
+        `next` never closes. Never force-push.
   - type: input
     id: milestone
     attributes:
-      label: Milestone
-      description: Milestone title or number being closed.
-      placeholder: v1.2
+      label: Version
+      description: The version this cycle cuts from `next`.
+      placeholder: v0.7.0
     validations:
       required: true
   - type: dropdown
@@ -33,27 +34,26 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: Verify every exit criterion is met, or record an explicit waiver.
-        - label: Cut the release as `cycle-five` per the release trains (no force-push).
-        - label: Write a short retro (keep / drop / change for the next milestone).
-        - label: Create the next milestone (scope placeholder is fine).
-        - label: Open the next milestone's three chore issues (Groom, Scope check, Close-out) from the issue forms.
-        - label: Assign those chores by `assigned:<agent>` using the rotation (nyx → muse → duet → nyx); assign three different agents, and do not repeat the same agent on the same chore type as this milestone.
-        - label: Close this milestone.
+        - label: Verify the train's gate - master is green and something user-visible landed - and every exit criterion is met, or record an explicit waiver.
+        - label: Cut the version from `next` as `cycle-five` (tag and release; no force-push).
+        - label: Create a milestone named for the version, move the closed issues that shipped in it from `next` into it, and close that version milestone. Leave `next` open.
+        - label: Write a short retro (keep / drop / change for the next cycle).
+        - label: Open the next cycle's three chore issues (Groom, Scope check, Close-out) from the issue forms.
+        - label: Assign those chores by `assigned:<agent>` using the rotation (nyx → muse → duet → nyx); assign three different agents, and do not repeat the same agent on the same chore type as this cycle.
   - type: input
     id: release
     attributes:
       label: Release
-      description: Tag, PR, or release URL cut as cycle-five. Leave blank if this milestone had no release.
+      description: Tag, PR, or release URL cut as cycle-five. Leave blank if the gate was not met and nothing was cut.
   - type: textarea
     id: retro
     attributes:
       label: Retro
-      description: Short keep / drop / change. Note the agents chosen for the next milestone's three chores.
+      description: Short keep / drop / change. Note the agents chosen for the next cycle's three chores.
     validations:
       required: true
   - type: textarea
     id: notes
     attributes:
       label: Notes
-      description: Waivers, leftover issues, links to the next milestone and its chore issues.
+      description: Waivers, leftover issues still in `next`, links to the version milestone and the next cycle's chore issues.

@@ -1,19 +1,20 @@
 name: Milestone Groom
-description: Start-of-milestone chore — write, size, label, and order work; set scope and exit criteria.
-title: "[groom] <milestone>: Groom"
+description: Start-of-cycle chore — write, size, label, and order work in `next`; set scope and exit criteria.
+title: "[groom] <version>: Groom"
 labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        Start-of-milestone chore. After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        Start-of-cycle chore. A chore cycle is one release train: the work in the rolling [`next`](https://github.com/CycleFive/kharon/milestone/12) milestone up to one version cut. See `docs/milestone-chores.md`.
+        After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
         Labels are trusted only when applied by a collaborator with triage or higher.
   - type: input
     id: milestone
     attributes:
-      label: Milestone
-      description: Milestone title or number this chore belongs to.
-      placeholder: v1.2
+      label: Version
+      description: The version this cycle will cut from `next`.
+      placeholder: v0.7.0
     validations:
       required: true
   - type: dropdown
@@ -32,17 +33,17 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: Write issues that cover the intended milestone scope (and only that scope).
+        - label: Write issues in `next` that cover the intended scope of this cycle (and only that scope).
         - label: Size each issue.
         - label: Apply type/priority labels and put issues in delivery order.
-        - label: Set the milestone description with scope and exit criteria.
-        - label: Move or close leftovers from the prior milestone so they are in or out on purpose.
-        - label: Apply `assigned:<agent>` for this chore (triage+ only). Do not use the label as a substitute for GitHub assignees.
+        - label: Record this cycle's scope and exit criteria in the Scope field below.
+        - label: Triage leftovers in `next` from the prior cycle so they are in or out on purpose.
+        - label: Confirm the `assigned:<agent>` label matches the dropdown. Do not use the label as a substitute for GitHub assignees.
   - type: textarea
     id: scope
     attributes:
       label: Scope and exit criteria
-      description: Paste or write the milestone scope and the conditions under which it is done.
+      description: Paste or write this cycle's scope and the conditions under which the version is ready to cut.
     validations:
       required: true
   - type: textarea

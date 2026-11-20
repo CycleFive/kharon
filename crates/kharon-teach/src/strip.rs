@@ -237,8 +237,7 @@ pub(crate) fn holds_typed(
 ///
 /// A URL that cannot be a base (`data:`, `blob:`, `about:`, `mailto:`) keeps only its scheme.
 /// The scheme is kept only when it is in a short known list, else it is `{other}`.
-/// Known limits: an internationalised host is compared in its punycode form, so a non-ASCII
-/// typed value inside such a label is not recognised; the port is not tested.
+/// Known limit: the port is not tested.
 pub fn strip_url(
     url: &str,
     markers: &[Marker],
@@ -374,6 +373,41 @@ fn strip_host(
     let mut typed = touched(&ranges, &spans);
     for (t, label) in typed.iter_mut().zip(host.split('.')) {
         *t |= kept_hit(label.as_bytes(), markers, pair);
+    }
+    // An internationalised label arrives as punycode (`xn--jos-dma` for `josé`), which holds
+    // none of the typed value's bytes, so the host is compared again in its Unicode form,
+    // lowercased. Known limit: a value typed in a decomposed form (NFD) is not recognised,
+    // because the host's Unicode form is always composed (NFC).
+    if host.split('.').any(|label| label.starts_with("xn--")) {
+        let (unicode, result) = idna::domain_to_unicode(host);
+        let unicode = Zeroizing::new(unicode);
+        if result.is_err() || unicode.split('.').count() != spans.len() {
+            // The Unicode form cannot be lined up with the labels: fail closed.
+            for (t, label) in typed.iter_mut().zip(host.split('.')) {
+                *t |= label.starts_with("xn--");
+            }
+        } else {
+            let lowered_labels: Vec<Zeroizing<String>> = unicode
+                .split('.')
+                .map(|label| Zeroizing::new(label.to_lowercase()))
+                .collect();
+            let mut lowered = Zeroizing::new(String::with_capacity(unicode.len()));
+            for (i, label) in lowered_labels.iter().enumerate() {
+                if i > 0 {
+                    lowered.push('.');
+                }
+                lowered.push_str(label);
+            }
+            let lowered_spans = spans_of(lowered_labels.iter().map(|label| label.len()));
+            let mut lowered_ranges = occurrences(&lowered, markers);
+            for m in markers {
+                lowered_ranges.extend(m.find_lowercased_in(&lowered));
+            }
+            let hit = touched(&lowered_ranges, &lowered_spans);
+            for ((t, hit), label) in typed.iter_mut().zip(hit).zip(&lowered_labels) {
+                *t |= hit || kept_hit(label.as_bytes(), markers, pair);
+            }
+        }
     }
     let mut labels: Vec<&str> = Vec::new();
     let mut previous_typed = false;
@@ -780,6 +814,25 @@ mod tests {
         let m = [user("bob12")];
         let s = strip_url("https://bob12.ex.bob12.test/", &m, None).unwrap();
         assert_eq!(s.value.origin, "https://{typed}.ex.{typed}.test");
+    }
+
+    #[test]
+    fn an_idn_host_label_holding_a_typed_value_is_replaced() {
+        // The parser writes the host as punycode: `josé` is `xn--jos-dma`.
+        let m = [user("josé")];
+        let s = strip_url("https://xn--jos-dma.ex.test/login", &m, None).unwrap();
+        assert_eq!(s.value.origin, "https://{typed}.ex.test");
+        // Typed in another case: the host's Unicode form is lowercase.
+        let m = [user("JOSÉ")];
+        let s = strip_url("https://xn--jos-dma.ex.test/login", &m, None).unwrap();
+        assert_eq!(s.value.origin, "https://{typed}.ex.test");
+        // A value that spans two internationalised labels.
+        let m = [user("josé.ñu")];
+        let s = strip_url("https://josé.ñu.ex.test/login", &m, None).unwrap();
+        assert_eq!(s.value.origin, "https://{typed}.ex.test");
+        // An internationalised label that holds no typed value is kept as it is.
+        let s = strip_url("https://xn--bcher-kva.ex.test/login", &m, None).unwrap();
+        assert_eq!(s.value.origin, "https://xn--bcher-kva.ex.test");
     }
 
     #[test]

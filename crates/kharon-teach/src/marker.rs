@@ -92,6 +92,21 @@ impl Marker {
             .position(|w| w.eq_ignore_ascii_case(needle))
             .map(|start| start..start + needle.len())
     }
+
+    /// Byte ranges of every place this marker's value, lowercased (Unicode lowercasing), occurs
+    /// in `lowered`, which the caller has already lowercased. Empty for an empty or all-ASCII
+    /// value: `find_ignore_ascii_case` covers those without copying the value. Used for an
+    /// internationalised host name in its Unicode form. The lowercase copy is zeroized.
+    pub(crate) fn find_lowercased_in(&self, lowered: &str) -> Vec<std::ops::Range<usize>> {
+        if self.value.is_empty() || self.value.is_ascii() {
+            return Vec::new();
+        }
+        let needle = Zeroizing::new(self.value.to_lowercase());
+        lowered
+            .match_indices(needle.as_str())
+            .map(|(start, found)| start..start + found.len())
+            .collect()
+    }
 }
 
 type Needle = Zeroizing<Vec<u8>>;

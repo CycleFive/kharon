@@ -26,6 +26,7 @@ hex = "0.4"
 percent-encoding = "2"
 memchr = "2"
 url = "2"
+idna = "1"
 serde_json = { version = "1", features = ["raw_value"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

@@ -1087,6 +1087,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hex",
+ "idna",
  "kharon-recording",
  "md-5",
  "memchr",

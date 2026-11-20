@@ -1,0 +1,59 @@
+name: Milestone Close-out
+description: End-of-milestone chore — verify exit criteria, cut the release, retro, open the next milestone and its chores.
+title: "[close-out] <milestone>: Close-out"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        End-of-milestone chore. After opening, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        Labels are trusted only when applied by a collaborator with triage or higher.
+        Releases are cut as `cycle-five` per the release trains. Never force-push.
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone
+      description: Milestone title or number being closed.
+      placeholder: v1.2
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Assigned agent
+      description: Must match the `assigned:<agent>` label you apply after opening.
+      options:
+        - nyx
+        - muse
+        - duet
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Verify every exit criterion is met, or record an explicit waiver.
+        - label: Cut the release as `cycle-five` per the release trains (no force-push).
+        - label: Write a short retro (keep / drop / change for the next milestone).
+        - label: Create the next milestone (scope placeholder is fine).
+        - label: Open the next milestone's three chore issues (Groom, Scope check, Close-out) from the issue forms.
+        - label: Assign those chores by `assigned:<agent>` using the rotation (nyx → muse → duet → nyx); assign three different agents, and do not repeat the same agent on the same chore type as this milestone.
+        - label: Close this milestone.
+  - type: input
+    id: release
+    attributes:
+      label: Release
+      description: Tag, PR, or release URL cut as cycle-five. Leave blank if this milestone had no release.
+  - type: textarea
+    id: retro
+    attributes:
+      label: Retro
+      description: Short keep / drop / change. Note the agents chosen for the next milestone's three chores.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Waivers, leftover issues, links to the next milestone and its chore issues.

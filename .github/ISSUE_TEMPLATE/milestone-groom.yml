@@ -1,0 +1,52 @@
+name: Milestone Groom
+description: Start-of-milestone chore. Set the milestone's goal, exit criteria, and due date, and groom its issues.
+title: "[groom] <milestone>: Groom"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start-of-milestone chore. A milestone is a unit of scope with a goal, exit criteria, and a due date. Releases run on their own train. See `docs/milestone-chores.md`.
+        Put this issue in the milestone it grooms. After opening it, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        A label counts only when a collaborator with triage access or higher applied it.
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone
+      description: The title of the milestone this chore belongs to.
+      placeholder: M6 — teach mode
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Assigned agent
+      description: This must match the `assigned:<agent>` label you apply after opening the issue.
+      options:
+        - nyx
+        - muse
+        - duet
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Fill in the milestone (the prior Close-out created it with a title only). Put its goal and exit criteria in the description and set a due date.
+        - label: Pull issues from `next` (and from the prior milestone's leftovers) into this milestone, or write new ones, covering this scope and only this scope.
+        - label: Size each issue, apply type and priority labels, and put the issues in delivery order.
+        - label: Make sure this milestone's Scope check and Close-out issues exist and are in it.
+        - label: Confirm the `assigned:<agent>` label matches the dropdown. Don't use the label as a substitute for GitHub assignees.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Goal and exit criteria
+      description: The milestone's goal and the conditions under which it is done. Copy them into the milestone description.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Sizing questions, deferred items, and links to the board or project.

@@ -1,0 +1,62 @@
+name: Milestone Close-out
+description: End-of-milestone chore. Verify the exit criteria, record what shipped, write a retro, and open the next milestone's chores.
+title: "[close-out] <milestone>: Close-out"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        End-of-milestone chore. This is the last open issue in the milestone, and closing it closes the milestone. See `docs/milestone-chores.md`.
+        Put this issue in the milestone it closes. After opening it, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        A label counts only when a collaborator with triage access or higher applied it.
+        Releases run on their own train, which cuts a version whenever master is green and something user-visible has landed, so Close-out doesn't cut one. Never force-push.
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone
+      description: The title of the milestone being closed.
+      placeholder: M6 — teach mode
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Assigned agent
+      description: This must match the `assigned:<agent>` label you apply after opening the issue.
+      options:
+        - nyx
+        - muse
+        - duet
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Verify that every exit criterion is met, or record an explicit waiver.
+        - label: "List the versions the release train shipped during this milestone. If user-visible work landed and no version was cut, raise it in #kharon (or in #needs-lothrop if it needs Lothrop's call), and don't cut one here."
+        - label: Move every unfinished issue on purpose, either into the next milestone or back to `next`.
+        - label: Write a short retro covering what to keep, drop, or change for the next milestone.
+        - label: Create the next milestone with a title only (its Groom sets the goal, exit criteria, and due date). Then open its three chore issues (Groom, Scope check, and Close-out) from the issue forms and put them in it.
+        - label: Assign those chores with `assigned:<agent>` labels following the rotation (nyx → muse → duet → nyx). Each chore goes to a different agent, and no chore type repeats this milestone's agent.
+        - label: Close this issue and then the milestone.
+  - type: textarea
+    id: releases
+    attributes:
+      label: Versions shipped
+      description: Tags or release URLs the train cut during this milestone. Write "none" if it cut none.
+    validations:
+      required: true
+  - type: textarea
+    id: retro
+    attributes:
+      label: Retro
+      description: A short note on what to keep, drop, or change. Name the agents chosen for the next milestone's three chores.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Waivers, issues that were moved and where they went, and links to the next milestone and its chore issues.

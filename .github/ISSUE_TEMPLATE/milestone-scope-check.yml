@@ -1,0 +1,53 @@
+name: Milestone Scope Check
+description: Midpoint chore. Compare the open work to the exit criteria, and cut or defer anything that has drifted.
+title: "[scope] <milestone>: Scope check"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Midpoint chore, done around halfway to the milestone's due date. See `docs/milestone-chores.md`.
+        Put this issue in the milestone it checks. After opening it, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
+        A label counts only when a collaborator with triage access or higher applied it.
+        Ping Lothrop in #needs-lothrop only when a decision is required: a scope change, a slip, or something this chore can't cut or defer on its own.
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone
+      description: The title of the milestone this chore belongs to.
+      placeholder: M6 — teach mode
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Assigned agent
+      description: This must match the `assigned:<agent>` label you apply after opening the issue.
+      options:
+        - nyx
+        - muse
+        - duet
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Check the milestone's open issues against its exit criteria.
+        - label: Identify drift, meaning work that's out of scope, unneeded, or unbounded.
+        - label: Cut or defer the drift by closing it or moving it back to `next`.
+        - label: "Flag Lothrop in #needs-lothrop only if a decision is needed. Otherwise finish the chore without a ping."
+        - label: Record the midpoint status (on track, at risk, or slipping) and what changed, and adjust the due date only with a stated reason.
+  - type: textarea
+    id: status
+    attributes:
+      label: Midpoint status
+      description: "On track, at risk, or slipping. What still maps to the exit criteria, what was cut or deferred, and any decision needed."
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Links to issues that were deferred or closed, and any decision request for Lothrop.

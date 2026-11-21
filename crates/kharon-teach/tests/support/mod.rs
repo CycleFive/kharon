@@ -435,12 +435,18 @@ impl Person {
 
     pub async fn type_into(&self, css: &str, text: &str) {
         let sel = serde_json::to_string(css).unwrap();
-        let focus = format!("(()=>{{document.querySelector({sel}).focus();return 'ok'}})()");
-        assert_eq!(
-            self.eval(&focus).await.as_deref(),
-            Some("ok"),
-            "focus {css}"
+        let focus = format!(
+            "(()=>{{const e=document.querySelector({sel});if(!e)return 'no';e.focus();return 'ok'}})()"
         );
+        // The page may still be loading: wait for the field, as `type_into_frame` does.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while self.eval(&focus).await.as_deref() != Some("ok") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the field {css} never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let _: Ignored = self
             .cdp
             .call("Input.insertText", &TextParam { text }, Some(&self.session))
@@ -470,11 +476,24 @@ impl Person {
 
     pub async fn click(&self, css: &str) {
         let sel = serde_json::to_string(css).unwrap();
+        // The page may still be loading, or its context may be torn down mid-navigation (eval
+        // then gives None): wait for the element to exist and have a box.
         let centre = format!(
-            "(()=>{{const r=document.querySelector({sel}).getBoundingClientRect();\
+            "(()=>{{const e=document.querySelector({sel});if(!e)return null;\
+             const r=e.getBoundingClientRect();if(!r.width||!r.height)return null;\
              return (r.x+r.width/2)+','+(r.y+r.height/2)}})()"
         );
-        let at = self.eval(&centre).await.expect("element centre");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let at = loop {
+            if let Some(at) = self.eval(&centre).await {
+                break at;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no clickable {css} in 15 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         let (x, y) = at.split_once(',').unwrap();
         let (x, y): (f64, f64) = (x.parse().unwrap(), y.parse().unwrap());
         for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1)] {

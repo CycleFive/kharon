@@ -14,9 +14,9 @@ Platform goals are still tracked with `platform:` labels and tracking issues.
 
 ## The three chores
 
-1. **Groom** (start). Set the milestone's goal, exit criteria, and due date (the prior Close-out created it with a title only). Then write, size, label, and order its issues, pulling them from `next`.
+1. **Groom** (start). Set the milestone's goal, exit criteria, and due date (the prior Close-out created it with a title only). Then write, size, label, and order its issues, pulling them from `next`. For each gate in the exit criteria, list its consequences: the state changes elsewhere that finishing the gate triggers (for example, flipping a platform to supported once its canary passes).
 2. **Scope check** (around the midpoint, using the due date). Compare the open work to the exit criteria, and cut or defer anything that has drifted. Ping Lothrop in #needs-lothrop only when a decision is needed.
-3. **Close-out** (end). Verify the exit criteria or record a waiver, and list the versions the train shipped during the milestone. Move unfinished issues on purpose, write a short retro, create the next milestone (title only) and open its three chores in it, and then close this issue and the milestone. Close-out doesn't cut a release; the train does that whenever its gate passes.
+3. **Close-out** (end). Verify the exit criteria or record a waiver, confirm that every consequence from the Groom is done or handed to a named owner, and list the versions the train shipped during the milestone. Create the next milestone (title only) and open its three chores in it, move unfinished issues on purpose (into that milestone or back to `next`), write a short retro, and then close this issue and the milestone. Close-out doesn't cut a release; the train does that whenever its gate passes.
 
 Use the issue forms in `.github/ISSUE_TEMPLATE/`. Open all three chores into the milestone they belong to, then apply exactly one of `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
 

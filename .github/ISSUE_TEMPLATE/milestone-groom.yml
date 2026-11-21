@@ -36,6 +36,7 @@ body:
         - label: Fill in the milestone (the prior Close-out created it with a title only). Put its goal and exit criteria in the description and set a due date.
         - label: Pull issues from `next` (and from the prior milestone's leftovers) into this milestone, or write new ones, covering this scope and only this scope.
         - label: Size each issue, apply type and priority labels, and put the issues in delivery order.
+        - label: "For each gate in the exit criteria, list its consequences: the state changes that finishing it triggers elsewhere, written as conditional tasks (for example \"on canary pass: flip #346/#347 to supported\")."
         - label: Make sure this milestone's Scope check and Close-out issues exist and are in it.
         - label: Confirm the `assigned:<agent>` label matches the dropdown. Don't use the label as a substitute for GitHub assignees.
   - type: textarea
@@ -43,6 +44,13 @@ body:
     attributes:
       label: Goal and exit criteria
       description: The milestone's goal and the conditions under which it is done. Copy them into the milestone description.
+    validations:
+      required: true
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Consequences
+      description: For each gate, the downstream state changes its completion triggers, one conditional task per line, for example "on canary pass, flip #346/#347 to supported". Write "none" if no gate triggers anything. Close-out isn't done until each one is done or handed to a named owner.
     validations:
       required: true
   - type: textarea

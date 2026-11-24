@@ -231,7 +231,7 @@ pub fn check_out_path(p: &Path) -> Result<(), Refusal> {
 /// U+FFFD: control characters (escape sequences start with one), the line and paragraph
 /// separators, and the bidirectional controls that can make text read differently from how it
 /// is stored. A recording sent by someone else must not be able to drive the terminal.
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control()
@@ -764,6 +764,10 @@ pub(crate) mod tests {
         LoginMethod::from_recording(&r, b"bytes", "ex.test", ConvertOptions::default()).unwrap()
     }
 
+    pub(crate) fn a_method_json() -> String {
+        a_method().to_json()
+    }
+
     #[test]
     fn show_prints_a_method() {
         let s = method_summary(&a_method());
@@ -797,19 +801,62 @@ pub(crate) mod tests {
 
     #[test]
     fn show_never_prints_a_control_character_from_a_method() {
-        let mut m = a_method();
-        if let MethodStep::Fill { selectors, .. } = &mut m.legs[0].steps[1] {
-            selectors[0] = "#pw\u{1b}[2J".into();
-        }
-        m.site.path = "/x\u{7}".into();
-        m.provenance = Provenance::HandWritten {
-            author: "a\u{1b}[0mb".into(),
+        use kharon_recording::{Expected, FillRole, Leg, Site, SubmitVia, SuccessCheck};
+        let bad = |t: &str| format!("{t}\u{1b}[2J\u{7}");
+        let expect = Expected {
+            tag: "input".into(),
+            input_type: None,
+            id: None,
+            name: None,
+            autocomplete: None,
         };
+        let mut m = a_method();
+        m.site = Site {
+            domain: bad("dom"),
+            origin: bad("https://o"),
+            path: bad("/sp"),
+        };
+        m.legs = vec![Leg {
+            steps: vec![
+                MethodStep::Navigate { path: bad("/nav") },
+                MethodStep::Fill {
+                    role: FillRole::Password,
+                    selectors: vec![bad("#pw")],
+                    expect: expect.clone(),
+                },
+                MethodStep::Submit {
+                    via: SubmitVia::Click {
+                        selectors: vec![bad("#go")],
+                        expect,
+                    },
+                },
+            ],
+        }];
+        m.success = SuccessCheck::PathChangedTo { path: bad("/ok") };
+        if let Provenance::Recording { sha256, .. } = &mut m.provenance {
+            *sha256 = bad("sha");
+        }
         let s = method_summary(&m);
         for c in s.chars().filter(|c| *c != '\n') {
             assert!(!c.is_control(), "a control character {c:?} was printed");
         }
-        assert!(s.contains("#pw\u{FFFD}[2J"), "{s}");
+        for want in [
+            "dom",
+            "https://o",
+            "/sp",
+            "/nav",
+            "#pw",
+            "#go",
+            "/ok",
+            "sha",
+        ] {
+            assert!(
+                s.contains(&format!("{want}\u{FFFD}[2J\u{FFFD}")),
+                "{want}: {s}"
+            );
+        }
+        m.provenance = Provenance::HandWritten { author: bad("au") };
+        assert!(method_summary(&m).contains("au\u{FFFD}[2J"));
     }
 
     #[test]

@@ -168,11 +168,22 @@ fn show(file: &Path, stdout: &mut impl Write, stderr: &mut impl Write) -> Exit {
     let read = || -> Result<String, Refusal> {
         let text = String::from_utf8(read_capped(file)?)
             .map_err(|_| Refusal::NotARecording(file.to_owned(), "not text".to_owned()))?;
+        // A file that fails as both: a text holding `"legs"` was meant as a method, so its parse
+        // error is the one reported; otherwise the recording's. Serde quotes the file's own text
+        // in these errors, so it goes through `plain` before it reaches the terminal.
         match Recording::from_json(&text) {
             Ok(r) => Ok(summary(&r)),
-            Err(rec_err) => LoginMethod::from_json(&text)
-                .map(|m| method_summary(&m))
-                .map_err(|_| Refusal::NotARecording(file.to_owned(), rec_err.to_string())),
+            Err(rec_err) => match LoginMethod::from_json(&text) {
+                Ok(m) => Ok(method_summary(&m)),
+                Err(method_err) => {
+                    let why = if text.contains("\"legs\"") {
+                        method_err.to_string()
+                    } else {
+                        rec_err.to_string()
+                    };
+                    Err(Refusal::NotARecording(file.to_owned(), cli::plain(&why)))
+                }
+            },
         }
     };
     match read() {
@@ -195,7 +206,7 @@ fn method_command(
     dir: &Path,
 ) -> Result<(PathBuf, LoginMethod), Refusal> {
     let bytes = read_capped(recording)?;
-    let not_a = |why: String| Refusal::NotARecording(recording.to_owned(), why);
+    let not_a = |why: String| Refusal::NotARecording(recording.to_owned(), cli::plain(&why));
     let rec = Recording::from_json(
         std::str::from_utf8(&bytes).map_err(|_| not_a("not text".to_owned()))?,
     )
@@ -703,6 +714,34 @@ mod tests {
         assert!(o.is_empty());
         let er = String::from_utf8(er).unwrap();
         assert!(er.starts_with("kharon-teach: ") && er.contains(&want) && er.lines().count() == 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_parse_error_never_prints_a_control_character_from_the_file() {
+        let d = private_dir("parse-err");
+        let with_bad_key = |json: &str| json.replacen('{', "{\"bad\\u001b[2Jkey\":1,", 1);
+        let f = d.join("m.json");
+        std::fs::write(&f, with_bad_key(&cli::tests::a_method_json())).unwrap();
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let exit = show(&f, &mut o, &mut e);
+        assert_eq!(exit, Exit::Refused);
+        let e = String::from_utf8(e).unwrap();
+        assert!(e.contains("bad\u{FFFD}[2Jkey"), "{e}");
+        assert!(e.contains("not a kharon login method"), "{e}");
+        assert!(!e.chars().any(|c| c != '\n' && c.is_control()), "{e:?}");
+        // The same through `method`, for a recording with an unknown `ended_by` value.
+        let bad_variant = cli::tests::convertible_recording().to_json().replacen(
+            "\"confirmed\"",
+            "\"bad\\u001b[2Jv\"",
+            1,
+        );
+        std::fs::write(&f, bad_variant).unwrap();
+        let e = method_command(&f, None, false, None, &d)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("bad\u{FFFD}[2Jv"), "{e:?}");
+        assert!(!e.chars().any(|c| c.is_control()), "{e:?}");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

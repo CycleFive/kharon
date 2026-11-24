@@ -40,6 +40,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use kharon_recording::{
+    FillRole, ListenerWorld, LoginMethod, MethodStep, Provenance, Rung, SubmitVia,
+};
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 /// The owner socket of a daemon with the SPEC §9 default
@@ -86,6 +90,9 @@ enum Command {
     /// List enrolled passkeys, or remove one (#258).
     #[command(subcommand)]
     Passkey(PasskeyCommand),
+    /// Login methods taught to the broker (#382): import, list, show, edit, remove.
+    #[command(subcommand)]
+    Teach(TeachCommand),
     /// List pending grant requests (REQ-APR-006).
     Grants {
         /// The daemon's owner socket.
@@ -176,6 +183,67 @@ enum PasskeyCommand {
     },
 }
 
+/// `kharon teach` — the per-site registry of login methods (#382).
+#[derive(Subcommand)]
+enum TeachCommand {
+    /// Import a login method file (`*.kharon-method.json`) for its site.
+    Import {
+        /// The method file.
+        file: PathBuf,
+        /// Overwrite the site's existing method.
+        #[arg(long)]
+        replace: bool,
+        /// Accept a recording made in the page's own world (the page's scripts could see it).
+        #[arg(long)]
+        accept_main_world: bool,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// List every site that has a method.
+    List {
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Show one site's method, step by step, with the numbers `override` takes.
+    Show {
+        /// The site (a host or its registrable domain).
+        domain: String,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Try this selector first for one step of a site's method.
+    Override {
+        /// The site.
+        domain: String,
+        /// The step number from `teach show`, counted from 0.
+        step: u32,
+        /// The CSS selector to try first.
+        selector: String,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Clear a site's "stale" mark once you have fixed the method.
+    ClearStale {
+        /// The site.
+        domain: String,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Remove a site's method.
+    Remove {
+        /// The site.
+        domain: String,
+        /// The daemon's owner socket.
+        #[arg(long, default_value = DEFAULT_OWNER_SOCKET)]
+        socket: PathBuf,
+    },
+}
+
 /// `kharon token` — out-of-band agent token provisioning (REQ-API-003).
 #[derive(Subcommand)]
 enum TokenCommand {
@@ -258,6 +326,14 @@ fn owner_request(
     socket: &PathBuf,
     request: &Zeroizing<String>,
 ) -> Result<serde_json::Value, String> {
+    let response = owner_request_text(socket, request.as_str())?;
+    serde_json::from_str(&response).map_err(|_| "malformed reply from daemon".to_owned())
+}
+
+/// The same round trip, with the daemon's reply line left as text for
+/// the caller to parse into its own typed reply. The peer-uid check
+/// lives here, before anything is written.
+fn owner_request_text(socket: &PathBuf, request: &str) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|e| format!("cannot connect to owner socket {socket:?}: {e}"))?;
     let peer_uid = {
@@ -279,7 +355,7 @@ fn owner_request(
     stream
         .read_to_string(&mut response)
         .map_err(|e| format!("cannot read owner socket reply: {e}"))?;
-    serde_json::from_str(&response).map_err(|_| "malformed reply from daemon".to_owned())
+    Ok(response)
 }
 
 /// Longest password accepted, in bytes. The daemon's whole
@@ -558,6 +634,393 @@ fn passkey_remove(socket: &PathBuf, id: &str) -> ExitCode {
     }
 }
 
+// ---- kharon teach (#382) ----
+
+/// Largest method file `teach import` reads.
+const MAX_METHOD_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Room left for the rest of the request line around the method.
+const REQUEST_FRAMING_BYTES: usize = 64;
+
+/// One request to a teach op. Only the fields an op uses are written.
+#[derive(Serialize)]
+struct TeachRequest<'a> {
+    op: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<&'a LoginMethod>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    replace: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    accept_main_world: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<&'a str>,
+}
+
+impl<'a> TeachRequest<'a> {
+    fn op(op: &'static str) -> Self {
+        Self {
+            op,
+            method: None,
+            replace: false,
+            accept_main_world: false,
+            domain: None,
+            step: None,
+            selector: None,
+        }
+    }
+
+    fn for_domain(op: &'static str, domain: &'a str) -> Self {
+        Self {
+            domain: Some(domain),
+            ..Self::op(op)
+        }
+    }
+}
+
+/// The daemon's reply to any teach op: `error` on a refusal, otherwise
+/// `entry`, `entries` (list) and `method` (show).
+#[derive(Deserialize)]
+struct TeachReply {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    entry: Option<kharond::owner::TeachRow>,
+    #[serde(default)]
+    entries: Option<Vec<kharond::owner::TeachRow>>,
+    #[serde(default)]
+    method: Option<LoginMethod>,
+}
+
+/// Text from a method file or a reply is the file's author's, not ours:
+/// control characters and bidirectional controls are replaced so it cannot
+/// drive the terminal or change how a line reads.
+fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn rung_name(rung: Rung) -> &'static str {
+    match rung {
+        Rung::Milliseconds => "milliseconds",
+        Rung::AgentContinues => "agent_continues",
+    }
+}
+
+fn shape_name(shape: &kharon_recording::Shape) -> &'static str {
+    use kharon_recording::Shape;
+    match shape {
+        Shape::FormPost => "form_post",
+        Shape::ScriptPost => "script_post",
+        Shape::TwoStep { .. } => "two_step",
+        Shape::Transformed { .. } => "transformed",
+        Shape::Unrecognized => "unrecognized",
+    }
+}
+
+/// The request line for `teach_import`, or the refusal to send it: a line
+/// the daemon would cut off is never written to the socket.
+fn teach_import_request_line(
+    method: &LoginMethod,
+    replace: bool,
+    accept_main_world: bool,
+) -> Result<String, String> {
+    let line = serde_json::to_string(&TeachRequest {
+        method: Some(method),
+        replace,
+        accept_main_world,
+        ..TeachRequest::op("teach_import")
+    })
+    .map_err(|_| "kharon: cannot encode the method".to_owned())?;
+    if line.len() > kharond::owner::MAX_REQUEST_BYTES - REQUEST_FRAMING_BYTES {
+        return Err("kharon: the method file is too large to send (limit 32 KiB)".to_owned());
+    }
+    Ok(line)
+}
+
+/// What the owner is shown before an import is sent.
+fn import_summary(method: &LoginMethod) -> Vec<String> {
+    let mut lines = vec![
+        format!("domain: {}", plain(&method.site.domain)),
+        format!("rung: {}", rung_name(method.rung)),
+        format!(
+            "hand-written: {}",
+            if method.digest().is_none() {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+    ];
+    if matches!(
+        method.provenance,
+        Provenance::Recording {
+            listener_world: ListenerWorld::Main,
+            ..
+        }
+    ) {
+        lines.push("recorded in the page's own world: yes".to_owned());
+    }
+    lines
+}
+
+/// One tab-separated line per site, for `teach list` and the head of `teach show`.
+fn list_line(row: &kharond::owner::TeachRow) -> String {
+    let stale = match &row.stale {
+        Some(s) => format!("step {} since {}", s.step, plain(&s.at)),
+        None => "no".to_owned(),
+    };
+    let result = match &row.last_result {
+        Some(kharond::teach::LastResult::Succeeded) => "succeeded".to_owned(),
+        Some(kharond::teach::LastResult::Unconfirmed) => "unconfirmed".to_owned(),
+        Some(kharond::teach::LastResult::Failed) => "failed".to_owned(),
+        Some(kharond::teach::LastResult::Drift { step }) => format!("drift at step {step}"),
+        Some(kharond::teach::LastResult::NotReady) => "not_ready".to_owned(),
+        None => "-".to_owned(),
+    };
+    let (at, browser) = match &row.last_checked {
+        Some(c) => (
+            plain(&c.at),
+            c.browser.as_deref().map_or_else(|| "-".to_owned(), plain),
+        ),
+        None => ("-".to_owned(), "-".to_owned()),
+    };
+    format!(
+        "{}\trung={}\tshape={}\t{}\tstale={stale}\tlast={result} @ {at} ({browser})",
+        plain(&row.domain),
+        rung_name(row.rung),
+        shape_name(&row.shape),
+        if row.hand_written {
+            "hand-written"
+        } else {
+            "converted"
+        },
+    )
+}
+
+/// `teach show`: the row, then each step by its flat number. The owner's
+/// override selectors come first and are marked.
+fn show_lines(row: &kharond::owner::TeachRow, method: &LoginMethod) -> Vec<String> {
+    let mut lines = vec![list_line(row)];
+    for (index, _leg, step) in method.steps() {
+        let overrides = row.overrides.get(&index).map(Vec::as_slice).unwrap_or(&[]);
+        let with_overrides = |selectors: &[String]| {
+            let mut parts: Vec<String> = Vec::new();
+            for (n, sel) in overrides.iter().chain(selectors).enumerate() {
+                let sel = plain(sel);
+                parts.push(if n == 0 && !overrides.is_empty() {
+                    format!("[override] {sel}")
+                } else {
+                    sel
+                });
+            }
+            parts.join(", ")
+        };
+        lines.push(match step {
+            MethodStep::Navigate { path } => format!("{index}\tnavigate\t{}", plain(path)),
+            MethodStep::Fill {
+                role, selectors, ..
+            } => {
+                let role = match role {
+                    FillRole::Username => "username",
+                    FillRole::Password => "password",
+                };
+                format!("{index}\tfill {role}\t{}", with_overrides(selectors))
+            }
+            MethodStep::Submit {
+                via: SubmitVia::Form {},
+            } => format!("{index}\tsubmit\tform"),
+            MethodStep::Submit {
+                via: SubmitVia::Enter {},
+            } => format!("{index}\tsubmit\tenter"),
+            MethodStep::Submit {
+                via: SubmitVia::Click { selectors, .. },
+            } => format!("{index}\tsubmit\tclick {}", with_overrides(selectors)),
+        });
+    }
+    lines
+}
+
+/// One teach round trip. A refusal or a transport failure is printed here;
+/// the exit code to use is the error.
+fn teach_call(socket: &PathBuf, line: &str) -> Result<TeachReply, ExitCode> {
+    let text = owner_request_text(socket, line).map_err(|e| {
+        eprintln!("kharon: {e}");
+        ExitCode::from(2)
+    })?;
+    let reply: TeachReply = serde_json::from_str(&text).map_err(|_| {
+        eprintln!("kharon: malformed reply from daemon");
+        ExitCode::from(2)
+    })?;
+    if reply.ok {
+        Ok(reply)
+    } else {
+        let code = plain(reply.error.as_deref().unwrap_or("unknown"));
+        eprintln!("{}", refusal_line(&code));
+        Err(ExitCode::FAILURE)
+    }
+}
+
+fn teach_simple(socket: &PathBuf, request: &TeachRequest<'_>, done: &str) -> ExitCode {
+    let Ok(line) = serde_json::to_string(request) else {
+        eprintln!("kharon: cannot encode the request");
+        return ExitCode::from(2);
+    };
+    match teach_call(socket, &line) {
+        Ok(_) => {
+            println!("{done}");
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn teach_import(
+    file: &PathBuf,
+    replace: bool,
+    accept_main_world: bool,
+    socket: &PathBuf,
+) -> ExitCode {
+    let read = std::fs::File::open(file).and_then(|f| {
+        let mut text = String::new();
+        f.take(MAX_METHOD_FILE_BYTES + 1)
+            .read_to_string(&mut text)?;
+        Ok(text)
+    });
+    let text = match read {
+        Ok(t) if t.len() as u64 > MAX_METHOD_FILE_BYTES => {
+            eprintln!("kharon: {file:?} is larger than 16 MiB");
+            return ExitCode::from(2);
+        }
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("kharon: cannot read {file:?}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let method = match LoginMethod::from_json(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("kharon: {}", plain(&e.to_string()));
+            return ExitCode::from(2);
+        }
+    };
+    for line in import_summary(&method) {
+        println!("{line}");
+    }
+    let line = match teach_import_request_line(&method, replace, accept_main_world) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    match teach_call(socket, &line) {
+        Ok(_) => {
+            println!("imported {}", plain(&method.site.domain));
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn teach_list(socket: &PathBuf) -> ExitCode {
+    let Ok(line) = serde_json::to_string(&TeachRequest::op("teach_list")) else {
+        return ExitCode::from(2);
+    };
+    match teach_call(socket, &line) {
+        Ok(reply) => {
+            let Some(entries) = reply.entries else {
+                eprintln!("kharon: daemon reply had no method list");
+                return ExitCode::FAILURE;
+            };
+            if entries.is_empty() {
+                println!("no methods");
+            }
+            for row in &entries {
+                println!("{}", list_line(row));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn teach_show(socket: &PathBuf, domain: &str) -> ExitCode {
+    let Ok(line) = serde_json::to_string(&TeachRequest::for_domain("teach_show", domain)) else {
+        return ExitCode::from(2);
+    };
+    match teach_call(socket, &line) {
+        Ok(TeachReply {
+            entry: Some(row),
+            method: Some(method),
+            ..
+        }) => {
+            for line in show_lines(&row, &method) {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!("kharon: daemon reply had no method");
+            ExitCode::FAILURE
+        }
+        Err(code) => code,
+    }
+}
+
+fn teach_command(command: &TeachCommand) -> ExitCode {
+    match command {
+        TeachCommand::Import {
+            file,
+            replace,
+            accept_main_world,
+            socket,
+        } => teach_import(file, *replace, *accept_main_world, socket),
+        TeachCommand::List { socket } => teach_list(socket),
+        TeachCommand::Show { domain, socket } => teach_show(socket, domain),
+        TeachCommand::Override {
+            domain,
+            step,
+            selector,
+            socket,
+        } => teach_simple(
+            socket,
+            &TeachRequest {
+                step: Some(*step),
+                selector: Some(selector),
+                ..TeachRequest::for_domain("teach_override", domain)
+            },
+            &format!(
+                "step {step} of {} will try that selector first",
+                plain(domain)
+            ),
+        ),
+        TeachCommand::ClearStale { domain, socket } => teach_simple(
+            socket,
+            &TeachRequest::for_domain("teach_clear_stale", domain),
+            &format!("cleared the stale mark for {}", plain(domain)),
+        ),
+        TeachCommand::Remove { domain, socket } => teach_simple(
+            socket,
+            &TeachRequest::for_domain("teach_remove", domain),
+            &format!("removed {}", plain(domain)),
+        ),
+    }
+}
+
 /// Print the enrollment code once, to stdout only. Stderr is for
 /// refusals, which do not include the code.
 fn passkey_enroll(socket: &PathBuf) -> ExitCode {
@@ -662,7 +1125,8 @@ fn owner_command(command: &Command) -> ExitCode {
         | Command::Token(_)
         | Command::Tunnel(_)
         | Command::PasskeyEnroll { .. }
-        | Command::Passkey(_) => {
+        | Command::Passkey(_)
+        | Command::Teach(_) => {
             unreachable!()
         }
     };
@@ -724,8 +1188,43 @@ fn refusal_line(code: &str) -> String {
             "kharon: daemon refused [{code}]: {}",
             kharond::owner::SCOPE_TOO_BROAD_HINT
         ),
+        "invalid_method" => teach_refusal("that is not a usable login method"),
+        "off_domain" => teach_refusal(
+            "the method's own site and address do not agree, or it sends the fill to another site",
+        ),
+        "main_world" => teach_refusal(
+            "this method was recorded in the page's own world; re-run with --accept-main-world if you have read it",
+        ),
+        "rung_above_ceiling" => teach_refusal(
+            "the method asks for a faster rung than its recording showed the site allows",
+        ),
+        "method_exists" => teach_refusal("that site already has a method; use --replace"),
+        "bad_step" => teach_refusal(
+            "the method has no such step, or that step has no selector to override; see `kharon teach show`",
+        ),
+        "bad_selector" => teach_refusal("that selector is empty, too long, or not usable"),
+        "teach_unavailable" => teach_refusal("this broker has no method registry"),
+        // Codes the older commands also return keep their bracketed code.
+        "not_found" => coded_refusal(code, "nothing with that name is known to the broker"),
+        "store_failed" => coded_refusal(
+            code,
+            "the broker could not save the change, so nothing was changed",
+        ),
+        "audit_failed" => coded_refusal(
+            code,
+            "the broker could not write its audit log, so nothing was changed",
+        ),
+        "bad_request" => coded_refusal(code, "the broker did not understand the request"),
         _ => format!("kharon: daemon refused [{code}]"),
     }
+}
+
+fn coded_refusal(code: &str, sentence: &str) -> String {
+    format!("kharon: daemon refused [{code}]: {sentence}")
+}
+
+fn teach_refusal(sentence: &str) -> String {
+    format!("kharon: {sentence}")
 }
 
 /// Random bytes in a generated master password: 160 bits, above
@@ -946,6 +1445,7 @@ fn main() -> ExitCode {
         Command::PasskeyEnroll { socket } => passkey_enroll(&socket),
         Command::Passkey(PasskeyCommand::List { socket }) => passkey_list(&socket),
         Command::Passkey(PasskeyCommand::Remove { id, socket }) => passkey_remove(&socket, &id),
+        Command::Teach(command) => teach_command(&command),
         Command::Audit(AuditCommand::Verify { data, checkpoints }) => {
             let key_path = data.join("keys").join("audit_sign.pub");
             let key_bytes = match std::fs::read(&key_path) {
@@ -1230,5 +1730,222 @@ mod tests {
             unlock_frame("é\u{8}").as_str(),
             "{\"op\":\"unlock\",\"password\":\"é\\u0008\"}"
         );
+    }
+
+    // ---- kharon teach (#382) ----
+
+    use kharon_recording::{
+        Expected, FillRole, Leg, ListenerWorld, LoginMethod, METHOD_FORMAT_VERSION, MethodStep,
+        Provenance, Rung, RungCeiling, Shape, Site, SubmitVia, SuccessCheck,
+    };
+
+    fn expected(input_type: &str) -> Expected {
+        Expected {
+            tag: "input".into(),
+            input_type: Some(input_type.into()),
+            id: None,
+            name: None,
+            autocomplete: None,
+        }
+    }
+
+    fn sample_method(world: ListenerWorld, selectors: Vec<String>) -> LoginMethod {
+        LoginMethod {
+            format_version: METHOD_FORMAT_VERSION,
+            site: Site {
+                domain: "example.test".into(),
+                origin: "https://example.test".into(),
+                path: "/login".into(),
+            },
+            shape: Shape::FormPost,
+            rung: Rung::Milliseconds,
+            legs: vec![Leg {
+                steps: vec![
+                    MethodStep::Navigate {
+                        path: "/login".into(),
+                    },
+                    MethodStep::Fill {
+                        role: FillRole::Username,
+                        selectors: vec!["#user".into()],
+                        expect: expected("text"),
+                    },
+                    MethodStep::Fill {
+                        role: FillRole::Password,
+                        selectors,
+                        expect: expected("password"),
+                    },
+                    MethodStep::Submit {
+                        via: SubmitVia::Form {},
+                    },
+                ],
+            }],
+            success: SuccessCheck::None {},
+            provenance: Provenance::Recording {
+                sha256: "ab12".into(),
+                tool_version: "0.0.0".into(),
+                browser_product: "Chrome/1".into(),
+                listener_world: world,
+                rung_ceiling: RungCeiling::Milliseconds,
+            },
+        }
+    }
+
+    fn row(method: &LoginMethod) -> kharond::owner::TeachRow {
+        kharond::owner::TeachRow {
+            domain: method.site.domain.clone(),
+            rung: method.rung,
+            shape: method.shape.clone(),
+            hand_written: method.digest().is_none(),
+            digest: method.digest().map(str::to_owned),
+            stale: None,
+            overrides: Default::default(),
+            imported_at: "2026-11-24T10:00:00Z".into(),
+            last_checked: None,
+            last_result: None,
+        }
+    }
+
+    #[test]
+    fn teach_import_request_line_is_typed_and_compact() {
+        #[derive(serde::Deserialize)]
+        struct Mirror {
+            op: String,
+            method: LoginMethod,
+            #[serde(default)]
+            replace: bool,
+            #[serde(default)]
+            accept_main_world: bool,
+        }
+        let method = sample_method(ListenerWorld::Isolated, vec!["#pw".into()]);
+        let line = teach_import_request_line(&method, true, false).expect("fits");
+        assert!(!line.contains('\n'), "one line, no pretty printing");
+        let back: Mirror = serde_json::from_str(&line).expect("daemon shape");
+        assert_eq!(back.op, "teach_import");
+        assert_eq!(back.method, method);
+        assert!(back.replace);
+        assert!(!back.accept_main_world);
+    }
+
+    #[test]
+    fn teach_import_refuses_an_oversized_method_before_sending() {
+        // Forty 1000-byte selectors: each is within the per-selector limit, so
+        // the method validates, but the request line is over the daemon's cap.
+        let selectors: Vec<String> = (0..40).map(|i| format!("{i:0>1000}")).collect();
+        let method = sample_method(ListenerWorld::Isolated, selectors);
+        method.validate().expect("passes validate");
+        let err = teach_import_request_line(&method, false, false).expect_err("too large");
+        assert_eq!(
+            err,
+            "kharon: the method file is too large to send (limit 32 KiB)"
+        );
+    }
+
+    #[test]
+    fn teach_import_prints_domain_rung_and_hand_written() {
+        let recorded = sample_method(ListenerWorld::Isolated, vec!["#pw".into()]);
+        assert_eq!(
+            import_summary(&recorded),
+            vec![
+                "domain: example.test",
+                "rung: milliseconds",
+                "hand-written: no"
+            ]
+        );
+        let main = sample_method(ListenerWorld::Main, vec!["#pw".into()]);
+        assert!(
+            import_summary(&main).contains(&"recorded in the page's own world: yes".to_owned())
+        );
+        let mut hand = recorded;
+        hand.provenance = Provenance::HandWritten {
+            author: "me\u{1b}[2J".into(),
+        };
+        hand.rung = Rung::AgentContinues;
+        let lines = import_summary(&hand);
+        assert_eq!(lines[1], "rung: agent_continues");
+        assert_eq!(lines[2], "hand-written: yes");
+    }
+
+    #[test]
+    fn teach_list_line_format() {
+        let method = sample_method(ListenerWorld::Isolated, vec!["#pw".into()]);
+        let mut r = row(&method);
+        assert_eq!(
+            list_line(&r),
+            "example.test\trung=milliseconds\tshape=form_post\tconverted\tstale=no\tlast=- @ - (-)"
+        );
+        r.hand_written = true;
+        r.stale = Some(kharond::teach::Stale {
+            step: 2,
+            at: "2026-11-24T11:00:00Z".into(),
+        });
+        r.last_result = Some(kharond::teach::LastResult::Succeeded);
+        r.last_checked = Some(kharond::teach::Checked {
+            at: "2026-11-24T12:00:00Z".into(),
+            browser: Some("Chrome/1".into()),
+        });
+        assert_eq!(
+            list_line(&r),
+            "example.test\trung=milliseconds\tshape=form_post\thand-written\tstale=step 2 since 2026-11-24T11:00:00Z\tlast=succeeded @ 2026-11-24T12:00:00Z (Chrome/1)"
+        );
+    }
+
+    #[test]
+    fn teach_show_lists_steps_with_overrides_first_and_marked() {
+        let method = sample_method(
+            ListenerWorld::Isolated,
+            vec!["#pw".into(), "[name=p]".into()],
+        );
+        let mut r = row(&method);
+        r.overrides.insert(2, vec!["#new\u{7}".into()]);
+        let lines = show_lines(&r, &method);
+        assert!(lines.iter().any(|l| l == "0\tnavigate\t/login"));
+        assert!(lines.iter().any(|l| l == "1\tfill username\t#user"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "2\tfill password\t[override] #new\u{FFFD}, #pw, [name=p]")
+        );
+        assert!(lines.iter().any(|l| l == "3\tsubmit\tform"));
+    }
+
+    #[test]
+    fn teach_output_has_no_control_characters() {
+        assert_eq!(
+            plain("a\u{1b}[2Jb\nc\u{202e}"),
+            "a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn refusal_lines_for_teach_codes() {
+        assert_eq!(
+            refusal_line("main_world"),
+            "kharon: this method was recorded in the page's own world; re-run with --accept-main-world if you have read it"
+        );
+        assert_eq!(
+            refusal_line("method_exists"),
+            "kharon: that site already has a method; use --replace"
+        );
+        for code in [
+            "invalid_method",
+            "off_domain",
+            "rung_above_ceiling",
+            "bad_step",
+            "bad_selector",
+            "teach_unavailable",
+        ] {
+            let line = refusal_line(code);
+            assert!(
+                !line.contains(code) && !line.contains("daemon refused ["),
+                "{code}: {line}"
+            );
+        }
+        for code in ["not_found", "store_failed", "audit_failed", "bad_request"] {
+            let line = refusal_line(code);
+            assert!(
+                line.starts_with(&format!("kharon: daemon refused [{code}]: ")),
+                "{code}: {line}"
+            );
+        }
     }
 }

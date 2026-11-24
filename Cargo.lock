@@ -1044,8 +1044,10 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "ed25519-dalek",
+ "kharon-recording",
  "kharond",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

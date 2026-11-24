@@ -142,9 +142,26 @@ fn response(status: &str, extra: &str, body: &str, ctype: &str) -> String {
     )
 }
 
-fn route(method: &str, path: &str, host: &str) -> String {
+/// `FORM` with the password input renamed, so a method's selectors no longer find it.
+fn drifted(page: &str) -> String {
+    page.replace("name=pass type=password", "name=secret type=password")
+}
+
+fn route(method: &str, path: &str, query: &str, host: &str) -> String {
     let html = "text/html; charset=utf-8";
+    let drift = query == "v=drift";
     match (method, path) {
+        ("GET", "/") => response(
+            "200 OK",
+            "",
+            "<!doctype html><title>index</title><p>no form</p>",
+            html,
+        ),
+        ("GET", "/form") if drift => response("200 OK", "", &drifted(FORM), html),
+        ("GET", "/two-step/password") if drift => {
+            response("200 OK", "", &drifted(TWO_STEP_PASSWORD), html)
+        }
+        ("GET", "/two-step/password") => response("200 OK", "", TWO_STEP_PASSWORD, html),
         ("GET", "/form") => response("200 OK", "", FORM, html),
         ("POST", "/form-login") => response(
             "302 Found",
@@ -206,7 +223,7 @@ async fn serve_one(mut sock: tokio::net::TcpStream) {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
-    let path = path.split('?').next().unwrap_or("");
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let host = head
         .lines()
         .find_map(|l| {
@@ -215,7 +232,9 @@ async fn serve_one(mut sock: tokio::net::TcpStream) {
                 .then(|| l[5..].trim().to_owned())
         })
         .unwrap_or_default();
-    let _ = sock.write_all(route(method, path, &host).as_bytes()).await;
+    let _ = sock
+        .write_all(route(method, path, query, &host).as_bytes())
+        .await;
     let _ = sock.shutdown().await;
 }
 
@@ -629,6 +648,15 @@ impl Run {
         self.wait().await
     }
 
+    /// [`Run::finish`], handing the fixture server back instead of stopping it.
+    pub async fn finish_keep(mut self, how: End) -> (Outcome, Fixture) {
+        if let Some(tx) = self.end.take() {
+            let _ = tx.send(how);
+        }
+        let outcome = self.wait().await;
+        (outcome, self.fixture)
+    }
+
     /// The outcome of a session that ends by itself (the window closing).
     pub async fn wait(&mut self) -> Outcome {
         tokio::time::timeout(Duration::from_secs(10), &mut self.task)
@@ -674,6 +702,15 @@ impl Login {
 /// Starts a run, does what a person does on `which`, confirms, and hands back the recording.
 /// `None` when the run is skipped for want of a browser.
 pub async fn record_login(test: &str, which: Login) -> Option<kharon_recording::Recording> {
+    record_login_keep(test, which).await.map(|(rec, _)| rec)
+}
+
+/// [`record_login`], and the fixture server the recording was made on, still running: a later
+/// fill of the same pages is the same origin.
+pub async fn record_login_keep(
+    test: &str,
+    which: Login,
+) -> Option<(kharon_recording::Recording, Fixture)> {
     let run = Run::start(test, which.path()).await?;
     run.begin(which.path()).await;
     let p = &run.person;
@@ -702,8 +739,9 @@ pub async fn record_login(test: &str, which: Login) -> Option<kharon_recording::
         }
     }
     p.wait_for_path("/home").await;
-    match run.finish(End::Confirmed).await {
-        Outcome::Recorded(r) => Some(*r),
+    let (outcome, fixture) = run.finish_keep(End::Confirmed).await;
+    match outcome {
+        Outcome::Recorded(r) => Some((*r, fixture)),
         _ => panic!("expected a recording"),
     }
 }

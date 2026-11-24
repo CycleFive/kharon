@@ -272,11 +272,12 @@ fill becomes a method fill.
   first open question below.
 - A `two_step` method runs leg by leg, at `agent_continues`. Each leg
   is one `kharon_fill` call by the agent. The broker picks the leg
-  whose `navigate` path matches the live path and whose fill steps all
-  pass the pre-check. Leg 1 fills the user name and submits. Leg 2
-  fills the password and submits atomically, with the scrub, like a
-  one-page method. The rung stays `agent_continues`, because the agent
-  drives the page between the legs (the classifier's rule).
+  whose `navigate` path matches the live path. No leg matching is the
+  wrong page, not drift. A leg whose path matches but whose fields fail
+  rule 2 is drift on that leg. Leg 1 fills the user name and submits.
+  Leg 2 fills the password and submits atomically, with the scrub,
+  like a one-page method. The rung stays `agent_continues`, because the
+  agent drives the page between the legs (the classifier's rule).
 
 **The pre-check.** Inside the same in-page call, before the first
 value is written, the fill function checks every step of the leg:
@@ -296,27 +297,34 @@ cannot change between them (the same argument as REQ-ORG-003).
 
 **On a miss**, the fill function throws before it writes anything:
 
-- Rule 1 or 2 fails (element gone, two matches, a changed type or
-  name, the page is on another step): `field_not_found`, detail
-  `method_drift`. The broker marks the entry stale with the step's
-  index and the time, writes the step index into the fill's audit
-  entry, and sends the owner one notice through the existing notify
-  channel. It does not retry with other selectors, the broker's
-  heuristics or the agent's selector.
+- Rule 1 fails (the live path matches no leg: the home page, a consent
+  page, a fill before the login redirect finishes): `field_not_found`,
+  detail `method_wrong_page`. No stale mark, no owner notice and no
+  registry write; only the fill's audit entry. The agent may navigate
+  and retry. A wrong page says nothing about whether the site changed,
+  and any agent can cause one, so it must not lock the site.
+- Rule 1 passes and rule 2 fails (element gone, two matches, a changed
+  type or name): `field_not_found`, detail `method_drift`. The broker
+  marks the entry stale with the step's index and the time, writes the
+  step index into the fill's audit entry, and sends the owner one
+  notice through the existing notify channel. It does not retry with
+  other selectors, the broker's heuristics or the agent's selector.
 - Only rule 3 fails (the field is there but disabled): `field_not_found`,
   detail `method_not_ready`. Not drift, nothing marked. The agent may
   try again. The test pages hit this case: their fields sit in a
   disabled `fieldset` until the page's service worker is ready.
 
 **A stale entry** refuses method fills on its site (`field_not_found`,
-detail `method_stale`) until the owner re-imports a method, sets a
-selector override, or clears the mark. It does not quietly fall back
-to today's fill. This is the second open question below.
+detail `method_stale`) until the owner re-imports a method or runs
+`kharon teach clear-stale`. Setting an override does not clear it by
+itself. It does not quietly fall back to today's fill. This is the
+second open question below.
 
 **After the submit**, at the scrub's single re-read, the broker
 evaluates the success check and records the result, the time and the
 browser's product string (`Browser.getVersion`, which the CDP client
-already calls) on the entry.
+already calls) on the entry. If the main frame is still navigating at
+the re-read, the result is `unconfirmed`, not `failed`.
 
 **Changes to the in-page fill function**, all inside `FILL_IN_PAGE`
 and its tests:
@@ -324,8 +332,9 @@ and its tests:
 - a `steps` form of its field list: selector lists plus expected
   attributes, checked as above before any write
 - the `click` submit
-- `method_drift` and `method_not_ready` failures, thrown before the
-  first write so that the existing clear-on-failure has nothing to do
+- `method_wrong_page`, `method_drift` and `method_not_ready` failures,
+  thrown before the first write so that the existing clear-on-failure
+  has nothing to do
 
 The `requestSubmit` and Enter paths are unchanged. REQ-API-008's
 wording gains the click submit in #382.
@@ -349,11 +358,11 @@ domain already has an entry, unless the owner replaces it.
 | `method` | The imported `LoginMethod`, as imported |
 | `rung` | The rung the player uses: the method's `rung` |
 | `shape` | Copied from the method, for listing |
-| `overrides` | Owner-set selectors per step index, tried before the method's own list |
+| `overrides` | Owner-set selectors per step index, tried before the method's own list. An override changes only where the element is looked for; the element it finds still has to pass rule 2 |
 | `imported_at` | Time |
 | `last_checked` | Time and browser product string of the last method fill that reached the browser |
-| `last_result` | `succeeded`, `unconfirmed` (success check `none`), `failed` (success check not met), `drift` (with the step index), `not_ready` |
-| `stale` | Set by drift, cleared by the owner |
+| `last_result` | `succeeded`, `unconfirmed` (success check `none`, or the main frame still navigating at the re-read), `failed` (success check not met), `drift` (with the step index), `not_ready` |
+| `stale` | Set by drift, cleared by re-import or `clear-stale` |
 
 **Who writes.** Only the owner, through the owner socket and the
 `kharon` CLI:
@@ -367,11 +376,15 @@ kharon teach clear-stale <domain>
 kharon teach remove <domain>
 ```
 
+`kharon teach import` prints the domain, the rung and whether the
+method is `hand_written` before it commits.
+
 Each is one owner-socket op and one audit entry (`teach_import`,
 `teach_override`, `teach_clear_stale`, `teach_remove`, carrying the
 domain and the method's provenance digest, never a selector the agent
 could have chosen). The broker itself writes only `last_checked`,
-`last_result` and `stale`, and only from a method fill.
+`last_result` and `stale`, and only from a method fill. A
+`method_wrong_page` fill writes none of them.
 
 **What agents see.** The rung, read-only. A method fill's reply and
 its audit entries name the rung used, and the approval prompt for a
@@ -398,9 +411,13 @@ method does not need. On top of that, **import refuses**:
   import can check it
 - a `rung` stronger than the provenance's recorded ceiling, for a
   converted method
-- a step in a shadow root, as in section 2
 - a second method for a domain that already has one, unless
   `--replace`
+
+The shadow-root refusal is at conversion only (section 2). Import
+cannot tell a shadow-root selector from any other. A hand-written
+shadow-root selector never resolves, so its first fill ends in
+`method_drift`.
 
 **Who is trusted to add a method:** the broker's owner, and nobody
 else. A method decides where kharon types a password on that site, so
@@ -442,17 +459,21 @@ teach list` marks it hand-written.
   with no agent route reaching it.
 - The in-page function, through the existing node harness in
   `page_js.rs`: the pre-check passes on a matching page; each drift
-  case (element gone, two matches, a renamed field, a changed type, the
-  wrong path) throws before any write; a disabled field throws
-  `method_not_ready`; the click submit fires once, and only after
-  every field filled.
+  case (element gone, two matches, a renamed field, a changed type)
+  throws `method_drift` before any write; a wrong path throws
+  `method_wrong_page` before any write, with no stale mark and no
+  notice; a disabled field throws `method_not_ready`; the click submit
+  fires once, and only after every field filled.
 
 **With a real Chromium in CI** (`KHARON_REQUIRE_CHROMIUM`): the
 kharon-teach fixture server's four logins, plus a drift variant of the
 form page, served on loopback. For each: record, convert, import into
 a test broker, fill by the method, and read the registry entry. The
 drift variant must end `field_not_found` / `method_drift` with the
-entry stale and nothing typed into the page.
+entry stale and nothing typed into the page. A fill on `/` must end
+`field_not_found` / `method_wrong_page` with the entry not stale. A
+two-step method whose leg 2 password field is renamed must end
+`method_drift` on leg 2.
 
 **The live test (#383)** runs on the public_oauth_test pages
 (`cycle-five/public_oauth_test`, served at `login.page.twkr.io`),
@@ -496,9 +517,9 @@ For the implementation PR (#382), wording to be reviewed there:
 | ID | Requirement |
 |---|---|
 | REQ-TCH-007 | A login method holds no typed value, no value length, no query key, no request shape and no page text, and a method whose `format_version` the library does not know is refused |
-| REQ-TCH-008 | A fill on a site with a method checks every step of the leg before writing, in the same in-page call, and on any miss writes nothing, replies `field_not_found` with `method_drift`, and marks the entry stale. It never uses the agent's selector or the broker's heuristics on that site |
+| REQ-TCH-008 | A fill on a site with a method checks every step of the leg before writing, in the same in-page call. When no leg's path matches the live page it writes nothing, replies `field_not_found` with `method_wrong_page`, and marks nothing. When a leg's path matches and a step does not, it writes nothing, replies `field_not_found` with `method_drift`, and marks the entry stale. It never uses the agent's selector or the broker's heuristics on that site |
 | REQ-TCH-009 | A method fill at `milliseconds` submits with the method's submit and runs the post-submit scrub, whatever the request's `submit` and `post_submit_scrub` say |
-| REQ-TCH-010 | Only the owner socket adds, changes or removes a registry entry. Import refuses an off-domain method, a main-world recording without the owner's flag, a rung above the recording's ceiling, and a shadow-root step |
+| REQ-TCH-010 | Only the owner socket adds, changes or removes a registry entry. Import refuses an off-domain method, a main-world recording without the owner's flag, and a rung above the recording's ceiling. Conversion refuses a shadow-root step |
 | REQ-TCH-011 | The registry records per site the rung, the shape, overrides, and the time, browser version and result of the last method fill |
 
 REQ-API-008 gains the click submit.
@@ -516,7 +537,8 @@ REQ-API-008 gains the click submit.
    back to today's fill until the owner looks. Refusing is safer and
    louder; falling back keeps agents working. Duet's view: refuse,
    with the owner notice, because drift is exactly when the player's
-   selectors would type into the wrong place.
+   selectors would type into the wrong place. Only real drift gets
+   there: a wrong page is `method_wrong_page` and marks nothing.
 3. **Whether a `two_step` password leg should earn `milliseconds`.**
    Its password is filled and submitted atomically, so in the page it
    sits for milliseconds too. The ceiling stays `agent_continues` here
@@ -544,9 +566,9 @@ Reading the code changed these points of the plan posted on #381:
   agent and the viewport, the method drops `value_len` (which gives
   away the password's length), `placeholder`, `aria-label`, every
   request shape, timings and flags.
-- **More is refused at import.** Shadow-root steps (the fill resolver
-  cannot reach them), a rung above the recording's ceiling, and
-  unconfirmed recordings without the person's flag.
+- **More is refused.** Shadow-root steps at conversion (the fill
+  resolver cannot reach them), and at import a rung above the
+  recording's ceiling; unconfirmed recordings need the person's flag.
 - **The test pages.** Only `form_post` and `script_post` pages exist on
   public_oauth_test today. The two-step page, the SHA-256 page and the
   drift variant have to be added before #383 runs. The `?expect=`

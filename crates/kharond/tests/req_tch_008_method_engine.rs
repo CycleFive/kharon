@@ -596,7 +596,7 @@ async fn req_tch_009_agent_continues_one_leg_keeps_the_requests_submit() {
         "the leg's submit is always sent"
     );
 
-    let rig2 = rig(Stub::at(PAGE)).await;
+    let rig2 = self::rig(Stub::at(PAGE)).await;
     let source = FixedSource::new(Some(lookup(two_step())));
     let p = plan(
         vec![field(FieldKind::Username, None, USER_CANARY)],
@@ -640,6 +640,11 @@ async fn req_tch_011_success_is_read_once_after_the_delay() {
         p.method.get().unwrap().end,
         MethodEnd::Filled(MethodResult::Succeeded)
     );
+    assert_eq!(
+        rig_nav.frames("Page.getFrameTree").len(),
+        2,
+        "the expected path at the first read needs no further read"
+    );
 
     // Same document: unconfirmed, the probe and the scrub both run, one re-read.
     let mut stub = Stub::at(PAGE);
@@ -675,7 +680,10 @@ async fn req_tch_011_success_is_read_once_after_the_delay() {
                 .to_owned()
         })
         .collect();
-    assert!(calls.iter().any(|d| d.contains("function methodProbe")));
+    assert!(
+        !calls.iter().any(|d| d.contains("function methodProbe")),
+        "a path check sends no probe"
+    );
     assert!(
         calls.iter().any(|d| d.contains("scrubWritten")),
         "the forced scrub ran"
@@ -777,4 +785,108 @@ async fn a_site_without_an_entry_takes_the_normal_path() {
     assert_eq!(source.asked().len(), 1);
     assert!(arg(&rig.fill_frames()[0], 6).is_null());
     assert!(p.method.get().is_none());
+}
+
+async fn redirect_case(
+    trees: Vec<(&'static str, &'static str)>,
+) -> (MethodEnd, usize, (), Vec<String>) {
+    let mut stub = Stub::at(PAGE);
+    stub.trees = trees;
+    let rig = rig(stub).await;
+    let m = one_leg(
+        Rung::Milliseconds,
+        SuccessCheck::PathChangedTo {
+            path: "/home".into(),
+        },
+    );
+    let p = plan(
+        both_fields(),
+        Some(FixedSource::new(Some(lookup(m)))),
+        true,
+        false,
+    );
+    let out = rig.engine.fill(&p, &rig.ctx, false).await;
+    assert_eq!(out.status(), "filled", "{out:?}");
+    let calls = rig
+        .frames("Runtime.callFunctionOn")
+        .iter()
+        .map(|f| {
+            f["params"]["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    (
+        p.method.get().unwrap().end,
+        rig.frames("Page.getFrameTree").len(),
+        (),
+        calls,
+    )
+}
+
+#[tokio::test]
+async fn req_tch_011_an_intermediate_hop_is_not_judged() {
+    // New loader at /sso on the first read, /home at the delayed one.
+    let (end, trees, _, calls) = redirect_case(vec![
+        ("l1", PAGE),
+        ("l2", "https://example.com/sso"),
+        ("l2", "https://example.com/home"),
+    ])
+    .await;
+    assert_eq!(end, MethodEnd::Filled(MethodResult::Succeeded));
+    assert_eq!(trees, 3, "one delayed re-read");
+    assert!(
+        !calls
+            .iter()
+            .any(|d| d.contains("scrubWritten") || d.contains("probeWritten")),
+        "a navigated page is not scrubbed"
+    );
+
+    // Still /sso after the delay: the login did not land.
+    let (end, trees, _, _) =
+        redirect_case(vec![("l1", PAGE), ("l2", "https://example.com/sso")]).await;
+    assert_eq!(end, MethodEnd::Filled(MethodResult::Failed));
+    assert_eq!(trees, 3);
+}
+
+#[tokio::test]
+async fn a_check_nothing_can_use_skips_the_wait_and_the_probe() {
+    let rig1 = rig(Stub::at(PAGE)).await;
+    let m = one_leg(Rung::Milliseconds, SuccessCheck::None {});
+    // Milliseconds forces the scrub, which needs the re-read: it runs, the probe does not.
+    let p = plan(
+        both_fields(),
+        Some(FixedSource::new(Some(lookup(m)))),
+        true,
+        false,
+    );
+    rig1.engine.fill(&p, &rig1.ctx, false).await;
+    assert_eq!(
+        p.method.get().unwrap().end,
+        MethodEnd::Filled(MethodResult::Unconfirmed)
+    );
+    assert!(!rig1.frames("Runtime.callFunctionOn").iter().any(|f| {
+        f["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("function methodProbe")
+    }));
+
+    // A path check on a submit-less (AgentContinues, no submit) fill reads nothing,
+    // and with no scrub there is no re-read for a `None` check either.
+    let rig2 = rig(Stub::at(PAGE)).await;
+    let m = one_leg(Rung::AgentContinues, SuccessCheck::None {});
+    let p = plan(
+        both_fields(),
+        Some(FixedSource::new(Some(lookup(m)))),
+        true,
+        false,
+    );
+    rig2.engine.fill(&p, &rig2.ctx, false).await;
+    assert_eq!(
+        rig2.frames("Page.getFrameTree").len(),
+        2,
+        "no wait, no re-read"
+    );
 }

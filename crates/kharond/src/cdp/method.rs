@@ -116,9 +116,6 @@ pub(crate) struct Prepared {
     pub order: Vec<FieldKind>,
     pub submit: bool,
     pub scrub: bool,
-    /// The live path the leg matched (same as `leg.path`); kept for the broker's audit.
-    #[allow(dead_code)]
-    pub leg_path: String,
     pub has_password: bool,
     pub success: SuccessCheck,
     pub rung: Rung,
@@ -249,7 +246,6 @@ pub(crate) fn prepare(
         order,
         submit,
         scrub,
-        leg_path: path.to_owned(),
         has_password,
         success: method.success.clone(),
         rung: method.rung,

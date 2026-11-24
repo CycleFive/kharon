@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use kharon_recording::SuccessCheck;
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -861,24 +862,25 @@ impl FillEngine {
                 // still `Navigated` / the failure.
                 if submit {
                     let outcome = parse_fill_results(&result);
-                    if let (Some(run), FillOutcome::Filled { .. }) =
-                        (method.as_deref_mut(), &outcome)
-                    {
-                        // A new document is already committed: its
-                        // URL is the path the submit led to.
-                        run.result = Some(judge(
-                            &run.prepared.success,
-                            run.prepared.has_password,
-                            true,
-                            frame_path(&tree_after).as_deref(),
-                            None,
-                        ));
-                    }
                     // The page already left. The delayed re-read would
                     // see the same thing and must not clear a new
                     // document, so record it and do not wait (#355).
                     if let (Some((note, _)), FillOutcome::Filled { .. }) = (scrub, &outcome) {
                         note.record(ScrubObservation::Navigated);
+                    }
+                    if let (Some(run), FillOutcome::Filled { .. }) =
+                        (method.as_deref_mut(), &outcome)
+                    {
+                        run.result = Some(
+                            method_success_after_navigation(
+                                session,
+                                deadline,
+                                run.prepared,
+                                run.delay,
+                                &tree_after,
+                            )
+                            .await,
+                        );
                     }
                     return outcome;
                 }
@@ -945,7 +947,8 @@ impl FillEngine {
         delay: Duration,
         scrub: Option<&ScrubNote>,
     ) -> MethodResult {
-        if !prepared.submit {
+        // Nothing can use the re-read: no wait, no call.
+        if !prepared.submit || (!reads_success(prepared) && scrub.is_none()) {
             return MethodResult::Unconfirmed;
         }
         let tree = match reread_frame_tree(session, deadline, delay).await {
@@ -975,7 +978,10 @@ impl FillEngine {
                 note.record(ScrubObservation::Navigated);
             }
         } else {
-            if scrub_room(deadline, Duration::ZERO, Instant::now()) {
+            if matches!(prepared.success, SuccessCheck::PasswordFieldGone {})
+                && prepared.has_password
+                && scrub_room(deadline, Duration::ZERO, Instant::now())
+            {
                 let probe = session
                     .request_with_timeout(
                         "Runtime.callFunctionOn",
@@ -1186,6 +1192,45 @@ async fn reread_frame_tree(
 fn frame_path(tree: &Value) -> Option<String> {
     let href = tree_frame(tree)?.get("url")?.as_str()?;
     url::Url::parse(href).ok().map(|u| u.path().to_owned())
+}
+
+/// Whether the method's success check can say anything for this leg.
+fn reads_success(prepared: &Prepared) -> bool {
+    prepared.has_password && !matches!(prepared.success, SuccessCheck::None {})
+}
+
+/// The success reading when the loader had already changed at the
+/// post-call read. A password field that was in the old document is
+/// gone with it. A path check cannot trust the first read, which may
+/// be an intermediate hop (a redirect): unless it already shows the
+/// expected path, wait the delay and read once more.
+async fn method_success_after_navigation(
+    session: &super::client::CdpSession,
+    deadline: Option<Instant>,
+    prepared: &Prepared,
+    delay: Duration,
+    first: &Value,
+) -> MethodResult {
+    if !reads_success(prepared) {
+        return MethodResult::Unconfirmed;
+    }
+    let SuccessCheck::PathChangedTo { path } = &prepared.success else {
+        return judge(&prepared.success, prepared.has_password, true, None, None);
+    };
+    let first_path = frame_path(first);
+    if first_path.as_deref() == Some(path.as_str()) {
+        return MethodResult::Succeeded;
+    }
+    match reread_frame_tree(session, deadline, delay).await {
+        Reread::Tree(t) => judge(
+            &prepared.success,
+            prepared.has_password,
+            true,
+            frame_path(&t).as_deref(),
+            None,
+        ),
+        _ => MethodResult::Unconfirmed,
+    }
 }
 
 // Private newtype so `fill` can hold Option<MismatchReason> without

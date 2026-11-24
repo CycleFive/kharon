@@ -465,6 +465,10 @@ pub struct ApprovalPrompt {
     pub action: GrantAction,
     /// The live origin observed at request time.
     pub origin: String,
+    /// The rung of the login method taught for that origin's site
+    /// (`milliseconds` or `agent_continues`), when there is one (#382).
+    /// The broker sets it; [`GrantRequest::prompt`] leaves it empty.
+    pub rung: Option<&'static str>,
 }
 
 impl GrantRequest {
@@ -478,6 +482,7 @@ impl GrantRequest {
             item_id: self.item_id.clone(),
             action: self.action,
             origin: self.observed_origin.clone(),
+            rung: None,
         })
     }
 }

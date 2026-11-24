@@ -465,7 +465,7 @@ impl OwnerOps for DaemonOwner {
             broker
                 .pending_grant_requests()
                 .iter()
-                .filter_map(|r| r.prompt())
+                .filter_map(|r| broker.approval_prompt(r))
                 .collect()
         })
         .await

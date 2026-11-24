@@ -370,6 +370,11 @@ pub struct FillResult {
     /// A fixed code, e.g. `unknown_item`, `clock_skew`, `cdp_error`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<&'static str>,
+    /// The rung of the taught login method this fill consulted:
+    /// `milliseconds` or `agent_continues` (#382). Absent when no
+    /// method was used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rung: Option<&'static str>,
 }
 
 /// What a fill came to, before it is a [`FillResult`]: the engine's
@@ -444,6 +449,7 @@ impl FillStatus {
             },
             grant_request_id: None,
             detail: self.detail(),
+            rung: None,
         }
     }
 }

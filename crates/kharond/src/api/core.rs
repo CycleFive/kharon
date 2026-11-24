@@ -73,11 +73,15 @@ use super::rollback::RollbackGuard;
 use super::token::TokenStore;
 use super::transport::TransportLimits;
 use crate::audit::{AuditLog, Entry, Event};
-use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin, ValuesSent};
+use crate::cdp::{
+    FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin, MethodEnd, MethodSource, MethodUse,
+    ValuesSent,
+};
 use crate::lock::{AuditError, Clock, LockController, LockEvent, LockReason, SystemClock};
 use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::wire::SyncResponse;
 use crate::sync::{LiveSync, SecretField, SyncError, SyncOutcome, Vault};
+use crate::teach::TeachRegistry;
 use crate::totp::skew::Observation;
 use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy, totp_code};
 
@@ -463,6 +467,9 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// (REQ-APR-004 send half, #128). `None` = no channel configured;
     /// requests then wait on the CLI / web UI alone.
     approval_notifier: Option<Arc<dyn ApprovalNotifier>>,
+    /// The taught login methods (#382). `None` = none installed: no
+    /// fill consults a method and no prompt names a rung.
+    teach_registry: Option<Arc<TeachRegistry>>,
     /// Rate limits, suspension, and agent revocation (REQ-RL-*,
     /// REQ-REV-001). Separate from the lock controller so owner
     /// revoke/panic never needs the session.
@@ -686,6 +693,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             grant_clock: Arc::new(SystemClock),
             approval_tokens: Mutex::new(ApprovalTokenStore::new()),
             approval_notifier: None,
+            teach_registry: None,
             rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
             transport: TransportLimits::new(),
             rollback: Mutex::new(RollbackGuard::new()),
@@ -790,6 +798,19 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     pub fn with_approval_notifier(mut self, notifier: Arc<dyn ApprovalNotifier>) -> Self {
         self.approval_notifier = Some(notifier);
         self
+    }
+
+    /// Fill by the site's taught login method when the registry holds
+    /// one (#382), and name its rung on replies, audit entries and
+    /// approval prompts.
+    pub fn with_teach_registry(mut self, registry: Arc<TeachRegistry>) -> Self {
+        self.teach_registry = Some(registry);
+        self
+    }
+
+    /// The installed teach registry, if any.
+    pub fn teach_registry(&self) -> Option<&Arc<TeachRegistry>> {
+        self.teach_registry.as_ref()
     }
 
     /// Apply `[policy]` to the grant store (standing grants on/off).
@@ -1317,6 +1338,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // was dropped. Not an outcome: the fill's own entry is still
         // exactly one.
         let mut scrub_note = None;
+        // How the fill used a taught login method, when it consulted
+        // one (#382). Holds a domain, a rung and a step number.
+        let mut method_used: Option<MethodUse> = None;
         // The grant request a `pending_approval` outcome created
         // (#20), and the grant an admitted fill spent.
         let mut grant_request_id: Option<String> = None;
@@ -1433,19 +1457,39 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     guard.abort_entry = None;
                     live_origin = guard.plan.live_origin.get();
                     scrub_note = guard.plan.scrub.get();
+                    method_used = guard.plan.method.get().cloned();
                     drop(guard);
                     status
                 }
             }
         };
+        // #382: what the fill learned about its method goes into the
+        // registry, and the owner hears once when it first went stale.
+        let method_detail = method_used.as_ref().and_then(|used| {
+            self.record_method_fill(used);
+            (matches!(status, FillStatus::Engine(FillOutcome::Filled { .. }))
+                && used.selectors_ignored)
+                .then_some("method_selectors")
+        });
+        let method_rung = method_used.as_ref().map(|u| rung_name(u.rung));
         let entry = if status == FillStatus::Engine(FillOutcome::Timeout) {
             base(Event::FillTimeout)
                 .result("timeout")
                 .detail_code("deadline_expired")
         } else {
             let mut e = base(event).result(status.status());
-            if let Some(d) = status.detail() {
+            if let Some(d) = method_detail.or(status.detail()) {
                 e = e.detail_code(d);
+            }
+            if let Some(r) = method_rung {
+                e = e.rung(r);
+            }
+            if let Some(MethodUse {
+                end: MethodEnd::Drift { step },
+                ..
+            }) = &method_used
+            {
+                e = e.step_index(u64::from(*step));
             }
             e
         };
@@ -1513,7 +1557,58 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
         let mut result = status.result();
         result.grant_request_id = grant_request_id;
+        result.rung = method_rung;
+        if method_detail.is_some() {
+            result.detail = method_detail;
+        }
         Ok(Outcome::Fill(result))
+    }
+
+    /// Note a method fill's outcome in the registry and tell the owner
+    /// when it newly marked the method stale (#382). A write that did
+    /// not happen for an outcome that should have been written is
+    /// reported on stderr; the fill's reply is unchanged.
+    fn record_method_fill(&self, used: &MethodUse) {
+        let Some(registry) = &self.teach_registry else {
+            return;
+        };
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let Ok(now) = now.format(&time::format_description::well_known::Rfc3339) else {
+            return;
+        };
+        let recorded = registry.record_fill(used, &now);
+        let should_write = matches!(
+            used.end,
+            MethodEnd::Drift { .. } | MethodEnd::NotReady { .. } | MethodEnd::Filled(_)
+        );
+        if should_write && !recorded.wrote {
+            eprintln!(
+                "kharond: warning: could not record a login-method fill for {}",
+                used.domain
+            );
+        }
+        if recorded.newly_stale
+            && let MethodEnd::Drift { step } = used.end
+            && let Some(notifier) = &self.approval_notifier
+        {
+            notifier.notify_method_drift(&used.domain, step);
+        }
+    }
+
+    /// The approval prompt for `request`, naming the rung of the login
+    /// method taught for the origin it observed (#382). Every owner
+    /// listing and the ntfy publish go through here;
+    /// [`GrantRequest::prompt`] alone knows no registry.
+    pub fn approval_prompt(&self, request: &GrantRequest) -> Option<super::grant::ApprovalPrompt> {
+        let mut prompt = request.prompt()?;
+        prompt.rung = self
+            .teach_registry
+            .as_ref()
+            .and_then(|r| r.rung_for_origin(&prompt.origin))
+            .map(rung_name);
+        Some(prompt)
     }
 
     /// The `grant_request` audit entry for a request's creation:
@@ -1995,7 +2090,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let Some(notifier) = &self.approval_notifier else {
             return;
         };
-        let Some(prompt) = greq.prompt() else {
+        let Some(prompt) = self.approval_prompt(greq) else {
             return;
         };
         let Some((approve, deny)) = self.approval_token_paths(&greq.id) else {
@@ -2034,7 +2129,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .unwrap_or_else(|p| p.into_inner())
             .peek(token, self.grant_now())?;
         let req = self.grant_request(&request_id).ok_or(TokenGone::Unknown)?;
-        let prompt = req.prompt().ok_or(TokenGone::Used)?;
+        let prompt = self.approval_prompt(&req).ok_or(TokenGone::Used)?;
         Ok((prompt, action))
     }
 
@@ -3174,7 +3269,19 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     .unwrap_or(self.fill_policy.post_submit_scrub),
             post_submit_scrub_delay: self.fill_policy.post_submit_scrub_delay,
             scrub: crate::cdp::fill::ScrubNote::new(),
-            method_source: None,
+            // #382: a login fill consults the taught methods; a TOTP
+            // fill never does.
+            method_source: self
+                .teach_registry
+                .as_ref()
+                .filter(|_| {
+                    req.operation == FillOperation::Fill
+                        && req
+                            .fields
+                            .iter()
+                            .any(|(k, _)| matches!(k, FieldKind::Username | FieldKind::Password))
+                })
+                .map(|r| Arc::clone(r) as Arc<dyn MethodSource>),
             method: crate::cdp::MethodNote::new(),
         };
         // `item` was the last borrow of the session. A spent grant
@@ -3184,5 +3291,14 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             lock.release_idle_hold(&admitted);
         }
         Ok((plan, generation, admitted))
+    }
+}
+
+/// The wire name of a method's rung, as on the reply, the audit entry
+/// and the approval prompt (#382).
+fn rung_name(rung: kharon_recording::Rung) -> &'static str {
+    match rung {
+        kharon_recording::Rung::Milliseconds => "milliseconds",
+        kharon_recording::Rung::AgentContinues => "agent_continues",
     }
 }

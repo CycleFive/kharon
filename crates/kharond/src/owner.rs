@@ -769,18 +769,16 @@ async fn dispatch_line<O: OwnerOps>(
         }
         "status" => status_response(ops.is_locked().await, ops.owner_ui_without_edge_address()),
         "grants" => {
-            let pending: Vec<serde_json::Value> = ops
-                .pending_grants()
-                .await
+            let prompts = ops.pending_grants().await;
+            let pending: Vec<PendingGrantRow<'_>> = prompts
                 .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "request_id": p.request_id,
-                        "agent_id": p.agent_id,
-                        "item_id": p.item_id,
-                        "action": p.action,
-                        "origin": p.origin,
-                    })
+                .map(|p| PendingGrantRow {
+                    request_id: &p.request_id,
+                    agent_id: &p.agent_id,
+                    item_id: &p.item_id,
+                    action: p.action,
+                    origin: &p.origin,
+                    rung: p.rung,
                 })
                 .collect();
             let mut out = serde_json::json!({ "ok": true, "pending": pending }).to_string();
@@ -953,6 +951,19 @@ fn ok_response(locked: Option<bool>) -> String {
 }
 
 /// The `status` reply.
+/// One pending request in the `grants` reply. `rung` is present only
+/// when a login method is taught for the origin (#382).
+#[derive(Serialize)]
+struct PendingGrantRow<'a> {
+    request_id: &'a str,
+    agent_id: &'a str,
+    item_id: &'a str,
+    action: crate::api::GrantAction,
+    origin: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rung: Option<&'static str>,
+}
+
 #[derive(Serialize)]
 struct StatusReply {
     ok: bool,

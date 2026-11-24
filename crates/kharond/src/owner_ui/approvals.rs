@@ -49,6 +49,9 @@ pub struct PendingRow {
     pub action: &'static str,
     /// The live origin observed at request time (REQ-APR-007).
     pub origin: String,
+    /// The rung of the login method taught for that origin's site,
+    /// when there is one (#382).
+    pub rung: Option<&'static str>,
     /// Seconds since the request was created.
     pub age_s: u64,
 }
@@ -323,7 +326,7 @@ where
             .pending_grant_requests()
             .iter()
             .filter_map(|r| {
-                let prompt = r.prompt()?;
+                let prompt = self.approval_prompt(r)?;
                 Some((
                     r.created_at,
                     PendingRow {
@@ -333,6 +336,7 @@ where
                         item_id: prompt.item_id,
                         action: prompt.action.as_str(),
                         origin: prompt.origin,
+                        rung: prompt.rung,
                         age_s: now.saturating_sub(r.created_at).as_secs(),
                     },
                 ))

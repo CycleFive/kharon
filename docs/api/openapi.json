@@ -779,7 +779,21 @@
               "decrypt_failed",
               "fill_unavailable",
               "sync_failed",
-              "grant_denied"
+              "grant_denied",
+              "method_wrong_page",
+              "method_drift",
+              "method_not_ready",
+              "method_stale",
+              "method_field_not_requested",
+              "method_selectors"
+            ]
+          },
+          "rung": {
+            "type": "string",
+            "description": "The rung of the taught login method this fill consulted. Absent when no method was used (#382).",
+            "enum": [
+              "milliseconds",
+              "agent_continues"
             ]
           }
         }

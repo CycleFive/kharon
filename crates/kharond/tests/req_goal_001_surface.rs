@@ -73,6 +73,7 @@ const REVIEWED_STRINGS: &[(&str, &str)] = &[
     ("FillResult.status", "fixed FillStatus literal"),
     ("FillResult.fields_filled[]", "fixed field-kind literal"),
     ("FillResult.detail", "fixed detail-code literal"),
+    ("FillResult.rung", "fixed rung literal (#382)"),
     (
         "FillResult.grant_request_id",
         "broker-assigned grant request id (#20)",

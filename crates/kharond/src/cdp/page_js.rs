@@ -228,6 +228,9 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
   const legEls = [];
   let legClickEl = null;
   if (leg) {
+    // A leg fill that throws must never leave an earlier fill's element
+    // for the probe.
+    try { delete globalThis.__kharonMethodPw; } catch (_) { /* already gone */ }
     if (location.pathname !== leg.path) fail("method_wrong_page");
     if (fields.length !== leg.fills.length) {
       fail("method_drift:" + (leg.fills[0] ? leg.fills[0].index : 0));
@@ -244,6 +247,9 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
     }
     for (let i = 0; i < leg.fills.length; i++) legEls.push(resolved[i]);
     if (legSubmit && legSubmit.via === "click") legClickEl = resolved[leg.fills.length];
+    if (legSubmit && !["form", "enter", "click"].includes(legSubmit.via)) {
+      fail("method_drift:" + legSubmit.index);
+    }
     if (legSubmit && legSubmit.via === "form") {
       const lastEl = legEls[legEls.length - 1];
       const form = lastEl ? lastEl.form || (lastEl.closest ? lastEl.closest("form") : null) : null;
@@ -265,6 +271,11 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
       checkBudget();
       const el = leg ? legEls[i] : resolveField(f.kind, f.selector);
       if (!el) fail("field_not_found:" + f.kind);
+      // Leg mode: an earlier field's page handlers may have changed
+      // this element since the pre-check.
+      if (leg && (!el.isConnected || (leg.fills[i].password === true && el.type !== "password"))) {
+        fail("method_drift:" + leg.fills[i].index);
+      }
       written.push(el);
       setNativeValue(el, f.value);
       results.push({ kind: f.kind, filled: true });
@@ -292,8 +303,17 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
     const last = lastFilledElement;
     const form = last ? last.form || (last.closest ? last.closest("form") : null) : null;
     if (leg && legSubmit.via === "click") {
+      // Page handlers ran during the writes: re-check the target.
+      if (!legClickEl.isConnected) {
+        clearWritten(written);
+        fail("method_drift:" + legSubmit.index);
+      }
       legClickEl.click();
     } else if (leg && legSubmit.via === "form") {
+      if (!form || typeof form.requestSubmit !== "function") {
+        clearWritten(written);
+        fail("method_drift:" + legSubmit.index);
+      }
       form.requestSubmit();
     } else if (!leg && form && typeof form.requestSubmit === "function") {
       form.requestSubmit();
@@ -1430,6 +1450,99 @@ eq(methodProbe().password_connected, null, "nothing recorded");
   p.pw.isConnected = false;
   eq(methodProbe().password_connected, false, "disconnected");
   eq(methodProbe().password_connected, null, "forgotten again");
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_page_handlers_cannot_defeat_the_precheck_mid_fill() {
+        run_leg_harness(
+            "midfill",
+            r##"
+{
+  // the form is detached by the password field's input handler
+  const p = new Page();
+  p.pw.onInput = () => { p.pw.form = null; p.u.form = null; };
+  eq(p.code(true), "method_drift:2", "form detached");
+  eq(p.u._v, "", "user cleared"); eq(p.pw._v, "", "pw cleared");
+  eq(p.form.submits, 0, "no submit");
+}
+{
+  // requestSubmit clobbered
+  const p = new Page();
+  p.pw.onInput = () => { p.form.requestSubmit = undefined; };
+  eq(p.code(true), "method_drift:2", "requestSubmit gone");
+  eq(p.pw._v, "", "pw cleared");
+}
+{
+  // click target detached
+  const p = new Page();
+  p.submit = { index: 2, via: "click", selectors: ["#go"], expect: null };
+  p.pw.onInput = () => { p.btn.isConnected = false; };
+  eq(p.code(true), "method_drift:2", "button detached");
+  eq(p.btn.clicks, 0, "no click"); eq(p.pw._v, "", "pw cleared");
+}
+{
+  // the user field's handler flips the password element's type
+  const p = new Page();
+  p.u.onInput = () => { p.pw.type = "text"; };
+  eq(p.code(true), "method_drift:1", "type swapped");
+  eq(p.pw._v, "", "password never written");
+  eq(p.pw.events.length, 0, "no event on pw");
+  eq(p.u._v, "", "user cleared");
+  eq(p.form.submits, 0, "no submit");
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_probe_global_is_reset_and_unknown_via_is_drift() {
+        run_leg_harness(
+            "reset",
+            r##"
+{
+  const p = new Page();
+  p.run(false);
+  const q = new Page();
+  q.pw.rects = 0;
+  eq(q.code(false), "method_drift:1", "second fill drifts");
+  eq(methodProbe().password_connected, null, "stale element not left behind");
+}
+{
+  const p = new Page();
+  p.submit = { index: 2, via: "teleport", selectors: [], expect: null };
+  eq(p.code(true), "method_drift:2", "unknown via");
+  p.untouched();
+  eq(p.u.events.length + p.pw.events.length, 0, "no key events");
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_enter_submit_and_unrequested_submit() {
+        run_leg_harness(
+            "enter",
+            r##"
+{
+  const p = new Page();
+  p.submit = { index: 2, via: "enter", selectors: [], expect: null };
+  p.run(true);
+  const seq = p.pw.events.map((e) => e.type).join(",");
+  eq(seq, "input,change,keydown,keypress,keyup", "enter on last element");
+  eq(p.u.events.map((e) => e.type).join(","), "input,change", "user got no keys");
+  eq(p.form.submits, 0, "no requestSubmit");
+}
+{
+  // submit not requested: nothing dispatched, a missing form is not drift
+  const p = new Page();
+  p.pw.form = null;
+  p.run(false);
+  eq(p.pw.events.map((e) => e.type).join(","), "input,change", "no submit events");
+  eq(p.form.submits, 0, "no submit");
+  eq(p.pw._v, "s3cret", "still filled");
 }
 "##,
         );

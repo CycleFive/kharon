@@ -2,7 +2,9 @@
 //! summary of a recording.
 
 use kharon_recording::{
-    EndedBy, ListenerWorld, PasswordLeg, Recording, RungCeiling, Shape, StrippedUrl,
+    EndedBy, FillRole, ListenerWorld, LoginMethod, METHOD_FILE_SUFFIX, MethodStep, PasswordLeg,
+    Provenance, Recording, Rung, RungCeiling, Shape, StrippedUrl, SubmitVia, SuccessCheck,
+    SuccessOverride,
 };
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -37,6 +39,41 @@ pub struct Cli {
 pub enum Command {
     /// Print what a recording file says, in plain words
     Show { file: PathBuf },
+    /// Turn a recording into a login method kharon can replay
+    Method {
+        /// The recording file to convert
+        recording: PathBuf,
+        /// Where to write the method (must not exist yet)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Convert even though nobody confirmed that the login worked
+        #[arg(long)]
+        unconfirmed: bool,
+        /// How kharon should tell that the login worked, instead of its own pick
+        #[arg(long, value_enum)]
+        success: Option<SuccessArg>,
+    },
+}
+
+/// What `--success` can say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SuccessArg {
+    /// The page address changes to the one the recording ended on
+    PathChanged,
+    /// The password field is gone from the page
+    PasswordFieldGone,
+    /// Do not check
+    None,
+}
+
+impl From<SuccessArg> for SuccessOverride {
+    fn from(a: SuccessArg) -> Self {
+        match a {
+            SuccessArg::PathChanged => SuccessOverride::PathChanged,
+            SuccessArg::PasswordFieldGone => SuccessOverride::PasswordFieldGone,
+            SuccessArg::None => SuccessOverride::None,
+        }
+    }
 }
 
 /// Why the program will not start. One line each.
@@ -62,6 +99,10 @@ pub enum Refusal {
     TooLarge(PathBuf),
     #[error("{} is not a recording kharon-teach can read: {}", .0.display(), .1)]
     NotARecording(PathBuf, String),
+    #[error("cannot write {}: {}", .0.display(), .1)]
+    Unwritable(PathBuf, String),
+    #[error("{0}")]
+    NotConvertible(String),
 }
 
 /// `https`, or `http` when the host is `localhost` or a loopback address; no user name or
@@ -99,6 +140,11 @@ fn sanitize_host(host: &str) -> String {
             }
         })
         .collect()
+}
+
+/// `<domain>.kharon-method.json`, with every character of the domain outside `[a-z0-9.-]` made `_`.
+pub fn default_method_name(domain: &str) -> String {
+    format!("{}{METHOD_FILE_SUFFIX}", sanitize_host(domain))
 }
 
 /// `<host>-<YYYYMMDDTHHMMSSZ>.kharon-recording.json`. Every character of the host outside
@@ -203,21 +249,9 @@ fn site(u: &StrippedUrl) -> String {
     plain(&format!("{}{}", u.origin, u.path))
 }
 
-/// What a recording says, in plain words, one fact per line. It is built from the recording
-/// only and holds no JSON.
-pub fn summary(r: &Recording) -> String {
-    let mut out: Vec<String> = Vec::new();
-    out.push(format!("Site: {}", site(&r.start_url)));
-    out.push(
-        match r.ended_by {
-            EndedBy::Confirmed => "How it ended: you pressed Enter to say the login worked.",
-            EndedBy::WindowClosed => "How it ended: the window was closed before you confirmed.",
-        }
-        .to_owned(),
-    );
-    out.push(format!(
-        "How the login works: {}",
-        match &r.classification.shape {
+/// The login's shape in plain words.
+fn shape_words(shape: &Shape) -> String {
+    match shape {
             Shape::FormPost => "One page; the form sends the password to the site as typed or encoded.".to_owned(),
             Shape::ScriptPost =>
                 "One page; the page's script sends the password to the site as typed or encoded.".to_owned(),
@@ -239,6 +273,23 @@ pub fn summary(r: &Recording) -> String {
             Shape::Unrecognized =>
                 "kharon-teach did not recognize how this login sends the password.".to_owned(),
         }
+}
+
+/// What a recording says, in plain words, one fact per line. It is built from the recording
+/// only and holds no JSON.
+pub fn summary(r: &Recording) -> String {
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!("Site: {}", site(&r.start_url)));
+    out.push(
+        match r.ended_by {
+            EndedBy::Confirmed => "How it ended: you pressed Enter to say the login worked.",
+            EndedBy::WindowClosed => "How it ended: the window was closed before you confirmed.",
+        }
+        .to_owned(),
+    );
+    out.push(format!(
+        "How the login works: {}",
+        shape_words(&r.classification.shape)
     ));
     out.push(format!(
         "Strongest protection: {}.",
@@ -308,11 +359,129 @@ pub fn summary(r: &Recording) -> String {
     text
 }
 
+fn fill_words(role: FillRole) -> &'static str {
+    match role {
+        FillRole::Username => "user name",
+        FillRole::Password => "password",
+    }
+}
+
+fn first_selector(selectors: &[String]) -> String {
+    selectors
+        .first()
+        .map_or_else(|| "(no selector)".to_owned(), |s| plain(s))
+}
+
+fn submit_words(via: &SubmitVia) -> String {
+    match via {
+        SubmitVia::Form {} => "submit the form".to_owned(),
+        SubmitVia::Enter {} => "press Enter".to_owned(),
+        SubmitVia::Click { selectors, .. } => format!("click {}", first_selector(selectors)),
+    }
+}
+
+fn step_words(step: &MethodStep) -> String {
+    match step {
+        MethodStep::Navigate { path } => format!("go to {}", plain(path)),
+        MethodStep::Fill {
+            role, selectors, ..
+        } => format!(
+            "fill the {} into {}",
+            fill_words(*role),
+            first_selector(selectors)
+        ),
+        MethodStep::Submit { via } => submit_words(via),
+    }
+}
+
+/// What a login method says, in plain words, one fact per line. Every string from the file goes
+/// through the control-character filter. It holds no JSON.
+pub fn method_summary(m: &LoginMethod) -> String {
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!(
+        "Site: {} (login page {})",
+        plain(&m.site.domain),
+        plain(&format!("{}{}", m.site.origin, m.site.path))
+    ));
+    out.push(format!("How the login works: {}", shape_words(&m.shape)));
+    out.push(format!(
+        "Strongest protection: {}.",
+        match m.rung {
+            Rung::Milliseconds =>
+                "kharon can fill and submit in one step, so the password is in the page for milliseconds",
+            Rung::AgentContinues => "the agent has to continue after the fill",
+        }
+    ));
+    let legs = m.legs.len();
+    let mut current = None;
+    for (index, leg, step) in m.steps() {
+        if legs > 1 && current != Some(leg) {
+            current = Some(leg);
+            out.push(format!("Part {} of {legs}:", leg + 1));
+        }
+        out.push(format!("  step {index}: {}", step_words(step)));
+    }
+    let submits: Vec<String> = m
+        .steps()
+        .filter_map(|(_, _, s)| match s {
+            MethodStep::Submit { via } => Some(submit_words(via)),
+            _ => None,
+        })
+        .collect();
+    out.push(if submits.is_empty() {
+        "How it submits: nothing is submitted by kharon; the agent does it.".to_owned()
+    } else {
+        format!("How it submits: {}.", submits.join("; then "))
+    });
+    out.push(match &m.success {
+        SuccessCheck::PathChangedTo { path } => format!(
+            "The login counts as worked when the page address becomes {}.",
+            plain(path)
+        ),
+        SuccessCheck::PasswordFieldGone {} => {
+            "The login counts as worked when the password field is gone from the page.".to_owned()
+        }
+        SuccessCheck::None {} => "kharon does not check whether the login worked.".to_owned(),
+    });
+    match &m.provenance {
+        Provenance::Recording {
+            sha256,
+            listener_world,
+            ..
+        } => {
+            let world = match listener_world {
+                ListenerWorld::Isolated => "isolated world",
+                ListenerWorld::Main => "main world",
+            };
+            out.push(format!(
+                "Where it came from: converted from a recording (sha256 {}, {world}).",
+                plain(sha256)
+            ));
+            if *listener_world == ListenerWorld::Main {
+                out.push(
+                    "Caution: the page listener ran in the page's own script world, where the site's scripts can see and fake what it reports. Trust this method less."
+                        .to_owned(),
+                );
+            }
+        }
+        Provenance::HandWritten { author } => out.push(format!(
+            "Where it came from: hand-written by {}.",
+            plain(author)
+        )),
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use clap::CommandFactory;
-    use kharon_recording::{BrowserInfo, Classification, Flags, StrippedCounts, Viewport};
+    use kharon_recording::{
+        BrowserInfo, Classification, ConvertOptions, Flags, LoginMethod, MethodStep, Provenance,
+        StrippedCounts, Viewport,
+    };
     use std::time::Duration;
 
     #[test]
@@ -520,6 +689,164 @@ pub(crate) mod tests {
         let mut r = recording();
         r.classification.notes = vec!["héllo wörld".into()];
         assert!(summary(&r).contains("Note: héllo wörld"));
+    }
+
+    /// A confirmed one-page form login that converts to a method.
+    pub(crate) fn convertible_recording() -> Recording {
+        use kharon_recording::{ElementDescriptor, FormRef, FrameRef, Role, Step};
+        let frame = || FrameRef {
+            main: true,
+            origin: "https://login.ex.test".into(),
+            cross_origin: false,
+        };
+        let url = |path: &str| StrippedUrl {
+            origin: "https://login.ex.test".into(),
+            path: path.into(),
+            query_keys: vec![],
+        };
+        let el = |id: &str, ty: &str| ElementDescriptor {
+            element_id: 1,
+            tag: "input".into(),
+            input_type: Some(ty.into()),
+            id: Some(id.into()),
+            name: Some(id.into()),
+            autocomplete: None,
+            placeholder: None,
+            aria_label: None,
+            was_password: ty == "password",
+            form: None,
+            selectors: vec![format!("#{id}")],
+            in_shadow_root: false,
+        };
+        let mut r = recording();
+        r.start_url = url("/login");
+        r.final_url = Some(url("/home"));
+        r.steps = vec![
+            Step::Navigation {
+                t_ms: 1,
+                frame: frame(),
+                url: url("/login"),
+            },
+            Step::Input {
+                t_ms: 2,
+                frame: frame(),
+                element: el("user", "text"),
+                value_len: 5,
+                role: Role::Username,
+            },
+            Step::Input {
+                t_ms: 3,
+                frame: frame(),
+                element: el("pw", "password"),
+                value_len: 9,
+                role: Role::Password,
+            },
+            Step::Submit {
+                t_ms: 4,
+                frame: frame(),
+                form: FormRef {
+                    index: 0,
+                    action: None,
+                    method: "post".into(),
+                },
+            },
+            Step::Navigation {
+                t_ms: 5,
+                frame: frame(),
+                url: url("/home"),
+            },
+        ];
+        r
+    }
+
+    fn a_method() -> LoginMethod {
+        let r = convertible_recording();
+        LoginMethod::from_recording(&r, b"bytes", "ex.test", ConvertOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn show_prints_a_method() {
+        let s = method_summary(&a_method());
+        assert!(s.contains("ex.test"), "{s}");
+        assert!(s.contains("https://login.ex.test/login"), "{s}");
+        assert!(s.contains("milliseconds"), "{s}");
+        assert!(s.contains("step 1: fill the user name into #user"), "{s}");
+        assert!(s.contains("step 2: fill the password into #pw"), "{s}");
+        assert!(s.contains("step 3: submit the form"), "{s}");
+        assert!(
+            s.contains("converted from a recording (sha256 ") && s.contains("isolated world)"),
+            "{s}"
+        );
+        assert!(!s.contains("Caution"), "{s}");
+        assert!(!s.contains('{') && !s.contains('"'), "{s}");
+    }
+
+    #[test]
+    fn a_method_from_the_main_world_carries_a_warning_and_a_hand_written_one_names_its_author() {
+        let mut m = a_method();
+        if let Provenance::Recording { listener_world, .. } = &mut m.provenance {
+            *listener_world = ListenerWorld::Main;
+        }
+        let s = method_summary(&m);
+        assert!(s.contains("main world") && s.contains("Caution"), "{s}");
+        m.provenance = Provenance::HandWritten {
+            author: "Pat".into(),
+        };
+        assert!(method_summary(&m).contains("hand-written by Pat"));
+    }
+
+    #[test]
+    fn show_never_prints_a_control_character_from_a_method() {
+        let mut m = a_method();
+        if let MethodStep::Fill { selectors, .. } = &mut m.legs[0].steps[1] {
+            selectors[0] = "#pw\u{1b}[2J".into();
+        }
+        m.site.path = "/x\u{7}".into();
+        m.provenance = Provenance::HandWritten {
+            author: "a\u{1b}[0mb".into(),
+        };
+        let s = method_summary(&m);
+        for c in s.chars().filter(|c| *c != '\n') {
+            assert!(!c.is_control(), "a control character {c:?} was printed");
+        }
+        assert!(s.contains("#pw\u{FFFD}[2J"), "{s}");
+    }
+
+    #[test]
+    fn cli_has_a_method_subcommand_and_still_no_headless_option() {
+        let cmd = Cli::command();
+        let method = cmd.find_subcommand("method").expect("method subcommand");
+        let names: Vec<_> = method
+            .get_arguments()
+            .map(|a| a.get_id().to_string())
+            .collect();
+        for want in ["recording", "out", "unconfirmed", "success"] {
+            assert!(names.iter().any(|n| n == want), "{want}: {names:?}");
+        }
+        for banned in ["headless", "attach", "port", "profile", "browser"] {
+            assert!(!names.iter().any(|n| n.contains(banned)), "{banned}");
+        }
+        use clap::Parser;
+        let c = Cli::try_parse_from([
+            "kharon-teach",
+            "method",
+            "r.json",
+            "--success",
+            "path-changed",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.command,
+            Some(Command::Method {
+                success: Some(SuccessArg::PathChanged),
+                ..
+            })
+        ));
+        for v in ["password-field-gone", "none"] {
+            assert!(
+                Cli::try_parse_from(["kharon-teach", "method", "r.json", "--success", v]).is_ok()
+            );
+        }
     }
 
     #[test]

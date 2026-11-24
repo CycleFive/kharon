@@ -15,10 +15,10 @@ pub mod strip;
 pub mod testing;
 
 use cli::{
-    Cli, Command, Refusal, check_dir_writable, check_out_path, default_file_name,
-    default_file_name_at, summary, validate_login_url,
+    Cli, Command, Refusal, SuccessArg, check_dir_writable, check_out_path, default_file_name,
+    default_file_name_at, default_method_name, method_summary, summary, validate_login_url,
 };
-use kharon_recording::Recording;
+use kharon_recording::{ConvertOptions, LoginMethod, Recording};
 use session::{End, Outcome, Ready, RecordOptions, record};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -147,32 +147,80 @@ pub fn write_new(
     ))
 }
 
-/// `kharon-teach show <file>`.
-fn show(file: &Path, stdout: &mut impl Write, stderr: &mut impl Write) -> Exit {
+/// The bytes of a file a person pointed us at, never more than 16 MiB.
+fn read_capped(file: &Path) -> Result<Vec<u8>, Refusal> {
     use std::io::Read;
     const CAP: u64 = 16 * 1024 * 1024;
-    let read = || -> Result<Recording, Refusal> {
-        let unreadable = |e: std::io::Error| Refusal::Unreadable(file.to_owned(), e.to_string());
-        let f = std::fs::File::open(file).map_err(unreadable)?;
-        let mut bytes = Vec::new();
-        f.take(CAP + 1)
-            .read_to_end(&mut bytes)
-            .map_err(unreadable)?;
-        if bytes.len() as u64 > CAP {
-            return Err(Refusal::TooLarge(file.to_owned()));
-        }
-        let text = String::from_utf8(bytes)
+    let unreadable = |e: std::io::Error| Refusal::Unreadable(file.to_owned(), e.to_string());
+    let f = std::fs::File::open(file).map_err(unreadable)?;
+    let mut bytes = Vec::new();
+    f.take(CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > CAP {
+        return Err(Refusal::TooLarge(file.to_owned()));
+    }
+    Ok(bytes)
+}
+
+/// `kharon-teach show <file>`: a recording, or else a method.
+fn show(file: &Path, stdout: &mut impl Write, stderr: &mut impl Write) -> Exit {
+    let read = || -> Result<String, Refusal> {
+        let text = String::from_utf8(read_capped(file)?)
             .map_err(|_| Refusal::NotARecording(file.to_owned(), "not text".to_owned()))?;
-        Recording::from_json(&text)
-            .map_err(|e| Refusal::NotARecording(file.to_owned(), e.to_string()))
+        match Recording::from_json(&text) {
+            Ok(r) => Ok(summary(&r)),
+            Err(rec_err) => LoginMethod::from_json(&text)
+                .map(|m| method_summary(&m))
+                .map_err(|_| Refusal::NotARecording(file.to_owned(), rec_err.to_string())),
+        }
     };
     match read() {
-        Ok(r) => {
-            let _ = stdout.write_all(summary(&r).as_bytes());
+        Ok(text) => {
+            let _ = stdout.write_all(text.as_bytes());
             Exit::Done
         }
         Err(e) => fail(stderr, &e, Exit::Refused),
     }
+}
+
+/// `kharon-teach method <recording>`: convert, and write the method in `dir` (or at `out`).
+/// Returns the path written. The recording is read once; its bytes are what the method's
+/// digest covers. This starts no browser.
+fn method_command(
+    recording: &Path,
+    out: Option<&Path>,
+    unconfirmed: bool,
+    success: Option<SuccessArg>,
+    dir: &Path,
+) -> Result<(PathBuf, LoginMethod), Refusal> {
+    let bytes = read_capped(recording)?;
+    let not_a = |why: String| Refusal::NotARecording(recording.to_owned(), why);
+    let rec = Recording::from_json(
+        std::str::from_utf8(&bytes).map_err(|_| not_a("not text".to_owned()))?,
+    )
+    .map_err(|e| not_a(e.to_string()))?;
+    let origin = url::Url::parse(&rec.start_url.origin)
+        .map_err(|_| not_a("its login address is not a web address".to_owned()))?;
+    let host = origin
+        .host_str()
+        .ok_or_else(|| not_a("its login address has no host".to_owned()))?;
+    let domain = site::registrable_domain(host);
+    let method = LoginMethod::from_recording(
+        &rec,
+        &bytes,
+        &domain,
+        ConvertOptions {
+            allow_unconfirmed: unconfirmed,
+            success: success.map(Into::into),
+        },
+    )
+    .map_err(|e| Refusal::NotConvertible(e.to_string()))?;
+    let target = out.map_or_else(|| dir.join(default_method_name(&domain)), Path::to_owned);
+    check_out_path(&target)?;
+    let path = write_new(&target, Naming::Explicit, &method.to_json())
+        .map_err(|(at, e)| Refusal::Unwritable(at, e.to_string()))?;
+    Ok((path, method))
 }
 
 /// Everything checked before the notice.
@@ -259,6 +307,28 @@ pub async fn run_with(
     use tokio::signal::unix::{SignalKind, signal};
     if let Some(Command::Show { file }) = &cli.command {
         return show(file, &mut stdout, &mut stderr);
+    }
+    if let Some(Command::Method {
+        recording,
+        out,
+        unconfirmed,
+        success,
+    }) = &cli.command
+    {
+        return match method_command(
+            recording,
+            out.as_deref(),
+            *unconfirmed,
+            *success,
+            Path::new("."),
+        ) {
+            Ok((path, method)) => {
+                let _ = writeln!(stdout, "Saved: {}\n", path.display());
+                let _ = stdout.write_all(method_summary(&method).as_bytes());
+                Exit::Done
+            }
+            Err(e) => fail(&mut stderr, &e, Exit::Refused),
+        };
     }
     let prep = match prepare(&cli) {
         Ok(p) => p,
@@ -564,6 +634,137 @@ mod tests {
         let r = go(&["show", good.to_str().unwrap()], "").await;
         assert_eq!(r.exit, Exit::Done, "{}", r.err);
         assert!(r.out.contains("Site: https://ex.test/login"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn method_args(rec: &std::path::Path) -> (std::path::PathBuf, bool, Option<cli::SuccessArg>) {
+        (rec.to_owned(), false, None)
+    }
+
+    fn write_recording(dir: &std::path::Path, r: &Recording) -> std::path::PathBuf {
+        let p = dir.join("in.kharon-recording.json");
+        std::fs::write(&p, r.to_json()).unwrap();
+        p
+    }
+
+    #[test]
+    fn method_command_writes_a_0600_file_named_for_the_domain() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = private_dir("method-ok");
+        let rec = write_recording(&d, &cli::tests::convertible_recording());
+        let (r, un, su) = method_args(&rec);
+        let (path, _) = method_command(&r, None, un, su, &d).unwrap();
+        assert_eq!(path, d.join("ex.test.kharon-method.json"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let m = kharon_recording::LoginMethod::from_json(&std::fs::read_to_string(&path).unwrap())
+            .unwrap();
+        use sha2::{Digest, Sha256};
+        let want: String = Sha256::digest(std::fs::read(&rec).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(m.digest(), Some(want.as_str()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn method_command_refuses_and_says_why() {
+        let d = private_dir("method-no");
+        let mut r = cli::tests::convertible_recording();
+        r.classification.shape = kharon_recording::Shape::Unrecognized;
+        r.classification.rung_ceiling = kharon_recording::RungCeiling::NeedsPerson;
+        let rec = write_recording(&d, &r);
+        let out = d.join("o.json");
+        let e = method_command(&rec, Some(&out), false, None, &d).unwrap_err();
+        let want = kharon_recording::NotConvertible::NeedsPerson.to_string();
+        assert!(e.to_string().contains(&want), "{e}");
+        assert!(!out.exists());
+        assert!(!d.join("ex.test.kharon-method.json").exists());
+        // Through `run`, it is one line on stderr and exit 2.
+        let (mut o, mut er) = (Vec::new(), Vec::new());
+        let exit = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(run(
+                cli(&[
+                    "method",
+                    rec.to_str().unwrap(),
+                    "--out",
+                    out.to_str().unwrap(),
+                ]),
+                &b""[..],
+                &mut o,
+                &mut er,
+            ));
+        assert_eq!(exit, Exit::Refused);
+        assert!(o.is_empty());
+        let er = String::from_utf8(er).unwrap();
+        assert!(er.starts_with("kharon-teach: ") && er.contains(&want) && er.lines().count() == 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn method_command_refuses_an_existing_out_file() {
+        let d = private_dir("method-exists");
+        let rec = write_recording(&d, &cli::tests::convertible_recording());
+        let out = d.join("taken.json");
+        std::fs::write(&out, b"x").unwrap();
+        let e = method_command(&rec, Some(&out), false, None, &d).unwrap_err();
+        assert!(matches!(e, Refusal::OutExists(_)), "{e}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"x");
+        // The default name is refused the same way.
+        std::fs::write(d.join("ex.test.kharon-method.json"), b"y").unwrap();
+        let e = method_command(&rec, None, false, None, &d).unwrap_err();
+        assert!(matches!(e, Refusal::OutExists(_)), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn method_command_honours_unconfirmed_and_success() {
+        let d = private_dir("method-opts");
+        let mut r = cli::tests::convertible_recording();
+        r.success_confirmed = false;
+        let rec = write_recording(&d, &r);
+        let e = method_command(&rec, None, false, None, &d).unwrap_err();
+        assert!(matches!(e, Refusal::NotConvertible(_)), "{e}");
+        let (path, _) = method_command(&rec, None, true, Some(cli::SuccessArg::None), &d).unwrap();
+        let m = kharon_recording::LoginMethod::from_json(&std::fs::read_to_string(path).unwrap())
+            .unwrap();
+        assert_eq!(m.success, kharon_recording::SuccessCheck::None {});
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn show_reads_a_method_file_too() {
+        let d = private_dir("show-method");
+        let rec = write_recording(&d, &cli::tests::convertible_recording());
+        let out = d.join("m.json");
+        let r = go(
+            &[
+                "method",
+                rec.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(r.exit, Exit::Done, "{}", r.err);
+        assert!(
+            r.out.contains(out.to_str().unwrap()) && r.out.contains("step 2: fill the password")
+        );
+        let r = go(&["show", out.to_str().unwrap()], "").await;
+        assert_eq!(r.exit, Exit::Done, "{}", r.err);
+        assert!(r.out.contains("step 3: submit the form"), "{}", r.out);
+        let bad = d.join("bad.json");
+        std::fs::write(&bad, b"{}").unwrap();
+        assert_eq!(
+            go(&["show", bad.to_str().unwrap()], "").await.exit,
+            Exit::Refused
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 

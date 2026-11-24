@@ -13,6 +13,7 @@ pub mod client;
 pub mod discover;
 pub mod endpoint;
 pub mod fill;
+pub mod method;
 pub(crate) mod page_js;
 pub mod tls;
 
@@ -24,3 +25,4 @@ pub use fill::{
     FieldFill, FieldKind, FillEngine, FillOutcome, FillPlan, LiveOrigin, RETURN_MARGIN, ScrubNote,
     ValuesSent,
 };
+pub use method::{MethodEnd, MethodLookup, MethodNote, MethodResult, MethodSource, MethodUse};

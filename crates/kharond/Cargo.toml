@@ -58,6 +58,7 @@ zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
 # extra CA (self-hosted / fixture).
 kharon-bwcrypto = { version = "0.0.0", path = "../kharon-bwcrypto" }
 kharon-connector = { version = "0.0.0", path = "../kharon-connector" }
+kharon-recording = { version = "0.0.0", path = "../kharon-recording" }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "http2"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }

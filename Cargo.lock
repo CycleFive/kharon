@@ -1128,6 +1128,7 @@ dependencies = [
  "hyper-util",
  "kharon-bwcrypto",
  "kharon-connector",
+ "kharon-recording",
  "kharond",
  "nix",
  "pbkdf2",

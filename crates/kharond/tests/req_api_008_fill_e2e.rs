@@ -837,6 +837,8 @@ async fn req_apr_008_engine_marks_values_sent_only_with_the_fill_call() {
         post_submit_scrub: false,
         post_submit_scrub_delay: std::time::Duration::from_millis(500),
         scrub: ScrubNote::new(),
+        method_source: None,
+        method: kharond::cdp::MethodNote::new(),
     };
     let fill_calls = || {
         received
@@ -888,6 +890,8 @@ async fn req_apr_008_dropped_socket_on_the_fill_call_counts_as_sent() {
         post_submit_scrub: false,
         post_submit_scrub_delay: std::time::Duration::from_millis(500),
         scrub: ScrubNote::new(),
+        method_source: None,
+        method: kharond::cdp::MethodNote::new(),
     };
     let out = FillEngine::new(browser).fill(&plan, &ctx, false).await;
     assert_ne!(out.status(), "filled", "{out:?}");
@@ -1105,6 +1109,8 @@ async fn req_api_013_engine_ignores_scrub_without_submit() {
         post_submit_scrub: true,
         post_submit_scrub_delay: std::time::Duration::from_secs(30),
         scrub: ScrubNote::new(),
+        method_source: None,
+        method: kharond::cdp::MethodNote::new(),
     };
     let started = std::time::Instant::now();
     let out = FillEngine::new(browser).fill(&plan, &ctx, false).await;

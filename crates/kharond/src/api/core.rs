@@ -3174,6 +3174,8 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     .unwrap_or(self.fill_policy.post_submit_scrub),
             post_submit_scrub_delay: self.fill_policy.post_submit_scrub_delay,
             scrub: crate::cdp::fill::ScrubNote::new(),
+            method_source: None,
+            method: crate::cdp::MethodNote::new(),
         };
         // `item` was the last borrow of the session. A spent grant
         // no longer defers the idle lock; an unlimited grant stays

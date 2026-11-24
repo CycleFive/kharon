@@ -356,8 +356,6 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
 ///
 /// Returns `{ password_connected: true | false | null }`; `null` when
 /// nothing was recorded (no leg fill, or already probed).
-// Wired by the engine in a later task of #382.
-#[allow(dead_code)]
 pub const METHOD_PROBE_IN_PAGE: &str = r#"
 function methodProbe() {
   "use strict";

@@ -46,7 +46,12 @@ use crate::origin::{MismatchReason, OriginConfig, OriginMatcher};
 
 use super::browser::{AgentContext, Browser, OwnershipError};
 use super::client::CdpError;
-use super::page_js::{CLEAR_IN_PAGE, FILL_IN_PAGE, PROBE_WRITTEN_IN_PAGE, SCRUB_WRITTEN_IN_PAGE};
+use super::method::{
+    MethodEnd, MethodNote, MethodResult, MethodSource, MethodUse, Prepared, judge, prepare,
+};
+use super::page_js::{
+    CLEAR_IN_PAGE, FILL_IN_PAGE, METHOD_PROBE_IN_PAGE, PROBE_WRITTEN_IN_PAGE, SCRUB_WRITTEN_IN_PAGE,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
@@ -129,6 +134,13 @@ pub struct FillPlan {
     /// What the post-submit scrub observed, if it was attempted.
     /// Shared by every clone of the plan, like [`LiveOrigin`].
     pub scrub: ScrubNote,
+    /// Where to look up the site's taught login method (#382). `None`
+    /// never consults a registry. The lookup uses the live URL the
+    /// browser reports, never the agent's claim.
+    pub method_source: Option<Arc<dyn MethodSource>>,
+    /// How this fill used a method, if it consulted one. Write-once,
+    /// shared by every clone of the plan.
+    pub method: MethodNote,
 }
 
 /// The live origin one fill observed (REQ-AUD-003†, #67): the
@@ -293,6 +305,20 @@ pub enum FillOutcome {
     /// `otpauth://totp`, `steam://` or base32 secret. No CDP call was
     /// made.
     TotpUnsupported,
+    /// #382: a method fill ended before or in the page, with status
+    /// `field_not_found` and these fixed details. The first three end
+    /// before anything is sent to the page.
+    MethodWrongPage,
+    MethodStale,
+    MethodFieldNotRequested,
+    /// The page no longer matches the recorded step (flat step index).
+    MethodDrift {
+        step: u32,
+    },
+    /// The recorded element is there but disabled.
+    MethodNotReady {
+        step: u32,
+    },
     Error(String),
 }
 
@@ -305,7 +331,12 @@ impl FillOutcome {
                 "origin_mismatch"
             }
             Self::Navigated => "navigated",
-            Self::FieldNotFound { .. } => "field_not_found",
+            Self::FieldNotFound { .. }
+            | Self::MethodWrongPage
+            | Self::MethodStale
+            | Self::MethodFieldNotRequested
+            | Self::MethodDrift { .. }
+            | Self::MethodNotReady { .. } => "field_not_found",
             Self::TargetNotOwned | Self::DefaultContextRefused => "target_not_owned",
             Self::UnknownTarget => "not_found",
             Self::Timeout => "timeout",
@@ -323,6 +354,11 @@ impl FillOutcome {
             Self::UnknownTarget => Some("unknown_target"),
             Self::ClockSkew => Some("clock_skew"),
             Self::TotpUnsupported => Some("totp_unsupported"),
+            Self::MethodWrongPage => Some("method_wrong_page"),
+            Self::MethodStale => Some("method_stale"),
+            Self::MethodFieldNotRequested => Some("method_field_not_requested"),
+            Self::MethodDrift { .. } => Some("method_drift"),
+            Self::MethodNotReady { .. } => Some("method_not_ready"),
             Self::Error(_) => Some("cdp_error"),
             _ => None,
         }
@@ -529,26 +565,89 @@ impl FillEngine {
             };
         }
 
+        // #382: a site with a taught login method is filled by the
+        // method's steps. The lookup uses the URL read above.
+        let requested: Vec<FieldKind> = plan.fields.iter().map(|f| f.kind).collect();
+        let lookup = plan
+            .method_source
+            .as_ref()
+            .filter(|_| {
+                requested
+                    .iter()
+                    .any(|k| matches!(k, FieldKind::Username | FieldKind::Password))
+            })
+            .and_then(|source| source.lookup(&info.url));
+        let selectors_ignored = plan.fields.iter().any(|f| f.selector.is_some());
+        let mut prepared: Option<Prepared> = None;
+        if let Some(lookup) = &lookup {
+            match prepare(
+                lookup,
+                &info.url,
+                &requested,
+                plan.submit,
+                plan.post_submit_scrub,
+            ) {
+                Ok(p) => prepared = Some(p),
+                Err(end) => {
+                    // Nothing was sent to the browser.
+                    plan.method.record(MethodUse {
+                        domain: lookup.domain.clone(),
+                        rung: lookup.method.rung,
+                        end,
+                        selectors_ignored,
+                        browser_product: None,
+                    });
+                    return match end {
+                        MethodEnd::Stale => FillOutcome::MethodStale,
+                        MethodEnd::FieldNotRequested => FillOutcome::MethodFieldNotRequested,
+                        _ => FillOutcome::MethodWrongPage,
+                    };
+                }
+            }
+        }
+        // Read once per connection, before the values are anywhere near
+        // the wire, so a slow browser cannot eat the deadline afterwards.
+        let product = match prepared {
+            Some(_) => self.browser.product().await,
+            None => None,
+        };
+        let is_method = prepared.is_some();
+        // The leg decides which values go to the page, and in what order.
+        let ordered: Vec<&FieldFill> = match &prepared {
+            Some(p) => p
+                .order
+                .iter()
+                .filter_map(|k| plan.fields.iter().find(|f| f.kind == *k))
+                .collect(),
+            None => plan.fields.iter().collect(),
+        };
+        // The leg argument holds selectors and shape checks only.
+        let leg_arg = match &prepared {
+            Some(p) => serde_json::to_value(&p.leg).expect("leg serializes"),
+            None => Value::Null,
+        };
+
         let specs: Vec<Value> = plan
             .item_matchers
             .iter()
             .map(|m| serde_json::to_value(m.in_page_spec()).expect("spec serializes"))
             .collect();
-        let mut field_args: Vec<Value> = plan
-            .fields
+        // In leg mode the agent's selector is dropped here: the page
+        // only ever sees the method's.
+        let selector_of = |f: &FieldFill| if is_method { None } else { f.selector.clone() };
+        let mut field_args: Vec<Value> = ordered
             .iter()
             .map(|f| {
                 json!({
                     "kind": f.kind.as_str(),
-                    "selector": f.selector,
+                    "selector": selector_of(f),
                     "value": &*f.value,
                 })
             })
             .collect();
-        let clear_args: Vec<Value> = plan
-            .fields
+        let clear_args: Vec<Value> = ordered
             .iter()
-            .map(|f| json!({ "kind": f.kind.as_str(), "selector": f.selector }))
+            .map(|f| json!({ "kind": f.kind.as_str(), "selector": selector_of(f) }))
             .collect();
 
         let session = match self.browser.client().attach(&plan.target_id).await {
@@ -560,8 +659,16 @@ impl FillEngine {
         // `submit` is checked here, not only by the broker: a plan that
         // sets the scrub flag on a non-submit fill must not wait or
         // send the values again (#355 review).
-        let scrub = (plan.submit && plan.post_submit_scrub)
-            .then_some((&plan.scrub, plan.post_submit_scrub_delay));
+        let (submit, scrub_on) = match &prepared {
+            Some(p) => (p.submit, p.scrub),
+            None => (plan.submit, plan.submit && plan.post_submit_scrub),
+        };
+        let scrub = scrub_on.then_some((&plan.scrub, plan.post_submit_scrub_delay));
+        let mut run = prepared.as_ref().map(|prepared| MethodRun {
+            prepared,
+            delay: plan.post_submit_scrub_delay,
+            result: None,
+        });
         let outcome = self
             .fill_attached(
                 &session,
@@ -569,10 +676,12 @@ impl FillEngine {
                 &field_args,
                 &clear_args,
                 &info.url,
-                plan.submit,
+                submit,
                 plan.deadline,
                 &plan.values_sent,
                 scrub,
+                &leg_arg,
+                run.as_mut(),
             )
             .await;
 
@@ -592,6 +701,26 @@ impl FillEngine {
         }
 
         session.detach().await;
+
+        if let (Some(lookup), Some(run)) = (&lookup, &run) {
+            let end = match &outcome {
+                FillOutcome::Filled { .. } => {
+                    MethodEnd::Filled(run.result.unwrap_or(MethodResult::Unconfirmed))
+                }
+                FillOutcome::MethodWrongPage => MethodEnd::WrongPage,
+                FillOutcome::MethodDrift { step } => MethodEnd::Drift { step: *step },
+                FillOutcome::MethodNotReady { step } => MethodEnd::NotReady { step: *step },
+                _ => MethodEnd::Other,
+            };
+            let reached = !matches!(end, MethodEnd::Other);
+            plan.method.record(MethodUse {
+                domain: lookup.domain.clone(),
+                rung: run.prepared.rung,
+                end,
+                selectors_ignored,
+                browser_product: if reached { product } else { None },
+            });
+        }
         outcome
     }
 
@@ -608,6 +737,8 @@ impl FillEngine {
         deadline: Option<Instant>,
         values_sent: &ValuesSent,
         scrub: Option<(&ScrubNote, Duration)>,
+        leg: &Value,
+        mut method: Option<&mut MethodRun<'_>>,
     ) -> FillOutcome {
         // Step 1's frame-tree read: the loader id we'll re-check against.
         let tree = match session.request("Page.getFrameTree", json!({})).await {
@@ -676,6 +807,7 @@ impl FillEngine {
                         { "value": submit },
                         { "value": budget_ms },
                         { "value": scrub.is_some() },
+                        { "value": leg },
                     ],
                     "returnByValue": true,
                     "awaitPromise": false,
@@ -703,7 +835,13 @@ impl FillEngine {
         // Step 4: loader re-check.
         let tree_after = match session.request("Page.getFrameTree", json!({})).await {
             Ok(t) => t,
-            Err(_) => return parse_fill_results(&result),
+            Err(_) => {
+                let outcome = parse_fill_results(&result);
+                if let (Some(run), FillOutcome::Filled { .. }) = (method.as_deref_mut(), &outcome) {
+                    run.result = Some(MethodResult::Unconfirmed);
+                }
+                return outcome;
+            }
         };
         let loader_after = tree_frame(&tree_after)
             .and_then(|f| f.get("loaderId"))
@@ -723,6 +861,19 @@ impl FillEngine {
                 // still `Navigated` / the failure.
                 if submit {
                     let outcome = parse_fill_results(&result);
+                    if let (Some(run), FillOutcome::Filled { .. }) =
+                        (method.as_deref_mut(), &outcome)
+                    {
+                        // A new document is already committed: its
+                        // URL is the path the submit led to.
+                        run.result = Some(judge(
+                            &run.prepared.success,
+                            run.prepared.has_password,
+                            true,
+                            frame_path(&tree_after).as_deref(),
+                            None,
+                        ));
+                    }
                     // The page already left. The delayed re-read would
                     // see the same thing and must not clear a new
                     // document, so record it and do not wait (#355).
@@ -748,16 +899,116 @@ impl FillEngine {
             }
             (Some(before), Some(_)) => {
                 let outcome = parse_fill_results(&result);
-                if let (Some((note, delay)), FillOutcome::Filled { .. }) = (scrub, &outcome) {
-                    self.post_submit_scrub(
-                        session, context_id, field_args, before, deadline, delay, note,
-                    )
-                    .await;
+                if let FillOutcome::Filled { .. } = &outcome {
+                    if let Some(run) = method.as_mut() {
+                        run.result = Some(
+                            self.method_success(
+                                session,
+                                context_id,
+                                field_args,
+                                before,
+                                deadline,
+                                run.prepared,
+                                run.delay,
+                                scrub.map(|(note, _)| note),
+                            )
+                            .await,
+                        );
+                    } else if let Some((note, delay)) = scrub {
+                        self.post_submit_scrub(
+                            session, context_id, field_args, before, deadline, delay, note,
+                        )
+                        .await;
+                    }
                 }
                 outcome
             }
             _ => FillOutcome::Error("frame tree loader id missing after fill".into()),
         }
+    }
+
+    /// Read a submitted method fill's success once (#382): after the
+    /// delay, the one re-read decides whether the loader changed and
+    /// where the page is; on the same document the password element is
+    /// asked about too. The scrub, when it is on, rides the same
+    /// re-read. A fill that did not submit is `Unconfirmed` and reads
+    /// nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn method_success(
+        &self,
+        session: &super::client::CdpSession,
+        context_id: u64,
+        field_args: &[Value],
+        loader_before: &str,
+        deadline: Option<Instant>,
+        prepared: &Prepared,
+        delay: Duration,
+        scrub: Option<&ScrubNote>,
+    ) -> MethodResult {
+        if !prepared.submit {
+            return MethodResult::Unconfirmed;
+        }
+        let tree = match reread_frame_tree(session, deadline, delay).await {
+            Reread::NoRoom => return MethodResult::Unconfirmed,
+            Reread::TimedOut => {
+                if let Some(note) = scrub {
+                    note.record(ScrubObservation::Nothing);
+                }
+                return MethodResult::Unconfirmed;
+            }
+            Reread::Failed => {
+                if let Some(note) = scrub {
+                    note.record(ScrubObservation::Navigated);
+                }
+                return MethodResult::Unconfirmed;
+            }
+            Reread::Tree(t) => t,
+        };
+        let loader_now = tree_frame(&tree)
+            .and_then(|f| f.get("loaderId"))
+            .and_then(Value::as_str);
+        let loader_changed = loader_now != Some(loader_before);
+        let path_now = frame_path(&tree);
+        let mut password_connected = None;
+        if loader_changed {
+            if let Some(note) = scrub {
+                note.record(ScrubObservation::Navigated);
+            }
+        } else {
+            if scrub_room(deadline, Duration::ZERO, Instant::now()) {
+                let probe = session
+                    .request_with_timeout(
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "functionDeclaration": METHOD_PROBE_IN_PAGE,
+                            "executionContextId": context_id,
+                            "arguments": [],
+                            "returnByValue": true,
+                            "awaitPromise": false,
+                        }),
+                        scrub_call_timeout(deadline, Instant::now()),
+                    )
+                    .await;
+                if let Ok(reply) = probe
+                    && reply.get("exceptionDetails").is_none()
+                {
+                    password_connected = reply
+                        .pointer("/result/value/password_connected")
+                        .and_then(Value::as_bool);
+                }
+            }
+            if let Some(note) = scrub {
+                self.clear_if_held(session, context_id, field_args, deadline, note)
+                    .await;
+            }
+        }
+        judge(
+            &prepared.success,
+            prepared.has_password,
+            loader_changed,
+            path_now.as_deref(),
+            password_connected,
+        )
     }
 
     /// One re-read after `delay`, then a clear of the recorded elements
@@ -777,30 +1028,17 @@ impl FillEngine {
         delay: Duration,
         note: &ScrubNote,
     ) {
-        if !scrub_room(deadline, delay, Instant::now()) {
-            return;
-        }
-        tokio::time::sleep(delay).await;
-        if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
-            return;
-        }
-        // Bounded: an unanswered re-read must not turn a `filled`
-        // reply into the broker's `timeout`, and an engine caller with
-        // no deadline must not wait forever (#355 review).
-        let timeout = scrub_call_timeout(deadline, Instant::now());
-        let tree = match session
-            .request_with_timeout("Page.getFrameTree", json!({}), timeout)
-            .await
-        {
-            Ok(t) => t,
-            Err(CdpError::Timeout) => {
+        let tree = match reread_frame_tree(session, deadline, delay).await {
+            Reread::NoRoom => return,
+            Reread::TimedOut => {
                 note.record(ScrubObservation::Nothing);
                 return;
             }
-            Err(_) => {
+            Reread::Failed => {
                 note.record(ScrubObservation::Navigated);
                 return;
             }
+            Reread::Tree(t) => t,
         };
         let loader_now = tree_frame(&tree)
             .and_then(|f| f.get("loaderId"))
@@ -809,6 +1047,20 @@ impl FillEngine {
             note.record(ScrubObservation::Navigated);
             return;
         }
+        self.clear_if_held(session, context_id, field_args, deadline, note)
+            .await;
+    }
+
+    /// The tail of the scrub once the page is known to be the filled
+    /// document: probe, then clear what is still held.
+    async fn clear_if_held(
+        &self,
+        session: &super::client::CdpSession,
+        context_id: u64,
+        field_args: &[Value],
+        deadline: Option<Instant>,
+        note: &ScrubNote,
+    ) {
         if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
             return;
         }
@@ -884,6 +1136,58 @@ impl FillEngine {
     }
 }
 
+/// A method fill's view of the engine's tail: what the fill planned,
+/// and where its success reading goes.
+struct MethodRun<'a> {
+    prepared: &'a Prepared,
+    delay: Duration,
+    result: Option<MethodResult>,
+}
+
+/// The one delayed `Page.getFrameTree` read.
+enum Reread {
+    /// The deadline cannot cover the delay (or no longer has room).
+    NoRoom,
+    TimedOut,
+    Failed,
+    Tree(Value),
+}
+
+/// Wait `delay`, then read the frame tree once, bounded as the scrub's
+/// own call is. Never runs when the deadline cannot cover the delay plus
+/// [`RETURN_MARGIN`]; a drop during the wait sends nothing.
+async fn reread_frame_tree(
+    session: &super::client::CdpSession,
+    deadline: Option<Instant>,
+    delay: Duration,
+) -> Reread {
+    if !scrub_room(deadline, delay, Instant::now()) {
+        return Reread::NoRoom;
+    }
+    tokio::time::sleep(delay).await;
+    if !scrub_room(deadline, Duration::ZERO, Instant::now()) {
+        return Reread::NoRoom;
+    }
+    // Bounded: an unanswered re-read must not turn a `filled` reply
+    // into the broker's `timeout`, and an engine caller with no
+    // deadline must not wait forever (#355 review).
+    let timeout = scrub_call_timeout(deadline, Instant::now());
+    match session
+        .request_with_timeout("Page.getFrameTree", json!({}), timeout)
+        .await
+    {
+        Ok(t) => Reread::Tree(t),
+        Err(CdpError::Timeout) => Reread::TimedOut,
+        Err(_) => Reread::Failed,
+    }
+}
+
+/// The path of the main frame's URL in a `Page.getFrameTree` reply.
+fn frame_path(tree: &Value) -> Option<String> {
+    let href = tree_frame(tree)?.get("url")?.as_str()?;
+    url::Url::parse(href).ok().map(|u| u.path().to_owned())
+}
+
 // Private newtype so `fill` can hold Option<MismatchReason> without
 // exposing it in the public API.
 struct Decision_(Option<MismatchReason>);
@@ -933,6 +1237,12 @@ fn classify_exception(description: &str) -> FillOutcome {
         FillOutcome::OriginMismatch
     } else if description.contains("kharon:non_secure") {
         FillOutcome::NonSecureContext
+    } else if description.contains("kharon:method_wrong_page") {
+        FillOutcome::MethodWrongPage
+    } else if let Some(step) = method_step(description, "kharon:method_drift:") {
+        FillOutcome::MethodDrift { step }
+    } else if let Some(step) = method_step(description, "kharon:method_not_ready:") {
+        FillOutcome::MethodNotReady { step }
     } else if description.contains("kharon:field_not_found") {
         let kinds = if description.contains(":password") {
             vec![FieldKind::Password]
@@ -945,6 +1255,14 @@ fn classify_exception(description: &str) -> FillOutcome {
     } else {
         FillOutcome::Error(format!("in-page exception: {description}"))
     }
+}
+
+/// The step number after `prefix` in an in-page failure description;
+/// an unparsable number is step 0.
+fn method_step(description: &str, prefix: &str) -> Option<u32> {
+    let rest = description.split_once(prefix)?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some(digits.parse().unwrap_or(0))
 }
 
 fn map_context_error(code: i64, message: &str) -> FillOutcome {

@@ -189,6 +189,9 @@ pub struct Browser {
     /// Filled on the first ownership check that needs it. Empty on a
     /// new connection, so a restarted browser's id cannot linger.
     default_context: Arc<Mutex<Option<DefaultContext>>>,
+    /// The `product` of the first `Browser.getVersion` reply that had
+    /// one, read for a method fill's note (#382).
+    product: Arc<Mutex<Option<String>>>,
 }
 
 impl Browser {
@@ -197,7 +200,27 @@ impl Browser {
             client,
             agent_contexts: Arc::new(Mutex::new(Vec::new())),
             default_context: Arc::new(Mutex::new(None)),
+            product: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The browser's product string (`Browser.getVersion`), asked once
+    /// per connection. `None` when the browser does not answer within a
+    /// second; the next call asks again.
+    pub async fn product(&self) -> Option<String> {
+        if let Some(p) = self.product.lock().expect("product lock").clone() {
+            return Some(p);
+        }
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.client.request("Browser.getVersion", json!({})),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let product = reply.get("product")?.as_str()?.to_owned();
+        *self.product.lock().expect("product lock") = Some(product.clone());
+        Some(product)
     }
 
     pub fn client(&self) -> &CdpClient {

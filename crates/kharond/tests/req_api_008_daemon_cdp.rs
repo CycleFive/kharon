@@ -750,10 +750,11 @@ async fn req_api_009_page_deadline_exception_is_timeout() {
     let args = args.as_array().expect("arguments array");
     assert_eq!(
         args.len(),
-        6,
-        "specs, fields, top origin, submit, budget, scrub"
+        7,
+        "specs, fields, top origin, submit, budget, scrub, leg"
     );
     assert_eq!(args[5]["value"], json!(false), "scrub is off by default");
+    assert!(args[6]["value"].is_null(), "no method: a null leg");
     let budget = args[4]["value"].as_u64().expect("budgetMs is a number");
     assert!(
         budget > 0 && budget <= 9750,

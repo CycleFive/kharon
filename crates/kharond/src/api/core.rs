@@ -1481,17 +1481,20 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             if let Some(d) = method_detail.or(status.detail()) {
                 e = e.detail_code(d);
             }
-            if let Some(r) = method_rung {
-                e = e.rung(r);
-            }
-            if let Some(MethodUse {
+            e
+        };
+        // The reply and the audit trail agree on the method's rung,
+        // whichever outcome entry the fill ends in.
+        let entry = match method_rung {
+            Some(r) => entry.rung(r),
+            None => entry,
+        };
+        let entry = match &method_used {
+            Some(MethodUse {
                 end: MethodEnd::Drift { step },
                 ..
-            }) = &method_used
-            {
-                e = e.step_index(u64::from(*step));
-            }
-            e
+            }) => entry.step_index(u64::from(*step)),
+            _ => entry,
         };
         let entry = match &live_origin {
             Some(o) => entry.live_origin(o.clone()),

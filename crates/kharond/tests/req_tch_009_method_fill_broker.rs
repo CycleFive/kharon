@@ -20,9 +20,10 @@ use kharon_recording::{
 };
 use kharond::api::token::{TokenStore, generate_with};
 use kharond::api::{
-    ApprovalNotifier, ApprovalPrompt, Broker, CdpFillBackend, FillPolicy, GrantTerms,
+    ApprovalNotifier, ApprovalPrompt, Broker, CdpFillBackend, FillPolicy, GrantTerms, RatePolicy,
 };
 use kharond::cdp::{Browser, CdpClient, CdpEndpoint, FillEngine, Tunnel};
+use kharond::cdp::{MethodEnd, MethodUse};
 use kharond::export::{ExportFile, ExportSession};
 use kharond::lock::{LockController, LockPolicy, ManualClock, StaticHardening};
 use kharond::origin::OriginConfig;
@@ -248,6 +249,10 @@ fn policy() -> FillPolicy {
 /// `method`: the rung to teach for `example.com`, or `None` to leave the
 /// registry empty.
 async fn rig(stub: Stub, method: Option<Rung>, grants: Grants) -> Rig {
+    rig_with(stub, method, grants, RatePolicy::default()).await
+}
+
+async fn rig_with(stub: Stub, method: Option<Rung>, grants: Grants, rates: RatePolicy) -> Rig {
     let (url, received) = cdp_stub(stub).await;
     let endpoint = CdpEndpoint::validate(&url, Tunnel::Direct, None).unwrap();
     let browser = Browser::new(CdpClient::connect(&endpoint).await.unwrap());
@@ -292,6 +297,7 @@ async fn rig(stub: Stub, method: Option<Rung>, grants: Grants) -> Rig {
     )
     .with_fill_backend(Box::new(backend))
     .with_fill_policy(policy())
+    .with_rate_policy(rates)
     .with_teach_registry(Arc::clone(&registry))
     .with_approval_notifier(notices.clone());
     {
@@ -744,4 +750,121 @@ async fn no_reply_or_audit_entry_holds_a_secret() {
     );
     let drift = r.drift_notices();
     assert_eq!(drift, vec![("example.com".to_owned(), 1)]);
+}
+
+/// Taint the entry the way a drifted fill does, without a fill.
+fn mark_stale(r: &Rig) {
+    let used = MethodUse {
+        domain: "example.com".into(),
+        rung: Rung::AgentContinues,
+        end: MethodEnd::Drift { step: 1 },
+        selectors_ignored: false,
+        browser_product: None,
+    };
+    assert!(r.registry.record_fill(&used, NOW).newly_stale);
+}
+
+#[tokio::test]
+async fn req_tch_008_stale_refusal_gives_the_grant_use_back() {
+    let r = rig(Stub::at(PAGE), Some(Rung::AgentContinues), Grants::Once).await;
+    mark_stale(&r);
+    for _ in 0..2 {
+        let reply = r.login(false).await;
+        assert_eq!(
+            reply.json(),
+            json!({
+                "status": "field_not_found", "fields_filled": [],
+                "detail": "method_stale", "rung": "agent_continues",
+            })
+        );
+    }
+    assert!(r.fill_frames().is_empty(), "nothing reached the page");
+    assert!(
+        r.drift_notices().is_empty(),
+        "no notice for a stale refusal"
+    );
+}
+
+#[tokio::test]
+async fn req_tch_008_field_not_requested_refuses_before_any_value_is_sent() {
+    let r = rig(Stub::at(PAGE), Some(Rung::Milliseconds), Grants::Once).await;
+    let before = r.registry_bytes();
+    for _ in 0..2 {
+        let reply = r.fill(json!([{"kind": "password"}]), false).await;
+        assert_eq!(
+            reply.json(),
+            json!({
+                "status": "field_not_found", "fields_filled": [],
+                "detail": "method_field_not_requested", "rung": "milliseconds",
+            })
+        );
+    }
+    assert!(r.fill_frames().is_empty());
+    assert!(
+        r.received
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|m| m["method"] != "Runtime.callFunctionOn"),
+        "no call reached the page"
+    );
+    assert_eq!(r.registry_bytes(), before);
+    assert_secret_free(&r.audit_text());
+}
+
+#[tokio::test]
+async fn req_rl_002_method_refusals_do_not_count_as_origin_mismatches() {
+    let rates = RatePolicy {
+        origin_mismatch_suspend: 3,
+        fills_per_minute: 1000,
+        fills_per_day: 10_000,
+        item_fills_per_window: 1000,
+        ..RatePolicy::default()
+    };
+    let r = rig_with(
+        Stub::at("https://example.com/other"),
+        Some(Rung::AgentContinues),
+        Grants::PerOrigin,
+        rates,
+    )
+    .await;
+    let mismatch = || {
+        r.post(
+            "/v1/fill",
+            json!({
+                "item_id": r.item_id,
+                "target": {"cdp_target_id": "t1", "expected_origin": "https://phish.example.com"},
+                "fields": [{"kind": "password"}],
+                "submit": false,
+            }),
+        )
+    };
+    // Two mismatches, a method refusal, two more: the refusal reset the
+    // streak, so the agent is not suspended (it would be at three).
+    for _ in 0..2 {
+        assert_eq!(mismatch().await.json()["status"], "origin_mismatch");
+    }
+    assert_eq!(r.login(false).await.json()["detail"], "method_wrong_page");
+    for _ in 0..2 {
+        assert_eq!(mismatch().await.json()["status"], "origin_mismatch");
+    }
+    // Many method refusals in a row never suspend either.
+    for _ in 0..6 {
+        assert_eq!(r.login(false).await.json()["detail"], "method_wrong_page");
+    }
+    assert_eq!(mismatch().await.json()["status"], "origin_mismatch");
+    let suspended = r
+        .audit_values()
+        .iter()
+        .any(|v| v["detail_code"] == "origin_mismatch_streak");
+    assert!(!suspended, "{:?}", r.audit_values());
+    // Control: three in a row do suspend.
+    for _ in 0..2 {
+        mismatch().await;
+    }
+    assert!(
+        r.audit_values()
+            .iter()
+            .any(|v| v["detail_code"] == "origin_mismatch_streak")
+    );
 }

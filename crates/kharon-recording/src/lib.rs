@@ -13,8 +13,9 @@ pub use format::{
     ListenerWorld, Recording, Step, StrippedCounts, StrippedUrl, Viewport,
 };
 pub use method::{
-    Expected, FillRole, Leg, LoginMethod, METHOD_FILE_SUFFIX, METHOD_FORMAT_VERSION, MethodError,
-    MethodStep, Provenance, Rung, Site, SubmitVia, SuccessCheck,
+    ConvertOptions, Expected, FillRole, Leg, LoginMethod, METHOD_FILE_SUFFIX,
+    METHOD_FORMAT_VERSION, MethodError, MethodStep, NotConvertible, Provenance, Rung, Site,
+    SubmitVia, SuccessCheck, SuccessOverride,
 };
 pub use request::{
     AuthShape, BodyShape, Deciding, Encoding, FieldShape, JsonField, JsonShape, MarkerHit,

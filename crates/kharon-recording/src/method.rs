@@ -2,9 +2,11 @@
 //! the broker can replay (#382).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::classify::{RungCeiling, Shape};
-use crate::format::ListenerWorld;
+use crate::format::{ElementDescriptor, ListenerWorld, Recording, Step};
+use crate::request::Role;
 
 pub const METHOD_FORMAT_VERSION: u32 = 1;
 pub const METHOD_FILE_SUFFIX: &str = ".kharon-method.json";
@@ -284,6 +286,285 @@ impl LoginMethod {
             Provenance::Recording { sha256, .. } => Some(sha256),
             Provenance::HandWritten { .. } => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConvertOptions {
+    pub allow_unconfirmed: bool,
+    pub success: Option<SuccessOverride>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SuccessOverride {
+    PathChanged,
+    PasswordFieldGone,
+    None,
+}
+
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum NotConvertible {
+    #[error("kharon cannot tell how this login works; a person has to write the method by hand")]
+    NeedsPerson,
+    #[error(
+        "a credential field sits in a shadow root, which a fill cannot reach; write the method by hand"
+    )]
+    InShadowRoot,
+    #[error("no submit was recorded after the last field of a step")]
+    NoSubmit,
+    #[error("nobody confirmed that this login worked; pass --unconfirmed to convert it anyway")]
+    Unconfirmed,
+    #[error("the recording does not match its own classification")]
+    ShapeMismatch,
+}
+
+fn expected_of(el: &ElementDescriptor) -> Expected {
+    Expected {
+        tag: el.tag.clone(),
+        input_type: el.input_type.clone(),
+        id: el.id.clone(),
+        name: el.name.clone(),
+        autocomplete: el.autocomplete.clone(),
+    }
+}
+
+fn is_submit_button(el: &ElementDescriptor) -> bool {
+    el.tag == "button"
+        || matches!(
+            el.input_type.as_deref(),
+            Some("submit" | "button" | "image")
+        )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The element a method step acts on, refused when it cannot be reached.
+fn reachable(el: &ElementDescriptor) -> Result<(Vec<String>, Expected), NotConvertible> {
+    if el.in_shadow_root {
+        return Err(NotConvertible::InShadowRoot);
+    }
+    if el.selectors.is_empty() {
+        return Err(NotConvertible::ShapeMismatch);
+    }
+    Ok((el.selectors.clone(), expected_of(el)))
+}
+
+impl LoginMethod {
+    /// `domain` is the registrable domain of the login origin; the caller computes it (this
+    /// crate has no PSL).
+    pub fn from_recording(
+        rec: &Recording,
+        recording_bytes: &[u8],
+        domain: &str,
+        opts: ConvertOptions,
+    ) -> Result<LoginMethod, NotConvertible> {
+        use NotConvertible::*;
+
+        if !rec.success_confirmed && !opts.allow_unconfirmed {
+            return Err(Unconfirmed);
+        }
+        let class = &rec.classification;
+        if matches!(
+            class.shape,
+            Shape::Unrecognized | Shape::Transformed { digest: None }
+        ) || class.rung_ceiling == RungCeiling::NeedsPerson
+        {
+            return Err(NeedsPerson);
+        }
+        let rung = match class.rung_ceiling {
+            RungCeiling::Milliseconds => Rung::Milliseconds,
+            RungCeiling::AgentContinues => Rung::AgentContinues,
+            RungCeiling::NeedsPerson => return Err(NeedsPerson),
+        };
+
+        let steps: Vec<&Step> = rec
+            .steps
+            .iter()
+            .filter(|s| match s {
+                Step::Navigation { frame, .. }
+                | Step::Input { frame, .. }
+                | Step::Click { frame, .. }
+                | Step::Submit { frame, .. }
+                | Step::EnterKey { frame, .. } => frame.main,
+            })
+            .collect();
+
+        let credentials: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                matches!(
+                    s,
+                    Step::Input {
+                        role: Role::Username | Role::Password,
+                        ..
+                    }
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for &i in &credentials {
+            if let Step::Input { element, .. } = steps[i]
+                && element.in_shadow_root
+            {
+                return Err(InShadowRoot);
+            }
+        }
+
+        // The (origin, path) of the last main-frame navigation before `idx`, else the start URL.
+        let nav_before = |idx: usize| -> (&str, &str) {
+            steps[..idx]
+                .iter()
+                .rev()
+                .find_map(|s| match s {
+                    Step::Navigation { url, .. } => Some((url.origin.as_str(), url.path.as_str())),
+                    _ => None,
+                })
+                .unwrap_or((rec.start_url.origin.as_str(), rec.start_url.path.as_str()))
+        };
+
+        // Group credential steps into legs.
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for &c in &credentials {
+            let split = match groups.last() {
+                None => true,
+                Some(prev) => {
+                    let first = prev[0];
+                    let leg_path = nav_before(first).1;
+                    let last = *prev.last().expect("a group is never empty");
+                    steps[last..c]
+                        .iter()
+                        .any(|s| matches!(s, Step::Navigation { url, .. } if url.path != leg_path))
+                }
+            };
+            if split {
+                groups.push(vec![c]);
+            } else {
+                groups.last_mut().expect("just checked").push(c);
+            }
+        }
+        let want = if matches!(class.shape, Shape::TwoStep { .. }) {
+            2
+        } else {
+            1
+        };
+        if groups.len() != want {
+            return Err(ShapeMismatch);
+        }
+        let has_password = |g: &[usize]| {
+            g.iter().any(|&i| {
+                matches!(
+                    steps[i],
+                    Step::Input {
+                        role: Role::Password,
+                        ..
+                    }
+                )
+            })
+        };
+        if !has_password(groups.last().expect("want is at least 1")) {
+            return Err(ShapeMismatch);
+        }
+
+        let mut legs = Vec::new();
+        for g in &groups {
+            let (origin, path) = nav_before(g[0]);
+            if origin != rec.start_url.origin {
+                return Err(ShapeMismatch);
+            }
+            let mut method_steps = vec![MethodStep::Navigate { path: path.into() }];
+            for &i in g {
+                let Step::Input { element, role, .. } = steps[i] else {
+                    unreachable!("credential indexes point at inputs");
+                };
+                let (selectors, expect) = reachable(element)?;
+                let role = match role {
+                    Role::Username => FillRole::Username,
+                    _ => FillRole::Password,
+                };
+                method_steps.push(MethodStep::Fill {
+                    role,
+                    selectors,
+                    expect,
+                });
+            }
+
+            let after = *g.last().expect("a group is never empty") + 1;
+            let region: Vec<&Step> = steps[after..]
+                .iter()
+                .take_while(|s| !matches!(s, Step::Navigation { url, .. } if url.path != path))
+                .copied()
+                .collect();
+            let via = if region.iter().any(|s| matches!(s, Step::Submit { .. })) {
+                SubmitVia::Form {}
+            } else if region.iter().any(|s| matches!(s, Step::EnterKey { .. })) {
+                SubmitVia::Enter {}
+            } else {
+                let clicks: Vec<&ElementDescriptor> = region
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::Click { element, .. } => Some(element),
+                        _ => None,
+                    })
+                    .collect();
+                let pick = clicks
+                    .iter()
+                    .find(|e| is_submit_button(e))
+                    .or(clicks.first())
+                    .ok_or(NoSubmit)?;
+                let (selectors, expect) = reachable(pick)?;
+                SubmitVia::Click { selectors, expect }
+            };
+            method_steps.push(MethodStep::Submit { via });
+            legs.push(Leg {
+                steps: method_steps,
+            });
+        }
+
+        let last_path = match legs.last().and_then(|l| l.steps.first()) {
+            Some(MethodStep::Navigate { path }) => path.as_str(),
+            _ => return Err(ShapeMismatch),
+        };
+        let final_path = rec.final_url.as_ref().map(|u| u.path.clone());
+        let success = match opts.success {
+            Some(SuccessOverride::PathChanged) => SuccessCheck::PathChangedTo {
+                path: final_path.ok_or(ShapeMismatch)?,
+            },
+            Some(SuccessOverride::PasswordFieldGone) => SuccessCheck::PasswordFieldGone {},
+            Some(SuccessOverride::None) => SuccessCheck::None {},
+            None => match final_path {
+                Some(path) if path != last_path => SuccessCheck::PathChangedTo { path },
+                _ => SuccessCheck::None {},
+            },
+        };
+
+        let site_path = match legs[0].steps.first() {
+            Some(MethodStep::Navigate { path }) => path.clone(),
+            _ => return Err(ShapeMismatch),
+        };
+        let method = LoginMethod {
+            format_version: METHOD_FORMAT_VERSION,
+            site: Site {
+                domain: domain.into(),
+                origin: rec.start_url.origin.clone(),
+                path: site_path,
+            },
+            shape: class.shape.clone(),
+            rung,
+            legs,
+            success,
+            provenance: Provenance::Recording {
+                sha256: hex(&Sha256::digest(recording_bytes)),
+                tool_version: rec.tool_version.clone(),
+                browser_product: rec.browser.product.clone(),
+                listener_world: rec.listener_world,
+                rung_ceiling: class.rung_ceiling.clone(),
+            },
+        };
+        method.validate().map_err(|_| ShapeMismatch)?;
+        Ok(method)
     }
 }
 
@@ -669,5 +950,592 @@ mod tests {
         assert_eq!(m.digest(), Some("ab12"));
         m.provenance = Provenance::HandWritten { author: "a".into() };
         assert_eq!(m.digest(), None);
+    }
+
+    mod convert {
+        use super::super::*;
+        use crate::classify::{Classification, Flags, PasswordLeg};
+        use crate::format::{
+            BrowserInfo, EndedBy, FORMAT_VERSION, FormRef, FrameRef, StrippedCounts, StrippedUrl,
+            Viewport,
+        };
+        use crate::request::{
+            BodyShape, Encoding, FieldShape, MarkerHit, ResourceKind, StoredRequest, ValueKind,
+            ValueShape,
+        };
+
+        const ORIGIN: &str = "https://example.test";
+
+        fn url(path: &str) -> StrippedUrl {
+            StrippedUrl {
+                origin: ORIGIN.into(),
+                path: path.into(),
+                query_keys: vec!["receipt".into()],
+            }
+        }
+
+        fn frame(main: bool) -> FrameRef {
+            FrameRef {
+                main,
+                origin: ORIGIN.into(),
+                cross_origin: !main,
+            }
+        }
+
+        fn el(id: &str, tag: &str, input_type: &str, ac: Option<&str>) -> ElementDescriptor {
+            ElementDescriptor {
+                element_id: 1,
+                tag: tag.into(),
+                input_type: Some(input_type.into()),
+                id: Some(id.into()),
+                name: Some(id.into()),
+                autocomplete: ac.map(Into::into),
+                placeholder: Some("zz-ph".into()),
+                aria_label: Some("zz-aria".into()),
+                was_password: input_type == "password",
+                form: Some(FormRef {
+                    index: 0,
+                    action: Some(url("/zz-api/submit")),
+                    method: "post".into(),
+                }),
+                selectors: vec![format!("#{id}")],
+                in_shadow_root: false,
+            }
+        }
+
+        fn nav(path: &str) -> Step {
+            Step::Navigation {
+                t_ms: 1,
+                frame: frame(true),
+                url: url(path),
+            }
+        }
+
+        fn input(role: Role, e: ElementDescriptor) -> Step {
+            Step::Input {
+                t_ms: 2,
+                frame: frame(true),
+                element: e,
+                value_len: 9,
+                role,
+            }
+        }
+
+        fn click(e: ElementDescriptor) -> Step {
+            Step::Click {
+                t_ms: 3,
+                frame: frame(true),
+                element: e,
+            }
+        }
+
+        fn form_submit() -> Step {
+            Step::Submit {
+                t_ms: 4,
+                frame: frame(true),
+                form: FormRef {
+                    index: 0,
+                    action: None,
+                    method: "post".into(),
+                },
+            }
+        }
+
+        fn enter() -> Step {
+            Step::EnterKey {
+                t_ms: 4,
+                frame: frame(true),
+                element: el("pw", "input", "password", None),
+            }
+        }
+
+        fn user() -> Step {
+            input(
+                Role::Username,
+                el("user", "input", "text", Some("username")),
+            )
+        }
+
+        fn pass() -> Step {
+            input(Role::Password, el("pw", "input", "password", None))
+        }
+
+        fn rec(shape: Shape, ceiling: RungCeiling, steps: Vec<Step>) -> Recording {
+            let value = ValueShape {
+                kind: ValueKind::String,
+                len: 9,
+                markers: vec![MarkerHit {
+                    role: Role::Password,
+                    encoding: Encoding::AsTyped,
+                    low_confidence: false,
+                }],
+            };
+            Recording {
+                format_version: FORMAT_VERSION,
+                tool_version: "9.9.9".into(),
+                browser: BrowserInfo {
+                    product: "Chrome/1".into(),
+                    user_agent: "zz-agent".into(),
+                    viewport: Viewport {
+                        width: 1,
+                        height: 1,
+                    },
+                },
+                listener_world: ListenerWorld::Isolated,
+                started_at: "2026-11-24T00:00:00Z".into(),
+                ended_at: "2026-11-24T00:01:00Z".into(),
+                ended_by: EndedBy::Confirmed,
+                success_confirmed: true,
+                start_url: url("/login"),
+                final_url: Some(url("/home")),
+                steps,
+                requests: vec![StoredRequest {
+                    t_ms: 5,
+                    method: "POST".into(),
+                    url: url("/zz-api/submit"),
+                    resource: ResourceKind::Document,
+                    main_frame_navigation: true,
+                    content_type: None,
+                    authorization: None,
+                    url_markers: vec![],
+                    body: BodyShape::Urlencoded {
+                        fields: vec![FieldShape {
+                            key: "zz_field_key".into(),
+                            value,
+                        }],
+                    },
+                    response: None,
+                }],
+                flags: Flags::default(),
+                classification: Classification {
+                    shape,
+                    rung_ceiling: ceiling,
+                    network_swap_candidate: false,
+                    notes: vec![],
+                },
+                stripped: StrippedCounts {
+                    requests_seen: 1,
+                    requests_stored: 1,
+                    request_bodies_reduced: 1,
+                    query_values_removed: 1,
+                    path_segments_replaced: 0,
+                    typed_values_removed: 2,
+                    steps_dropped: 0,
+                },
+            }
+        }
+
+        fn form_post() -> Recording {
+            rec(
+                Shape::FormPost,
+                RungCeiling::Milliseconds,
+                vec![nav("/login"), user(), pass(), form_submit(), nav("/home")],
+            )
+        }
+
+        fn script_post() -> Recording {
+            let mut go = el("go", "button", "submit", None);
+            go.selectors = vec!["#go".into(), "button.go".into()];
+            rec(
+                Shape::ScriptPost,
+                RungCeiling::Milliseconds,
+                vec![nav("/login"), user(), pass(), click(go), nav("/home")],
+            )
+        }
+
+        fn two_step() -> Recording {
+            rec(
+                Shape::TwoStep {
+                    password_leg: PasswordLeg::FormPost,
+                },
+                RungCeiling::AgentContinues,
+                vec![
+                    nav("/login"),
+                    user(),
+                    form_submit(),
+                    nav("/password"),
+                    pass(),
+                    form_submit(),
+                    nav("/home"),
+                ],
+            )
+        }
+
+        fn transformed() -> Recording {
+            let mut r = form_post();
+            r.classification.shape = Shape::Transformed {
+                digest: Some("sha256".into()),
+            };
+            r
+        }
+
+        fn convert(r: &Recording) -> Result<LoginMethod, NotConvertible> {
+            LoginMethod::from_recording(r, b"bytes", "example.test", ConvertOptions::default())
+        }
+
+        fn exp(id: &str, tag: &str, input_type: &str, ac: Option<&str>) -> Expected {
+            Expected {
+                tag: tag.into(),
+                input_type: Some(input_type.into()),
+                id: Some(id.into()),
+                name: Some(id.into()),
+                autocomplete: ac.map(Into::into),
+            }
+        }
+
+        fn user_fill() -> MethodStep {
+            MethodStep::Fill {
+                role: FillRole::Username,
+                selectors: vec!["#user".into()],
+                expect: exp("user", "input", "text", Some("username")),
+            }
+        }
+
+        fn pass_fill() -> MethodStep {
+            MethodStep::Fill {
+                role: FillRole::Password,
+                selectors: vec!["#pw".into()],
+                expect: exp("pw", "input", "password", None),
+            }
+        }
+
+        fn form_step() -> MethodStep {
+            MethodStep::Submit {
+                via: SubmitVia::Form {},
+            }
+        }
+
+        fn want(shape: Shape, rung: Rung, ceiling: RungCeiling, legs: Vec<Leg>) -> LoginMethod {
+            LoginMethod {
+                format_version: METHOD_FORMAT_VERSION,
+                site: Site {
+                    domain: "example.test".into(),
+                    origin: ORIGIN.into(),
+                    path: "/login".into(),
+                },
+                shape,
+                rung,
+                legs,
+                success: SuccessCheck::PathChangedTo {
+                    path: "/home".into(),
+                },
+                provenance: Provenance::Recording {
+                    sha256: hex(&Sha256::digest(b"bytes")),
+                    tool_version: "9.9.9".into(),
+                    browser_product: "Chrome/1".into(),
+                    listener_world: ListenerWorld::Isolated,
+                    rung_ceiling: ceiling,
+                },
+            }
+        }
+
+        fn one_leg(submit: MethodStep) -> Vec<Leg> {
+            vec![Leg {
+                steps: vec![
+                    MethodStep::Navigate {
+                        path: "/login".into(),
+                    },
+                    user_fill(),
+                    pass_fill(),
+                    submit,
+                ],
+            }]
+        }
+
+        #[test]
+        fn converts_form_post() {
+            assert_eq!(
+                convert(&form_post()).unwrap(),
+                want(
+                    Shape::FormPost,
+                    Rung::Milliseconds,
+                    RungCeiling::Milliseconds,
+                    one_leg(form_step())
+                )
+            );
+        }
+
+        #[test]
+        fn converts_script_post() {
+            let click = MethodStep::Submit {
+                via: SubmitVia::Click {
+                    selectors: vec!["#go".into(), "button.go".into()],
+                    expect: exp("go", "button", "submit", None),
+                },
+            };
+            assert_eq!(
+                convert(&script_post()).unwrap(),
+                want(
+                    Shape::ScriptPost,
+                    Rung::Milliseconds,
+                    RungCeiling::Milliseconds,
+                    one_leg(click)
+                )
+            );
+        }
+
+        #[test]
+        fn converts_two_step() {
+            let legs = vec![
+                Leg {
+                    steps: vec![
+                        MethodStep::Navigate {
+                            path: "/login".into(),
+                        },
+                        user_fill(),
+                        form_step(),
+                    ],
+                },
+                Leg {
+                    steps: vec![
+                        MethodStep::Navigate {
+                            path: "/password".into(),
+                        },
+                        pass_fill(),
+                        form_step(),
+                    ],
+                },
+            ];
+            assert_eq!(
+                convert(&two_step()).unwrap(),
+                want(
+                    Shape::TwoStep {
+                        password_leg: PasswordLeg::FormPost
+                    },
+                    Rung::AgentContinues,
+                    RungCeiling::AgentContinues,
+                    legs
+                )
+            );
+        }
+
+        #[test]
+        fn converts_transformed_with_named_digest() {
+            assert_eq!(
+                convert(&transformed()).unwrap(),
+                want(
+                    Shape::Transformed {
+                        digest: Some("sha256".into())
+                    },
+                    Rung::Milliseconds,
+                    RungCeiling::Milliseconds,
+                    one_leg(form_step())
+                )
+            );
+        }
+
+        #[test]
+        fn refuses_unrecognized() {
+            let mut r = form_post();
+            r.classification.shape = Shape::Unrecognized;
+            assert_eq!(convert(&r), Err(NotConvertible::NeedsPerson));
+            let mut r = form_post();
+            r.classification.rung_ceiling = RungCeiling::NeedsPerson;
+            assert_eq!(convert(&r), Err(NotConvertible::NeedsPerson));
+        }
+
+        #[test]
+        fn refuses_transformed_without_digest() {
+            let mut r = form_post();
+            r.classification.shape = Shape::Transformed { digest: None };
+            assert_eq!(convert(&r), Err(NotConvertible::NeedsPerson));
+        }
+
+        #[test]
+        fn refuses_shadow_root_step() {
+            let mut e = el("pw", "input", "password", None);
+            e.in_shadow_root = true;
+            let mut r = form_post();
+            r.steps[2] = input(Role::Password, e);
+            assert_eq!(convert(&r), Err(NotConvertible::InShadowRoot));
+            let mut go = el("go", "button", "submit", None);
+            go.in_shadow_root = true;
+            let mut r = script_post();
+            r.steps[3] = click(go);
+            assert_eq!(convert(&r), Err(NotConvertible::InShadowRoot));
+        }
+
+        #[test]
+        fn refuses_a_leg_without_submit() {
+            let mut r = form_post();
+            r.steps.remove(3);
+            assert_eq!(convert(&r), Err(NotConvertible::NoSubmit));
+            let mut r = two_step();
+            r.steps.remove(2);
+            assert_eq!(convert(&r), Err(NotConvertible::NoSubmit));
+        }
+
+        #[test]
+        fn refuses_unconfirmed_without_the_flag() {
+            let mut r = form_post();
+            r.success_confirmed = false;
+            assert_eq!(convert(&r), Err(NotConvertible::Unconfirmed));
+            let opts = ConvertOptions {
+                allow_unconfirmed: true,
+                ..Default::default()
+            };
+            assert!(LoginMethod::from_recording(&r, b"bytes", "example.test", opts).is_ok());
+        }
+
+        #[test]
+        fn refuses_a_recording_that_disagrees_with_its_shape() {
+            let mut r = form_post();
+            r.classification.shape = Shape::TwoStep {
+                password_leg: PasswordLeg::FormPost,
+            };
+            assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+            let mut r = form_post();
+            r.steps.remove(2);
+            assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+            let mut r = form_post();
+            r.steps.retain(|s| !matches!(s, Step::Input { .. }));
+            assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+            let mut e = el("pw", "input", "password", None);
+            e.selectors.clear();
+            let mut r = form_post();
+            r.steps[2] = input(Role::Password, e);
+            assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+        }
+
+        #[test]
+        fn a_cross_origin_leg_is_a_mismatch() {
+            let mut r = two_step();
+            r.steps[3] = Step::Navigation {
+                t_ms: 1,
+                frame: frame(true),
+                url: StrippedUrl {
+                    origin: "https://other.test".into(),
+                    path: "/password".into(),
+                    query_keys: vec![],
+                },
+            };
+            assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+        }
+
+        #[test]
+        fn other_frames_are_ignored() {
+            let mut r = form_post();
+            let mut stray = click(el("ad", "button", "submit", None));
+            if let Step::Click { frame, .. } = &mut stray {
+                frame.main = false;
+            }
+            r.steps.insert(3, stray);
+            r.steps.remove(4);
+            assert_eq!(convert(&r), Err(NotConvertible::NoSubmit));
+        }
+
+        #[test]
+        fn req_tch_007_method_holds_none_of_the_dropped_fields() {
+            for r in [form_post(), script_post(), two_step(), transformed()] {
+                let text = convert(&r).unwrap().to_json();
+                for gone in [
+                    "receipt",
+                    "query_keys",
+                    "value_len",
+                    "placeholder",
+                    "aria_label",
+                    "requests",
+                    "t_ms",
+                    "user_agent",
+                    "viewport",
+                    "flags",
+                    "stripped",
+                    "zz-",
+                    "zz_",
+                ] {
+                    assert!(!text.contains(gone), "{gone} leaked into {text}");
+                }
+            }
+        }
+
+        #[test]
+        fn picks_the_button_not_the_checkbox() {
+            let mut r = script_post();
+            r.steps[3] = click(el("remember", "input", "checkbox", None));
+            let mut go = el("go", "button", "submit", None);
+            go.selectors = vec!["#go".into()];
+            r.steps.insert(4, click(go));
+            let m = convert(&r).unwrap();
+            match m.legs[0].steps.last() {
+                Some(MethodStep::Submit {
+                    via: SubmitVia::Click { selectors, .. },
+                }) => assert_eq!(selectors, &vec!["#go".to_string()]),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn enter_in_a_form_is_a_form_submit() {
+            let mut r = form_post();
+            r.steps.insert(3, enter());
+            let m = convert(&r).unwrap();
+            assert_eq!(m.legs[0].steps.last(), Some(&form_step()));
+            let mut r = form_post();
+            r.steps[3] = enter();
+            let m = convert(&r).unwrap();
+            assert_eq!(
+                m.legs[0].steps.last(),
+                Some(&MethodStep::Submit {
+                    via: SubmitVia::Enter {}
+                })
+            );
+        }
+
+        #[test]
+        fn success_override_is_used() {
+            let with = |success, r: &Recording| {
+                let opts = ConvertOptions {
+                    success: Some(success),
+                    ..Default::default()
+                };
+                LoginMethod::from_recording(r, b"bytes", "example.test", opts)
+            };
+            let r = form_post();
+            assert_eq!(
+                with(SuccessOverride::None, &r).unwrap().success,
+                SuccessCheck::None {}
+            );
+            assert_eq!(
+                with(SuccessOverride::PasswordFieldGone, &r)
+                    .unwrap()
+                    .success,
+                SuccessCheck::PasswordFieldGone {}
+            );
+            assert_eq!(
+                with(SuccessOverride::PathChanged, &r).unwrap().success,
+                SuccessCheck::PathChangedTo {
+                    path: "/home".into()
+                }
+            );
+            let mut r = form_post();
+            r.final_url = None;
+            assert_eq!(
+                with(SuccessOverride::PathChanged, &r),
+                Err(NotConvertible::ShapeMismatch)
+            );
+            assert_eq!(convert(&r).unwrap().success, SuccessCheck::None {});
+        }
+
+        #[test]
+        fn an_unchanged_final_path_is_no_success_check() {
+            let mut r = form_post();
+            r.final_url = Some(url("/login"));
+            assert_eq!(convert(&r).unwrap().success, SuccessCheck::None {});
+        }
+
+        #[test]
+        fn provenance_digest_is_the_sha256_of_the_bytes() {
+            let m = LoginMethod::from_recording(
+                &form_post(),
+                b"abc",
+                "example.test",
+                ConvertOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                m.digest(),
+                Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            );
+        }
     }
 }

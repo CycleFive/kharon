@@ -369,8 +369,7 @@ impl LoginMethod {
         if matches!(
             class.shape,
             Shape::Unrecognized | Shape::Transformed { digest: None }
-        ) || class.rung_ceiling == RungCeiling::NeedsPerson
-        {
+        ) {
             return Err(NeedsPerson);
         }
         let rung = match class.rung_ceiling {
@@ -432,11 +431,11 @@ impl LoginMethod {
                 None => true,
                 Some(prev) => {
                     let first = prev[0];
-                    let leg_path = nav_before(first).1;
+                    let leg_at = nav_before(first);
                     let last = *prev.last().expect("a group is never empty");
                     steps[last..c]
                         .iter()
-                        .any(|s| matches!(s, Step::Navigation { url, .. } if url.path != leg_path))
+                        .any(|s| matches!(s, Step::Navigation { url, .. } if (url.origin.as_str(), url.path.as_str()) != leg_at))
                 }
             };
             if split {
@@ -494,9 +493,17 @@ impl LoginMethod {
             let after = *g.last().expect("a group is never empty") + 1;
             let region: Vec<&Step> = steps[after..]
                 .iter()
-                .take_while(|s| !matches!(s, Step::Navigation { url, .. } if url.path != path))
+                .take_while(|s| {
+                    !matches!(s, Step::Navigation { url, .. }
+                        if (url.origin.as_str(), url.path.as_str()) != (origin, path))
+                })
                 .copied()
                 .collect();
+            // A foreign-origin navigation that cuts the region short, before any submit.
+            let foreign_cut = matches!(
+                steps.get(after + region.len()),
+                Some(Step::Navigation { url, .. }) if url.origin != rec.start_url.origin
+            );
             let via = if region.iter().any(|s| matches!(s, Step::Submit { .. })) {
                 SubmitVia::Form {}
             } else if region.iter().any(|s| matches!(s, Step::EnterKey { .. })) {
@@ -513,7 +520,7 @@ impl LoginMethod {
                     .iter()
                     .find(|e| is_submit_button(e))
                     .or(clicks.first())
-                    .ok_or(NoSubmit)?;
+                    .ok_or(if foreign_cut { ShapeMismatch } else { NoSubmit })?;
                 let (selectors, expect) = reachable(pick)?;
                 SubmitVia::Click { selectors, expect }
             };
@@ -1410,6 +1417,62 @@ mod tests {
                 },
             };
             assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+        }
+
+        fn nav_to(origin: &str, path: &str) -> Step {
+            Step::Navigation {
+                t_ms: 1,
+                frame: frame(true),
+                url: StrippedUrl {
+                    origin: origin.into(),
+                    path: path.into(),
+                    query_keys: vec![],
+                },
+            }
+        }
+
+        #[test]
+        fn a_same_path_on_another_origin_is_a_mismatch() {
+            // The password would be typed on a different origin.
+            let r = rec(
+                Shape::FormPost,
+                RungCeiling::Milliseconds,
+                vec![
+                    nav("/login"),
+                    user(),
+                    nav_to("https://other.test", "/login"),
+                    pass(),
+                    form_submit(),
+                ],
+            );
+            assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+            // Cut off before any submit by a foreign navigation.
+            let r = rec(
+                Shape::FormPost,
+                RungCeiling::Milliseconds,
+                vec![
+                    nav("/login"),
+                    user(),
+                    pass(),
+                    nav_to("https://other.test", "/login"),
+                    form_submit(),
+                ],
+            );
+            assert_eq!(convert(&r), Err(NotConvertible::ShapeMismatch));
+        }
+
+        #[test]
+        fn submit_selection_stops_at_the_leg_boundary() {
+            let mut r = two_step();
+            r.steps[2] = enter();
+            let m = convert(&r).unwrap();
+            assert_eq!(
+                m.legs[0].steps.last(),
+                Some(&MethodStep::Submit {
+                    via: SubmitVia::Enter {}
+                })
+            );
+            assert_eq!(m.legs[1].steps.last(), Some(&form_step()));
         }
 
         #[test]

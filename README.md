@@ -60,6 +60,8 @@ Approved designs, newest last. Each names its issue, builder and reviewers.
 - [`2026-11-10-n3-mcp-oauth-connect-design.md`](docs/superpowers/specs/2026-11-10-n3-mcp-oauth-connect-design.md): N3, connecting kharon from a dashboard over MCP OAuth (#213).
 - [`2026-11-11-n2-owner-ui-behind-edge-design.md`](docs/superpowers/specs/2026-11-11-n2-owner-ui-behind-edge-design.md): N2, the owner UI behind the edge (#208).
 - [`2026-11-12-n3-phase2-connector-auth-design.md`](docs/superpowers/specs/2026-11-12-n3-phase2-connector-auth-design.md): N3 phase 2, a dashboard runtime's connector authenticating with a Connect token (#235).
+- [`2026-11-18-teach-recorder-design.md`](docs/superpowers/specs/2026-11-18-teach-recorder-design.md): teach mode piece 1, `kharon-teach`, a recorder for a demonstrated login (#361).
+- [`2026-11-24-teach-method-design.md`](docs/superpowers/specs/2026-11-24-teach-method-design.md): teach mode piece 2, login methods, the player and the per-site registry (#381).
 
 ### Implementation plans
 
@@ -72,6 +74,7 @@ Task-by-task plans that implemented the specs above.
 - [`2026-11-10-220-compose-ws-e2e.md`](docs/superpowers/plans/2026-11-10-220-compose-ws-e2e.md): compose E2E for path B over WebSocket with no VPN (#220).
 - [`2026-11-11-n2-owner-ui-behind-edge.md`](docs/superpowers/plans/2026-11-11-n2-owner-ui-behind-edge.md): N2, the owner UI behind the edge.
 - [`2026-11-12-234-n3-compose-connect-e2e.md`](docs/superpowers/plans/2026-11-12-234-n3-compose-connect-e2e.md): N3 compose E2E with a fake dashboard running Connect, refresh, reuse-kill and Disconnect (#234).
+- [`2026-11-18-361-teach-recorder.md`](docs/superpowers/plans/2026-11-18-361-teach-recorder.md): the teach recorder, `kharon-recording` and `kharon-teach` (#361).
 
 ## License
 

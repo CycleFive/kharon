@@ -9,27 +9,17 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use kharon_recording::{
     ListenerWorld, LoginMethod, MethodStep, Provenance, Rung, RungCeiling, Shape, SubmitVia,
 };
-use publicsuffix::{List, Psl};
 use serde::{Deserialize, Serialize};
 
 use crate::cdp::{MethodEnd, MethodLookup, MethodResult, MethodSource, MethodUse};
 
 const REGISTRY_FORMAT_VERSION: u32 = 1;
 const MAX_SELECTOR_BYTES: usize = 1024;
-
-/// The vendored snapshot also used by `crate::origin` and `kharon-teach`.
-const PSL_SNAPSHOT: &[u8] = include_bytes!("../../data/public_suffix_list.dat");
-
-fn psl() -> Option<&'static List> {
-    static PSL: OnceLock<Option<List>> = OnceLock::new();
-    PSL.get_or_init(|| List::from_bytes(PSL_SNAPSHOT).ok())
-        .as_ref()
-}
 
 /// The registry key for a host: its registrable domain, lowercased and without a trailing dot.
 /// An IP literal, `localhost`, a single-label host or a host the list gives no answer for is its
@@ -43,12 +33,7 @@ pub fn site_key(host: &str) -> String {
     if bare.parse::<IpAddr>().is_ok() {
         return host;
     }
-    psl()
-        .and_then(|list| list.domain(host.as_bytes()))
-        .map_or_else(
-            || host.clone(),
-            |d| String::from_utf8_lossy(d.as_bytes()).into_owned(),
-        )
+    crate::origin::registrable_domain(&host).unwrap_or(host)
 }
 
 /// The site key of the host in `url`; `None` when it does not parse or has no host.
@@ -165,7 +150,12 @@ impl TeachRegistry {
                 }
                 let file: FileIn =
                     serde_json::from_str(&text).map_err(|_| invalid("registry file unreadable"))?;
-                if file.entries.values().any(|e| e.method.validate().is_err()) {
+                let sound = file.entries.iter().all(|(key, e)| {
+                    e.method.validate().is_ok()
+                        && *key == e.method.site.domain
+                        && url_site_key(&e.method.site.origin).as_deref() == Some(key.as_str())
+                });
+                if !sound {
                     return Err(invalid("registry holds an unusable method"));
                 }
                 file.entries
@@ -531,6 +521,7 @@ mod tests {
         assert_eq!(site_key("127.0.0.1"), "127.0.0.1");
         assert_eq!(site_key("[::1]"), "[::1]");
         assert_eq!(site_key("::1"), "::1");
+        assert_eq!(site_key("Login.Example.CO.UK."), "example.co.uk");
         assert_eq!(site_key("localhost"), "localhost");
         assert_eq!(site_key("LOCALHOST"), "localhost");
         assert_eq!(site_key("intranet"), "intranet");
@@ -816,6 +807,54 @@ mod tests {
             entries: &parsed.entries,
         };
         std::fs::write(file(&dir), serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            TeachRegistry::load(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    fn rewrite_entry(dir: &tempfile::TempDir, f: impl FnOnce(&mut Entries)) {
+        let good = std::fs::read_to_string(file(dir)).unwrap();
+        let mut parsed: FileIn = serde_json::from_str(&good).unwrap();
+        f(&mut parsed.entries);
+        let out = FileOut {
+            format_version: 1,
+            entries: &parsed.entries,
+        };
+        std::fs::write(file(dir), serde_json::to_string(&out).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn load_refuses_an_entry_under_the_wrong_key() {
+        let (dir, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        rewrite_entry(&dir, |e| {
+            let entry = e.remove("example.com").unwrap();
+            e.insert("other.org".into(), entry);
+        });
+        assert_eq!(
+            TeachRegistry::load(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn load_refuses_an_origin_off_the_entry_domain() {
+        let (dir, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        rewrite_entry(&dir, |e| {
+            e.get_mut("example.com").unwrap().method.site.origin = "https://login.other.org".into();
+        });
         assert_eq!(
             TeachRegistry::load(dir.path()).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData

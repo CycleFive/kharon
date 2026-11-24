@@ -820,7 +820,7 @@ fn show_lines(row: &kharond::owner::TeachRow, method: &LoginMethod) -> Vec<Strin
             let mut parts: Vec<String> = Vec::new();
             for (n, sel) in overrides.iter().chain(selectors).enumerate() {
                 let sel = plain(sel);
-                parts.push(if n == 0 && !overrides.is_empty() {
+                parts.push(if n < overrides.len() {
                     format!("[override] {sel}")
                 } else {
                     sel
@@ -1896,14 +1896,14 @@ mod tests {
             vec!["#pw".into(), "[name=p]".into()],
         );
         let mut r = row(&method);
-        r.overrides.insert(2, vec!["#new\u{7}".into()]);
+        r.overrides
+            .insert(2, vec!["#new\u{7}".into(), "#second".into()]);
         let lines = show_lines(&r, &method);
         assert!(lines.iter().any(|l| l == "0\tnavigate\t/login"));
         assert!(lines.iter().any(|l| l == "1\tfill username\t#user"));
         assert!(
-            lines
-                .iter()
-                .any(|l| l == "2\tfill password\t[override] #new\u{FFFD}, #pw, [name=p]")
+            lines.iter().any(|l| l
+                == "2\tfill password\t[override] #new\u{FFFD}, [override] #second, #pw, [name=p]")
         );
         assert!(lines.iter().any(|l| l == "3\tsubmit\tform"));
     }

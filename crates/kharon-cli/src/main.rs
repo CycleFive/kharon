@@ -283,7 +283,7 @@ fn owner_request(
 }
 
 /// Longest password accepted, in bytes. The daemon's whole
-/// request line is capped at 8192 bytes; a password near this cap
+/// request line is capped at 32 KiB (32768 bytes); a password near this cap
 /// plus framing still fits comfortably.
 const MAX_PASSWORD_BYTES: usize = 1024;
 

@@ -295,6 +295,18 @@ impl TeachRegistry {
         Ok(gone)
     }
 
+    /// Put `domain` back to `previous` (`None` removes it): the undo for an owner
+    /// edit whose audit entry could not be written.
+    pub(crate) fn restore(&self, domain: &str, previous: Option<Entry>) -> io::Result<()> {
+        let mut guard = self.guard();
+        let mut next = guard.clone();
+        match previous {
+            Some(entry) => next.insert(domain.to_owned(), entry),
+            None => next.remove(domain),
+        };
+        self.commit(&mut guard, next)
+    }
+
     fn edit(
         &self,
         guard: &mut Entries,
@@ -980,6 +992,22 @@ mod tests {
         for word in ["value_len", "placeholder", "query_keys"] {
             assert!(!text.contains(word), "{word}");
         }
+    }
+
+    #[test]
+    fn restore_puts_an_entry_back_or_removes_it() {
+        let (dir, reg) = fresh();
+        let m = method("example.com", "https://login.example.com");
+        reg.import(m, ImportFlags::default(), NOW).unwrap();
+        let before = reg.get("example.com").unwrap();
+        reg.set_override("example.com", 1, "#x").unwrap();
+        reg.restore("example.com", Some(before.clone())).unwrap();
+        assert_eq!(reg.get("example.com"), Some(before));
+        reg.restore("example.com", None).unwrap();
+        assert!(reg.list().is_empty());
+        // the file agrees with memory
+        let again = TeachRegistry::load(dir.path()).unwrap();
+        assert!(again.list().is_empty());
     }
 
     #[test]

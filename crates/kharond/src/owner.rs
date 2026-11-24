@@ -77,6 +77,27 @@
 //!   `store_failed` when the file could not be written (the passkey
 //!   stays). Without an owner UI the op is `unknown_op`.
 //!
+//! - `teach_import`, `teach_list`, `teach_show`, `teach_override`,
+//!   `teach_clear_stale`, `teach_remove` — the login-method registry
+//!   (#382). Only the owner adds, changes or removes a method, so
+//!   these ops exist on this socket and nowhere an agent can reach.
+//!   `teach_import` takes `"method":<a login method>` and the flags
+//!   `replace` and `accept_main_world`; the other ops take `"domain"`
+//!   (a host or site key), and `teach_override` also `"step"` (the
+//!   flat 0-based index across the method's legs) and `"selector"`.
+//!   Replies carry `"entry"` (a [`TeachRow`]), `"entries"` for the
+//!   list, and for `teach_show` also `"method"`. Each mutating op
+//!   writes one audit entry on channel `cli` (domain, provenance
+//!   digest or `hand_written`, and the step number for an override,
+//!   never its selector); a refusal writes none, and a failed append
+//!   is `audit_failed` with the change undone. The ops work while the
+//!   broker is locked. Codes: `invalid_method`, `off_domain`,
+//!   `main_world`, `rung_above_ceiling`, `method_exists`, `not_found`,
+//!   `bad_step`, `bad_selector`, `store_failed`, `audit_failed`,
+//!   `teach_unavailable` (no registry installed), and `bad_request`
+//!   for a line that does not parse (an unknown field or another
+//!   method `format_version` included) or lacks an argument.
+//!
 //!   The CLI/ntfy presentation of the grant ops is #16; this socket
 //!   is the broker-side seam they drive. The web UI never accepts
 //!   the master password.
@@ -130,6 +151,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
+
+use kharon_recording::{LoginMethod, METHOD_FORMAT_VERSION, Rung, Shape};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -137,10 +161,14 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "canary-scan")]
 use crate::memscan;
+use crate::teach::{Checked, Entry as TeachEntry, ImportFlags, LastResult, Stale, site_key};
 
 /// Longest accepted request line. A password plus JSON framing
-/// fits comfortably; anything longer is refused without parsing.
-pub const MAX_REQUEST_BYTES: usize = 8192;
+/// fits comfortably, and so does a login method for `teach_import`
+/// (#382: a method is a few steps and selectors, a few KiB at most);
+/// anything longer is refused without parsing. The read buffer is
+/// pre-sized from this constant, so it never reallocates.
+pub const MAX_REQUEST_BYTES: usize = 32 * 1024;
 
 /// Read chunk size; the request buffer is pre-sized to
 /// `MAX_REQUEST_BYTES + READ_CHUNK` so it never grows (a grow would
@@ -258,6 +286,59 @@ pub trait OwnerOps: Send + Sync + 'static {
     fn panic_lock(&self) -> impl Future<Output = Result<(), OwnerFailure>> + Send {
         async { Err(OwnerFailure::Unsupported) }
     }
+
+    /// Add a login method (#382). Default: unsupported.
+    fn teach_import(
+        &self,
+        method: LoginMethod,
+        flags: ImportFlags,
+    ) -> impl Future<Output = Result<TeachEntry, OwnerFailure>> + Send {
+        let _ = (method, flags);
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Every login method, by domain (#382). Default: unsupported.
+    fn teach_list(&self) -> impl Future<Output = Result<Vec<TeachEntry>, OwnerFailure>> + Send {
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// One login method (#382). Default: unsupported.
+    fn teach_show(
+        &self,
+        domain: String,
+    ) -> impl Future<Output = Result<TeachEntry, OwnerFailure>> + Send {
+        let _ = domain;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Put a selector first for one step (#382). Default: unsupported.
+    fn teach_override(
+        &self,
+        domain: String,
+        step: u32,
+        selector: String,
+    ) -> impl Future<Output = Result<TeachEntry, OwnerFailure>> + Send {
+        let _ = (domain, step, selector);
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Clear a method's stale mark (#382). Default: unsupported.
+    fn teach_clear_stale(
+        &self,
+        domain: String,
+    ) -> impl Future<Output = Result<TeachEntry, OwnerFailure>> + Send {
+        let _ = domain;
+        async { Err(OwnerFailure::Unsupported) }
+    }
+
+    /// Remove a login method (#382). Default: unsupported.
+    fn teach_remove(
+        &self,
+        domain: String,
+    ) -> impl Future<Output = Result<TeachEntry, OwnerFailure>> + Send {
+        let _ = domain;
+        async { Err(OwnerFailure::Unsupported) }
+    }
 }
 
 /// Owner-chosen approval terms from an `approve` request line.
@@ -320,6 +401,41 @@ pub enum OwnerFailure {
     /// socket allows it; this exists so that refusal cannot be
     /// reported as success if it is ever reached here.
     LastPasskey,
+    /// The method does not validate (#382).
+    TeachInvalid,
+    /// The method's origin is not on its domain (#382).
+    TeachOffDomain,
+    /// A recording made in the page's own world, without the flag (#382).
+    TeachMainWorld,
+    /// The method's rung is above what its recording reached (#382).
+    TeachRungAboveCeiling,
+    /// An entry for the site exists and `replace` was not set (#382).
+    TeachExists,
+    /// The step is not one an override can name (#382).
+    TeachBadStep,
+    /// The selector is empty or too long (#382).
+    TeachBadSelector,
+    /// No registry is installed (#382).
+    TeachUnavailable,
+}
+
+impl From<crate::api::TeachOpError> for OwnerFailure {
+    fn from(e: crate::api::TeachOpError) -> Self {
+        use crate::api::TeachOpError as E;
+        match e {
+            E::Unavailable => Self::TeachUnavailable,
+            E::Invalid => Self::TeachInvalid,
+            E::OffDomain => Self::TeachOffDomain,
+            E::MainWorld => Self::TeachMainWorld,
+            E::RungAboveCeiling => Self::TeachRungAboveCeiling,
+            E::Exists => Self::TeachExists,
+            E::NotFound => Self::NotFound,
+            E::BadStep => Self::TeachBadStep,
+            E::BadSelector => Self::TeachBadSelector,
+            E::StoreFailed => Self::StoreFailed,
+            E::AuditFailed => Self::AuditFailed,
+        }
+    }
 }
 
 impl OwnerFailure {
@@ -341,6 +457,14 @@ impl OwnerFailure {
             Self::Ambiguous => "ambiguous",
             Self::StoreFailed => "store_failed",
             Self::LastPasskey => "last_passkey",
+            Self::TeachInvalid => "invalid_method",
+            Self::TeachOffDomain => "off_domain",
+            Self::TeachMainWorld => "main_world",
+            Self::TeachRungAboveCeiling => "rung_above_ceiling",
+            Self::TeachExists => "method_exists",
+            Self::TeachBadStep => "bad_step",
+            Self::TeachBadSelector => "bad_selector",
+            Self::TeachUnavailable => "teach_unavailable",
         }
     }
 
@@ -409,6 +533,24 @@ struct Request {
     /// `passkey_remove`: the short id from `passkey_list` (#258).
     #[serde(default)]
     id: Option<String>,
+    /// `teach_import`: the login method (#382).
+    #[serde(default)]
+    method: Option<LoginMethod>,
+    /// `teach_import`: overwrite an existing entry.
+    #[serde(default)]
+    replace: bool,
+    /// `teach_import`: admit a recording made in the page's own world.
+    #[serde(default)]
+    accept_main_world: bool,
+    /// Teach ops: the site, as a host or site key.
+    #[serde(default)]
+    domain: Option<String>,
+    /// `teach_override`: the flat step index.
+    #[serde(default)]
+    step: Option<u32>,
+    /// `teach_override`: the selector to try first.
+    #[serde(default)]
+    selector: Option<String>,
 }
 
 /// The socket path for a daemon with this `data_dir`.
@@ -881,6 +1023,67 @@ async fn dispatch_line<O: OwnerOps>(
                 Err(e) => error_response(e.code()),
             }
         }
+        "teach_import" => {
+            let Some(method) = req.method else {
+                return error_response("bad_request");
+            };
+            if method.format_version != METHOD_FORMAT_VERSION {
+                return error_response("bad_request");
+            }
+            let flags = ImportFlags {
+                replace: req.replace,
+                accept_main_world: req.accept_main_world,
+            };
+            match ops.teach_import(method, flags).await {
+                Ok(entry) => teach_entry_reply(&entry, false),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "teach_list" => match ops.teach_list().await {
+            Ok(entries) => reply_line(&TeachListReply {
+                ok: true,
+                entries: entries.iter().map(TeachRow::new).collect(),
+            }),
+            Err(e) => error_response(e.code()),
+        },
+        "teach_show" => {
+            let Some(domain) = teach_domain(&req) else {
+                return error_response("bad_request");
+            };
+            match ops.teach_show(domain).await {
+                Ok(entry) => teach_entry_reply(&entry, true),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "teach_override" => {
+            let (Some(domain), Some(step), Some(selector)) =
+                (teach_domain(&req), req.step, req.selector.clone())
+            else {
+                return error_response("bad_request");
+            };
+            match ops.teach_override(domain, step, selector).await {
+                Ok(entry) => teach_entry_reply(&entry, false),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "teach_clear_stale" => {
+            let Some(domain) = teach_domain(&req) else {
+                return error_response("bad_request");
+            };
+            match ops.teach_clear_stale(domain).await {
+                Ok(entry) => teach_entry_reply(&entry, false),
+                Err(e) => error_response(e.code()),
+            }
+        }
+        "teach_remove" => {
+            let Some(domain) = teach_domain(&req) else {
+                return error_response("bad_request");
+            };
+            match ops.teach_remove(domain).await {
+                Ok(entry) => teach_entry_reply(&entry, false),
+                Err(e) => error_response(e.code()),
+            }
+        }
         _ => error_response("unknown_op"),
     }
 }
@@ -970,6 +1173,89 @@ struct StatusReply {
     locked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner_ui_without_edge_address: Option<u64>,
+}
+
+/// The request's `domain`, normalized to its site key; `None` when absent or blank.
+fn teach_domain(req: &Request) -> Option<String> {
+    let domain = req.domain.as_deref()?.trim();
+    (!domain.is_empty()).then(|| site_key(domain))
+}
+
+/// One login method as the owner sees it (#382). The owner's own channel,
+/// so the overrides are shown; nothing here is a value or page text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TeachRow {
+    pub domain: String,
+    pub rung: Rung,
+    pub shape: Shape,
+    pub hand_written: bool,
+    /// The recording's sha256; null for a hand-written method.
+    pub digest: Option<String>,
+    pub stale: Option<Stale>,
+    /// Flat step index to the selectors the owner put first.
+    pub overrides: BTreeMap<u32, Vec<String>>,
+    pub imported_at: String,
+    pub last_checked: Option<Checked>,
+    pub last_result: Option<LastResult>,
+}
+
+impl TeachRow {
+    fn new(entry: &TeachEntry) -> Self {
+        Self {
+            domain: entry.method.site.domain.clone(),
+            rung: entry.rung,
+            shape: entry.shape.clone(),
+            hand_written: entry.method.digest().is_none(),
+            digest: entry.method.digest().map(str::to_owned),
+            stale: entry.stale.clone(),
+            overrides: entry.overrides.clone(),
+            imported_at: entry.imported_at.clone(),
+            last_checked: entry.last_checked.clone(),
+            last_result: entry.last_result.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TeachEntryReply {
+    ok: bool,
+    entry: TeachRow,
+}
+
+#[derive(Serialize)]
+struct TeachShowReply<'a> {
+    ok: bool,
+    entry: TeachRow,
+    method: &'a LoginMethod,
+}
+
+#[derive(Serialize)]
+struct TeachListReply {
+    ok: bool,
+    entries: Vec<TeachRow>,
+}
+
+/// `{"ok":true,"entry":…}`, plus `"method"` when `with_method`.
+fn teach_entry_reply(entry: &TeachEntry, with_method: bool) -> String {
+    if with_method {
+        reply_line(&TeachShowReply {
+            ok: true,
+            entry: TeachRow::new(entry),
+            method: &entry.method,
+        })
+    } else {
+        reply_line(&TeachEntryReply {
+            ok: true,
+            entry: TeachRow::new(entry),
+        })
+    }
+}
+
+/// A typed reply as one line. Plain data: serializing cannot fail.
+fn reply_line<T: Serialize>(reply: &T) -> String {
+    let mut line = serde_json::to_string(reply).unwrap_or_else(|_| "{\"ok\":false}".to_owned());
+    line.push('\n');
+    line
 }
 
 fn status_response(locked: bool, without_edge_address: Option<u64>) -> String {

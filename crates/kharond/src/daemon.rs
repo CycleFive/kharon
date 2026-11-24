@@ -548,6 +548,54 @@ impl OwnerOps for DaemonOwner {
             .await
             .unwrap_or(Err(OwnerFailure::AuditFailed))
     }
+    async fn teach_import(
+        &self,
+        method: kharon_recording::LoginMethod,
+        flags: crate::teach::ImportFlags,
+    ) -> Result<crate::teach::Entry, OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.teach_import(method, flags))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+            .map_err(OwnerFailure::from)
+    }
+
+    async fn teach_list(&self) -> Result<Vec<crate::teach::Entry>, OwnerFailure> {
+        self.broker.teach_list().map_err(OwnerFailure::from)
+    }
+
+    async fn teach_show(&self, domain: String) -> Result<crate::teach::Entry, OwnerFailure> {
+        self.broker.teach_show(&domain).map_err(OwnerFailure::from)
+    }
+
+    async fn teach_override(
+        &self,
+        domain: String,
+        step: u32,
+        selector: String,
+    ) -> Result<crate::teach::Entry, OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.teach_override(&domain, step, &selector))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+            .map_err(OwnerFailure::from)
+    }
+
+    async fn teach_clear_stale(&self, domain: String) -> Result<crate::teach::Entry, OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.teach_clear_stale(&domain))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+            .map_err(OwnerFailure::from)
+    }
+
+    async fn teach_remove(&self, domain: String) -> Result<crate::teach::Entry, OwnerFailure> {
+        let broker = Arc::clone(&self.broker);
+        tokio::task::spawn_blocking(move || broker.teach_remove(&domain))
+            .await
+            .map_err(|_| OwnerFailure::AuditFailed)?
+            .map_err(OwnerFailure::from)
+    }
 }
 
 /// Map a broker grant refusal onto the owner channel's fixed codes.
@@ -660,6 +708,14 @@ pub enum StartupError {
         /// Configured address.
         addr: SocketAddr,
         /// `std::io::ErrorKind` rendering.
+        kind: String,
+    },
+    /// The login-method registry under `data_dir/teach` could not be read
+    /// (unreadable, group- or world-accessible, or holding an unusable
+    /// method). Refused rather than started without the owner's methods.
+    #[error("cannot load the login-method registry: {kind}")]
+    TeachRegistry {
+        /// `std::io::ErrorKind` rendering. No file contents.
         kind: String,
     },
     /// The passkey store under `data_dir/owner` could not be opened.
@@ -781,6 +837,7 @@ impl StartupError {
             Self::Bind { .. } => "bind",
             Self::OwnerUiBind { .. } => "owner_ui_bind",
             Self::OwnerUiStore { .. } => "owner_ui_store",
+            Self::TeachRegistry { .. } => "teach_registry",
             Self::OwnerUiAccess { .. } => "owner_ui_access",
             Self::OauthState { .. } => "oauth_state",
             Self::TlsMaterial { .. } => "tls_material",
@@ -803,7 +860,8 @@ impl StartupError {
             Self::DataDir { .. }
             | Self::Audit(_)
             | Self::OwnerBind { .. }
-            | Self::OwnerUiStore { .. } => EX_CANTCREAT,
+            | Self::OwnerUiStore { .. }
+            | Self::TeachRegistry { .. } => EX_CANTCREAT,
             Self::Bind { .. }
             | Self::OwnerUiBind { .. }
             | Self::ConnectorBind { .. }
@@ -1107,6 +1165,14 @@ pub async fn start(
         }
         _ => broker,
     };
+    // #382: the owner's taught login methods. Loaded before any listener
+    // opens; an unreadable or too-open file refuses startup.
+    let teach_registry = crate::teach::TeachRegistry::load(&cfg.data_dir).map_err(|e| {
+        StartupError::TeachRegistry {
+            kind: e.kind().to_string(),
+        }
+    })?;
+    let broker = broker.with_teach_registry(Arc::new(teach_registry));
     // SPEC §8: a fill against a vault older than 5 min re-syncs first.
     let broker = Arc::new(match &cfg.source {
         Source::Sync(bw) => broker.with_fill_sync(Arc::new(DaemonFillSync(Box::new(bw.clone())))),

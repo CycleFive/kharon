@@ -81,9 +81,12 @@ use crate::lock::{AuditError, Clock, LockController, LockEvent, LockReason, Syst
 use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::wire::SyncResponse;
 use crate::sync::{LiveSync, SecretField, SyncError, SyncOutcome, Vault};
-use crate::teach::TeachRegistry;
+use crate::teach::{
+    EditRefusal, Entry as TeachEntry, ImportFlags, ImportRefusal, TeachRegistry, site_key,
+};
 use crate::totp::skew::Observation;
 use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy, totp_code};
+use kharon_recording::LoginMethod;
 
 /// Longest accepted `origin` (bytes).
 pub const MAX_ORIGIN_LEN: usize = 2048;
@@ -470,6 +473,9 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// The taught login methods (#382). `None` = none installed: no
     /// fill consults a method and no prompt names a rung.
     teach_registry: Option<Arc<TeachRegistry>>,
+    /// Serializes the owner's registry edits, so an undo after a failed
+    /// audit append cannot overwrite another edit.
+    teach_edits: Mutex<()>,
     /// Rate limits, suspension, and agent revocation (REQ-RL-*,
     /// REQ-REV-001). Separate from the lock controller so owner
     /// revoke/panic never needs the session.
@@ -694,6 +700,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             approval_tokens: Mutex::new(ApprovalTokenStore::new()),
             approval_notifier: None,
             teach_registry: None,
+            teach_edits: Mutex::new(()),
             rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
             transport: TransportLimits::new(),
             rollback: Mutex::new(RollbackGuard::new()),
@@ -811,6 +818,128 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     /// The installed teach registry, if any.
     pub fn teach_registry(&self) -> Option<&Arc<TeachRegistry>> {
         self.teach_registry.as_ref()
+    }
+
+    /// The installed registry, or `teach_unavailable`.
+    fn teach_registry_for_edit(&self) -> Result<&Arc<TeachRegistry>, TeachOpError> {
+        self.teach_registry
+            .as_ref()
+            .ok_or(TeachOpError::Unavailable)
+    }
+
+    /// The audit entry of an owner edit: the domain as origin, the method's
+    /// provenance digest (or `hand_written`), channel `cli`. No selector, no
+    /// value, no page text.
+    fn teach_audit_entry(event: Event, entry: &TeachEntry) -> Entry {
+        let audit = Entry::new(event)
+            .origin(entry.method.site.domain.clone())
+            .channel("cli")
+            .result("ok");
+        match entry.method.digest() {
+            Some(digest) => audit.file_sha256(digest),
+            None => audit.detail_code("hand_written"),
+        }
+    }
+
+    /// Append `audit` for a registry change that has just been made; when the
+    /// append fails, put `domain` back to `previous` and report `audit_failed`.
+    /// The registry has no dry run, so a refused change appends nothing and an
+    /// applied one is undone rather than left unrecorded.
+    fn teach_record_or_undo(
+        &self,
+        registry: &TeachRegistry,
+        domain: &str,
+        previous: Option<TeachEntry>,
+        audit: Entry,
+    ) -> Result<(), TeachOpError> {
+        if self.append(audit).is_ok() {
+            return Ok(());
+        }
+        if registry.restore(domain, previous).is_err() {
+            eprintln!(
+                "kharond: warning: could not undo a login-method change after its audit entry failed"
+            );
+        }
+        Err(TeachOpError::AuditFailed)
+    }
+
+    /// Owner op: add a login method (#382). `replace` overwrites an existing
+    /// entry; `accept_main_world` admits a recording made in the page's own
+    /// world. One audit entry on success, none on a refusal.
+    pub fn teach_import(
+        &self,
+        method: LoginMethod,
+        flags: ImportFlags,
+    ) -> Result<TeachEntry, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        let now = now_rfc3339().ok_or(TeachOpError::StoreFailed)?;
+        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
+        let domain = method.site.domain.clone();
+        let previous = registry.get(&domain);
+        let entry = registry
+            .import(method, flags, &now)
+            .map_err(TeachOpError::from)?;
+        let audit = Self::teach_audit_entry(Event::TeachImport, &entry);
+        self.teach_record_or_undo(registry, &domain, previous, audit)?;
+        Ok(entry)
+    }
+
+    /// Owner op: every entry, sorted by domain. Not audited.
+    pub fn teach_list(&self) -> Result<Vec<TeachEntry>, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        Ok(registry.list().into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Owner op: one entry, by host or site key. Not audited.
+    pub fn teach_show(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        registry
+            .get(&site_key(domain))
+            .ok_or(TeachOpError::NotFound)
+    }
+
+    /// Owner op: put `selector` first for flat step `step`. The audit entry
+    /// names the step, never the selector.
+    pub fn teach_override(
+        &self,
+        domain: &str,
+        step: u32,
+        selector: &str,
+    ) -> Result<TeachEntry, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
+        let domain = site_key(domain);
+        let previous = registry.get(&domain);
+        let entry = registry
+            .set_override(&domain, step, selector)
+            .map_err(TeachOpError::from)?;
+        let audit =
+            Self::teach_audit_entry(Event::TeachOverride, &entry).step_index(u64::from(step));
+        self.teach_record_or_undo(registry, &domain, previous, audit)?;
+        Ok(entry)
+    }
+
+    /// Owner op: clear the stale mark.
+    pub fn teach_clear_stale(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
+        let domain = site_key(domain);
+        let previous = registry.get(&domain);
+        let entry = registry.clear_stale(&domain).map_err(TeachOpError::from)?;
+        let audit = Self::teach_audit_entry(Event::TeachClearStale, &entry);
+        self.teach_record_or_undo(registry, &domain, previous, audit)?;
+        Ok(entry)
+    }
+
+    /// Owner op: remove the entry; the removed entry is returned.
+    pub fn teach_remove(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
+        let domain = site_key(domain);
+        let gone = registry.remove(&domain).map_err(TeachOpError::from)?;
+        let audit = Self::teach_audit_entry(Event::TeachRemove, &gone);
+        self.teach_record_or_undo(registry, &domain, Some(gone.clone()), audit)?;
+        Ok(gone)
     }
 
     /// Apply `[policy]` to the grant store (standing grants on/off).
@@ -1575,10 +1704,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let Some(registry) = &self.teach_registry else {
             return;
         };
-        let now = time::OffsetDateTime::now_utc()
-            .replace_nanosecond(0)
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-        let Ok(now) = now.format(&time::format_description::well_known::Rfc3339) else {
+        let Some(now) = now_rfc3339() else {
             return;
         };
         let recorded = registry.record_fill(used, &now);
@@ -3299,6 +3425,67 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
 
 /// The wire name of a method's rung, as on the reply, the audit entry
 /// and the approval prompt (#382).
+/// Why an owner's registry operation failed. Fixed variants only; the owner
+/// socket maps each to a fixed code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeachOpError {
+    /// No registry is installed on this broker.
+    Unavailable,
+    /// The method does not validate.
+    Invalid,
+    /// The method's origin is not on its domain.
+    OffDomain,
+    /// A recording made in the page's own world, without the flag.
+    MainWorld,
+    /// The method's rung is above what its recording reached.
+    RungAboveCeiling,
+    /// An entry for the site exists and `replace` was not set.
+    Exists,
+    /// No entry for the site.
+    NotFound,
+    /// The step is not one an override can name.
+    BadStep,
+    /// The selector is empty or too long.
+    BadSelector,
+    /// The registry file could not be written.
+    StoreFailed,
+    /// The audit entry could not be written; the change was undone.
+    AuditFailed,
+}
+
+impl From<ImportRefusal> for TeachOpError {
+    fn from(e: ImportRefusal) -> Self {
+        match e {
+            ImportRefusal::Invalid => Self::Invalid,
+            ImportRefusal::OffDomain => Self::OffDomain,
+            ImportRefusal::MainWorld => Self::MainWorld,
+            ImportRefusal::RungAboveCeiling => Self::RungAboveCeiling,
+            ImportRefusal::Exists => Self::Exists,
+            ImportRefusal::Store => Self::StoreFailed,
+        }
+    }
+}
+
+impl From<EditRefusal> for TeachOpError {
+    fn from(e: EditRefusal) -> Self {
+        match e {
+            EditRefusal::NotFound => Self::NotFound,
+            EditRefusal::BadStep => Self::BadStep,
+            EditRefusal::BadSelector => Self::BadSelector,
+            EditRefusal::Store => Self::StoreFailed,
+        }
+    }
+}
+
+/// The current time as RFC 3339 UTC to the second.
+fn now_rfc3339() -> Option<String> {
+    let now = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    now.format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
 fn rung_name(rung: kharon_recording::Rung) -> &'static str {
     match rung {
         kharon_recording::Rung::Milliseconds => "milliseconds",

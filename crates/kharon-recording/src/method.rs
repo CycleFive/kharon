@@ -83,8 +83,10 @@ pub struct Expected {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubmitVia {
-    Form,
-    Enter,
+    // Empty struct variants, not unit variants: serde only enforces
+    // `deny_unknown_fields` on the former. The wire form is still {"kind":"form"}.
+    Form {},
+    Enter {},
     Click {
         selectors: Vec<String>,
         expect: Expected,
@@ -95,8 +97,8 @@ pub enum SubmitVia {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SuccessCheck {
     PathChangedTo { path: String },
-    PasswordFieldGone,
-    None,
+    PasswordFieldGone {},
+    None {},
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,7 +151,7 @@ fn bad_origin(origin: &str) -> bool {
     else {
         return true;
     };
-    host.is_empty() || host.contains(['/', '?', '#', '@'])
+    host.contains(['/', '?', '#', '@']) || host.split(':').next().is_none_or(str::is_empty)
 }
 
 impl LoginMethod {
@@ -313,7 +315,7 @@ mod tests {
 
     fn submit() -> MethodStep {
         MethodStep::Submit {
-            via: SubmitVia::Form,
+            via: SubmitVia::Form {},
         }
     }
 
@@ -388,15 +390,15 @@ mod tests {
             selectors: vec!["button.go".into()],
             expect: expected("submit"),
         };
-        for via in [SubmitVia::Form, SubmitVia::Enter, click] {
+        for via in [SubmitVia::Form {}, SubmitVia::Enter {}, click] {
             let mut m = sample();
             *m.legs[0].steps.last_mut().unwrap() = MethodStep::Submit { via };
             round_trip(&m);
         }
         for success in [
             SuccessCheck::PathChangedTo { path: "/x".into() },
-            SuccessCheck::PasswordFieldGone,
-            SuccessCheck::None,
+            SuccessCheck::PasswordFieldGone {},
+            SuccessCheck::None {},
         ] {
             let mut m = sample();
             m.success = success;
@@ -471,6 +473,46 @@ mod tests {
             Err(MethodError::Invalid(r)) => r,
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn req_tch_007_refuses_unknown_fields_on_unit_like_variants() {
+        for (via, kind) in [(SubmitVia::Form {}, "form"), (SubmitVia::Enter {}, "enter")] {
+            let mut m = sample();
+            *m.legs[0].steps.last_mut().unwrap() = MethodStep::Submit { via };
+            let json = m.to_json();
+            let needle = format!("\"kind\": \"{kind}\"");
+            assert!(json.contains(&needle), "{json}");
+            let bad = json.replacen(&needle, &format!("{needle},\n\"value_len\": 8"), 1);
+            assert!(matches!(
+                LoginMethod::from_json(&bad),
+                Err(MethodError::Parse(_))
+            ));
+        }
+        for (success, kind) in [
+            (SuccessCheck::None {}, "none"),
+            (SuccessCheck::PasswordFieldGone {}, "password_field_gone"),
+        ] {
+            let mut m = sample();
+            m.success = success;
+            let json = m.to_json();
+            let needle = format!("\"kind\": \"{kind}\"");
+            assert!(json.contains(&needle), "{json}");
+            let bad = json.replacen(&needle, &format!("{needle},\n\"placeholder\": \"x\""), 1);
+            assert!(matches!(
+                LoginMethod::from_json(&bad),
+                Err(MethodError::Parse(_))
+            ));
+        }
+        let hand = sample().to_json().replacen(
+            "\"source\": \"recording\"",
+            "\"source\": \"recording\",\n\"value_len\": 8",
+            1,
+        );
+        assert!(matches!(
+            LoginMethod::from_json(&hand),
+            Err(MethodError::Parse(_))
+        ));
     }
 
     #[test]
@@ -578,9 +620,13 @@ mod tests {
             "https://u@example.test",
             "https://example.test?x",
             "https://example.test#x",
+            "https://:80",
         ] {
             assert_eq!(mutate(&|m| m.site.origin = bad.into()), "origin", "{bad}");
         }
+        let mut two = two_leg();
+        two.legs[1].steps[0] = nav("password");
+        assert_eq!(reason(&two), "path");
         assert_eq!(mutate(&|m| m.site.domain.clear()), "domain");
         assert_eq!(mutate(&|m| m.site.path = "/other".into()), "site_path");
     }

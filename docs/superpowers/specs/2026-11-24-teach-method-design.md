@@ -192,10 +192,11 @@ where the post-submit scrub already re-reads the loader. One of:
 The result goes to the registry entry only. The fill reply stays
 `filled`, as the scrub's does.
 
-**Provenance.** The SHA-256 of the recording file's bytes, the
-recording's `tool_version`, and its browser product string. The user
-agent and viewport are not copied into the method; they are covered by
-the digest, so a reader holding the recording can check them.
+**Provenance.** One of two kinds, tagged `source`:
+- `recording`: the SHA-256 of the recording file's bytes, the recording's `tool_version`, its browser product string, its `listener_world` (`isolated` or `main`), and its `rung_ceiling`. The last two are copied because import gets only the method file, and section 5's main-world and ceiling checks read them there.
+- `hand_written`: an author string. No digest, no world, no ceiling (section 6).
+
+The user agent and viewport are not copied. The digest covers them, so a reader who holds the recording can check them. `listener_world` and `rung_ceiling` can't be left to the digest, because import has no recording to check a digest against.
 
 **Roles, never values.** The method holds no value, no value length,
 and no page text.
@@ -243,6 +244,7 @@ piece 3.
 | `requests` (every stored request shape) | Dropped. The player sends nothing itself, and piece 3 reads the recording, not the method |
 | `steps` timings, the person's other clicks and inputs, `stripped` counts, `flags` | Dropped |
 | User agent and viewport | Not copied; covered by the provenance digest |
+| `listener_world`, `rung_ceiling` | Copied into the provenance, not dropped. Import checks both (section 5) and has only the method file |
 
 ### 3. The player
 
@@ -424,8 +426,7 @@ convert writes the same JSON. They supply:
 - `provenance` with `source: "hand_written"`, an author string, and no
   recording digest
 
-Import treats it as any other method, with every refusal in section 5
-except the ceiling check, which has no recording to read. `kharon
+Import treats it as any other method, with every refusal in section 5 except the two that read a recording's provenance. The ceiling check has no ceiling to compare with. The main-world check has no listener world, because no listener ran. A hand-written method's rung is the author's claim, which is why it defaults to `agent_continues`. `kharon
 teach list` marks it hand-written.
 
 ### Tests
@@ -573,3 +574,4 @@ Reading the code changed these points of the plan posted on #381:
 - A method made from a throwaway account may differ from the real
   account's login (an extra prompt on the real one). That shows up as
   drift on the first real fill, which is the intended outcome.
+- Provenance is what the method file says. Import can't check a converted method's `listener_world` or `rung_ceiling` against the recording, because it doesn't have the recording. The owner reading `kharon-teach show` before import is that check. A `--recording <file>` flag on import that verifies the digest is left to the builder.

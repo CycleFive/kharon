@@ -1,6 +1,6 @@
 # Teach mode, piece 2: login methods, a player, and a per-site registry
 
-Status: design, 2026-11-24, for #381 (piece 2 of #361, milestone M2).
+Status: design, 2026-11-24, for #381 (piece 2 of #361, milestone M2). Built in #382.
 Author: Duet (kharon session). Reviewers: Muse and Nyx. Every decision
 here is Duet's call unless it is marked otherwise. The outline was
 posted on #381 before this note was written; where the code showed a

@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use kharon_recording::{
-    ListenerWorld, LoginMethod, MethodStep, Provenance, Rung, RungCeiling, Shape, SubmitVia,
+    ListenerWorld, LoginMethod, METHOD_FORMAT_VERSION, MethodStep, Provenance, Rung, RungCeiling,
+    Shape, SubmitVia,
 };
 use serde::{Deserialize, Serialize};
 
@@ -161,7 +162,8 @@ impl TeachRegistry {
                 let file: FileIn =
                     serde_json::from_str(&text).map_err(|_| invalid("registry file unreadable"))?;
                 let sound = file.entries.iter().all(|(key, e)| {
-                    e.method.validate().is_ok()
+                    e.method.format_version == METHOD_FORMAT_VERSION
+                        && e.method.validate().is_ok()
                         && *key == e.method.site.domain
                         && url_site_key(&e.method.site.origin).as_deref() == Some(key.as_str())
                 });
@@ -236,7 +238,7 @@ impl TeachRegistry {
     ) -> Result<Entry, WithHook<ImportRefusal, E>> {
         use WithHook::Refused;
         let refuse = |r| Err(Refused(r));
-        if method.validate().is_err() {
+        if method.format_version != METHOD_FORMAT_VERSION || method.validate().is_err() {
             return refuse(ImportRefusal::Invalid);
         }
         if url_site_key(&method.site.origin).as_deref() != Some(method.site.domain.as_str()) {
@@ -1118,6 +1120,44 @@ mod tests {
             selectors_ignored: false,
             browser_product: None,
         }
+    }
+
+    #[test]
+    fn import_refuses_another_format_version() {
+        let (_d, reg) = fresh();
+        let mut m = method("example.com", "https://login.example.com");
+        m.format_version = METHOD_FORMAT_VERSION + 1;
+        assert_eq!(
+            reg.import(m, ImportFlags::default(), NOW).unwrap_err(),
+            ImportRefusal::Invalid
+        );
+        assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn load_refuses_a_stored_method_with_another_format_version() {
+        let (d, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(file(&d)).unwrap();
+        let edited = text.replacen(
+            &format!("\"format_version\": {METHOD_FORMAT_VERSION},\n        \"site\""),
+            &format!(
+                "\"format_version\": {},\n        \"site\"",
+                METHOD_FORMAT_VERSION + 1
+            ),
+            1,
+        );
+        assert_ne!(edited, text, "the method's version field was found");
+        std::fs::write(file(&d), edited).unwrap();
+        assert_eq!(
+            TeachRegistry::load(d.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

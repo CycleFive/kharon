@@ -3424,8 +3424,6 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     }
 }
 
-/// The wire name of a method's rung, as on the reply, the audit entry
-/// and the approval prompt (#382).
 /// Why an owner's registry operation failed. Fixed variants only; the owner
 /// socket maps each to a fixed code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3487,6 +3485,8 @@ fn now_rfc3339() -> Option<String> {
         .ok()
 }
 
+/// The wire name of a method's rung, as on the reply, the audit entry
+/// and the approval prompt (#382).
 fn rung_name(rung: kharon_recording::Rung) -> &'static str {
     match rung {
         kharon_recording::Rung::Milliseconds => "milliseconds",

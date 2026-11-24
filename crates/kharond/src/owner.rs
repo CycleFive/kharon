@@ -77,6 +77,9 @@
 //!   `store_failed` when the file could not be written (the passkey
 //!   stays). Without an owner UI the op is `unknown_op`.
 //!
+//!   The CLI/ntfy presentation of the grant ops is #16; this socket
+//!   is the broker-side seam they drive. The web UI never accepts
+//!   the master password.
 //! - `teach_import`, `teach_list`, `teach_show`, `teach_override`,
 //!   `teach_clear_stale`, `teach_remove` — the login-method registry
 //!   (#382). Only the owner adds, changes or removes a method, so
@@ -90,17 +93,13 @@
 //!   writes one audit entry on channel `cli` (domain, provenance
 //!   digest or `hand_written`, and the step number for an override,
 //!   never its selector); a refusal writes none, and a failed append
-//!   is `audit_failed` with the change undone. The ops work while the
+//!   is `audit_failed` with nothing changed. The ops work while the
 //!   broker is locked. Codes: `invalid_method`, `off_domain`,
 //!   `main_world`, `rung_above_ceiling`, `method_exists`, `not_found`,
 //!   `bad_step`, `bad_selector`, `store_failed`, `audit_failed`,
 //!   `teach_unavailable` (no registry installed), and `bad_request`
 //!   for a line that does not parse (an unknown field or another
 //!   method `format_version` included) or lacks an argument.
-//!
-//!   The CLI/ntfy presentation of the grant ops is #16; this socket
-//!   is the broker-side seam they drive. The web UI never accepts
-//!   the master password.
 //! - `{"op":"scan","needle":"…"}` or
 //!   `{"op":"scan","needle_hex":"…"}` — only in builds with the
 //!   non-default cargo feature `canary-scan` (enabled by the test

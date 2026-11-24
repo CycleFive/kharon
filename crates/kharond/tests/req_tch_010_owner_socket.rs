@@ -760,3 +760,48 @@ async fn daemon_refuses_to_start_on_a_bad_registry_file() {
         kharond::daemon::start(&cfg, Box::new(kharond::lock::StaticHardening::all_ok())).await;
     assert!(started.is_ok(), "a sound registry file starts the daemon");
 }
+
+#[tokio::test]
+async fn req_tch_010_a_password_field_beside_a_teach_op_is_never_echoed() {
+    let rig = rig(false).await;
+    let secret = "CANARY-PASSWORD-9e1f";
+    let mut stream = UnixStream::connect(&rig.socket).await.unwrap();
+    let line = format!("{{\"op\":\"teach_list\",\"password\":\"{secret}\"}}\n");
+    stream.write_all(line.as_bytes()).await.unwrap();
+    let mut text = String::new();
+    stream.read_to_string(&mut text).await.unwrap();
+    assert!(text.contains("\"ok\":true"), "the teach op ran: {text}");
+    assert!(!text.contains(secret));
+    assert!(!audit_text(&rig.h).contains(secret));
+}
+
+#[tokio::test]
+async fn req_tch_010_the_request_cap_is_32_kib() {
+    let rig = rig(false).await;
+    // A hand-written method whose author name pads the line to a target size.
+    let line_for = |pad: usize| {
+        let mut m = hand_written();
+        m.provenance = Provenance::HandWritten {
+            author: "a".repeat(pad),
+        };
+        format!(
+            "{{\"op\":\"teach_import\",\"method\":{}}}",
+            serde_json::to_string(&m).unwrap()
+        )
+    };
+    let base = line_for(0).len();
+    let cap = kharond::owner::MAX_REQUEST_BYTES;
+    assert_eq!(cap, 32 * 1024);
+
+    // just under the cap (the line plus its newline stays within it)
+    let under = line_for(cap - base - 16);
+    assert!(under.len() < cap);
+    let r = send_line(&rig.socket, &under).await;
+    assert!(r.ok, "{:?}", r.error);
+
+    // over the cap
+    let over = line_for(cap - base + 16);
+    assert!(over.len() > cap);
+    let r = send_line(&rig.socket, &over).await;
+    assert_eq!(refused(&r), "bad_request");
+}

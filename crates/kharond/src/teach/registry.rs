@@ -5,6 +5,7 @@
 //! refusals are fixed enum variants, never strings built from file content.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::net::IpAddr;
@@ -101,6 +102,15 @@ pub enum EditRefusal {
     Store,
 }
 
+/// Why a `*_with` operation did not commit: the registry refused it (the hook was
+/// not called), or the hook did (nothing was changed). `Refused(Store)` after the
+/// hook returned `Ok` means the file could not be put in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithHook<R, E> {
+    Refused(R),
+    Hook(E),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recorded {
     pub newly_stale: bool,
@@ -173,14 +183,29 @@ impl TeachRegistry {
         self.entries.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Write `next` to disk; on success it replaces the in-memory state.
-    fn commit(&self, guard: &mut Entries, next: Entries) -> io::Result<()> {
+    /// Stage `next` on disk, call `hook`, then rename the staged
+    /// file into place and swap memory. A hook error removes the staged file and changes
+    /// nothing. Runs under the registry lock the caller holds in `guard`.
+    fn commit_with<E>(
+        &self,
+        guard: &mut Entries,
+        next: Entries,
+        hook: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), WithHook<(), E>> {
         let text = serde_json::to_string_pretty(&FileOut {
             format_version: REGISTRY_FORMAT_VERSION,
             entries: &next,
         })
-        .map_err(|_| invalid("registry not serializable"))?;
-        write_private(&self.path, text.as_bytes())?;
+        .map_err(|_| WithHook::Refused(()))?;
+        let tmp = stage_private(&self.path, text.as_bytes()).map_err(|_| WithHook::Refused(()))?;
+        if let Err(e) = hook() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(WithHook::Hook(e));
+        }
+        if std::fs::rename(&tmp, &self.path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(WithHook::Refused(()));
+        }
         *guard = next;
         Ok(())
     }
@@ -191,11 +216,31 @@ impl TeachRegistry {
         flags: ImportFlags,
         now: &str,
     ) -> Result<Entry, ImportRefusal> {
+        self.import_with(method, flags, now, |_| Ok::<(), Infallible>(()))
+            .map_err(|e| match e {
+                WithHook::Refused(r) => r,
+                WithHook::Hook(never) => match never {},
+            })
+    }
+
+    /// As [`Self::import`], with `before_commit` called with the new entry once every
+    /// check has passed and the file is staged, before it is put in place. The hook
+    /// runs under the registry lock: it must not call back into the registry, and it
+    /// is where the caller appends its audit entry. A hook error changes nothing.
+    pub fn import_with<E>(
+        &self,
+        method: LoginMethod,
+        flags: ImportFlags,
+        now: &str,
+        before_commit: impl FnOnce(&Entry) -> Result<(), E>,
+    ) -> Result<Entry, WithHook<ImportRefusal, E>> {
+        use WithHook::Refused;
+        let refuse = |r| Err(Refused(r));
         if method.validate().is_err() {
-            return Err(ImportRefusal::Invalid);
+            return refuse(ImportRefusal::Invalid);
         }
         if url_site_key(&method.site.origin).as_deref() != Some(method.site.domain.as_str()) {
-            return Err(ImportRefusal::OffDomain);
+            return refuse(ImportRefusal::OffDomain);
         }
         if let Provenance::Recording {
             listener_world,
@@ -204,7 +249,7 @@ impl TeachRegistry {
         } = &method.provenance
         {
             if *listener_world == ListenerWorld::Main && !flags.accept_main_world {
-                return Err(ImportRefusal::MainWorld);
+                return refuse(ImportRefusal::MainWorld);
             }
             let allowed = match rung_ceiling {
                 RungCeiling::Milliseconds => true,
@@ -212,12 +257,12 @@ impl TeachRegistry {
                 RungCeiling::NeedsPerson => false,
             };
             if !allowed {
-                return Err(ImportRefusal::RungAboveCeiling);
+                return refuse(ImportRefusal::RungAboveCeiling);
             }
         }
         let mut guard = self.guard();
         if guard.contains_key(&method.site.domain) && !flags.replace {
-            return Err(ImportRefusal::Exists);
+            return refuse(ImportRefusal::Exists);
         }
         let entry = Entry {
             rung: method.rung,
@@ -231,8 +276,11 @@ impl TeachRegistry {
         };
         let mut next = guard.clone();
         next.insert(entry.method.site.domain.clone(), entry.clone());
-        self.commit(&mut guard, next)
-            .map_err(|_| ImportRefusal::Store)?;
+        self.commit_with(&mut guard, next, || before_commit(&entry))
+            .map_err(|e| match e {
+                WithHook::Refused(()) => Refused(ImportRefusal::Store),
+                WithHook::Hook(e) => WithHook::Hook(e),
+            })?;
         Ok(entry)
     }
 
@@ -255,8 +303,23 @@ impl TeachRegistry {
         step: u32,
         selector: &str,
     ) -> Result<Entry, EditRefusal> {
+        Self::unhook(self.set_override_with(domain, step, selector, |_| Ok::<(), Infallible>(())))
+    }
+
+    /// As [`Self::set_override`], with `before_commit` called with the edited entry
+    /// before it is put in place. The hook runs under the registry lock and must not
+    /// call back into the registry.
+    pub fn set_override_with<E>(
+        &self,
+        domain: &str,
+        step: u32,
+        selector: &str,
+        before_commit: impl FnOnce(&Entry) -> Result<(), E>,
+    ) -> Result<Entry, WithHook<EditRefusal, E>> {
         let mut guard = self.guard();
-        let entry = guard.get(domain).ok_or(EditRefusal::NotFound)?;
+        let entry = guard
+            .get(domain)
+            .ok_or(WithHook::Refused(EditRefusal::NotFound))?;
         let editable = entry.method.steps().any(|(i, _, s)| {
             i == step
                 && matches!(
@@ -268,43 +331,73 @@ impl TeachRegistry {
                 )
         });
         if !editable {
-            return Err(EditRefusal::BadStep);
+            return Err(WithHook::Refused(EditRefusal::BadStep));
         }
         if selector.trim().is_empty() || selector.len() > MAX_SELECTOR_BYTES {
-            return Err(EditRefusal::BadSelector);
+            return Err(WithHook::Refused(EditRefusal::BadSelector));
         }
-        self.edit(&mut guard, domain, |e| {
-            let list = e.overrides.entry(step).or_default();
-            list.retain(|s| s != selector);
-            list.insert(0, selector.to_owned());
-        })
+        self.edit_with(
+            &mut guard,
+            domain,
+            |e| {
+                let list = e.overrides.entry(step).or_default();
+                list.retain(|s| s != selector);
+                list.insert(0, selector.to_owned());
+            },
+            before_commit,
+        )
     }
 
     pub fn clear_stale(&self, domain: &str) -> Result<Entry, EditRefusal> {
+        Self::unhook(self.clear_stale_with(domain, |_| Ok::<(), Infallible>(())))
+    }
+
+    /// As [`Self::clear_stale`], with a hook under the registry lock (see
+    /// [`Self::set_override_with`]).
+    pub fn clear_stale_with<E>(
+        &self,
+        domain: &str,
+        before_commit: impl FnOnce(&Entry) -> Result<(), E>,
+    ) -> Result<Entry, WithHook<EditRefusal, E>> {
         let mut guard = self.guard();
-        self.edit(&mut guard, domain, |e| e.stale = None)
+        self.edit_with(&mut guard, domain, |e| e.stale = None, before_commit)
     }
 
     pub fn remove(&self, domain: &str) -> Result<Entry, EditRefusal> {
+        Self::unhook(self.remove_with(domain, |_| Ok::<(), Infallible>(())))
+    }
+
+    /// As [`Self::remove`], with a hook called with the entry about to be removed,
+    /// under the registry lock (see [`Self::set_override_with`]).
+    pub fn remove_with<E>(
+        &self,
+        domain: &str,
+        before_commit: impl FnOnce(&Entry) -> Result<(), E>,
+    ) -> Result<Entry, WithHook<EditRefusal, E>> {
         let mut guard = self.guard();
-        let gone = guard.get(domain).cloned().ok_or(EditRefusal::NotFound)?;
+        let gone = guard
+            .get(domain)
+            .cloned()
+            .ok_or(WithHook::Refused(EditRefusal::NotFound))?;
         let mut next = guard.clone();
         next.remove(domain);
-        self.commit(&mut guard, next)
-            .map_err(|_| EditRefusal::Store)?;
+        self.commit_with(&mut guard, next, || before_commit(&gone))
+            .map_err(Self::store_or_hook)?;
         Ok(gone)
     }
 
-    /// Put `domain` back to `previous` (`None` removes it): the undo for an owner
-    /// edit whose audit entry could not be written.
-    pub(crate) fn restore(&self, domain: &str, previous: Option<Entry>) -> io::Result<()> {
-        let mut guard = self.guard();
-        let mut next = guard.clone();
-        match previous {
-            Some(entry) => next.insert(domain.to_owned(), entry),
-            None => next.remove(domain),
-        };
-        self.commit(&mut guard, next)
+    fn store_or_hook<E>(e: WithHook<(), E>) -> WithHook<EditRefusal, E> {
+        match e {
+            WithHook::Refused(()) => WithHook::Refused(EditRefusal::Store),
+            WithHook::Hook(e) => WithHook::Hook(e),
+        }
+    }
+
+    fn unhook(r: Result<Entry, WithHook<EditRefusal, Infallible>>) -> Result<Entry, EditRefusal> {
+        r.map_err(|e| match e {
+            WithHook::Refused(r) => r,
+            WithHook::Hook(never) => match never {},
+        })
     }
 
     fn edit(
@@ -313,11 +406,24 @@ impl TeachRegistry {
         domain: &str,
         f: impl FnOnce(&mut Entry),
     ) -> Result<Entry, EditRefusal> {
+        Self::unhook(self.edit_with(guard, domain, f, |_| Ok::<(), Infallible>(())))
+    }
+
+    fn edit_with<E>(
+        &self,
+        guard: &mut Entries,
+        domain: &str,
+        f: impl FnOnce(&mut Entry),
+        before_commit: impl FnOnce(&Entry) -> Result<(), E>,
+    ) -> Result<Entry, WithHook<EditRefusal, E>> {
         let mut next = guard.clone();
-        let entry = next.get_mut(domain).ok_or(EditRefusal::NotFound)?;
+        let entry = next
+            .get_mut(domain)
+            .ok_or(WithHook::Refused(EditRefusal::NotFound))?;
         f(entry);
         let out = entry.clone();
-        self.commit(guard, next).map_err(|_| EditRefusal::Store)?;
+        self.commit_with(guard, next, || before_commit(&out))
+            .map_err(Self::store_or_hook)?;
         Ok(out)
     }
 
@@ -399,9 +505,9 @@ fn check_mode(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `bytes` to `path` as mode 0600 (directory 0700) via a temp file in the same
-/// directory, then rename over the old file.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Write `bytes` to a temp file next to `path` as mode 0600 (directory 0700) and return
+/// its path; the caller renames it over `path` or removes it.
+fn stage_private(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     if let Some(parent) = path.parent() {
         let mut b = std::fs::DirBuilder::new();
@@ -410,24 +516,25 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         b.create(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let written = (|| {
-        {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
-        }
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&tmp, path)
+    let staged = (|| {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
     })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    match staged {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    written
 }
 
 #[cfg(test)]
@@ -994,20 +1101,144 @@ mod tests {
         }
     }
 
+    fn dir_listing(dir: &tempfile::TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("teach"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn drift(step: u32) -> MethodUse {
+        MethodUse {
+            domain: "example.com".into(),
+            rung: Rung::Milliseconds,
+            end: MethodEnd::Drift { step },
+            selectors_ignored: false,
+            browser_product: None,
+        }
+    }
+
     #[test]
-    fn restore_puts_an_entry_back_or_removes_it() {
-        let (dir, reg) = fresh();
+    fn the_hook_is_not_called_on_a_refusal() {
+        let (_d, reg) = fresh();
         let m = method("example.com", "https://login.example.com");
-        reg.import(m, ImportFlags::default(), NOW).unwrap();
-        let before = reg.get("example.com").unwrap();
-        reg.set_override("example.com", 1, "#x").unwrap();
-        reg.restore("example.com", Some(before.clone())).unwrap();
-        assert_eq!(reg.get("example.com"), Some(before));
-        reg.restore("example.com", None).unwrap();
-        assert!(reg.list().is_empty());
-        // the file agrees with memory
-        let again = TeachRegistry::load(dir.path()).unwrap();
-        assert!(again.list().is_empty());
+        reg.import(m.clone(), ImportFlags::default(), NOW).unwrap();
+        let mut called = 0;
+        let mut hook = |_: &Entry| {
+            called += 1;
+            Ok::<(), ()>(())
+        };
+        assert_eq!(
+            reg.import_with(m, ImportFlags::default(), NOW, &mut hook)
+                .unwrap_err(),
+            WithHook::Refused(ImportRefusal::Exists)
+        );
+        assert_eq!(
+            reg.set_override_with("example.com", 0, "#x", &mut hook)
+                .unwrap_err(),
+            WithHook::Refused(EditRefusal::BadStep)
+        );
+        assert_eq!(
+            reg.remove_with("nowhere.org", &mut hook).unwrap_err(),
+            WithHook::Refused(EditRefusal::NotFound)
+        );
+        assert_eq!(called, 0);
+    }
+
+    #[test]
+    fn a_hook_error_changes_nothing_in_memory_file_or_directory() {
+        let (d, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        let bytes = std::fs::read(file(&d)).unwrap();
+        let listing = dir_listing(&d);
+        let memory = reg.list();
+        let no = |_: &Entry| Err::<(), &str>("no");
+
+        let again = method("example.com", "https://login.example.com");
+        let flags = ImportFlags {
+            replace: true,
+            ..ImportFlags::default()
+        };
+        assert_eq!(
+            reg.import_with(again, flags, LATER, no).unwrap_err(),
+            WithHook::Hook("no")
+        );
+        assert_eq!(
+            reg.set_override_with("example.com", 1, "#x", no)
+                .unwrap_err(),
+            WithHook::Hook("no")
+        );
+        assert_eq!(
+            reg.clear_stale_with("example.com", no).unwrap_err(),
+            WithHook::Hook("no")
+        );
+        assert_eq!(
+            reg.remove_with("example.com", no).unwrap_err(),
+            WithHook::Hook("no")
+        );
+        assert_eq!(reg.list(), memory);
+        assert_eq!(std::fs::read(file(&d)).unwrap(), bytes);
+        assert_eq!(dir_listing(&d), listing);
+    }
+
+    #[test]
+    fn a_rename_failure_after_the_hook_changes_nothing_and_is_store() {
+        let (d, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        let memory = reg.list();
+        let target = file(&d);
+        // The hook puts a non-empty directory where the file goes, so the rename fails.
+        let sabotage = |_: &Entry| {
+            std::fs::remove_file(&target).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("x"), b"x").unwrap();
+            Ok::<(), ()>(())
+        };
+        assert_eq!(
+            reg.set_override_with("example.com", 1, "#x", sabotage)
+                .unwrap_err(),
+            WithHook::Refused(EditRefusal::Store)
+        );
+        assert_eq!(reg.list(), memory, "memory unchanged");
+        assert_eq!(
+            dir_listing(&d),
+            vec!["registry.json".to_owned()],
+            "no temp file"
+        );
+    }
+
+    #[test]
+    fn a_fill_recorded_between_two_owner_edits_survives_both() {
+        let (_d, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        reg.set_override_with("example.com", 1, "#a", |_| Ok::<(), ()>(()))
+            .unwrap();
+        assert!(reg.record_fill(&drift(2), LATER).newly_stale);
+        // an edit that fails its hook, then one that succeeds: neither drops the mark
+        let _ = reg.set_override_with("example.com", 1, "#b", |_| Err::<(), ()>(()));
+        reg.set_override_with("example.com", 2, "#c", |_| Ok::<(), ()>(()))
+            .unwrap();
+        let entry = reg.get("example.com").unwrap();
+        assert_eq!(entry.stale.as_ref().unwrap().step, 2);
+        assert_eq!(entry.last_result, Some(LastResult::Drift { step: 2 }));
+        assert_eq!(entry.overrides.len(), 2);
     }
 
     #[test]

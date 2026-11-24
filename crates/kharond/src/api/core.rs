@@ -82,7 +82,7 @@ use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::wire::SyncResponse;
 use crate::sync::{LiveSync, SecretField, SyncError, SyncOutcome, Vault};
 use crate::teach::{
-    EditRefusal, Entry as TeachEntry, ImportFlags, ImportRefusal, TeachRegistry, site_key,
+    EditRefusal, Entry as TeachEntry, ImportFlags, ImportRefusal, TeachRegistry, WithHook, site_key,
 };
 use crate::totp::skew::Observation;
 use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy, totp_code};
@@ -473,9 +473,6 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// The taught login methods (#382). `None` = none installed: no
     /// fill consults a method and no prompt names a rung.
     teach_registry: Option<Arc<TeachRegistry>>,
-    /// Serializes the owner's registry edits, so an undo after a failed
-    /// audit append cannot overwrite another edit.
-    teach_edits: Mutex<()>,
     /// Rate limits, suspension, and agent revocation (REQ-RL-*,
     /// REQ-REV-001). Separate from the lock controller so owner
     /// revoke/panic never needs the session.
@@ -700,7 +697,6 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             approval_tokens: Mutex::new(ApprovalTokenStore::new()),
             approval_notifier: None,
             teach_registry: None,
-            teach_edits: Mutex::new(()),
             rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
             transport: TransportLimits::new(),
             rollback: Mutex::new(RollbackGuard::new()),
@@ -841,26 +837,51 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
     }
 
-    /// Append `audit` for a registry change that has just been made; when the
-    /// append fails, put `domain` back to `previous` and report `audit_failed`.
-    /// The registry has no dry run, so a refused change appends nothing and an
-    /// applied one is undone rather than left unrecorded.
-    fn teach_record_or_undo(
+    /// Run one registry edit with its audit entry appended inside the registry's
+    /// commit, under its lock: the entry is written after every check passed and
+    /// before the change is put in place, so a refusal appends nothing and a failed
+    /// append (`audit_failed`) changes nothing. If the file then cannot be put in
+    /// place, one more entry for the op with result `store_failed` is appended
+    /// (best effort) so the log does not claim a change that did not happen.
+    fn teach_edit<R>(
         &self,
-        registry: &TeachRegistry,
-        domain: &str,
-        previous: Option<TeachEntry>,
-        audit: Entry,
-    ) -> Result<(), TeachOpError> {
-        if self.append(audit).is_ok() {
-            return Ok(());
+        event: Event,
+        step: Option<u32>,
+        run: impl FnOnce(
+            &TeachRegistry,
+            &mut dyn FnMut(&TeachEntry) -> Result<(), ()>,
+        ) -> Result<TeachEntry, WithHook<R, ()>>,
+    ) -> Result<TeachEntry, TeachOpError>
+    where
+        TeachOpError: From<R>,
+    {
+        let registry = self.teach_registry_for_edit()?;
+        let appended: std::cell::Cell<Option<TeachEntry>> = std::cell::Cell::new(None);
+        let audit_for = |e: &TeachEntry| {
+            let audit = Self::teach_audit_entry(event.clone(), e);
+            match step {
+                Some(s) => audit.step_index(u64::from(s)),
+                None => audit,
+            }
+        };
+        let mut hook = |e: &TeachEntry| {
+            self.append(audit_for(e)).map_err(|_| ())?;
+            appended.set(Some(e.clone()));
+            Ok(())
+        };
+        match run(registry, &mut hook) {
+            Ok(entry) => Ok(entry),
+            Err(WithHook::Hook(())) => Err(TeachOpError::AuditFailed),
+            Err(WithHook::Refused(r)) => {
+                let err = TeachOpError::from(r);
+                if err == TeachOpError::StoreFailed
+                    && let Some(entry) = appended.take()
+                {
+                    let _ = self.append(audit_for(&entry).result("store_failed"));
+                }
+                Err(err)
+            }
         }
-        if registry.restore(domain, previous).is_err() {
-            eprintln!(
-                "kharond: warning: could not undo a login-method change after its audit entry failed"
-            );
-        }
-        Err(TeachOpError::AuditFailed)
     }
 
     /// Owner op: add a login method (#382). `replace` overwrites an existing
@@ -871,17 +892,11 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         method: LoginMethod,
         flags: ImportFlags,
     ) -> Result<TeachEntry, TeachOpError> {
-        let registry = self.teach_registry_for_edit()?;
+        self.teach_registry_for_edit()?;
         let now = now_rfc3339().ok_or(TeachOpError::StoreFailed)?;
-        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
-        let domain = method.site.domain.clone();
-        let previous = registry.get(&domain);
-        let entry = registry
-            .import(method, flags, &now)
-            .map_err(TeachOpError::from)?;
-        let audit = Self::teach_audit_entry(Event::TeachImport, &entry);
-        self.teach_record_or_undo(registry, &domain, previous, audit)?;
-        Ok(entry)
+        self.teach_edit(Event::TeachImport, None, |reg, hook| {
+            reg.import_with(method, flags, &now, hook)
+        })
     }
 
     /// Owner op: every entry, sorted by domain. Not audited.
@@ -906,40 +921,26 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         step: u32,
         selector: &str,
     ) -> Result<TeachEntry, TeachOpError> {
-        let registry = self.teach_registry_for_edit()?;
-        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
         let domain = site_key(domain);
-        let previous = registry.get(&domain);
-        let entry = registry
-            .set_override(&domain, step, selector)
-            .map_err(TeachOpError::from)?;
-        let audit =
-            Self::teach_audit_entry(Event::TeachOverride, &entry).step_index(u64::from(step));
-        self.teach_record_or_undo(registry, &domain, previous, audit)?;
-        Ok(entry)
+        self.teach_edit(Event::TeachOverride, Some(step), |reg, hook| {
+            reg.set_override_with(&domain, step, selector, hook)
+        })
     }
 
     /// Owner op: clear the stale mark.
     pub fn teach_clear_stale(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
-        let registry = self.teach_registry_for_edit()?;
-        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
         let domain = site_key(domain);
-        let previous = registry.get(&domain);
-        let entry = registry.clear_stale(&domain).map_err(TeachOpError::from)?;
-        let audit = Self::teach_audit_entry(Event::TeachClearStale, &entry);
-        self.teach_record_or_undo(registry, &domain, previous, audit)?;
-        Ok(entry)
+        self.teach_edit(Event::TeachClearStale, None, |reg, hook| {
+            reg.clear_stale_with(&domain, hook)
+        })
     }
 
     /// Owner op: remove the entry; the removed entry is returned.
     pub fn teach_remove(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
-        let registry = self.teach_registry_for_edit()?;
-        let _edits = self.teach_edits.lock().unwrap_or_else(|p| p.into_inner());
         let domain = site_key(domain);
-        let gone = registry.remove(&domain).map_err(TeachOpError::from)?;
-        let audit = Self::teach_audit_entry(Event::TeachRemove, &gone);
-        self.teach_record_or_undo(registry, &domain, Some(gone.clone()), audit)?;
-        Ok(gone)
+        self.teach_edit(Event::TeachRemove, None, |reg, hook| {
+            reg.remove_with(&domain, hook)
+        })
     }
 
     /// Apply `[policy]` to the grant store (standing grants on/off).

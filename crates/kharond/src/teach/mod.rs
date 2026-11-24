@@ -4,5 +4,5 @@ pub mod registry;
 
 pub use registry::{
     Checked, EditRefusal, Entry, ImportFlags, ImportRefusal, LastResult, Recorded, Stale,
-    TeachRegistry, site_key,
+    TeachRegistry, WithHook, site_key,
 };

@@ -608,6 +608,24 @@ async fn audit_failure_changes_nothing() {
     rig.registry.record_fill(&used, "2026-11-24T10:00:00Z");
     let before = rig.registry.list();
     assert!(before[0].1.stale.is_some());
+    let teach_dir = rig._dir.path().join("teach");
+    let listing = || {
+        let mut names: Vec<String> = std::fs::read_dir(&teach_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let bytes = std::fs::read(teach_dir.join("registry.json")).unwrap();
+    let files_unchanged = || {
+        assert_eq!(
+            std::fs::read(teach_dir.join("registry.json")).unwrap(),
+            bytes,
+            "registry file bytes"
+        );
+        assert_eq!(listing(), ["registry.json"], "no temp file left");
+    };
 
     *rig.h.audit.fail.lock().unwrap() = true;
 
@@ -621,7 +639,8 @@ async fn audit_failure_changes_nothing() {
         ..import(&replacement)
     };
     assert_eq!(refused(&send(&rig.socket, &replace).await), "audit_failed");
-    assert_eq!(rig.registry.list(), before, "replace undone, entry intact");
+    assert_eq!(rig.registry.list(), before, "entry intact");
+    files_unchanged();
 
     let r = send(
         &rig.socket,
@@ -636,14 +655,17 @@ async fn audit_failure_changes_nothing() {
     .await;
     assert_eq!(refused(&r), "audit_failed");
     assert_eq!(rig.registry.list(), before);
+    files_unchanged();
 
     let r = send(&rig.socket, &on("teach_clear_stale", "example.com")).await;
     assert_eq!(refused(&r), "audit_failed");
     assert_eq!(rig.registry.list(), before);
+    files_unchanged();
 
     let r = send(&rig.socket, &on("teach_remove", "example.com")).await;
     assert_eq!(refused(&r), "audit_failed");
     assert_eq!(rig.registry.list(), before);
+    files_unchanged();
 
     // a first import that cannot be audited leaves the registry empty
     let fresh = rig_empty_after_failed_import().await;

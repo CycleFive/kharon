@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kharon_recording::{ConvertOptions, FillRole, LoginMethod, MethodStep, Rung, Shape};
+use kharond::cdp::fill::ScrubObservation;
 use kharond::cdp::{
     AgentContext, Browser, CdpClient, CdpEndpoint, CdpSession, FieldFill, FieldKind, FillEngine,
     FillOutcome, FillPlan, LiveOrigin, MethodEnd, MethodNote, MethodSource, ScrubNote, Tunnel,
@@ -22,6 +23,7 @@ use kharond::cdp::{
 use kharond::origin::{OriginConfig, OriginMatcher};
 use kharond::teach::{Entry, ImportFlags, LastResult, TeachRegistry};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use teach_support::{Fixture, Login, chromium_or_skip, record_login_keep};
 use zeroize::Zeroizing;
 
@@ -351,6 +353,17 @@ impl Rig {
     }
 }
 
+/// What the page last POSTed, which must carry this fill's values and never the recorder's.
+fn posted(rig: &Rig) -> String {
+    let body = rig
+        .fixture
+        .take_last_post_body()
+        .expect("the page posted something");
+    assert!(!body.contains(teach_support::PASS), "{body}");
+    assert!(!body.contains(teach_support::USER), "{body}");
+    body
+}
+
 const BOTH: [FieldKind; 2] = [FieldKind::Username, FieldKind::Password];
 
 #[tokio::test(flavor = "multi_thread")]
@@ -360,9 +373,13 @@ async fn req_tch_008_form_login_fills_by_its_method() {
         return;
     };
     let tab = rig.open("/form").await;
+    let _ = rig.fixture.take_last_post_body();
     let out = rig.fill(&tab, &BOTH, false).await;
     assert_eq!(out.status(), "filled", "{out:?}");
     tab.wait_for_path("/home").await;
+    let body = posted(&rig);
+    assert!(body.contains(&format!("user={FILL_USER}")), "{body}");
+    assert!(body.contains(&format!("pass={FILL_PASS}")), "{body}");
     let entry = rig.entry();
     rig.assert_checked_by_this_browser(&entry).await;
 }
@@ -378,9 +395,19 @@ async fn req_tch_008_script_login_fills_by_its_method() {
         return;
     };
     let tab = rig.open("/script").await;
+    let _ = rig.fixture.take_last_post_body();
     let out = rig.fill(&tab, &BOTH, false).await;
     assert_eq!(out.status(), "filled", "{out:?}");
     tab.wait_for_path("/home").await;
+    let body = posted(&rig);
+    assert!(
+        body.contains(&format!("\"user\":\"{FILL_USER}\"")),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("\"pass\":\"{FILL_PASS}\"")),
+        "{body}"
+    );
     let entry = rig.entry();
     rig.assert_checked_by_this_browser(&entry).await;
 }
@@ -402,9 +429,18 @@ async fn req_tch_008_hashed_login_fills_by_its_method() {
         }
     );
     let tab = rig.open("/hashed").await;
+    let _ = rig.fixture.take_last_post_body();
     let out = rig.fill(&tab, &BOTH, false).await;
     assert_eq!(out.status(), "filled", "{out:?}");
     tab.wait_for_path("/home").await;
+    let body = posted(&rig);
+    let digest = hex::encode(sha2::Sha256::digest(FILL_PASS.as_bytes()));
+    assert!(body.contains(&format!("\"digest\":\"{digest}\"")), "{body}");
+    assert!(
+        body.contains(&format!("\"user\":\"{FILL_USER}\"")),
+        "{body}"
+    );
+    assert!(!body.contains(FILL_PASS), "{body}");
     let entry = rig.entry();
     rig.assert_checked_by_this_browser(&entry).await;
 }
@@ -417,6 +453,7 @@ async fn req_tch_008_two_step_login_runs_leg_by_leg() {
     };
     assert_eq!(rig.method.rung, Rung::AgentContinues);
     let tab = rig.open("/two-step").await;
+    let _ = rig.fixture.take_last_post_body();
     let out = rig.fill(&tab, &[FieldKind::Username], false).await;
     assert_eq!(
         out,
@@ -425,6 +462,9 @@ async fn req_tch_008_two_step_login_runs_leg_by_leg() {
         }
     );
     tab.wait_for_path("/two-step/password").await;
+    let leg_one = posted(&rig);
+    assert!(leg_one.contains(&format!("user={FILL_USER}")), "{leg_one}");
+    assert!(!leg_one.contains(FILL_PASS), "{leg_one}");
     let out = rig.fill(&tab, &[FieldKind::Password], false).await;
     assert_eq!(
         out,
@@ -433,6 +473,9 @@ async fn req_tch_008_two_step_login_runs_leg_by_leg() {
         }
     );
     tab.wait_for_path("/home").await;
+    let leg_two = posted(&rig);
+    assert!(leg_two.contains(&format!("pass={FILL_PASS}")), "{leg_two}");
+    assert!(!leg_two.contains(FILL_USER), "{leg_two}");
     let entry = rig.entry();
     assert_eq!(entry.last_result, Some(LastResult::Succeeded), "{entry:?}");
     assert!(entry.stale.is_none(), "{entry:?}");
@@ -492,7 +535,13 @@ async fn req_tch_008_fill_on_the_home_page_is_wrong_page_and_not_stale() {
     let (out, end) = rig.fill_noted(&tab, &BOTH, false).await;
     assert_eq!(out, FillOutcome::MethodWrongPage, "{out:?}");
     assert_eq!(end, MethodEnd::WrongPage);
-    assert_eq!(tab.value_of("input").await, None, "the page has no field");
+    assert_eq!(
+        tab.eval("String(document.querySelectorAll('input').length)")
+            .await
+            .as_deref(),
+        Some("0"),
+        "the page has no field"
+    );
     assert_eq!(
         rig.entry(),
         before,
@@ -543,7 +592,11 @@ async fn req_tch_009_submit_false_does_not_leave_the_password_in_the_page() {
     let tab = rig.open("/form").await;
     // The request says no submit; a milliseconds method submits anyway, so the typed password
     // does not sit in the page waiting for the agent.
-    let out = rig.fill(&tab, &BOTH, false).await;
+    let plan = rig.plan(&tab, &BOTH, false);
+    assert!(!plan.post_submit_scrub);
+    let out = rig.engine.fill(&plan, &rig.ctx, false).await;
     assert_eq!(out.status(), "filled", "{out:?}");
     tab.wait_for_path("/home").await;
+    // The engine forced the scrub on, though the plan said off: the page navigated away.
+    assert_eq!(plan.scrub.get(), Some(ScrubObservation::Navigated));
 }

@@ -194,7 +194,7 @@ fn route(method: &str, path: &str, query: &str, host: &str) -> String {
     }
 }
 
-async fn serve_one(mut sock: tokio::net::TcpStream) {
+async fn serve_one(mut sock: tokio::net::TcpStream, posts: LastPost) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -223,6 +223,9 @@ async fn serve_one(mut sock: tokio::net::TcpStream) {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
+    if method == "POST" {
+        *posts.lock().unwrap() = Some(String::from_utf8_lossy(&buf[head_end..]).into_owned());
+    }
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let host = head
         .lines()
@@ -238,21 +241,37 @@ async fn serve_one(mut sock: tokio::net::TcpStream) {
     let _ = sock.shutdown().await;
 }
 
+/// The body of the last POST a fixture received. Test support only: nothing a recording test
+/// inspects reads it.
+type LastPost = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
 pub struct Fixture {
     pub port: u16,
     task: JoinHandle<()>,
+    last_post: LastPost,
 }
 
 impl Fixture {
     pub async fn start() -> Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let last_post = LastPost::default();
+        let posts = last_post.clone();
         let task = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
-                tokio::spawn(serve_one(sock));
+                tokio::spawn(serve_one(sock, posts.clone()));
             }
         });
-        Fixture { port, task }
+        Fixture {
+            port,
+            task,
+            last_post,
+        }
+    }
+
+    /// The body of the last POST received since the last call, if any.
+    pub fn take_last_post_body(&self) -> Option<String> {
+        self.last_post.lock().unwrap().take()
     }
 
     pub fn url(&self, path: &str) -> url::Url {

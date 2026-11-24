@@ -15,7 +15,9 @@
 //! Failure contract: every refusal throws `Error` whose message is
 //! `kharon:<code>`; the broker reads the code out of
 //! `exceptionDetails.exception.description`. Codes:
-//! `origin_mismatch`, `non_secure`, `field_not_found`, `deadline`.
+//! `origin_mismatch`, `non_secure`, `field_not_found`, `deadline`, and
+//! in leg mode (#382) `method_wrong_page`, `method_drift:<index>`,
+//! `method_not_ready:<index>`.
 
 /// Fill function. Arguments, in order:
 /// 1. `specs` — array of `InPageSpec` (any may match; mirrors the
@@ -52,6 +54,17 @@
 ///    references only; the values are not copied. Absent or false
 ///    leaves nothing behind.
 ///
+/// 7. `leg` — #382 leg mode, `null`/absent for a normal fill. When the
+///    broker holds a recorded login method: `{ path, fills: [{ index,
+///    selectors, password, expect }], submit: null | { index, via:
+///    "form"|"enter"|"click", selectors, expect } }`. `fields[i]` is the
+///    value for `leg.fills[i]` and `fields[i].selector` is ignored.
+///    Every step is checked against the live page before the first
+///    write (path, then resolve + shape for each step, then the form for
+///    a `form` submit, then readiness); `click` submits the recorded
+///    button once, after every field and the budget check. Leaves
+///    `globalThis.__kharonMethodPw` for [`METHOD_PROBE_IN_PAGE`].
+///
 /// Clear-on-failure (SPEC §2, #101): when a field fails after earlier
 /// fields were written, every element this call wrote is blanked
 /// (native setter, `input` + `change`, as for the write) before the
@@ -60,7 +73,7 @@
 ///
 /// Returns `{ results: [{ kind, filled: true }] }` by value.
 pub const FILL_IN_PAGE: &str = r#"
-function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs, scrubRequested) {
+function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs, scrubRequested, leg) {
   "use strict";
 
   function fail(code) {
@@ -176,13 +189,81 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
     }
   }
 
+  // Leg mode (#382): the broker holds a recorded login method for this
+  // page. Every step is checked against the live page here, before the
+  // first write; the agent's selectors are never used. Codes carry the
+  // step's index, never a value.
+  function legResolve(step) {
+    for (const sel of step.selectors || []) {
+      let found;
+      try {
+        found = document.querySelectorAll(sel);
+      } catch (_) {
+        continue; // an invalid selector skips the candidate
+      }
+      if (found && found.length === 1) return found[0];
+    }
+    return null;
+  }
+
+  function legMatches(el, step) {
+    if (!el.isConnected) return false;
+    if (!(el.getClientRects().length > 0)) return false;
+    if (getComputedStyle(el).visibility === "hidden") return false;
+    const want = step.expect;
+    if (want) {
+      if (String(el.tagName).toLowerCase() !== want.tag) return false;
+      if (want.input_type !== null && want.input_type !== undefined &&
+          String(el.type).toLowerCase() !== want.input_type) return false;
+      if (want.id !== null && want.id !== undefined && el.id !== want.id) return false;
+      if (want.name !== null && want.name !== undefined && el.getAttribute("name") !== want.name) return false;
+      if (want.autocomplete !== null && want.autocomplete !== undefined &&
+          el.getAttribute("autocomplete") !== want.autocomplete) return false;
+    }
+    if (step.password === true && el.type !== "password") return false;
+    return true;
+  }
+
+  const legSubmit = leg && submitRequested && leg.submit ? leg.submit : null;
+  const legEls = [];
+  let legClickEl = null;
+  if (leg) {
+    if (location.pathname !== leg.path) fail("method_wrong_page");
+    if (fields.length !== leg.fills.length) {
+      fail("method_drift:" + (leg.fills[0] ? leg.fills[0].index : 0));
+    }
+    const resolved = [];
+    const steps = leg.fills.slice();
+    if (legSubmit && legSubmit.via === "click") steps.push(legSubmit);
+    for (const step of steps) {
+      const el = legResolve(step);
+      if (!el || !legMatches(el, step) || resolved.includes(el)) {
+        fail("method_drift:" + step.index);
+      }
+      resolved.push(el);
+    }
+    for (let i = 0; i < leg.fills.length; i++) legEls.push(resolved[i]);
+    if (legSubmit && legSubmit.via === "click") legClickEl = resolved[leg.fills.length];
+    if (legSubmit && legSubmit.via === "form") {
+      const lastEl = legEls[legEls.length - 1];
+      const form = lastEl ? lastEl.form || (lastEl.closest ? lastEl.closest("form") : null) : null;
+      if (!form || typeof form.requestSubmit !== "function") fail("method_drift:" + legSubmit.index);
+    }
+    // Readiness only after every drift check has passed.
+    for (let i = 0; i < legEls.length; i++) {
+      if (legEls[i].matches(":disabled")) fail("method_not_ready:" + leg.fills[i].index);
+    }
+    if (legClickEl && legClickEl.matches(":disabled")) fail("method_not_ready:" + legSubmit.index);
+  }
+
   const results = [];
   const written = [];
   let lastFilledElement = null;
   try {
-    for (const f of fields) {
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
       checkBudget();
-      const el = resolveField(f.kind, f.selector);
+      const el = leg ? legEls[i] : resolveField(f.kind, f.selector);
       if (!el) fail("field_not_found:" + f.kind);
       written.push(el);
       setNativeValue(el, f.value);
@@ -198,7 +279,7 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
   // failure above threw out of the function. `requestSubmit` honors
   // constraint validation and fires one submit event; the Enter
   // fallback synthesizes what a real keyboard press delivers.
-  if (submitRequested && lastFilledElement) {
+  if (leg ? legSubmit : submitRequested && lastFilledElement) {
     // The important check (#118): a submit is never *dispatched*
     // after the budget expires. Expiry here is a failure like any
     // other — the written fields are cleared before the throw.
@@ -209,10 +290,14 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
       throw e;
     }
     const last = lastFilledElement;
-    const form = last.form || (last.closest ? last.closest("form") : null);
-    if (form && typeof form.requestSubmit === "function") {
+    const form = last ? last.form || (last.closest ? last.closest("form") : null) : null;
+    if (leg && legSubmit.via === "click") {
+      legClickEl.click();
+    } else if (leg && legSubmit.via === "form") {
       form.requestSubmit();
-    } else {
+    } else if (!leg && form && typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+    } else if (last) {
       for (const type of ["keydown", "keypress", "keyup"]) {
         last.dispatchEvent(
           new KeyboardEvent(type, {
@@ -232,7 +317,34 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
   if (submitRequested && scrubRequested) {
     globalThis.__kharonWritten = written.slice();
   }
+  // Leg mode only: the first password element, for the loader re-read
+  // to ask whether it is still in the page (METHOD_PROBE_IN_PAGE).
+  if (leg) {
+    let pwEl = null;
+    for (let i = 0; i < leg.fills.length; i++) {
+      if (leg.fills[i].password === true) { pwEl = legEls[i]; break; }
+    }
+    globalThis.__kharonMethodPw = pwEl;
+  }
   return { results };
+}
+"#;
+
+/// Leg-mode probe (#382): did the password element the last leg-mode
+/// fill wrote survive the submit? Reads and deletes
+/// `globalThis.__kharonMethodPw`; no value in, no value out.
+///
+/// Returns `{ password_connected: true | false | null }`; `null` when
+/// nothing was recorded (no leg fill, or already probed).
+// Wired by the engine in a later task of #382.
+#[allow(dead_code)]
+pub const METHOD_PROBE_IN_PAGE: &str = r#"
+function methodProbe() {
+  "use strict";
+  const el = globalThis.__kharonMethodPw;
+  try { delete globalThis.__kharonMethodPw; } catch (_) { /* already gone */ }
+  if (!el) return { password_connected: null };
+  return { password_connected: el.isConnected === true };
 }
 "#;
 
@@ -361,6 +473,9 @@ mod tests {
             "non_secure",
             "field_not_found",
             "deadline",
+            "method_wrong_page",
+            "method_drift",
+            "method_not_ready",
         ] {
             assert!(FILL_IN_PAGE.contains(code), "missing {code}");
         }
@@ -973,5 +1088,350 @@ console.log("ok");
         ] {
             assert!(stdout.contains(case), "missing {case} in {stdout}");
         }
+    }
+
+    // ---- leg mode (teach mode piece 2, #382) -------------------------
+
+    /// DOM stub shared by the leg-mode harness cases. Elements carry
+    /// what the pre-check reads; `document.querySelectorAll` is backed
+    /// by a map and throws for selectors registered as invalid.
+    const LEG_PRELUDE: &str = r##"
+const LOG = [];
+class HTMLInputElement {
+  constructor(o) {
+    o = o || {};
+    this._v = "";
+    this.tagName = (o.tag || "INPUT").toUpperCase();
+    this.type = o.type || "text";
+    this.id = o.id || "";
+    this._attrs = { name: o.name === undefined ? null : o.name, autocomplete: o.autocomplete === undefined ? null : o.autocomplete };
+    this.isConnected = true;
+    this.disabled = !!o.disabled;
+    this.form = o.form || null;
+    this.rects = o.rects === undefined ? 1 : o.rects;
+    this.visibility = "visible";
+    this.events = [];
+    this.clicks = 0;
+    this.label = o.label || this.id;
+    this.onInput = null;
+  }
+  get name() { return this._attrs.name; }
+  set name(v) { this._attrs.name = v; }
+  getAttribute(n) { return Object.prototype.hasOwnProperty.call(this._attrs, n) ? this._attrs[n] : null; }
+  getClientRects() { return { length: this.rects }; }
+  matches(s) { return s === ":disabled" ? this.disabled : false; }
+  click() { this.clicks += 1; LOG.push("click:" + this.label); }
+  closest() { return null; }
+  dispatchEvent(ev) {
+    this.events.push(ev);
+    if (ev.type === "input") { LOG.push("input:" + this.label); if (this.onInput) this.onInput(); }
+    return true;
+  }
+}
+Object.defineProperty(HTMLInputElement.prototype, "value", {
+  get() { return this._v; },
+  set(v) { this._v = v; },
+});
+class HTMLTextAreaElement extends HTMLInputElement {}
+class Event { constructor(type, opts) { this.type = type; this.bubbles = !!(opts && opts.bubbles); } }
+class KeyboardEvent extends Event {
+  constructor(type, opts) { super(type, opts); this.key = opts.key; }
+}
+let CLOCK = 0;
+globalThis.performance = { now: () => CLOCK };
+globalThis.getComputedStyle = (el) => ({ visibility: el.visibility });
+const origin = "https://accounts.example.com";
+const specs = [{ kind: "host", scheme: "https", origin }];
+function env(pathname, map, invalid) {
+  globalThis.window = { isSecureContext: true, top: { location: { origin } } };
+  globalThis.location = { protocol: "https:", hostname: "accounts.example.com", origin, href: origin + pathname, pathname };
+  globalThis.document = {
+    querySelectorAll: (sel) => {
+      if (invalid && invalid.includes(sel)) throw new Error("SyntaxError " + sel);
+      return map.get(sel) || [];
+    },
+    querySelector: () => null,
+  };
+}
+const ex = (tag, type, id, name) => ({ tag, input_type: type, id, name, autocomplete: null });
+class Page {
+  constructor() {
+    this.form = { submits: 0, requestSubmit() { this.submits += 1; } };
+    this.u = new HTMLInputElement({ id: "u", name: "user", type: "text", form: this.form });
+    this.pw = new HTMLInputElement({ id: "pw", name: "pass", type: "password", form: this.form });
+    this.btn = new HTMLInputElement({ tag: "button", id: "go", type: "submit", form: this.form });
+    this.map = new Map([["#u", [this.u]], ["#pw", [this.pw]], ["#go", [this.btn]]]);
+    this.fills = [
+      { index: 0, selectors: ["#u"], password: false, expect: ex("input", "text", "u", "user") },
+      { index: 1, selectors: ["#pw"], password: true, expect: ex("input", "password", "pw", "pass") },
+    ];
+    this.submit = { index: 2, via: "form", selectors: [], expect: null };
+    this.path = "/login";
+  }
+  leg() { return { path: this.path, fills: this.fills, submit: this.submit }; }
+  fields() {
+    return [
+      { kind: "username", selector: null, value: "alice" },
+      { kind: "password", selector: null, value: "s3cret" },
+    ];
+  }
+  run(submit, budget) {
+    env("/login", this.map, this.invalid);
+    return fillInPage(specs, this.fields(), origin, submit, budget || 0, false, this.leg());
+  }
+  code(submit, budget) {
+    try { this.run(submit, budget); } catch (e) { return (e && e.kharonCode) || e.message; }
+    return "returned";
+  }
+  untouched() {
+    for (const el of [this.u, this.pw, this.btn]) {
+      if (el._v !== "") throw new Error("value written on " + el.id);
+      if (el.events.length) throw new Error("event on " + el.id);
+      if (el.clicks) throw new Error("click on " + el.id);
+    }
+    if (this.form.submits) throw new Error("submit dispatched");
+  }
+}
+function eq(a, b, what) { if (a !== b) throw new Error(`${what}: expected ${b}, got ${a}`); }
+"##;
+
+    fn run_leg_harness(tag: &str, cases: &str) {
+        let mut script = String::new();
+        script.push_str(LEG_PRELUDE);
+        script.push_str(FILL_IN_PAGE);
+        script.push_str(METHOD_PROBE_IN_PAGE);
+        script.push_str(cases);
+        script.push_str("\nconsole.log(\"ok\");\n");
+        let mut path = std::env::temp_dir();
+        path.push(format!("kharon_leg_{tag}_{}.js", std::process::id()));
+        std::fs::write(&path, &script).expect("write harness");
+        let output = std::process::Command::new("node").arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        let output = match output {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node not on PATH; skipping leg harness test {tag}");
+                return;
+            }
+            Err(e) => panic!("spawn node: {e}"),
+        };
+        assert!(
+            output.status.success(),
+            "harness {tag} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    }
+
+    #[test]
+    fn req_tch_008_precheck_passes_and_fills_on_a_matching_page() {
+        run_leg_harness(
+            "pass",
+            r##"
+const p = new Page();
+const r = p.run(true);
+eq(p.u._v, "alice", "user"); eq(p.pw._v, "s3cret", "pw");
+eq(p.form.submits, 1, "submits");
+eq(r.results.map((x) => x.kind).join(","), "username,password", "order");
+eq(globalThis.__kharonMethodPw, p.pw, "recorded pw element");
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_each_drift_case_throws_before_any_write() {
+        run_leg_harness(
+            "drift",
+            r##"
+const cases = {
+  gone: [(p) => p.map.delete("#pw"), "method_drift:1"],
+  two_matches: [(p) => p.map.set("#pw", [p.pw, new HTMLInputElement({ type: "password" })]), "method_drift:1"],
+  renamed: [(p) => { p.pw.name = "pw2"; }, "method_drift:1"],
+  changed_type: [(p) => { p.pw.type = "text"; }, "method_drift:1"],
+  no_rects: [(p) => { p.u.rects = 0; }, "method_drift:0"],
+  visibility: [(p) => { p.pw.visibility = "hidden"; }, "method_drift:1"],
+  wrong_tag: [(p) => { p.u.tagName = "TEXTAREA"; }, "method_drift:0"],
+  disconnected: [(p) => { p.pw.isConnected = false; }, "method_drift:1"],
+  same_element: [(p) => {
+    p.map.set("#u", [p.pw]);
+    p.fills[0].expect = ex("input", null, null, null);
+  }, "method_drift:1"],
+  form_missing: [(p) => { p.pw.form = null; }, "method_drift:2"],
+};
+for (const [name, [mutate, want]] of Object.entries(cases)) {
+  const p = new Page();
+  mutate(p);
+  eq(p.code(true), want, name);
+  p.untouched();
+}
+// a password step whose element is not a password field drifts even
+// when the recorded expectation says otherwise
+{
+  const p = new Page();
+  p.fills[1].expect = ex("input", null, "pw", "pass");
+  p.pw.type = "text";
+  eq(p.code(true), "method_drift:1", "password:true forces type");
+  p.untouched();
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_second_candidate_selector_is_used() {
+        run_leg_harness(
+            "second",
+            r##"
+const p = new Page();
+const other = new HTMLInputElement({ id: "x" });
+p.map.set("#a", [p.pw, other]);
+p.map.set("#b", [p.pw]);
+p.fills[1].selectors = ["#a", "#b"];
+p.run(false);
+eq(p.pw._v, "s3cret", "second candidate's element filled");
+eq(other._v, "", "ambiguous candidate untouched");
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_an_invalid_selector_is_skipped_not_an_error() {
+        run_leg_harness(
+            "invalid",
+            r##"
+{
+  const p = new Page();
+  p.invalid = ["!!bad"];
+  p.fills[1].selectors = ["!!bad", "#pw"];
+  p.run(false);
+  eq(p.pw._v, "s3cret", "next candidate used");
+}
+{
+  const p = new Page();
+  p.invalid = ["!!bad", "??bad"];
+  p.fills[1].selectors = ["!!bad", "??bad"];
+  eq(p.code(false), "method_drift:1", "all throw");
+  p.untouched();
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_wrong_path_throws_method_wrong_page_before_any_write() {
+        run_leg_harness(
+            "path",
+            r##"
+const p = new Page();
+p.path = "/other";
+eq(p.code(true), "method_wrong_page", "wrong page");
+p.untouched();
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_disabled_field_is_not_ready_and_drift_wins() {
+        run_leg_harness(
+            "ready",
+            r##"
+{
+  const p = new Page();
+  p.pw.disabled = true;
+  eq(p.code(true), "method_not_ready:1", "disabled");
+  p.untouched();
+}
+{
+  const p = new Page();
+  p.u.rects = 0;      // step 0 drifted
+  p.pw.disabled = true; // step 1 not ready
+  eq(p.code(true), "method_drift:0", "drift wins");
+  p.untouched();
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_api_008_click_submit_fires_once_and_only_after_every_field() {
+        run_leg_harness(
+            "click",
+            r##"
+{
+  const p = new Page();
+  p.submit = { index: 2, via: "click", selectors: ["#go"], expect: ex("button", "submit", "go", null) };
+  p.run(true);
+  eq(p.btn.clicks, 1, "click count");
+  eq(p.form.submits, 0, "no requestSubmit for click");
+  const log = LOG.join(",");
+  eq(log, "input:u,input:pw,click:go", "order");
+}
+{
+  const p = new Page();
+  p.submit = { index: 2, via: "click", selectors: ["#go"], expect: null };
+  p.pw.onInput = () => { CLOCK += 1000; };
+  eq(p.code(true, 100), "deadline", "budget on last field");
+  eq(p.btn.clicks, 0, "no click after expiry");
+  eq(p.u._v, "", "user cleared"); eq(p.pw._v, "", "pw cleared");
+}
+{
+  // submit not requested: neither dispatched nor pre-checked
+  const p = new Page();
+  p.submit = { index: 2, via: "click", selectors: ["#missing"], expect: null };
+  p.run(false);
+  eq(p.btn.clicks, 0, "no click");
+}
+{
+  // click target gone: drift at the submit index
+  const p = new Page();
+  p.submit = { index: 2, via: "click", selectors: ["#missing"], expect: null };
+  eq(p.code(true), "method_drift:2", "click target gone");
+  p.untouched();
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_agent_selector_is_not_used_in_leg_mode() {
+        run_leg_harness(
+            "decoy",
+            r##"
+const p = new Page();
+const decoy = new HTMLInputElement({ id: "decoy" });
+p.map.set("#decoy", [decoy]);
+env("/login", p.map);
+const fields = p.fields();
+fields[0].selector = "#decoy";
+fields[1].selector = "#decoy";
+fillInPage(specs, fields, origin, false, 0, false, p.leg());
+eq(decoy._v, "", "decoy untouched");
+eq(p.u._v, "alice", "recorded user");
+eq(p.pw._v, "s3cret", "recorded pw");
+"##,
+        );
+    }
+
+    #[test]
+    fn method_probe_reports_and_forgets() {
+        run_leg_harness(
+            "probe",
+            r##"
+eq(methodProbe().password_connected, null, "nothing recorded");
+{
+  const p = new Page();
+  p.run(false);
+  eq(methodProbe().password_connected, true, "connected");
+  eq(methodProbe().password_connected, null, "forgotten");
+}
+{
+  const p = new Page();
+  p.run(false);
+  p.pw.isConnected = false;
+  eq(methodProbe().password_connected, false, "disconnected");
+  eq(methodProbe().password_connected, null, "forgotten again");
+}
+"##,
+        );
     }
 }

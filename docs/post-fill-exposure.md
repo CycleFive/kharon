@@ -6,7 +6,8 @@
 > The "tested" column was updated on 2026-11-18 with the results of
 > the OpenClaw (#336) and Hermes (#339) canaries. A3 was updated
 > on 2026-11-19 when the opt-in post-submit scrub landed (#355,
-> REQ-API-013).
+> REQ-API-013). C1, C2, C4 and A3 were updated on 2026-11-24 with
+> the submitted-fill canary (#369, milestone M1).
 
 kharon's guarantee ends at delivery: the right secret, typed into
 the right field, on the right origin, with approval. This page
@@ -100,7 +101,7 @@ names the evidence, or says unverified.
 |---|---|---|---|
 | A1 | Fill fails partway (field miss, origin recheck, budget expiry): earlier fields already written | **kharon** — clear-on-failure blanks every written field before the error propagates; submit never dispatched | Yes: `req_api_008` suite and `page_js` tests |
 | A2 | Non-submit fill, then the page navigates by itself | **kharon**, narrowly — the loader recheck catches only a navigation committed before the immediate post-call read (a few-ms window); a later navigation is A4, or C3 if the cache keeps the form. The scrub itself can miss a fallback-written username and cannot clear framework-held state (see "What kharon does at the boundary") | Yes: daemon-CDP tests, for the committed-before-read case |
-| A3 | Submit dispatched, page stays: rejected login, MFA step, SPA keeps the form mounted | **kharon, opt-in** — off unless `[policy] post_submit_scrub` or that fill's `post_submit_scrub` is true (default off, so a retry-in-place form or a streaming MFA step is not cleared under the user). When on: one re-read after the delay; if the loader is unchanged and a field still holds exactly the value this fill wrote, that recorded element is cleared and `input`/`change` are dispatched. A later navigation, a replaced node, or a value the page or the user has since changed is not cleared. The reply stays `filled` | Yes: the `req_api_013` suite (daemon CDP stub) and the `page_js` scrub harness |
+| A3 | Submit dispatched, page stays: rejected login, MFA step, SPA keeps the form mounted | **kharon, opt-in** — off unless `[policy] post_submit_scrub` or that fill's `post_submit_scrub` is true (default off, so a retry-in-place form or a streaming MFA step is not cleared under the user). When on: one re-read after the delay; if the loader is unchanged and a field still holds exactly the value this fill wrote, that recorded element is cleared and `input`/`change` are dispatched. A later navigation, a replaced node, or a value the page or the user has since changed is not cleared. The reply stays `filled`. The wait runs inside the fill, so when a navigation is not yet visible at the broker's immediate post-fill loader read the reply arrives up to `post_submit_scrub_delay` later (#369: 572 ms and 622 ms on a navigating page against 113 ms and 140 ms in the first round, when the navigation was already visible) | Yes: the `req_api_013` suite (daemon CDP stub) and the `page_js` scrub harness. Live in #369 (scrub on, both hosts): `cleared` on a page that keeps its filled form, `nothing` on a page that removes it, `navigated` on a page that navigates |
 | A4 | `submit: false`: the value stays in the field because the agent's flow continues from there | **scope** — by design; the agent owns the page after delivery. What the agent can then read is row D1 | n/a |
 | A5 | Multi-step login (username page, then password page) | Each step is its own fill; the secret is only ever written on its own step. The final step inherits A3/A4 | n/a |
 | A6 | "Show password" toggle | **scope** — cosmetic; the value is in the DOM either way (D1) | n/a |
@@ -118,10 +119,10 @@ names the evidence, or says unverified.
 
 | # | Path | Class | Tested |
 |---|---|---|---|
-| C1 | Password-save prompt and saved logins in the profile | **host** — managed policy disables the password manager and autofill save ([`agent-runtime-setup.md`](agent-runtime-setup.md) step 2; for Hermes's Chrome for Testing the policy directory is the non-obvious `/etc/opt/chrome_for_testing/policies/managed/`, [`hermes-end-to-end.md`](hermes-end-to-end.md) §1). kharon's own acceptance rig holds the same line as REQ-ARCH-004 | Yes: #201 sweep (`Login Data` 0 rows); #353 run (policy visible in `chrome://policy`). Both canaries, with the form filled and not submitted: `Login Data` 0 rows on Hermes (#339) and on OpenClaw (#336). A submitted fill, which is when a browser offers to save, was not part of either canary |
-| C2 | Autofill form-data memory in a persistent profile | **host** — the same policy, plus profile lifetime. Hermes deletes its throwaway profile at session exit; OpenClaw's managed profile persists, so policy is the whole mitigation there | Hermes: yes (#353). OpenClaw: partly (#336). After the first two fills, which were not submitted, `Web Data` held 0 autofill rows; it was not read again after the third. Browsers record form data on submit, and no submitted fill was run |
+| C1 | Password-save prompt and saved logins in the profile | **host** — managed policy disables the password manager and autofill save ([`agent-runtime-setup.md`](agent-runtime-setup.md) step 2; for Hermes's Chrome for Testing the policy directory is the non-obvious `/etc/opt/chrome_for_testing/policies/managed/`, [`hermes-end-to-end.md`](hermes-end-to-end.md) §1). kharon's own acceptance rig holds the same line as REQ-ARCH-004 | Yes: #201 sweep (`Login Data` 0 rows); #353 run (policy visible in `chrome://policy`). Both canaries, with the form filled and not submitted: `Login Data` 0 rows on Hermes (#339) and on OpenClaw (#336). Submitted fill (#369, 2026-11-23, master `ead6a9f`): `Login Data` `logins` and `stats` 0 on both hosts with the policy on. With the policy lifted, the same fill gave `stats` 1 (the browser offered to save) on both hosts, so the policy is what holds the line. `logins` stays 0 either way unless someone accepts the offer, so `stats` is the signal |
+| C2 | Autofill form-data memory in a persistent profile | **host** — the same policy, plus profile lifetime. Hermes deletes its throwaway profile at session exit; OpenClaw's managed profile persists, so policy is the whole mitigation there | Both hosts, submitted fill (#369): `Web Data` `autofill` 0 rows with the policy on; with the policy lifted, the same fill gave 1 row on each host. Hermes also #353. Earlier, unsubmitted fills on OpenClaw (#336) read 0 |
 | C3 | Back/forward cache and form restore re-presenting a filled form | **scope** — browser behaviour after navigation; kharon has no post-navigation control of the page | Unverified |
-| C4 | The profile folder on disk | **host** — a value reaches disk only through C1/C2; Hermes profile dirs are mode `0700` and deleted at exit (#353) | Hermes: yes (#353; #339 swept the live profile with the form filled, 0 files). OpenClaw: yes for fills that were not submitted (#336: a whole-filesystem sweep with two forms filled found 0 files, the persistent profile included) |
+| C4 | The profile folder on disk | **host** — a value reaches disk only through C1/C2; Hermes profile dirs are mode `0700` and deleted at exit (#353) | Hermes: yes (#353; #339 swept the live profile with the form filled, 0 files; #369 after a submitted fill: profile 0 of 205 files, whole filesystem 0). OpenClaw: yes (#336, unsubmitted: a whole-filesystem sweep with two forms filled found 0 files, the persistent profile included; #369, submitted: whole-filesystem sweep 0 files) |
 | C5 | Browser crash dumps | **host** — the browser is the platform's process. (kharond's own memory hygiene is REQ-MEM-* and covers the broker, not the browser) | Unverified |
 
 ### D. What the agent can watch (shared CDP)
@@ -165,8 +166,13 @@ names the evidence, or says unverified.
   "What kharon does at the boundary").
 - **Canaries run** — the OpenClaw canary (#336) and the Hermes
   canary (#339) ran on 2026-11-18, and the "tested" column above
-  carries what they showed. Neither submitted a form, so the
-  save-on-submit half of C1 and C2 is still open on both hosts.
+  carries what they showed. Neither submitted a form.
+- **Submitted-fill canary run** — #369 (milestone M1) ran on
+  2026-11-23 on master `ead6a9f` with the post-submit scrub on,
+  one submitted fill per host. It closed the save-on-submit half
+  of C1 and C2 on both hosts: 0 stored rows with the policy on,
+  and policy-lifted controls (`stats` 1, `autofill` 1) showing
+  that the policy is the mitigation.
 - **No new scope cuts proposed.** The scope rows above restate
   cuts SPEC §2.4 already makes. Anything further is Lothrop's
   call, per the issue.

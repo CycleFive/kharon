@@ -1044,8 +1044,10 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "ed25519-dalek",
+ "kharon-recording",
  "kharond",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1076,6 +1078,7 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
 ]
 
@@ -1116,6 +1119,7 @@ dependencies = [
  "axum",
  "base64ct",
  "ciborium",
+ "clap",
  "ed25519-dalek",
  "fs2",
  "futures-util",
@@ -1127,6 +1131,8 @@ dependencies = [
  "hyper-util",
  "kharon-bwcrypto",
  "kharon-connector",
+ "kharon-recording",
+ "kharon-teach",
  "kharond",
  "nix",
  "pbkdf2",

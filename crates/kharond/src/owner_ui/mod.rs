@@ -1446,6 +1446,7 @@ impl OwnerUi {
                     "item_id": r.item_id,
                     "action": r.action,
                     "origin": r.origin,
+                    "rung": r.rung,
                     "age_s": r.age_s,
                 })
             })
@@ -3091,7 +3092,7 @@ window.kharonRefresh = async function () {
   for (const p of data.pending) {
     const tr = document.createElement("tr");
     tr.dataset.requestId = p.request_id;
-    tr.append(cell(p.agent_name ? p.agent_name + " (" + p.agent_id + ")" : p.agent_id), cell(p.action), cell(p.origin, "origin"), cell(p.item_id), cell(p.age_s + " s"));
+    tr.append(cell(p.agent_name ? p.agent_name + " (" + p.agent_id + ")" : p.agent_id), cell(p.rung ? p.action + " (rung: " + p.rung + ")" : p.action), cell(p.origin, "origin"), cell(p.item_id), cell(p.age_s + " s"));
     const actions = document.createElement("td");
     actions.append(
       button("Approve once", () => decide("/owner/approvals/approve", { request_id: p.request_id, kind: "once" })),
@@ -4813,6 +4814,7 @@ mod tests {
                 item_id: "item-1".into(),
                 action: "fill",
                 origin: "https://login.example.com".into(),
+                rung: None,
                 age_s: 7,
             }]
         }

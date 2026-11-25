@@ -17,4 +17,5 @@ pub mod origin;
 pub mod owner;
 pub mod owner_ui;
 pub mod sync;
+pub mod teach;
 pub mod totp;

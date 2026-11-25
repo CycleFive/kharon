@@ -154,6 +154,8 @@ pub fn plan() -> FillPlan {
         post_submit_scrub: false,
         post_submit_scrub_delay: Duration::from_millis(500),
         scrub: ScrubNote::new(),
+        method_source: None,
+        method: kharond::cdp::MethodNote::new(),
     }
 }
 

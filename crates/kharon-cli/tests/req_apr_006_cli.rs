@@ -64,6 +64,28 @@ fn req_apr_006_cli_grants_lists_pending_requests() {
 }
 
 #[test]
+fn req_apr_006_cli_grants_shows_the_rung_only_when_the_site_has_a_method() {
+    let (socket, _rx) = fake_owner(
+        r#"{"ok":true,"pending":[{"request_id":"gr_1","agent_id":"alpha","item_id":"item-a","action":"fill","origin":"https://a.example","rung":"milliseconds"},{"request_id":"gr_2","agent_id":"alpha","item_id":"item-b","action":"fill","origin":"https://b.example"},{"request_id":"gr_3","agent_id":"alpha","item_id":"item-c","action":"fill","origin":"https://c.example","rung":"agent\u001b[2J"}]}"#,
+    );
+    let (ok, stdout, _) = run_cli(&socket, &["grants"]);
+    assert!(ok, "{stdout}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        "gr_1 agent=alpha item=item-a action=fill origin=https://a.example\trung=milliseconds"
+    );
+    assert_eq!(
+        lines[1],
+        "gr_2 agent=alpha item=item-b action=fill origin=https://b.example"
+    );
+    assert_eq!(
+        lines[2],
+        "gr_3 agent=alpha item=item-c action=fill origin=https://c.example\trung=agent\u{FFFD}[2J"
+    );
+}
+
+#[test]
 fn req_apr_006_cli_approve_sends_the_owner_terms() {
     let (socket, rx) = fake_owner(r#"{"ok":true,"grant_id":"g_1"}"#);
     let (ok, stdout, _) = run_cli(

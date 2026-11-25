@@ -341,6 +341,33 @@ async fn req_apr_004_panic_notifies_without_actions() {
     assert_eq!(stub.count(), 1);
 }
 
+/// #382: the drift notice is a plain message, no actions; the domain
+/// and the step number are its only variable text.
+#[test]
+fn req_tch_008_drift_notice_is_plain_and_names_only_the_domain_and_step() {
+    let stub = stub_ntfy();
+    let base = url::Url::parse(&format!("http://127.0.0.1:{}", stub.port)).unwrap();
+    let notifier = NtfyApprovalNotifier::new(
+        &base,
+        "kharon-alerts",
+        None,
+        "http://127.0.0.1:8788".to_owned(),
+    )
+    .unwrap();
+    notifier.publish_method_drift("example.com", 2).unwrap();
+    let requests = stub.wait_for(1);
+    let (_, _, body) = parse_request(&requests[0]);
+    assert_eq!(body["topic"], "kharon-alerts");
+    assert_eq!(body["title"], "kharon: login method out of date");
+    assert_eq!(
+        body["message"],
+        "The login page of example.com no longer matches its method (step 2). \
+         Fills there are refused until you re-import it or run: \
+         kharon teach clear-stale example.com"
+    );
+    assert!(body.get("actions").is_none(), "{body}");
+}
+
 /// #208: behind the edge the action URLs name the public origin, not
 /// the loopback listener, and a public UI publishes even when its
 /// configured port is ephemeral.

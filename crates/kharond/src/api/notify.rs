@@ -53,6 +53,19 @@ pub trait ApprovalNotifier: Send + Sync {
     /// `kharon panic` revoked every grant and locked the daemon
     /// (REQ-REV-002). Default: no notification.
     fn notify_panic(&self) {}
+
+    /// A taught login method for `domain` just went stale: the page no
+    /// longer matched at method step `step` (#382). Called once per
+    /// stale mark, never per refused fill. Default: no notification.
+    fn notify_method_drift(&self, _domain: &str, _step: u32) {}
+}
+
+/// A plain ntfy message: no actions, nothing to redeem.
+#[derive(serde::Serialize)]
+struct PlainMessage<'a> {
+    topic: &'a str,
+    title: &'static str,
+    message: String,
 }
 
 /// The detached publish state, cloned into the publish thread.
@@ -81,13 +94,17 @@ impl NtfyPublisher {
             "topic": self.topic,
             "title": "kharon: approval requested",
             "message": format!(
-                "agent {} wants to {} item {} at {} (request {}). \
+                "agent {} wants to {} item {} at {} (request {}){}. \
                  Approve and deny are single-use and expire in 120 s.",
                 prompt.agent_id,
                 prompt.action.as_str(),
                 prompt.item_id,
                 prompt.origin,
                 prompt.request_id,
+                match prompt.rung {
+                    Some(rung) => format!(", rung: {rung}"),
+                    None => String::new(),
+                },
             ),
             "actions": [
                 {
@@ -118,6 +135,23 @@ impl NtfyPublisher {
             "message": "kharon panic: every grant was revoked and the daemon is locked.",
         });
         self.transport.post(&self.path, None, &payload.to_string())
+    }
+
+    /// The POST for a method drift: no actions. The domain and the
+    /// step number are the only variable text (#382).
+    fn publish_method_drift(&self, domain: &str, step: u32) -> io::Result<()> {
+        let payload = PlainMessage {
+            topic: &self.topic,
+            title: "kharon: login method out of date",
+            message: format!(
+                "The login page of {domain} no longer matches its method (step {step}). \
+                 Fills there are refused until you re-import it or run: \
+                 kharon teach clear-stale {domain}"
+            ),
+        };
+        let text = serde_json::to_string(&payload)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "notice not serializable"))?;
+        self.transport.post(&self.path, None, &text)
     }
 }
 
@@ -176,6 +210,12 @@ impl NtfyApprovalNotifier {
     pub fn publish_panic(&self) -> io::Result<()> {
         self.publisher.publish_panic()
     }
+
+    /// Publish one method-drift notice synchronously (the detached
+    /// wrapper is [`ApprovalNotifier::notify_method_drift`]).
+    pub fn publish_method_drift(&self, domain: &str, step: u32) -> io::Result<()> {
+        self.publisher.publish_method_drift(domain, step)
+    }
 }
 
 impl ApprovalNotifier for NtfyApprovalNotifier {
@@ -198,6 +238,14 @@ impl ApprovalNotifier for NtfyApprovalNotifier {
         let publisher = self.publisher.clone();
         let _ = std::thread::spawn(move || {
             let _ = publisher.publish_panic();
+        });
+    }
+
+    fn notify_method_drift(&self, domain: &str, step: u32) {
+        let publisher = self.publisher.clone();
+        let domain = domain.to_owned();
+        let _ = std::thread::spawn(move || {
+            let _ = publisher.publish_method_drift(&domain, step);
         });
     }
 }

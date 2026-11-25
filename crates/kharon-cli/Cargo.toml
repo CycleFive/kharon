@@ -18,6 +18,7 @@ ed25519-dalek = "2.1"
 # thread (async-signal-safe by construction), so no signal-hook
 # FFI is needed in this crate.
 tokio = { version = "1", features = ["rt", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 zeroize = "1"
 # Terminal echo control for the unlock password prompt (tty, no
@@ -26,6 +27,7 @@ zeroize = "1"
 # the same rustix kharond already uses.
 rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net", "rand"] }
 kharond = { path = "../kharond", version = "0.0.0" }
+kharon-recording = { path = "../kharon-recording", version = "0.0.0" }
 
 [dev-dependencies]
 tempfile = "3"

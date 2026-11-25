@@ -23,6 +23,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod api_support;
+
 use kharond::api::http::OPENAPI_JSON;
 use kharond::api::mcp::Tool;
 use kharond::api::surface::{error_schema, http_route, response_schema};
@@ -73,6 +75,7 @@ const REVIEWED_STRINGS: &[(&str, &str)] = &[
     ("FillResult.status", "fixed FillStatus literal"),
     ("FillResult.fields_filled[]", "fixed field-kind literal"),
     ("FillResult.detail", "fixed detail-code literal"),
+    ("FillResult.rung", "fixed rung literal (#382)"),
     (
         "FillResult.grant_request_id",
         "broker-assigned grant request id (#20)",
@@ -330,4 +333,28 @@ fn req_goal_001_error_body_is_the_enumerated_error_type() {
     let keys: BTreeSet<String> = body.as_object().unwrap().keys().cloned().collect();
     let error = serde_json::to_value(error_schema()).unwrap();
     assert_eq!(keys, object_properties(&error, &Value::Null));
+}
+
+/// REQ-TCH-010 (#382): the login-method registry is the owner's. No MCP
+/// tool and no HTTP route names it, and the agent listener answers a
+/// request for one of its ops with 404.
+#[tokio::test]
+async fn req_tch_010_no_agent_route_reaches_the_registry() {
+    for tool in Tool::ALL {
+        let (_, path) = http_route(tool);
+        assert!(!tool.name().contains("teach"), "tool {}", tool.name());
+        assert!(!path.contains("teach"), "route {path}");
+    }
+    let doc = openapi();
+    for path in doc["paths"].as_object().unwrap().keys() {
+        assert!(!path.contains("teach"), "documented route {path}");
+    }
+
+    let h = api_support::Harness::new(false);
+    let addr = api_support::serve_http(std::sync::Arc::clone(&h.broker)).await;
+    for path in ["/v1/teach_import", "/v1/teach/import"] {
+        let r = api_support::post_json(addr, path, Some(&h.alpha), "{}").await;
+        assert_eq!(r.status, 404, "POST {path}");
+    }
+    assert!(h.audit.entries.lock().unwrap().is_empty());
 }

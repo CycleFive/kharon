@@ -135,6 +135,16 @@ pub enum Event {
     /// Best effort, like [`Event::ConnectorAuthFail`]: a failed
     /// append never turns the refusal into an admission.
     OauthClientRefused,
+    /// #382: a taught login method was imported into the registry.
+    /// Written by the owner-socket op; declared with the other teach
+    /// events.
+    TeachImport,
+    /// #382: an owner override replaced a method step's selectors.
+    TeachOverride,
+    /// #382: the owner cleared a method's stale mark.
+    TeachClearStale,
+    /// #382: the owner removed a method from the registry.
+    TeachRemove,
     /// REQ-OAU-004 (#231): a Connect identity was created at code
     /// redemption. `agent_id` is the new `c-…` id, `origin` the
     /// client's CIMD hostname, channel `web_ui`. Appended before the
@@ -199,6 +209,10 @@ impl Event {
             Event::PasskeyListed => "passkey_listed",
             Event::PasskeyRemoved => "passkey_removed",
             Event::OauthClientRefused => "oauth_client_refused",
+            Event::TeachImport => "teach_import",
+            Event::TeachOverride => "teach_override",
+            Event::TeachClearStale => "teach_clear_stale",
+            Event::TeachRemove => "teach_remove",
             Event::OauthConnect => "oauth_connect",
             Event::OauthDisconnect => "oauth_disconnect",
             Event::OauthRefreshReuse => "oauth_refresh_reuse",
@@ -258,6 +272,10 @@ impl<'de> Deserialize<'de> for Event {
             "oauth_refresh_reuse" => Event::OauthRefreshReuse,
             "oauth_connector_grant" => Event::OauthConnectorGrant,
             "oauth_client_refused" => Event::OauthClientRefused,
+            "teach_import" => Event::TeachImport,
+            "teach_override" => Event::TeachOverride,
+            "teach_clear_stale" => Event::TeachClearStale,
+            "teach_remove" => Event::TeachRemove,
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown audit event `{other}`"
@@ -343,6 +361,15 @@ pub struct Entry {
     /// Number of fields a `fill_dispatch` is about to fill (1..=3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_count: Option<u64>,
+    /// The login method's rung (`milliseconds` or `agent_continues`),
+    /// on a fill outcome entry whose fill consulted a taught method
+    /// (#382). Never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rung: Option<String>,
+    /// The flat 0-based method step a drift ended at (#382), on the
+    /// `fill` entry of a `method_drift` fill. A number, never a selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<u64>,
     /// The target's live origin as the browser reported it during the
     /// fill (only on fill outcome entries: `fill`, `fill_totp`,
     /// `fill_timeout`, `fill_aborted`; REQ-AUD-003†, #67). Absent when
@@ -416,6 +443,8 @@ impl Entry {
             file_sha256: None,
             request_id: None,
             field_count: None,
+            rung: None,
+            step_index: None,
             live_origin: None,
             transport: None,
             client_ip: None,
@@ -488,6 +517,18 @@ impl Entry {
     /// Fields a `fill_dispatch` is about to fill.
     pub fn field_count(mut self, v: u64) -> Self {
         self.field_count = Some(v);
+        self
+    }
+
+    /// The rung of the taught login method a fill used (#382).
+    pub fn rung(mut self, v: impl Into<String>) -> Self {
+        self.rung = Some(v.into());
+        self
+    }
+
+    /// The method step a drifted fill ended at (#382).
+    pub fn step_index(mut self, v: u64) -> Self {
+        self.step_index = Some(v);
         self
     }
 

@@ -73,13 +73,20 @@ use super::rollback::RollbackGuard;
 use super::token::TokenStore;
 use super::transport::TransportLimits;
 use crate::audit::{AuditLog, Entry, Event};
-use crate::cdp::{FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin, ValuesSent};
+use crate::cdp::{
+    FieldFill, FieldKind, FillOutcome, FillPlan, LiveOrigin, MethodEnd, MethodSource, MethodUse,
+    ValuesSent,
+};
 use crate::lock::{AuditError, Clock, LockController, LockEvent, LockReason, SystemClock};
 use crate::origin::{OriginConfig, OriginMatcher};
 use crate::sync::wire::SyncResponse;
 use crate::sync::{LiveSync, SecretField, SyncError, SyncOutcome, Vault};
+use crate::teach::{
+    EditRefusal, Entry as TeachEntry, ImportFlags, ImportRefusal, TeachRegistry, WithHook, site_key,
+};
 use crate::totp::skew::Observation;
 use crate::totp::{ClockSample, ClockSkewGate, SkewPolicy, totp_code};
+use kharon_recording::LoginMethod;
 
 /// Longest accepted `origin` (bytes).
 pub const MAX_ORIGIN_LEN: usize = 2048;
@@ -463,6 +470,9 @@ pub struct Broker<S: VaultView, C: Clock = SystemClock> {
     /// (REQ-APR-004 send half, #128). `None` = no channel configured;
     /// requests then wait on the CLI / web UI alone.
     approval_notifier: Option<Arc<dyn ApprovalNotifier>>,
+    /// The taught login methods (#382). `None` = none installed: no
+    /// fill consults a method and no prompt names a rung.
+    teach_registry: Option<Arc<TeachRegistry>>,
     /// Rate limits, suspension, and agent revocation (REQ-RL-*,
     /// REQ-REV-001). Separate from the lock controller so owner
     /// revoke/panic never needs the session.
@@ -686,6 +696,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             grant_clock: Arc::new(SystemClock),
             approval_tokens: Mutex::new(ApprovalTokenStore::new()),
             approval_notifier: None,
+            teach_registry: None,
             rates: Mutex::new(RateLimiter::new(RatePolicy::default())),
             transport: TransportLimits::new(),
             rollback: Mutex::new(RollbackGuard::new()),
@@ -790,6 +801,146 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
     pub fn with_approval_notifier(mut self, notifier: Arc<dyn ApprovalNotifier>) -> Self {
         self.approval_notifier = Some(notifier);
         self
+    }
+
+    /// Fill by the site's taught login method when the registry holds
+    /// one (#382), and name its rung on replies, audit entries and
+    /// approval prompts.
+    pub fn with_teach_registry(mut self, registry: Arc<TeachRegistry>) -> Self {
+        self.teach_registry = Some(registry);
+        self
+    }
+
+    /// The installed teach registry, if any.
+    pub fn teach_registry(&self) -> Option<&Arc<TeachRegistry>> {
+        self.teach_registry.as_ref()
+    }
+
+    /// The installed registry, or `teach_unavailable`.
+    fn teach_registry_for_edit(&self) -> Result<&Arc<TeachRegistry>, TeachOpError> {
+        self.teach_registry
+            .as_ref()
+            .ok_or(TeachOpError::Unavailable)
+    }
+
+    /// The audit entry of an owner edit: the domain as origin, the method's
+    /// provenance digest (or `hand_written`), channel `cli`. No selector, no
+    /// value, no page text.
+    fn teach_audit_entry(event: Event, entry: &TeachEntry) -> Entry {
+        let audit = Entry::new(event)
+            .origin(entry.method.site.domain.clone())
+            .channel("cli")
+            .result("ok");
+        match entry.method.digest() {
+            Some(digest) => audit.file_sha256(digest),
+            None => audit.detail_code("hand_written"),
+        }
+    }
+
+    /// Run one registry edit with its audit entry appended inside the registry's
+    /// commit, under its lock: the entry is written after every check passed and
+    /// before the change is put in place, so a refusal appends nothing and a failed
+    /// append (`audit_failed`) changes nothing. If the file then cannot be put in
+    /// place, one more entry for the op with result `store_failed` is appended
+    /// (best effort) so the log does not claim a change that did not happen.
+    fn teach_edit<R>(
+        &self,
+        event: Event,
+        step: Option<u32>,
+        run: impl FnOnce(
+            &TeachRegistry,
+            &mut dyn FnMut(&TeachEntry) -> Result<(), ()>,
+        ) -> Result<TeachEntry, WithHook<R, ()>>,
+    ) -> Result<TeachEntry, TeachOpError>
+    where
+        TeachOpError: From<R>,
+    {
+        let registry = self.teach_registry_for_edit()?;
+        let appended: std::cell::Cell<Option<TeachEntry>> = std::cell::Cell::new(None);
+        let audit_for = |e: &TeachEntry| {
+            let audit = Self::teach_audit_entry(event.clone(), e);
+            match step {
+                Some(s) => audit.step_index(u64::from(s)),
+                None => audit,
+            }
+        };
+        let mut hook = |e: &TeachEntry| {
+            self.append(audit_for(e)).map_err(|_| ())?;
+            appended.set(Some(e.clone()));
+            Ok(())
+        };
+        match run(registry, &mut hook) {
+            Ok(entry) => Ok(entry),
+            Err(WithHook::Hook(())) => Err(TeachOpError::AuditFailed),
+            Err(WithHook::Refused(r)) => {
+                let err = TeachOpError::from(r);
+                if err == TeachOpError::StoreFailed
+                    && let Some(entry) = appended.take()
+                {
+                    let _ = self.append(audit_for(&entry).result("store_failed"));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Owner op: add a login method (#382). `replace` overwrites an existing
+    /// entry; `accept_main_world` admits a recording made in the page's own
+    /// world. One audit entry on success, none on a refusal.
+    pub fn teach_import(
+        &self,
+        method: LoginMethod,
+        flags: ImportFlags,
+    ) -> Result<TeachEntry, TeachOpError> {
+        self.teach_registry_for_edit()?;
+        let now = now_rfc3339().ok_or(TeachOpError::StoreFailed)?;
+        self.teach_edit(Event::TeachImport, None, |reg, hook| {
+            reg.import_with(method, flags, &now, hook)
+        })
+    }
+
+    /// Owner op: every entry, sorted by domain. Not audited.
+    pub fn teach_list(&self) -> Result<Vec<TeachEntry>, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        Ok(registry.list().into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Owner op: one entry, by host or site key. Not audited.
+    pub fn teach_show(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
+        let registry = self.teach_registry_for_edit()?;
+        registry
+            .get(&site_key(domain))
+            .ok_or(TeachOpError::NotFound)
+    }
+
+    /// Owner op: put `selector` first for flat step `step`. The audit entry
+    /// names the step, never the selector.
+    pub fn teach_override(
+        &self,
+        domain: &str,
+        step: u32,
+        selector: &str,
+    ) -> Result<TeachEntry, TeachOpError> {
+        let domain = site_key(domain);
+        self.teach_edit(Event::TeachOverride, Some(step), |reg, hook| {
+            reg.set_override_with(&domain, step, selector, hook)
+        })
+    }
+
+    /// Owner op: clear the stale mark.
+    pub fn teach_clear_stale(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
+        let domain = site_key(domain);
+        self.teach_edit(Event::TeachClearStale, None, |reg, hook| {
+            reg.clear_stale_with(&domain, hook)
+        })
+    }
+
+    /// Owner op: remove the entry; the removed entry is returned.
+    pub fn teach_remove(&self, domain: &str) -> Result<TeachEntry, TeachOpError> {
+        let domain = site_key(domain);
+        self.teach_edit(Event::TeachRemove, None, |reg, hook| {
+            reg.remove_with(&domain, hook)
+        })
     }
 
     /// Apply `[policy]` to the grant store (standing grants on/off).
@@ -1317,6 +1468,9 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         // was dropped. Not an outcome: the fill's own entry is still
         // exactly one.
         let mut scrub_note = None;
+        // How the fill used a taught login method, when it consulted
+        // one (#382). Holds a domain, a rung and a step number.
+        let mut method_used: Option<MethodUse> = None;
         // The grant request a `pending_approval` outcome created
         // (#20), and the grant an admitted fill spent.
         let mut grant_request_id: Option<String> = None;
@@ -1433,21 +1587,44 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     guard.abort_entry = None;
                     live_origin = guard.plan.live_origin.get();
                     scrub_note = guard.plan.scrub.get();
+                    method_used = guard.plan.method.get().cloned();
                     drop(guard);
                     status
                 }
             }
         };
+        // #382: what the fill learned about its method goes into the
+        // registry, and the owner hears once when it first went stale.
+        let method_detail = method_used.as_ref().and_then(|used| {
+            self.record_method_fill(used);
+            (matches!(status, FillStatus::Engine(FillOutcome::Filled { .. }))
+                && used.selectors_ignored)
+                .then_some("method_selectors")
+        });
+        let method_rung = method_used.as_ref().map(|u| rung_name(u.rung));
         let entry = if status == FillStatus::Engine(FillOutcome::Timeout) {
             base(Event::FillTimeout)
                 .result("timeout")
                 .detail_code("deadline_expired")
         } else {
             let mut e = base(event).result(status.status());
-            if let Some(d) = status.detail() {
+            if let Some(d) = method_detail.or(status.detail()) {
                 e = e.detail_code(d);
             }
             e
+        };
+        // The reply and the audit trail agree on the method's rung,
+        // whichever outcome entry the fill ends in.
+        let entry = match method_rung {
+            Some(r) => entry.rung(r),
+            None => entry,
+        };
+        let entry = match &method_used {
+            Some(MethodUse {
+                end: MethodEnd::Drift { step },
+                ..
+            }) => entry.step_index(u64::from(*step)),
+            _ => entry,
         };
         let entry = match &live_origin {
             Some(o) => entry.live_origin(o.clone()),
@@ -1513,7 +1690,55 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         }
         let mut result = status.result();
         result.grant_request_id = grant_request_id;
+        result.rung = method_rung;
+        if method_detail.is_some() {
+            result.detail = method_detail;
+        }
         Ok(Outcome::Fill(result))
+    }
+
+    /// Note a method fill's outcome in the registry and tell the owner
+    /// when it newly marked the method stale (#382). A write that did
+    /// not happen for an outcome that should have been written is
+    /// reported on stderr; the fill's reply is unchanged.
+    fn record_method_fill(&self, used: &MethodUse) {
+        let Some(registry) = &self.teach_registry else {
+            return;
+        };
+        let Some(now) = now_rfc3339() else {
+            return;
+        };
+        let recorded = registry.record_fill(used, &now);
+        let should_write = matches!(
+            used.end,
+            MethodEnd::Drift { .. } | MethodEnd::NotReady { .. } | MethodEnd::Filled(_)
+        );
+        if should_write && !recorded.wrote {
+            eprintln!(
+                "kharond: warning: could not record a login-method fill for {}",
+                used.domain
+            );
+        }
+        if recorded.newly_stale
+            && let MethodEnd::Drift { step } = used.end
+            && let Some(notifier) = &self.approval_notifier
+        {
+            notifier.notify_method_drift(&used.domain, step);
+        }
+    }
+
+    /// The approval prompt for `request`, naming the rung of the login
+    /// method taught for the origin it observed (#382). Every owner
+    /// listing and the ntfy publish go through here;
+    /// [`GrantRequest::prompt`] alone knows no registry.
+    pub fn approval_prompt(&self, request: &GrantRequest) -> Option<super::grant::ApprovalPrompt> {
+        let mut prompt = request.prompt()?;
+        prompt.rung = self
+            .teach_registry
+            .as_ref()
+            .and_then(|r| r.rung_for_origin(&prompt.origin))
+            .map(rung_name);
+        Some(prompt)
     }
 
     /// The `grant_request` audit entry for a request's creation:
@@ -1995,7 +2220,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
         let Some(notifier) = &self.approval_notifier else {
             return;
         };
-        let Some(prompt) = greq.prompt() else {
+        let Some(prompt) = self.approval_prompt(greq) else {
             return;
         };
         let Some((approve, deny)) = self.approval_token_paths(&greq.id) else {
@@ -2034,7 +2259,7 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             .unwrap_or_else(|p| p.into_inner())
             .peek(token, self.grant_now())?;
         let req = self.grant_request(&request_id).ok_or(TokenGone::Unknown)?;
-        let prompt = req.prompt().ok_or(TokenGone::Used)?;
+        let prompt = self.approval_prompt(&req).ok_or(TokenGone::Used)?;
         Ok((prompt, action))
     }
 
@@ -3174,6 +3399,20 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
                     .unwrap_or(self.fill_policy.post_submit_scrub),
             post_submit_scrub_delay: self.fill_policy.post_submit_scrub_delay,
             scrub: crate::cdp::fill::ScrubNote::new(),
+            // #382: a login fill consults the taught methods; a TOTP
+            // fill never does.
+            method_source: self
+                .teach_registry
+                .as_ref()
+                .filter(|_| {
+                    req.operation == FillOperation::Fill
+                        && req
+                            .fields
+                            .iter()
+                            .any(|(k, _)| matches!(k, FieldKind::Username | FieldKind::Password))
+                })
+                .map(|r| Arc::clone(r) as Arc<dyn MethodSource>),
+            method: crate::cdp::MethodNote::new(),
         };
         // `item` was the last borrow of the session. A spent grant
         // no longer defers the idle lock; an unlimited grant stays
@@ -3182,5 +3421,75 @@ impl<S: VaultView, C: Clock> Broker<S, C> {
             lock.release_idle_hold(&admitted);
         }
         Ok((plan, generation, admitted))
+    }
+}
+
+/// Why an owner's registry operation failed. Fixed variants only; the owner
+/// socket maps each to a fixed code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeachOpError {
+    /// No registry is installed on this broker.
+    Unavailable,
+    /// The method does not validate.
+    Invalid,
+    /// The method's origin is not on its domain.
+    OffDomain,
+    /// A recording made in the page's own world, without the flag.
+    MainWorld,
+    /// The method's rung is above what its recording reached.
+    RungAboveCeiling,
+    /// An entry for the site exists and `replace` was not set.
+    Exists,
+    /// No entry for the site.
+    NotFound,
+    /// The step is not one an override can name.
+    BadStep,
+    /// The selector is empty or too long.
+    BadSelector,
+    /// The registry file could not be written.
+    StoreFailed,
+    /// The audit entry could not be written; the change was undone.
+    AuditFailed,
+}
+
+impl From<ImportRefusal> for TeachOpError {
+    fn from(e: ImportRefusal) -> Self {
+        match e {
+            ImportRefusal::Invalid => Self::Invalid,
+            ImportRefusal::OffDomain => Self::OffDomain,
+            ImportRefusal::MainWorld => Self::MainWorld,
+            ImportRefusal::RungAboveCeiling => Self::RungAboveCeiling,
+            ImportRefusal::Exists => Self::Exists,
+            ImportRefusal::Store => Self::StoreFailed,
+        }
+    }
+}
+
+impl From<EditRefusal> for TeachOpError {
+    fn from(e: EditRefusal) -> Self {
+        match e {
+            EditRefusal::NotFound => Self::NotFound,
+            EditRefusal::BadStep => Self::BadStep,
+            EditRefusal::BadSelector => Self::BadSelector,
+            EditRefusal::Store => Self::StoreFailed,
+        }
+    }
+}
+
+/// The current time as RFC 3339 UTC to the second.
+fn now_rfc3339() -> Option<String> {
+    let now = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    now.format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
+/// The wire name of a method's rung, as on the reply, the audit entry
+/// and the approval prompt (#382).
+fn rung_name(rung: kharon_recording::Rung) -> &'static str {
+    match rung {
+        kharon_recording::Rung::Milliseconds => "milliseconds",
+        kharon_recording::Rung::AgentContinues => "agent_continues",
     }
 }

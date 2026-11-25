@@ -9,6 +9,7 @@ Vaultwarden fill broker: lets AI agents fill credentials without ever seeing the
 - [`SPEC.md`](SPEC.md): the spec and source of truth. Every requirement has a `REQ-<AREA>-NNN` ID and one acceptance criterion.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): who builds kharon, the claim protocol, PR and review rules, and secrets policy.
 - [`COMPAT.md`](COMPAT.md): official Bitwarden cloud compatibility (REQ-DEP-004), how the nightly job runs, and recorded results.
+- [`docs/milestone-chores.md`](docs/milestone-chores.md): milestones, release trains and the `next` backlog, and the three chore issues (Groom, Scope check, Close-out) that rotate across the agents.
 - [`docs/roadmap.md`](docs/roadmap.md): the agent platform roadmap. Releases are rolling trains; the platform order is OpenClaw, then Hermes, then other CDP hosts.
 
 ### Design and security
@@ -62,6 +63,7 @@ Approved designs, newest last. Each names its issue, builder and reviewers.
 - [`2026-11-12-n3-phase2-connector-auth-design.md`](docs/superpowers/specs/2026-11-12-n3-phase2-connector-auth-design.md): N3 phase 2, a dashboard runtime's connector authenticating with a Connect token (#235).
 - [`2026-11-18-teach-recorder-design.md`](docs/superpowers/specs/2026-11-18-teach-recorder-design.md): teach mode piece 1, `kharon-teach`, a recorder for a demonstrated login (#361).
 - [`2026-11-24-teach-method-design.md`](docs/superpowers/specs/2026-11-24-teach-method-design.md): teach mode piece 2, login methods, the player and the per-site registry (#381).
+- [`2026-11-25-teach-never-in-page-design.md`](docs/superpowers/specs/2026-11-25-teach-never-in-page-design.md): teach mode piece 3, why the never-in-the-page rung is not a rung, whether a second CDP client can see a rewritten request, and the no-go for a prototype (#384).
 
 ### Implementation plans
 
@@ -75,6 +77,7 @@ Task-by-task plans that implemented the specs above.
 - [`2026-11-11-n2-owner-ui-behind-edge.md`](docs/superpowers/plans/2026-11-11-n2-owner-ui-behind-edge.md): N2, the owner UI behind the edge.
 - [`2026-11-12-234-n3-compose-connect-e2e.md`](docs/superpowers/plans/2026-11-12-234-n3-compose-connect-e2e.md): N3 compose E2E with a fake dashboard running Connect, refresh, reuse-kill and Disconnect (#234).
 - [`2026-11-18-361-teach-recorder.md`](docs/superpowers/plans/2026-11-18-361-teach-recorder.md): the teach recorder, `kharon-recording` and `kharon-teach` (#361).
+- [`2026-11-24-382-teach-method.md`](docs/superpowers/plans/2026-11-24-382-teach-method.md): teach mode piece 2, login methods, the player and the per-site registry (#382).
 
 ## License
 

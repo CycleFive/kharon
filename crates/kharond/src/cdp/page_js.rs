@@ -227,6 +227,16 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
   const legSubmit = leg && submitRequested && leg.submit ? leg.submit : null;
   const legEls = [];
   let legClickEl = null;
+  let legForm = null;
+  // Page handlers run synchronously inside the writes, so the page can
+  // change between the pre-check and a later write. Run the pre-check's
+  // own match again on the element about to be used; a miss is a drift,
+  // and an element that only became disabled is "not ready".
+  function legRecheck(el, step) {
+    if (!legMatches(el, step)) return "method_drift:" + step.index;
+    if (el.matches(":disabled")) return "method_not_ready:" + step.index;
+    return null;
+  }
   if (leg) {
     // A leg fill that throws must never leave an earlier fill's element
     // for the probe.
@@ -254,6 +264,7 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
       const lastEl = legEls[legEls.length - 1];
       const form = lastEl ? lastEl.form || (lastEl.closest ? lastEl.closest("form") : null) : null;
       if (!form || typeof form.requestSubmit !== "function") fail("method_drift:" + legSubmit.index);
+      legForm = form;
     }
     // Readiness only after every drift check has passed.
     for (let i = 0; i < legEls.length; i++) {
@@ -273,8 +284,9 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
       if (!el) fail("field_not_found:" + f.kind);
       // Leg mode: an earlier field's page handlers may have changed
       // this element since the pre-check.
-      if (leg && (!el.isConnected || (leg.fills[i].password === true && el.type !== "password"))) {
-        fail("method_drift:" + leg.fills[i].index);
+      if (leg) {
+        const miss = legRecheck(el, leg.fills[i]);
+        if (miss) fail(miss);
       }
       written.push(el);
       setNativeValue(el, f.value);
@@ -304,13 +316,14 @@ function fillInPage(specs, fields, expectedTopOrigin, submitRequested, budgetMs,
     const form = last ? last.form || (last.closest ? last.closest("form") : null) : null;
     if (leg && legSubmit.via === "click") {
       // Page handlers ran during the writes: re-check the target.
-      if (!legClickEl.isConnected) {
+      const miss = legRecheck(legClickEl, legSubmit);
+      if (miss) {
         clearWritten(written);
-        fail("method_drift:" + legSubmit.index);
+        fail(miss);
       }
       legClickEl.click();
     } else if (leg && legSubmit.via === "form") {
-      if (!form || typeof form.requestSubmit !== "function") {
+      if (!form || form !== legForm || typeof form.requestSubmit !== "function") {
         clearWritten(written);
         fail("method_drift:" + legSubmit.index);
       }
@@ -1490,6 +1503,47 @@ eq(methodProbe().password_connected, null, "nothing recorded");
   eq(p.pw.events.length, 0, "no event on pw");
   eq(p.u._v, "", "user cleared");
   eq(p.form.submits, 0, "no submit");
+}
+"##,
+        );
+    }
+
+    #[test]
+    fn req_tch_008_midfill_recheck_covers_the_whole_precheck() {
+        run_leg_harness(
+            "midfill_full",
+            r##"
+const cases = [
+  ["renamed", (p) => { p.pw.name = "other"; }, "method_drift:1"],
+  ["hidden", (p) => { p.pw.visibility = "hidden"; }, "method_drift:1"],
+  ["zero-size", (p) => { p.pw.rects = 0; }, "method_drift:1"],
+  ["disabled", (p) => { p.pw.disabled = true; }, "method_not_ready:1"],
+];
+for (const [label, change, want] of cases) {
+  const p = new Page();
+  p.u.onInput = () => change(p);
+  eq(p.code(true), want, label);
+  eq(p.pw._v, "", label + ": password never written");
+  eq(p.pw.events.length, 0, label + ": no event on pw");
+  eq(p.u._v, "", label + ": user cleared");
+  eq(p.form.submits, 0, label + ": no submit");
+}
+{
+  // the password input is pointed at another form mid-fill
+  const p = new Page();
+  const other = { submits: 0, requestSubmit() { this.submits += 1; } };
+  p.pw.onInput = () => { p.pw.form = other; };
+  eq(p.code(true), "method_drift:2", "form swapped");
+  eq(p.u._v, "", "user cleared"); eq(p.pw._v, "", "pw cleared");
+  eq(p.form.submits + other.submits, 0, "no submit on either form");
+}
+{
+  // click target changed by the password handler
+  const p = new Page();
+  p.submit = { index: 2, via: "click", selectors: ["#go"], expect: ex("button", "submit", "go", null) };
+  p.pw.onInput = () => { p.btn.id = "other"; };
+  eq(p.code(true), "method_drift:2", "click target changed");
+  eq(p.btn.clicks, 0, "no click"); eq(p.pw._v, "", "pw cleared"); eq(p.u._v, "", "user cleared");
 }
 "##,
         );

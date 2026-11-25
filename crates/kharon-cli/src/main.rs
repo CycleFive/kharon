@@ -1138,8 +1138,12 @@ fn owner_command(command: &Command) -> ExitCode {
                 None => {
                     if let Some(pending) = reply["pending"].as_array() {
                         for p in pending {
+                            let rung = p["rung"]
+                                .as_str()
+                                .map(|r| format!("\trung={}", plain(r)))
+                                .unwrap_or_default();
                             println!(
-                                "{} agent={} item={} action={} origin={}",
+                                "{} agent={} item={} action={} origin={}{rung}",
                                 p["request_id"].as_str().unwrap_or("?"),
                                 p["agent_id"].as_str().unwrap_or("?"),
                                 p["item_id"].as_str().unwrap_or("?"),

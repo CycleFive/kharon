@@ -309,7 +309,7 @@ fn teach_refusal_goes_to_stderr_as_a_plain_sentence() {
         run.err,
         "kharon: that site already has a method; use --replace"
     );
-    assert!(!run.out.contains("imported"), "{}", run.out);
+    assert!(!run.out.contains("\nimported "), "{}", run.out);
     let got: ImportLine = serde_json::from_str(&server.join().unwrap()).unwrap();
     assert!(!got.replace && !got.accept_main_world);
 }

@@ -142,6 +142,16 @@ pub struct TeachRegistry {
     entries: Mutex<Entries>,
 }
 
+/// True when `origin` is exactly what the browser reports as `location.origin` for
+/// that address, so the method's origin check can ever match a live page.
+fn origin_is_canonical(origin: &str) -> bool {
+    url::Url::parse(origin).is_ok_and(|u| {
+        u.origin().ascii_serialization() == origin
+            // A trailing dot names the same host as the site key but is a different origin.
+            && !u.host_str().is_some_and(|h| h.ends_with('.'))
+    })
+}
+
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
@@ -164,6 +174,7 @@ impl TeachRegistry {
                 let sound = file.entries.iter().all(|(key, e)| {
                     e.method.format_version == METHOD_FORMAT_VERSION
                         && e.method.validate().is_ok()
+                        && origin_is_canonical(&e.method.site.origin)
                         && *key == e.method.site.domain
                         && url_site_key(&e.method.site.origin).as_deref() == Some(key.as_str())
                 });
@@ -238,7 +249,10 @@ impl TeachRegistry {
     ) -> Result<Entry, WithHook<ImportRefusal, E>> {
         use WithHook::Refused;
         let refuse = |r| Err(Refused(r));
-        if method.format_version != METHOD_FORMAT_VERSION || method.validate().is_err() {
+        if method.format_version != METHOD_FORMAT_VERSION
+            || method.validate().is_err()
+            || !origin_is_canonical(&method.site.origin)
+        {
             return refuse(ImportRefusal::Invalid);
         }
         if url_site_key(&method.site.origin).as_deref() != Some(method.site.domain.as_str()) {
@@ -477,7 +491,11 @@ impl TeachRegistry {
     /// The rung of the method held for the site of `origin`, for the approval prompt.
     pub fn rung_for_origin(&self, origin: &str) -> Option<Rung> {
         let key = url_site_key(origin)?;
-        self.guard().get(&key).map(|e| e.rung)
+        let origin = url::Url::parse(origin).ok()?.origin().ascii_serialization();
+        self.guard()
+            .get(&key)
+            .filter(|e| e.method.site.origin == origin)
+            .map(|e| e.rung)
     }
 }
 
@@ -661,6 +679,70 @@ mod tests {
     }
 
     #[test]
+    fn req_tch_010_import_refuses_a_non_canonical_origin() {
+        for bad in [
+            "https://Login.Example.com",
+            "https://login.example.com:443",
+            "https://login.example.com.",
+            "https://login.example.com:",
+        ] {
+            let (_d, reg) = fresh();
+            assert_eq!(
+                reg.import(method("example.com", bad), ImportFlags::default(), NOW)
+                    .unwrap_err(),
+                ImportRefusal::Invalid,
+                "{bad}"
+            );
+        }
+        for good in ["https://login.example.com", "http://127.0.0.1:4455"] {
+            let (_d, reg) = fresh();
+            let domain = if good.contains("127") {
+                "127.0.0.1"
+            } else {
+                "example.com"
+            };
+            assert!(
+                reg.import(method(domain, good), ImportFlags::default(), NOW)
+                    .is_ok(),
+                "{good}"
+            );
+        }
+    }
+
+    #[test]
+    fn req_tch_010_load_refuses_a_non_canonical_origin() {
+        let (dir, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        rewrite_entry(&dir, |e| {
+            e.get_mut("example.com").unwrap().method.site.origin =
+                "https://login.example.com:443".into();
+        });
+        assert_eq!(
+            TeachRegistry::load(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn req_tch_011_rung_for_origin_names_a_rung_only_for_the_methods_own_origin() {
+        let (_d, reg) = fresh();
+        reg.import(
+            method("example.com", "https://login.example.com"),
+            ImportFlags::default(),
+            NOW,
+        )
+        .unwrap();
+        assert!(reg.rung_for_origin("https://login.example.com").is_some());
+        assert!(reg.rung_for_origin("https://app.example.com").is_none());
+        assert!(reg.rung_for_origin("http://login.example.com").is_none());
+    }
+
+    #[test]
     fn req_tch_010_import_refuses_main_world_without_the_flag() {
         let (_d, reg) = fresh();
         let m = recorded(
@@ -781,7 +863,7 @@ mod tests {
         assert_eq!(e.last_result, Some(LastResult::Succeeded));
         assert!(e.stale.is_none());
         assert_eq!(
-            back.rung_for_origin("https://x.example.com"),
+            back.rung_for_origin("https://login.example.com"),
             Some(Rung::AgentContinues)
         );
         assert_eq!(back.rung_for_origin("https://nope.org"), None);

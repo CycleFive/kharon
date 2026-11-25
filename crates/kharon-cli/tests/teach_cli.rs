@@ -235,8 +235,8 @@ fn teach_show_prints_the_row_and_numbered_steps() {
         [
             "a.example\trung=milliseconds\tshape=form_post\tconverted\tstale=no\tlast=- @ - (-)",
             "0\tnavigate\t/login",
-            "1\tfill username\t#user",
-            "2\tfill password\t[override] #pw2, #pw, [name=pass]",
+            "1\tfill username\t#user\texpects input type=text",
+            "2\tfill password\t[override] #pw2, #pw, [name=pass]\texpects input type=password",
             "3\tsubmit\tform",
         ]
     );
@@ -276,6 +276,7 @@ fn teach_import_sends_the_method_and_flags() {
             "domain: a.example",
             "rung: milliseconds",
             "hand-written: no",
+            "fills on other addresses of a.example will be refused while this method is imported",
             "imported a.example"
         ]
     );

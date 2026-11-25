@@ -2,9 +2,9 @@
 //! summary of a recording.
 
 use kharon_recording::{
-    EndedBy, FillRole, ListenerWorld, LoginMethod, METHOD_FILE_SUFFIX, MethodStep, PasswordLeg,
-    Provenance, Recording, Rung, RungCeiling, Shape, StrippedUrl, SubmitVia, SuccessCheck,
-    SuccessOverride,
+    EndedBy, Expected, FillRole, ListenerWorld, LoginMethod, METHOD_FILE_SUFFIX, MethodStep,
+    PasswordLeg, Provenance, Recording, Rung, RungCeiling, Shape, StrippedUrl, SubmitVia,
+    SuccessCheck, SuccessOverride,
 };
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -366,17 +366,43 @@ fn fill_words(role: FillRole) -> &'static str {
     }
 }
 
-fn first_selector(selectors: &[String]) -> String {
+/// Every candidate selector, in the order the player tries them.
+fn all_selectors(selectors: &[String]) -> String {
+    if selectors.is_empty() {
+        return "(no selector)".to_owned();
+    }
     selectors
-        .first()
-        .map_or_else(|| "(no selector)".to_owned(), |s| plain(s))
+        .iter()
+        .map(|s| plain(s))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The element a step expects to find: its tag, then each attribute that is set.
+fn expect_words(e: &Expected) -> String {
+    let mut parts = vec![plain(&e.tag)];
+    for (name, value) in [
+        ("type", &e.input_type),
+        ("id", &e.id),
+        ("name", &e.name),
+        ("autocomplete", &e.autocomplete),
+    ] {
+        if let Some(v) = value {
+            parts.push(format!("{name}={}", plain(v)));
+        }
+    }
+    format!("(expects {})", parts.join(" "))
 }
 
 fn submit_words(via: &SubmitVia) -> String {
     match via {
         SubmitVia::Form {} => "submit the form".to_owned(),
         SubmitVia::Enter {} => "press Enter".to_owned(),
-        SubmitVia::Click { selectors, .. } => format!("click {}", first_selector(selectors)),
+        SubmitVia::Click { selectors, expect } => format!(
+            "click {} {}",
+            all_selectors(selectors),
+            expect_words(expect)
+        ),
     }
 }
 
@@ -384,11 +410,14 @@ fn step_words(step: &MethodStep) -> String {
     match step {
         MethodStep::Navigate { path } => format!("go to {}", plain(path)),
         MethodStep::Fill {
-            role, selectors, ..
+            role,
+            selectors,
+            expect,
         } => format!(
-            "fill the {} into {}",
+            "fill the {} into {} {}",
             fill_words(*role),
-            first_selector(selectors)
+            all_selectors(selectors),
+            expect_words(expect)
         ),
         MethodStep::Submit { via } => submit_words(via),
     }
@@ -783,6 +812,41 @@ pub(crate) mod tests {
         );
         assert!(!s.contains("Caution"), "{s}");
         assert!(!s.contains('{') && !s.contains('"'), "{s}");
+    }
+
+    #[test]
+    fn show_prints_every_candidate_selector_and_the_expected_element() {
+        let mut m = a_method();
+        if let Some(MethodStep::Fill {
+            selectors, expect, ..
+        }) = m.legs[0].steps.get_mut(2)
+        {
+            *selectors = vec!["#pw".into(), "input[name=pass]".into()];
+            expect.id = Some("pw".into());
+            expect.name = Some("pass".into());
+            expect.autocomplete = Some("current-password".into());
+        }
+        *m.legs[0].steps.last_mut().unwrap() = MethodStep::Submit {
+            via: SubmitVia::Click {
+                selectors: vec!["#go".into(), "button.go".into()],
+                expect: Expected {
+                    tag: "button".into(),
+                    input_type: Some("submit".into()),
+                    id: None,
+                    name: None,
+                    autocomplete: None,
+                },
+            },
+        };
+        let s = method_summary(&m);
+        assert!(
+            s.contains("step 2: fill the password into #pw, input[name=pass] (expects input type=password id=pw name=pass autocomplete=current-password)"),
+            "{s}"
+        );
+        assert!(
+            s.contains("step 3: click #go, button.go (expects button type=submit)"),
+            "{s}"
+        );
     }
 
     #[test]

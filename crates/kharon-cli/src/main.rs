@@ -41,7 +41,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use kharon_recording::{
-    FillRole, ListenerWorld, LoginMethod, MethodStep, Provenance, Rung, SubmitVia,
+    Expected, FillRole, ListenerWorld, LoginMethod, MethodStep, Provenance, Rung, SubmitVia,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -773,6 +773,10 @@ fn import_summary(method: &LoginMethod) -> Vec<String> {
     ) {
         lines.push("recorded in the page's own world: yes".to_owned());
     }
+    lines.push(format!(
+        "fills on other addresses of {} will be refused while this method is imported",
+        plain(&method.site.domain)
+    ));
     lines
 }
 
@@ -810,6 +814,22 @@ fn list_line(row: &kharond::owner::TeachRow) -> String {
     )
 }
 
+/// The element a step expects: its tag, then each attribute that is set.
+fn expect_words(e: &Expected) -> String {
+    let mut parts = vec![plain(&e.tag)];
+    for (name, value) in [
+        ("type", &e.input_type),
+        ("id", &e.id),
+        ("name", &e.name),
+        ("autocomplete", &e.autocomplete),
+    ] {
+        if let Some(v) = value {
+            parts.push(format!("{name}={}", plain(v)));
+        }
+    }
+    format!("expects {}", parts.join(" "))
+}
+
 /// `teach show`: the row, then each step by its flat number. The owner's
 /// override selectors come first and are marked.
 fn show_lines(row: &kharond::owner::TeachRow, method: &LoginMethod) -> Vec<String> {
@@ -831,13 +851,19 @@ fn show_lines(row: &kharond::owner::TeachRow, method: &LoginMethod) -> Vec<Strin
         lines.push(match step {
             MethodStep::Navigate { path } => format!("{index}\tnavigate\t{}", plain(path)),
             MethodStep::Fill {
-                role, selectors, ..
+                role,
+                selectors,
+                expect,
             } => {
                 let role = match role {
                     FillRole::Username => "username",
                     FillRole::Password => "password",
                 };
-                format!("{index}\tfill {role}\t{}", with_overrides(selectors))
+                format!(
+                    "{index}\tfill {role}\t{}\t{}",
+                    with_overrides(selectors),
+                    expect_words(expect)
+                )
             }
             MethodStep::Submit {
                 via: SubmitVia::Form {},
@@ -846,8 +872,12 @@ fn show_lines(row: &kharond::owner::TeachRow, method: &LoginMethod) -> Vec<Strin
                 via: SubmitVia::Enter {},
             } => format!("{index}\tsubmit\tenter"),
             MethodStep::Submit {
-                via: SubmitVia::Click { selectors, .. },
-            } => format!("{index}\tsubmit\tclick {}", with_overrides(selectors)),
+                via: SubmitVia::Click { selectors, expect },
+            } => format!(
+                "{index}\tsubmit\tclick {}\t{}",
+                with_overrides(selectors),
+                expect_words(expect)
+            ),
         });
     }
     lines
@@ -1852,7 +1882,8 @@ mod tests {
             vec![
                 "domain: example.test",
                 "rung: milliseconds",
-                "hand-written: no"
+                "hand-written: no",
+                "fills on other addresses of example.test will be refused while this method is imported"
             ]
         );
         let main = sample_method(ListenerWorld::Main, vec!["#pw".into()]);
@@ -1904,12 +1935,39 @@ mod tests {
             .insert(2, vec!["#new\u{7}".into(), "#second".into()]);
         let lines = show_lines(&r, &method);
         assert!(lines.iter().any(|l| l == "0\tnavigate\t/login"));
-        assert!(lines.iter().any(|l| l == "1\tfill username\t#user"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "1\tfill username\t#user\texpects input type=text")
+        );
         assert!(
             lines.iter().any(|l| l
-                == "2\tfill password\t[override] #new\u{FFFD}, [override] #second, #pw, [name=p]")
+                == "2\tfill password\t[override] #new\u{FFFD}, [override] #second, #pw, [name=p]\texpects input type=password")
         );
         assert!(lines.iter().any(|l| l == "3\tsubmit\tform"));
+    }
+
+    #[test]
+    fn teach_show_lists_every_click_selector_and_the_expected_element() {
+        let mut method = sample_method(ListenerWorld::Isolated, vec!["#pw".into()]);
+        *method.legs[0].steps.last_mut().unwrap() = MethodStep::Submit {
+            via: SubmitVia::Click {
+                selectors: vec!["#go".into(), "button.go\u{7}".into()],
+                expect: Expected {
+                    tag: "button".into(),
+                    input_type: Some("submit".into()),
+                    id: Some("go".into()),
+                    name: Some("n".into()),
+                    autocomplete: Some("off".into()),
+                },
+            },
+        };
+        let lines = show_lines(&row(&method), &method);
+        assert!(
+            lines.iter().any(|l| l
+                == "3\tsubmit\tclick #go, button.go\u{FFFD}\texpects button type=submit id=go name=n autocomplete=off"),
+            "{lines:?}"
+        );
     }
 
     #[test]

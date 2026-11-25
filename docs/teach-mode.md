@@ -167,7 +167,7 @@ The program reads the recording and writes `<registrable domain>.kharon-method.j
 It converts a recording whose shape is `form_post`, `script_post` or `two_step`, or `transformed` when the summary names the digest. It refuses, and prints why, in these cases:
 
 - The shape is `unrecognized`, the strongest protection is `needs_person`, or the shape is `transformed` with no named digest. A person has to write such a method by hand (see "Writing a method by hand").
-- A user name or password field sat in a shadow root. The fill cannot reach into one.
+- A user name or password field sat in a shadow root. A fill cannot reach into one, and a hand-written method cannot either.
 - A part of the login has no submit after its last field.
 - The recording was marked "not confirmed" (you closed the window instead of pressing Enter). Pass `--unconfirmed` to convert it anyway.
 
@@ -175,7 +175,7 @@ What the file keeps: for each step of the login, the role (user name or password
 
 The method's rung is the recording's "Strongest protection" (see "Reading the result"). `milliseconds` means a fill submits the login in the same step as the fill, so the password is in the page for milliseconds. `agent_continues` means the agent has to continue after the fill. A two-step login is always `agent_continues`, and each of its two parts is one fill by the agent.
 
-How kharon tells that the login worked: if the recording ended on another path than the login page, the login worked when the page's path becomes that path (`path_changed_to`). If it ended on the same path, kharon does not check (`none`). `--success` overrides this with `path-changed`, `password-field-gone` (the password field is gone from the page, for a login script that removes its form) or `none`. The check is read once, after the fill, and goes only to the registry entry. The fill's reply is still `filled`.
+How kharon tells that the login worked: if the recording ended on another path than where the last part of the login starts (the login page, or for a two-step login the password page), the login worked when the page's path becomes that path (`path_changed_to`). If it ended on the same path, kharon does not check (`none`). `--success` overrides this with `path-changed`, `password-field-gone` (the password field is gone from the page, for a login script that removes its form) or `none`. The check is read once, after the fill, and goes only to the registry entry. The fill's reply is still `filled`.
 
 ## Importing a method into the broker
 
@@ -194,7 +194,7 @@ Only the broker's owner can add a method. The commands talk to the daemon over i
 
 | Reason | Meaning |
 |---|---|
-| `invalid_method` | The file is not a usable method (an unknown version or field, the wrong number of parts, a password step that is not a password field, a bad path). |
+| `invalid_method` | The file parses but is not a usable method (the wrong number of parts, a password step that is not a password field, a bad path). `kharon teach import` itself refuses a file with an unknown version or field before it connects, with exit code 2. It also refuses a method too large for the owner socket's 32 KiB request limit. |
 | `off_domain` | The method's `site.domain` is not the registrable domain of its `site.origin`. |
 | `main_world` | The recording was made with the listener in the page's own script world, where the page's scripts can see and fake what it reports. Pass `--accept-main-world` if you have read the method and trust it. |
 | `rung_above_ceiling` | The method asks for `milliseconds` but its recording only showed `agent_continues`. |
@@ -214,7 +214,7 @@ On such a page the agent still names the item and which kinds it wants. The meth
 - **Before anything is typed.** In one step in the page, kharon checks the page's address and every field of this part of the login. The page must have the login's origin and the part's path. For each field, kharon uses the first of the method's selectors (yours first) that matches exactly one element. That element must be visible and have the tag, `type`, `id`, `name` and `autocomplete` the method recorded, and a password field must be a password field now. If any check fails, nothing is typed. The elements are checked again just before each write.
 - **What is typed.** Only the fields this part of the login has. A kind the agent asked for that the part has no field for is not sent. A kind the part needs that the agent did not ask for stops the fill before any value is sent.
 - **Submit.** At `milliseconds`, and for each part of a two-step login, the fill always submits, with the method's own submit. When the part has a password step it also always runs the clean-up after the submit (the post-submit scrub, see [`post-fill-exposure.md`](post-fill-exposure.md)). The agent's `submit` and the deploy's scrub setting do not change this, so an agent that sends `submit: false` does not leave the password sitting in the page. A one-part `agent_continues` method, which only a person can write by hand, keeps the agent's `submit`.
-- **The result.** After a submit, kharon looks once, after the scrub's delay, and records on the entry whether the login worked (`succeeded`), plainly did not (`failed`), or cannot be told (`unconfirmed`). The fill's reply is still `filled`.
+- **The result.** After a submit, kharon looks after the scrub's delay (once more after the delay if the page had already moved on without showing the expected path) and records on the entry whether the login worked (`succeeded`), plainly did not (`failed`), or cannot be told (`unconfirmed`). The fill's reply is still `filled`.
 
 A two-step login is two fills. On the user name page the agent asks for `username`, and on the password page it asks for `password`. The broker picks the part whose path matches the page.
 
@@ -228,7 +228,7 @@ A fill the method stopped has status `field_not_found` and one of these details:
 | `method_stale` | The entry is already stale. Nothing was sent to the browser. | Stop and tell the person. |
 | `method_field_not_requested` | The part of the login on this page needs a user name or a password that the request did not ask for. Nothing was typed. | Ask again with every kind the page needs. |
 
-A `method_wrong_page`, `method_stale` or `method_field_not_requested` reply sends no value to the browser, gives the grant use back and writes nothing to the registry. It does not count toward the origin-mismatch limit.
+A `method_stale` or `method_field_not_requested` reply always sends no value to the browser and gives the grant use back. So does `method_wrong_page` when the broker sees the wrong page before the call. If the page changed between the broker's read and the check in the page, the in-page check refuses it: nothing is typed and nothing is recorded, but the values went with the call and the grant use is spent. None of the three writes to the registry or notifies the owner, and none counts toward the origin-mismatch limit.
 
 A stale entry refuses fills on its site until the owner re-imports a method (`kharon teach import --replace`) or runs `kharon teach clear-stale <DOMAIN>`. Setting an override does not clear the mark. Falling back to the ordinary fill would type into whatever a changed page now has in that place, so kharon refuses and tells the owner instead. The notification reads: "The login page of DOMAIN no longer matches its method (step N). Fills there are refused until you re-import it or run: kharon teach clear-stale DOMAIN". It names the domain and a step number and nothing else.
 
@@ -236,7 +236,7 @@ The approval prompt (the ntfy message, `kharon grants` and the web page) shows t
 
 ## Writing a method by hand
 
-Some logins cannot be converted: a bank that encrypts the password in the page with a key the site supplies, a field in a shadow root, or a login you cannot record. A person can write the method file instead. It is one JSON file. The program that reads it refuses a field it does not know, so a typing mistake is caught at once.
+Some logins cannot be converted: a bank that encrypts the password in the page with a key the site supplies, or a login you cannot record. A person can write the method file instead. It is one JSON file. The program that reads it refuses a field it does not know, so a typing mistake is caught at once.
 
 | Field | What it holds |
 |---|---|
@@ -248,13 +248,13 @@ Some logins cannot be converted: a bank that encrypts the password in the page w
 | `success` | `{"kind": "path_changed_to", "path": "/account"}`, `{"kind": "password_field_gone"}` or `{"kind": "none"}`. |
 | `provenance` | `{"source": "hand_written", "author": "your name"}`. |
 
-A part is its steps in order, and must be exactly this: one `navigate`, then at least one `fill`, then one `submit`, which is the last step. The last part must have a password `fill`.
+A part is its steps in order. It must begin with a `navigate`, hold at least one `fill`, and end with exactly one `submit`. The last part must have a password `fill`.
 
 - `{"kind": "navigate", "path": "/signin"}`: the path the part starts on. For the first part it must equal `site.path`. The agent navigates; kharon only compares.
-- `{"kind": "fill", "role": "username" | "password", "selectors": [...], "expect": {...}}`: `selectors` is a list of CSS selectors, most stable first, at least one, each at most 1,024 bytes. `expect` is `tag`, `input_type`, `id`, `name` and `autocomplete`. Each may be `null` or left out, and each that is set must match the live element. A password step must have `"input_type": "password"`.
+- `{"kind": "fill", "role": "username" | "password", "selectors": [...], "expect": {...}}`: `selectors` is a list of CSS selectors, most stable first, at least one, each at most 1,024 bytes. `expect` is `tag`, `input_type`, `id`, `name` and `autocomplete`. `tag` is required and lowercase (`input`, `button`). `input_type`, `id`, `name` and `autocomplete` may each be `null` or left out, and each that is set must match the live element. A password step must have `"input_type": "password"`.
 - `{"kind": "submit", "via": {"kind": "form"}}` calls `requestSubmit()` on the form of the last field. `{"kind": "submit", "via": {"kind": "enter"}}` presses Enter on the last field. `{"kind": "submit", "via": {"kind": "click", "selectors": [...], "expect": {...}}}` clicks one element, found and checked like a field.
 
-A selector cannot reach into a shadow root, so a method that needs one ends in `method_drift` on its first fill.
+A selector cannot reach into a shadow root, so a method that needs one ends in `method_drift` on its first fill. Do not write one for such a login.
 
 A complete example: one page, a click submit, and a password the page changes in a way kharon cannot name.
 
@@ -325,7 +325,8 @@ Check a file with `kharon-teach show <FILE>` before you import it. `show` refuse
 - Putting the password into the page without it ever sitting there, by swapping it into the request as it leaves the browser (rung 1 of #361, tracked in #384). Today the strongest rung is `milliseconds`: the password is in the page for the milliseconds between the fill and the submit.
 - Logins with a one-time code. A recording notes the `otp_step` flag. A method has no step for it.
 - Sharing methods between brokers. A method lives in one broker's registry. Copy the file and import it on the other one.
-- Converting a login that needs a person (`unrecognized`, a `transformed` login with no named digest, a field in a shadow root). These are written by hand.
+- Converting a login that needs a person (`unrecognized`, or a `transformed` login with no named digest). These are written by hand.
+- A login with a field in a shadow root. Neither a converted nor a hand-written method can reach one; the first fill ends in `method_drift`.
 
 ## What it cannot do
 
@@ -348,4 +349,4 @@ Check a file with `kharon-teach show <FILE>` before you import it. `show` refuse
 - Once 32 MiB of request bodies are held, later bodies are recorded as unavailable.
 - A `transformed` login with no named digest is mostly a site that encrypts the password in the page with a key the site supplies, as banks often do. It is an expected result and is marked `needs_person`.
 - A recording made with the listener in the page's own script world, not the isolated one, is marked as such and is less trustworthy.
-- A method cannot follow a login that sends the person through another site, a pop-up or a frame from another address. The recorder flags those and `kharon-teach method` refuses to convert them.
+- A method cannot reach a field in a shadow root, and it cannot follow a login that sends the person through another site, a pop-up or a frame from another address. The recorder flags those and `kharon-teach method` refuses to convert them.

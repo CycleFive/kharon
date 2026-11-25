@@ -1,5 +1,5 @@
 name: Milestone Groom
-description: Start-of-milestone chore. Set the milestone's goal, exit criteria, and due date, and groom its issues.
+description: Start-of-milestone chore. Set the milestone's goal, exit criteria, and due date, sweep `next`, and groom its issues.
 title: "[groom] <milestone>: Groom"
 labels: []
 body:
@@ -34,6 +34,8 @@ body:
       label: Checklist
       options:
         - label: Fill in the milestone (the prior Close-out created it with a title only). Put its goal and exit criteria in the description and set a due date.
+        - label: "Sweep `next` (see `docs/milestone-chores.md`): read every open issue in `next`, with no milestone, or labeled `parked`. Close done or stale issues with a link to the proof, close duplicates into the survivor, and fold nits into the open rolling list. Post the result below as one action list; judgment-call closes wait for Lothrop's ✅."
+        - label: Confirm every `parked` label still matches Lothrop's last word on that issue. Don't start, unpark, or re-milestone a parked issue in the sweep.
         - label: Pull issues from `next` (and from the prior milestone's leftovers) into this milestone, or write new ones, covering this scope and only this scope.
         - label: Size each issue, apply type and priority labels, and put the issues in delivery order.
         - label: "For each gate in the exit criteria, list its consequences: the state changes that finishing it triggers elsewhere, written as conditional tasks (for example \"on canary pass: flip #346/#347 to supported\")."
@@ -51,6 +53,13 @@ body:
     attributes:
       label: Consequences
       description: For each gate, the downstream state changes its completion triggers, one conditional task per line, for example "on canary pass, flip #346/#347 to supported". Write "none" if no gate triggers anything. Close-out isn't done until each one is done or handed to a named owner.
+    validations:
+      required: true
+  - type: textarea
+    id: sweep
+    attributes:
+      label: Sweep of `next`
+      description: One line per issue the sweep touched, with the issue number, the action (close as done, close as duplicate of #N, fold into #N, relabel, keep), and a one-line reason. List any `parked` label that doesn't match Lothrop's last word. Write "nothing to change" if the sweep found nothing.
     validations:
       required: true
   - type: textarea

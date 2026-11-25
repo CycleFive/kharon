@@ -169,6 +169,22 @@ pub struct TargetInfo {
     pub type_: String,
 }
 
+/// The empty params object for a CDP method that takes none.
+#[derive(serde::Serialize)]
+pub(super) struct NoParams {}
+
+/// The most of the browser's product string kept: it comes from the agent's
+/// browser and is written to the registry file on every recorded fill.
+const PRODUCT_MAX: usize = 256;
+
+/// Printable ASCII only, at most [`PRODUCT_MAX`] bytes.
+fn clean_product(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .take(PRODUCT_MAX)
+        .collect()
+}
+
 /// Browser-level context/target management on top of a [`CdpClient`].
 ///
 /// Clones share one connection's default-context resolution. A
@@ -213,12 +229,15 @@ impl Browser {
         }
         let reply = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            self.client.request("Browser.getVersion", json!({})),
+            self.client.request(
+                "Browser.getVersion",
+                serde_json::to_value(NoParams {}).unwrap_or_default(),
+            ),
         )
         .await
         .ok()?
         .ok()?;
-        let product = reply.get("product")?.as_str()?.to_owned();
+        let product = clean_product(reply.get("product")?.as_str()?);
         *self.product.lock().expect("product lock") = Some(product.clone());
         Some(product)
     }
@@ -583,6 +602,15 @@ fn default_context_gate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn req_tch_011_product_string_is_capped_and_printable() {
+        let raw = format!("Chrome/142\n\u{1b}[31m{}\u{e9}", "x".repeat(1000));
+        let got = super::clean_product(&raw);
+        assert_eq!(got.len(), 256);
+        assert!(got.starts_with("Chrome/142[31mxxx"));
+        assert!(got.bytes().all(|b| (0x20..0x7f).contains(&b)));
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;

@@ -873,8 +873,8 @@ async fn a_check_nothing_can_use_skips_the_wait_and_the_probe() {
             .contains("function methodProbe")
     }));
 
-    // A path check on a submit-less (AgentContinues, no submit) fill reads nothing,
-    // and with no scrub there is no re-read for a `None` check either.
+    // Submit on, check `none`, scrub off (AgentContinues, so nothing forces one): there is
+    // no success reading to take and no scrub to run, so no re-read happens either.
     let rig2 = rig(Stub::at(PAGE)).await;
     let m = one_leg(Rung::AgentContinues, SuccessCheck::None {});
     let p = plan(

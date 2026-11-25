@@ -45,7 +45,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::origin::{MismatchReason, OriginConfig, OriginMatcher};
 
-use super::browser::{AgentContext, Browser, OwnershipError};
+use super::browser::{AgentContext, Browser, NoParams, OwnershipError};
 use super::client::CdpError;
 use super::method::{
     MethodEnd, MethodNote, MethodResult, MethodSource, MethodUse, Prepared, judge, prepare,
@@ -985,13 +985,14 @@ impl FillEngine {
                 let probe = session
                     .request_with_timeout(
                         "Runtime.callFunctionOn",
-                        json!({
-                            "functionDeclaration": METHOD_PROBE_IN_PAGE,
-                            "executionContextId": context_id,
-                            "arguments": [],
-                            "returnByValue": true,
-                            "awaitPromise": false,
-                        }),
+                        serde_json::to_value(ProbeCall {
+                            function_declaration: METHOD_PROBE_IN_PAGE,
+                            execution_context_id: context_id,
+                            arguments: [],
+                            return_by_value: true,
+                            await_promise: false,
+                        })
+                        .unwrap_or_default(),
                         scrub_call_timeout(deadline, Instant::now()),
                     )
                     .await;
@@ -1150,6 +1151,17 @@ struct MethodRun<'a> {
     result: Option<MethodResult>,
 }
 
+/// `Runtime.callFunctionOn` params for the value-free method probe.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeCall {
+    function_declaration: &'static str,
+    execution_context_id: u64,
+    arguments: [(); 0],
+    return_by_value: bool,
+    await_promise: bool,
+}
+
 /// The one delayed `Page.getFrameTree` read.
 enum Reread {
     /// The deadline cannot cover the delay (or no longer has room).
@@ -1179,7 +1191,11 @@ async fn reread_frame_tree(
     // deadline must not wait forever (#355 review).
     let timeout = scrub_call_timeout(deadline, Instant::now());
     match session
-        .request_with_timeout("Page.getFrameTree", json!({}), timeout)
+        .request_with_timeout(
+            "Page.getFrameTree",
+            serde_json::to_value(NoParams {}).unwrap_or_default(),
+            timeout,
+        )
         .await
     {
         Ok(t) => Reread::Tree(t),

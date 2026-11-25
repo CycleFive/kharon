@@ -17,10 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: shellcheck
         run: shellcheck --severity=warning deploy/agent-host/provision.sh deploy/agent-host/tests/req_dep_005_vm.sh
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "22" }
       - name: Install QEMU, cloud-image-utils and wireguard-tools
         run: |
@@ -40,7 +40,7 @@ jobs:
         run: deploy/agent-host/tests/req_dep_005_vm.sh
       - name: Keep the VM's console and provisioning log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: req_dep_005_vm
           path: |

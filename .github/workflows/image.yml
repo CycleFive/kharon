@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build the image
         run: docker build -t "$KHARON_IMAGE" .
@@ -67,9 +67,9 @@ jobs:
         --profile vaultwarden
       FIXTURE: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install "cryptography==43.0.3"
       - name: Build the kharond and agent-host images
@@ -113,9 +113,9 @@ jobs:
         --profile vaultwarden
       FIXTURE: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install "cryptography==43.0.3"
       - name: Build the kharond, agent-host and connector images
@@ -155,9 +155,9 @@ jobs:
         --profile vaultwarden
       FIXTURE: crates/kharon-bwcrypto/tests/fixtures/vaultwarden
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pip install "cryptography==43.0.3"
       - name: Build the kharond and agent-host images

@@ -120,6 +120,6 @@ tokio = { version = "1", features = ["test-util"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The record-then-fill test (REQ-TCH-008) includes kharon-teach's fixture server and recorder
 # harness (`#[path]`), which need the program itself and its CLI and RNG crates.
-kharon-teach = { path = "../kharon-teach" }
+kharon-teach = { version = "0.0.0", path = "../kharon-teach" }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"

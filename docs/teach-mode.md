@@ -171,6 +171,8 @@ It converts a recording whose shape is `form_post`, `script_post` or `two_step`,
 - A part of the login has no submit after its last field.
 - The recording was marked "not confirmed" (you closed the window instead of pressing Enter). Pass `--unconfirmed` to convert it anyway.
 
+If you typed a field more than once on the same page, for example a wrong password and then the right one after the page drew its form again, the method keeps only the last field of each role. That is the one the login that worked used.
+
 What the file keeps: for each step of the login, the role (user name or password), a list of ways to find the element again, and what the element must look like (its tag, `type`, `id`, `name` and `autocomplete`), plus how the step was submitted (the form, Enter, or a click on one element). It also keeps the site's registrable domain and the login page's origin and path, the shape, the rung (below), how kharon will tell that the login worked, and where the method came from: the SHA-256 of the recording file, the recorder's version, the browser's product string, whether the recorder's listener ran in the isolated or the page's own script world, and the recording's strongest protection. It holds no typed value, no value length, no query key, no request, no placeholder or label text and no page text.
 
 The method's rung is the recording's "Strongest protection" (see "Reading the result"). `milliseconds` means a fill submits the login in the same step as the fill, so the password is in the page for milliseconds. `agent_continues` means the agent has to continue after the fill. A two-step login is always `agent_continues`, and each of its two parts is one fill by the agent.
@@ -194,7 +196,7 @@ Only the broker's owner can add a method. The commands talk to the daemon over i
 
 | Reason | Meaning |
 |---|---|
-| `invalid_method` | The file parses but is not a usable method (the wrong number of parts, a password step that is not a password field, a bad path or tag, two parts with the same path, an origin that is not written as the browser writes it). `kharon teach import` itself refuses a file with an unknown version or field before it connects, with exit code 2. It also refuses a method too large for the owner socket's 32 KiB request limit. |
+| `invalid_method` | The file parses but is not a usable method (the wrong number of parts, two fill steps of the same role in one part, a password step that is not a password field, a bad path or tag, two parts with the same path, an origin that is not written as the browser writes it). `kharon teach import` itself refuses a file with an unknown version or field before it connects, with exit code 2. It also refuses a method too large for the owner socket's 32 KiB request limit. |
 | `off_domain` | The method's `site.domain` is not the registrable domain of its `site.origin`. |
 | `main_world` | The recording was made with the listener in the page's own script world, where the page's scripts can see and fake what it reports. Pass `--accept-main-world` if you have read the method and trust it. |
 | `rung_above_ceiling` | The method asks for `milliseconds` but its recording only showed `agent_continues`. |
@@ -252,7 +254,7 @@ Some logins cannot be converted: a bank that encrypts the password in the page w
 | `success` | `{"kind": "path_changed_to", "path": "/account"}`, `{"kind": "password_field_gone"}` or `{"kind": "none"}`. |
 | `provenance` | `{"source": "hand_written", "author": "your name"}`. |
 
-A part is its steps in order. It must begin with a `navigate`, hold at least one `fill`, and end with exactly one `submit`. The last part must have a password `fill`. The two parts of a two-step login must have different `navigate` paths, because the broker picks the part by the page's path. A path holds only what the browser reports for `location.pathname`: ASCII, no space, no control character, and `%`-escapes for anything else (`/log%20in`, not `/log in`).
+A part is its steps in order. It must begin with a `navigate`, hold at least one `fill`, at most one for each role, and end with exactly one `submit`. The last part must have a password `fill`. The two parts of a two-step login must have different `navigate` paths, because the broker picks the part by the page's path. A path holds only what the browser reports for `location.pathname`: ASCII, no space, no control character, and `%`-escapes for anything else (`/log%20in`, not `/log in`).
 
 - `{"kind": "navigate", "path": "/signin"}`: the path the part starts on. For the first part it must equal `site.path`. The agent navigates; kharon only compares.
 - `{"kind": "fill", "role": "username" | "password", "selectors": [...], "expect": {...}}`: `selectors` is a list of CSS selectors, most stable first, at least one, each at most 1,024 bytes. `expect` is `tag`, `input_type`, `id`, `name` and `autocomplete`. `tag` is required and is lowercase letters, digits and hyphens (`input`, `button`); the browser reports tags in lowercase, so `INPUT` would never match. `input_type`, `id`, `name` and `autocomplete` may each be `null` or left out, and each that is set must match the live element. A password step must have `"input_type": "password"`.

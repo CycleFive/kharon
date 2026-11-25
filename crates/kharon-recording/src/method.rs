@@ -233,6 +233,21 @@ impl LoginMethod {
         if !last_has_password {
             return Err(Invalid("no_password"));
         }
+        // One value per role goes to the page, and one element takes it. A second fill
+        // step of the same role would resolve to the same element and drift, or write
+        // the value into a second element.
+        for leg in &self.legs {
+            for role in [FillRole::Username, FillRole::Password] {
+                let fills = leg
+                    .steps
+                    .iter()
+                    .filter(|s| matches!(s, MethodStep::Fill { role: r, .. } if *r == role))
+                    .count();
+                if fills > 1 {
+                    return Err(Invalid("duplicate_role"));
+                }
+            }
+        }
         for (_, _, step) in self.steps() {
             match step {
                 MethodStep::Fill {
@@ -510,15 +525,25 @@ impl LoginMethod {
                 return Err(ShapeMismatch);
             }
             let mut method_steps = vec![MethodStep::Navigate { path: path.into() }];
-            for &i in g {
-                let Step::Input { element, role, .. } = steps[i] else {
+            let role_at = |i: usize| match steps[i] {
+                Step::Input {
+                    role: Role::Username,
+                    ..
+                } => FillRole::Username,
+                _ => FillRole::Password,
+            };
+            for (n, &i) in g.iter().enumerate() {
+                let Step::Input { element, .. } = steps[i] else {
                     unreachable!("credential indexes point at inputs");
                 };
+                let role = role_at(i);
+                // A person who typed a field again (a mistyped password, a form the page
+                // drew again on the same path) left one input step per element. Only the
+                // last of a role is the attempt that the successful submit followed.
+                if g[n + 1..].iter().any(|&later| role_at(later) == role) {
+                    continue;
+                }
                 let (selectors, expect) = reachable(element)?;
-                let role = match role {
-                    Role::Username => FillRole::Username,
-                    _ => FillRole::Password,
-                };
                 method_steps.push(MethodStep::Fill {
                     role,
                     selectors,
@@ -890,6 +915,20 @@ mod tests {
         assert_eq!(
             mutate(&|m| m.legs[0].steps[2] = fill(FillRole::Username, "#pw", "text")),
             "no_password"
+        );
+        assert_eq!(
+            mutate(&|m| m.legs[0]
+                .steps
+                .insert(3, fill(FillRole::Password, "#pw", "password"))),
+            "duplicate_role",
+            "two password fills in one leg"
+        );
+        assert_eq!(
+            mutate(&|m| m.legs[0]
+                .steps
+                .insert(1, fill(FillRole::Username, "#login", "text"))),
+            "duplicate_role",
+            "two user name fills in one leg, on different elements"
         );
         assert_eq!(
             mutate(&|m| m.legs[0].steps[1] = MethodStep::Fill {
@@ -1419,6 +1458,100 @@ mod tests {
                     one_leg(form_step())
                 )
             );
+        }
+
+        #[test]
+        fn a_retyped_field_keeps_only_its_last_input() {
+            // A wrong password, the form drawn again on the same path with a new
+            // password element, then the attempt that worked.
+            let retry = || input(Role::Password, el("pw2", "input", "password", None));
+            let pass2_fill = || MethodStep::Fill {
+                role: FillRole::Password,
+                selectors: vec!["#pw2".into()],
+                expect: exp("pw2", "input", "password", None),
+            };
+            let r = rec(
+                Shape::FormPost,
+                RungCeiling::Milliseconds,
+                vec![
+                    nav("/login"),
+                    user(),
+                    pass(),
+                    form_submit(),
+                    nav("/login"),
+                    retry(),
+                    form_submit(),
+                    nav("/home"),
+                ],
+            );
+            let got = convert(&r).unwrap();
+            let leg = vec![Leg {
+                steps: vec![
+                    MethodStep::Navigate {
+                        path: "/login".into(),
+                    },
+                    user_fill(),
+                    pass2_fill(),
+                    form_step(),
+                ],
+            }];
+            assert_eq!(
+                got,
+                want(
+                    Shape::FormPost,
+                    Rung::Milliseconds,
+                    RungCeiling::Milliseconds,
+                    leg
+                )
+            );
+            got.validate().unwrap();
+
+            // Both fields typed again: the last of each role, in the order typed.
+            let user2 = input(Role::Username, el("user2", "input", "text", None));
+            let r = rec(
+                Shape::FormPost,
+                RungCeiling::Milliseconds,
+                vec![
+                    nav("/login"),
+                    user(),
+                    pass(),
+                    form_submit(),
+                    nav("/login"),
+                    user2,
+                    retry(),
+                    form_submit(),
+                    nav("/home"),
+                ],
+            );
+            let got = convert(&r).unwrap();
+            assert_eq!(
+                got.legs[0].steps[1..3],
+                [
+                    MethodStep::Fill {
+                        role: FillRole::Username,
+                        selectors: vec!["#user2".into()],
+                        expect: exp("user2", "input", "text", None),
+                    },
+                    pass2_fill(),
+                ]
+            );
+            got.validate().unwrap();
+
+            // The password leg of a two-step login.
+            let mut r = two_step();
+            r.steps.insert(5, retry());
+            let got = convert(&r).unwrap();
+            assert_eq!(
+                got.legs[1].steps,
+                vec![
+                    MethodStep::Navigate {
+                        path: "/password".into(),
+                    },
+                    pass2_fill(),
+                    form_step(),
+                ]
+            );
+            got.validate().unwrap();
         }
 
         #[test]

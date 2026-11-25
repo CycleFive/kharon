@@ -133,10 +133,23 @@ struct VersionProbe {
     format_version: u32,
 }
 
+/// A path as `location.pathname` reports it: ASCII, `%`-escapes, and the
+/// unreserved and sub-delimiter characters. No space, control character,
+/// non-ASCII character or other character the URL parser escapes.
 fn bad_path(path: &str) -> bool {
     !path.starts_with('/')
         || path.starts_with("//")
-        || path.chars().any(|c| c == '?' || c == '#' || c.is_control())
+        || !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/%".contains(c))
+}
+
+/// The in-page compare is against `tagName.toLowerCase()`.
+fn bad_tag(tag: &str) -> bool {
+    tag.is_empty()
+        || !tag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn bad_selectors(selectors: &[String]) -> bool {
@@ -230,6 +243,9 @@ impl LoginMethod {
                     if bad_selectors(selectors) {
                         return Err(Invalid("selector"));
                     }
+                    if bad_tag(&expect.tag) {
+                        return Err(Invalid("tag"));
+                    }
                     if *role == FillRole::Password
                         && expect.input_type.as_deref() != Some("password")
                     {
@@ -237,8 +253,15 @@ impl LoginMethod {
                     }
                 }
                 MethodStep::Submit {
-                    via: SubmitVia::Click { selectors, .. },
-                } if bad_selectors(selectors) => return Err(Invalid("selector")),
+                    via: SubmitVia::Click { selectors, expect },
+                } => {
+                    if bad_selectors(selectors) {
+                        return Err(Invalid("selector"));
+                    }
+                    if bad_tag(&expect.tag) {
+                        return Err(Invalid("tag"));
+                    }
+                }
                 _ => {}
             }
         }
@@ -256,6 +279,19 @@ impl LoginMethod {
             .any(bad_path)
         {
             return Err(Invalid("path"));
+        }
+        // The player picks a leg by the page's path; two legs on one path
+        // could never be told apart.
+        let leg_paths: Vec<&str> = self
+            .legs
+            .iter()
+            .filter_map(|l| match l.steps.first() {
+                Some(MethodStep::Navigate { path }) => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        if leg_paths.len() == 2 && leg_paths[0] == leg_paths[1] {
+            return Err(Invalid("legs"));
         }
         if bad_origin(&self.site.origin) {
             return Err(Invalid("origin"));
@@ -307,7 +343,7 @@ pub enum NotConvertible {
     #[error("kharon cannot tell how this login works; a person has to write the method by hand")]
     NeedsPerson,
     #[error(
-        "a credential field sits in a shadow root, which a fill cannot reach; write the method by hand"
+        "a credential field sits in a shadow root, which a fill cannot reach; kharon cannot use a login method on this page"
     )]
     InShadowRoot,
     #[error("no submit was recorded after the last field of a step")]
@@ -320,7 +356,7 @@ pub enum NotConvertible {
 
 fn expected_of(el: &ElementDescriptor) -> Expected {
     Expected {
-        tag: el.tag.clone(),
+        tag: el.tag.to_ascii_lowercase(),
         input_type: el.input_type.clone(),
         id: el.id.clone(),
         name: el.name.clone(),
@@ -917,6 +953,60 @@ mod tests {
         assert_eq!(reason(&two), "path");
         assert_eq!(mutate(&|m| m.site.domain.clear()), "domain");
         assert_eq!(mutate(&|m| m.site.path = "/other".into()), "site_path");
+    }
+
+    #[test]
+    fn req_tch_007_refuses_a_bad_tag_a_bad_path_and_equal_leg_paths() {
+        for bad in ["", "INPUT", "in put", "input!", "inp\u{fc}t"] {
+            let mut m = sample();
+            m.legs[0].steps[1] = MethodStep::Fill {
+                role: FillRole::Username,
+                selectors: vec!["#user".into()],
+                expect: Expected {
+                    tag: bad.into(),
+                    ..expected("text")
+                },
+            };
+            assert_eq!(reason(&m), "tag", "fill {bad:?}");
+            let mut m = sample();
+            *m.legs[0].steps.last_mut().unwrap() = MethodStep::Submit {
+                via: SubmitVia::Click {
+                    selectors: vec!["button".into()],
+                    expect: Expected {
+                        tag: bad.into(),
+                        ..expected("submit")
+                    },
+                },
+            };
+            assert_eq!(reason(&m), "tag", "click {bad:?}");
+        }
+        for ok in ["input", "button", "my-element", "h1"] {
+            let mut m = sample();
+            m.legs[0].steps[1] = MethodStep::Fill {
+                role: FillRole::Username,
+                selectors: vec!["#user".into()],
+                expect: Expected {
+                    tag: ok.into(),
+                    ..expected("text")
+                },
+            };
+            assert!(m.validate().is_ok(), "{ok}");
+        }
+        for bad in ["/log in", "/l\u{f6}gin", "/a\\b", "/a\"b", "/a<b", "/a{b}"] {
+            let mut m = sample();
+            m.site.path = bad.into();
+            m.legs[0].steps[0] = nav(bad);
+            assert_eq!(reason(&m), "path", "{bad:?}");
+        }
+        for ok in ["/log%20in", "/a-b_c.d~e/f", "/u/(x);y=1,2:3@4+5*6!7$8&9'"] {
+            let mut m = sample();
+            m.site.path = ok.into();
+            m.legs[0].steps[0] = nav(ok);
+            assert!(m.validate().is_ok(), "{ok}");
+        }
+        let mut two = two_leg();
+        two.legs[1].steps[0] = nav("/login");
+        assert_eq!(reason(&two), "legs");
     }
 
     #[test]

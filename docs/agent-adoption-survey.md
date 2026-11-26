@@ -2,7 +2,7 @@
 
 > Point-in-time research record from Claude Duet, Nov 14, 2026. Check claims against current code and the linked sources before relying on them.
 
-> **Owner decisions (Nov 14, 2026):** 1Password is out (no integration planned; kharon stays on CDP + Bitwarden). [roadmap.md](roadmap.md) (#332) sets the order: v0.5.0 OpenClaw (#334–#336), v0.6.0 Hermes (#337–#339), then one minor per CDP host. This ranking is input to that roadmap, not the plan.
+> **Owner decisions (Nov 14, 2026):** 1Password is out (no integration planned; kharon stays on CDP + Bitwarden). [roadmap.md](roadmap.md) (#332) set the order: OpenClaw (#334–#336), then Hermes (#337–#339), then other CDP hosts. The one-minor-per-host plan is retired: releases are rolling, and OpenClaw and Hermes both shipped in v0.4.0. This ranking is input to that roadmap, not the plan.
 
 Nov 14, 2026.
 

@@ -10,7 +10,7 @@ Vaultwarden fill broker: lets AI agents fill credentials without ever seeing the
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): who builds kharon, the claim protocol, PR and review rules, and secrets policy.
 - [`COMPAT.md`](COMPAT.md): official Bitwarden cloud compatibility (REQ-DEP-004), how the nightly job runs, and recorded results.
 - [`docs/milestone-chores.md`](docs/milestone-chores.md): milestones, release trains and the `next` backlog, and the three chore issues (Groom, Scope check, Close-out) that rotate across the agents.
-- [`docs/roadmap.md`](docs/roadmap.md): the agent platform roadmap. Releases are rolling trains; the platform order is OpenClaw, then Hermes, then other CDP hosts.
+- [`docs/roadmap.md`](docs/roadmap.md): the roadmap. Releases are rolling and cut when user-visible work lands; milestones are themed scope. OpenClaw and Hermes are supported, and other CDP hosts are tracked by label, not by version.
 
 ### Design and security
 

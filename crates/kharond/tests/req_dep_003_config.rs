@@ -310,6 +310,21 @@ fn bad_configs() -> Vec<Row> {
         );
         set_bw(p, "", &k)
     }));
+    // #403: malformed and unknown `client_id` prefixes stay refused.
+    rows.push(row("api key user prefix with no id", "api_key_file", |p| {
+        let k = fixture_file(
+            "user_no_id_key.json",
+            br#"{"client_id":"user.","client_secret":"xyz"}"#,
+        );
+        set_bw(p, "", &k)
+    }));
+    rows.push(row("api key unknown prefix", "api_key_file", |p| {
+        let k = fixture_file(
+            "installation_key.json",
+            br#"{"client_id":"installation.6b1e0c52-0a3e-4a8e-9a4f-1f0e2d3c4b5a","client_secret":"xyz"}"#,
+        );
+        set_bw(p, "", &k)
+    }));
     rows.push(row("api key file world-writable", "api_key_file", |p| {
         use std::os::unix::fs::PermissionsExt;
         let k = fixture_file(
@@ -517,4 +532,56 @@ fn req_dep_003_ca_file_is_not_a_secret_key() {
     };
     assert!(bw.ca_file.is_none());
     assert!(bw.tls_trust().unwrap().extra_ca_pem.is_none());
+}
+
+/// #403: an organization key file, written like the fixtures above
+/// (placeholder id, canary secret).
+fn org_key_config(extra: &str) -> String {
+    let mut p = Parts::good();
+    let k = fixture_file(
+        "org_key_403.json",
+        br#"{"client_id":"organization.00000000-0000-0000-0000-000000000000","client_secret":"xyzCANARYsecret"}"#,
+    );
+    set_bw(&mut p, extra, &k);
+    p.render()
+}
+
+/// #403: startup refuses an organization key with a message that names
+/// the fix, through the library and through `kharond --check`, and the
+/// message carries neither the secret nor the client id.
+#[test]
+fn req_cry_005_startup_refuses_org_key_with_fix() {
+    let text = org_key_config("");
+    let err = check(&text, &StaticMlockProbe(Ok(()))).unwrap_err();
+    assert_eq!(err.code(), "api_key_file");
+    let msg = err.to_string();
+    assert_eq!(
+        msg,
+        format!(
+            "bitwarden.api_key_file: {}",
+            kharond::sync::KeyTypeError::Organization.message()
+        )
+    );
+    assert!(msg.contains("personal API key"), "{msg}");
+    assert!(!msg.contains("xyz") && !msg.contains("00000000"), "{msg}");
+
+    let (code, stderr) = run_daemon(&text);
+    assert_eq!(code, Some(78), "{stderr}");
+    assert!(
+        stderr.contains("config error [api_key_file]")
+            && stderr.contains("organization API key")
+            && stderr.contains("Settings > Security > Keys"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("xyz"), "{stderr}");
+}
+
+/// #403: the key type is checked before the CA file, so an operator who
+/// got both wrong hears about the key first.
+#[test]
+fn req_cry_005_key_type_checked_before_ca_file() {
+    let ca = fixture_dir().join("no-ca-403.pem");
+    let text = org_key_config(&format!("ca_file = \"{}\"\n", ca.display()));
+    let err = check(&text, &StaticMlockProbe(Ok(()))).unwrap_err();
+    assert_eq!(err.code(), "api_key_file", "{err:?}");
 }

@@ -336,12 +336,18 @@ other key (`ApiKey::from_json`):
 
 Both values are placeholders. `client_id` must start with `user.`
 and continue past that prefix. `client_secret` must be non-empty.
+The key type is read from the `client_id` prefix, with no network
+call, before the CA file and before any login (#403). The same check
+(`kharond::sync::check_client_id`) is the one `kharon setup` calls
+on entry (#404).
 The refusals, all `api_key_file`, exit 78:
 
 ```text
 kharond: config error [api_key_file]: bitwarden.api_key_file: API key file must be {"client_id", "client_secret"}
-kharond: config error [api_key_file]: bitwarden.api_key_file: client_id must be user.<uuid>
-kharond: config error [api_key_file]: bitwarden.api_key_file: organization API keys cannot sync a vault
+kharond: config error [api_key_file]: bitwarden.api_key_file: this is an organization API key (client_id organization.<id>); it reaches the Public API only and cannot sync a vault. Fix: sign in to the web vault as the dedicated kharon account and use its personal API key (Settings > Security > Keys > View API key; client_id user.<uuid>), not the organization's API key
+kharond: config error [api_key_file]: bitwarden.api_key_file: client_id is "user." with no id after it; copy the whole client_id. Fix: sign in to the web vault as the dedicated kharon account and use its personal API key (Settings > Security > Keys > View API key; client_id user.<uuid>), not the organization's API key
+kharond: config error [api_key_file]: bitwarden.api_key_file: client_id is not a personal API key (expected user.<uuid>). Fix: sign in to the web vault as the dedicated kharon account and use its personal API key (Settings > Security > Keys > View API key; client_id user.<uuid>), not the organization's API key
+kharond: config error [api_key_file]: bitwarden.api_key_file: client_id is empty. Fix: sign in to the web vault as the dedicated kharon account and use its personal API key (Settings > Security > Keys > View API key; client_id user.<uuid>), not the organization's API key
 kharond: config error [api_key_file]: bitwarden.api_key_file: client_secret is empty
 kharond: config error [api_key_file]: bitwarden.api_key_file: unreadable
 kharond: config error [api_key_file]: bitwarden.api_key_file: not a regular file

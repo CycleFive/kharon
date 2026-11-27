@@ -207,6 +207,10 @@ struct DaemonOwner {
     /// Owner web UI, when `[owner_ui]` is configured (REQ-APR-005).
     /// `passkey_enroll` mints into this; absent → `unknown_op`.
     owner_ui: Option<Arc<crate::owner_ui::OwnerUi>>,
+    /// Configured agent ids, for the `status` reply's attachment
+    /// report (#406): an agent is attached when the broker holds a
+    /// live connector session for it.
+    agent_ids: Vec<String>,
 }
 
 impl DaemonOwner {
@@ -389,6 +393,16 @@ impl OwnerOps for DaemonOwner {
             .as_ref()
             .filter(|ui| ui.is_public())
             .map(|ui| ui.requests_without_edge_address())
+    }
+
+    fn attached_agents(&self) -> Vec<crate::owner::AgentAttachment> {
+        self.agent_ids
+            .iter()
+            .map(|id| crate::owner::AgentAttachment {
+                id: id.clone(),
+                since: self.broker.connector_session_since(id),
+            })
+            .collect()
     }
 
     async fn is_locked(&self) -> bool {
@@ -1225,6 +1239,7 @@ pub async fn start(
         source,
         sync_task: std::sync::Mutex::new(None),
         owner_ui: owner_ui.as_ref().map(|(_, ui)| Arc::clone(ui)),
+        agent_ids: cfg.agents.keys().cloned().collect(),
     });
     if let Some((_, ui)) = &owner_ui {
         // Web unlock (#131 slice 5b): the UI reaches the owner
@@ -2397,6 +2412,7 @@ mod tests {
                 source: UnlockSource::Export(Arc::new(file)),
                 sync_task: std::sync::Mutex::new(None),
                 owner_ui: None,
+                agent_ids: Vec::new(),
             },
             events,
             broker,
@@ -2523,6 +2539,7 @@ mod tests {
             )),
             sync_task: std::sync::Mutex::new(None),
             owner_ui: Some(ui),
+            agent_ids: Vec::new(),
         };
         let err = owner.passkey_enroll().await.unwrap_err();
         assert_eq!(err, OwnerFailure::AuditFailed);

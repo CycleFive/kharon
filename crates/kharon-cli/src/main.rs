@@ -24,7 +24,10 @@
 //! not append `token_create` (SPEC §7). `kharon setup` is the guided
 //! first-run flow (#404, module [`setup`]): it checks the API key type,
 //! discovers the organization and collections, writes `kharon.toml` and
-//! the key file, and mints the first agent token.
+//! the key file, and mints the first agent token. `kharon doctor` is
+//! the verification pass for that installation (#406, module
+//! [`doctor`]): six checks over the config, the key file, one sync,
+//! and the live daemon, each failure naming its fix.
 //!
 //! Password hygiene in this short-lived CLI (#86, closing the
 //! PR #81 carry-overs): the password is read with `rustix::io::read`
@@ -49,6 +52,7 @@ use kharon_recording::{
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+mod doctor;
 mod setup;
 
 /// The owner socket of a daemon with the SPEC §9 default
@@ -167,6 +171,12 @@ enum Command {
     /// key type, discovers the organization and collections, writes
     /// kharon.toml and the key file, and mints the first agent token.
     Setup(Box<setup::Answers>),
+    /// Verify a first-run installation (#406): config and key-file
+    /// permissions, API key type, sync visibility of the scoped
+    /// collections, audit sink, passkey enrollment, agent attachment.
+    /// Every failure names its fix; the exit status is non-zero when
+    /// any check fails.
+    Doctor(doctor::DoctorArgs),
 }
 
 /// `kharon passkey` — list or remove an enrolled owner passkey (#258).
@@ -1162,6 +1172,7 @@ fn owner_command(command: &Command) -> ExitCode {
         Command::Audit(_)
         | Command::Init
         | Command::Setup(_)
+        | Command::Doctor(_)
         | Command::Token(_)
         | Command::Tunnel(_)
         | Command::PasskeyEnroll { .. }
@@ -1476,6 +1487,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Init => init_command(),
         Command::Setup(answers) => setup::command(*answers),
+        Command::Doctor(args) => doctor::command(&args),
         Command::Token(TokenCommand::Mint { agent_id }) => mint_token_command(&agent_id),
         Command::Tunnel(TunnelCommand::Mint { agent_id }) => mint_tunnel_command(&agent_id),
         Command::Unlock { .. }

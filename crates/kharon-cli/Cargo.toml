@@ -13,22 +13,27 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2.1"
-# Only for the SIGINT watcher during the tty password prompt:
-# tokio's signal handling restores the terminal from a normal
-# thread (async-signal-safe by construction), so no signal-hook
-# FFI is needed in this crate.
-tokio = { version = "1", features = ["rt", "signal"] }
+# The SIGINT watcher during the tty password prompt: tokio's
+# signal handling restores the terminal from a normal thread
+# (async-signal-safe by construction), so no signal-hook FFI is
+# needed in this crate. `kharon setup` (#404) also runs its one
+# login and sync on a current-thread runtime (net, time).
+tokio = { version = "1", features = ["rt", "signal", "net", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-zeroize = "1"
+# `kharon setup --answers` (TOML) and the server URL (#404).
+toml = "1"
+url = "2"
+zeroize = { version = "1", features = ["serde"] }
 # Terminal echo control for the unlock password prompt (tty, no
 # echo; SPEC §8), the owner socket's uid check, and the OS RNG for
-# `kharon init`'s master password (REQ-DEP-007). Safe wrappers only,
+# `kharon init`'s master password (REQ-DEP-007), and `fchown` for
+# the key file `kharon setup` writes (#404). Safe wrappers only,
 # the same rustix kharond already uses.
-rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net", "rand"] }
+rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net", "rand", "fs"] }
 kharond = { path = "../kharond", version = "0.0.0" }
 kharon-recording = { path = "../kharon-recording", version = "0.0.0" }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }

@@ -12,6 +12,7 @@
 //! [`run_push`] feeds those nudges from the notifications hub.
 
 mod client;
+mod discovery;
 mod key_type;
 mod live;
 pub mod push;
@@ -23,6 +24,7 @@ pub use client::{
     ApiKey, CLIENT_NAME, CLIENT_VERSION, DEVICE_NAME, DEVICE_TYPE, Endpoints, MAX_RESPONSE_BYTES,
     SyncClient, TlsTrust, device_identifier,
 };
+pub use discovery::{DiscoveredCollection, DiscoveredOrg, Discovery, discover};
 pub use key_type::{ApiKeyType, KeyTypeError, check_client_id, classify_client_id};
 pub use live::{
     LiveSync, LockReason, MAX_SYNC_INTERVAL, PreparedUnlock, ScopeViolation, SyncOutcome,

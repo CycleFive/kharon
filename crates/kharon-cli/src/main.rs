@@ -21,7 +21,10 @@
 //! same way (once, on the terminal only) and prints the Argon2id
 //! PHC `token_hash` on stdout for the config (REQ-API-003). That
 //! mint is out of band: it does not talk to the daemon and does
-//! not append `token_create` (SPEC §7).
+//! not append `token_create` (SPEC §7). `kharon setup` is the guided
+//! first-run flow (#404, module [`setup`]): it checks the API key type,
+//! discovers the organization and collections, writes `kharon.toml` and
+//! the key file, and mints the first agent token.
 //!
 //! Password hygiene in this short-lived CLI (#86, closing the
 //! PR #81 carry-overs): the password is read with `rustix::io::read`
@@ -45,6 +48,8 @@ use kharon_recording::{
 };
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
+
+mod setup;
 
 /// The owner socket of a daemon with the SPEC §9 default
 /// `data_dir` (`/data`). Override with `--socket`.
@@ -158,6 +163,10 @@ enum Command {
     /// the connector must not be given a token that can call `fill`.
     #[command(subcommand)]
     Tunnel(TunnelCommand),
+    /// Guided first-run setup on the broker host (#404): checks the API
+    /// key type, discovers the organization and collections, writes
+    /// kharon.toml and the key file, and mints the first agent token.
+    Setup(Box<setup::Answers>),
 }
 
 /// `kharon passkey` — list or remove an enrolled owner passkey (#258).
@@ -1152,6 +1161,7 @@ fn owner_command(command: &Command) -> ExitCode {
         Command::Panic { socket } => (socket, Zeroizing::new("{\"op\":\"panic\"}".to_owned())),
         Command::Audit(_)
         | Command::Init
+        | Command::Setup(_)
         | Command::Token(_)
         | Command::Tunnel(_)
         | Command::PasskeyEnroll { .. }
@@ -1465,6 +1475,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => init_command(),
+        Command::Setup(answers) => setup::command(*answers),
         Command::Token(TokenCommand::Mint { agent_id }) => mint_token_command(&agent_id),
         Command::Tunnel(TunnelCommand::Mint { agent_id }) => mint_tunnel_command(&agent_id),
         Command::Unlock { .. }

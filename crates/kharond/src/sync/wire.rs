@@ -86,6 +86,11 @@ pub struct Profile {
 #[serde(rename_all = "camelCase")]
 pub struct ProfileOrganization {
     pub id: String,
+    /// Display name. Plaintext in the profile on Bitwarden and
+    /// Vaultwarden (unlike collection names, which are encrypted under
+    /// the org key). Read only by setup discovery (#404); untrusted.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Protected org key (EncString type 4 under the user's public key).
     pub key: Option<String>,
 }

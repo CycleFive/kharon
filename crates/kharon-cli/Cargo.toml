@@ -33,7 +33,17 @@ zeroize = { version = "1", features = ["serde"] }
 rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "net", "rand", "fs"] }
 kharond = { path = "../kharond", version = "0.0.0" }
 kharon-recording = { path = "../kharon-recording", version = "0.0.0" }
+# The agent-host bundle (#405): the `[connector]` certificate's pin
+# (`pin_of_der`), and a fresh self-signed certificate for it (the
+# connector pins the SHA-256 and does not use WebPKI). rcgen is already
+# in the tree as a dev-dependency of the connector crates.
+kharon-connector = { path = "../kharon-connector", version = "0.0.0" }
+rcgen = { version = "0.13", features = ["crypto", "ring"] }
 
 [dev-dependencies]
+# The bundle's connector.toml is checked with the connector's own loader.
+kharon-agent-connector = { path = "../kharon-agent-connector", version = "0.0.0" }
+# Reads the bundle's certificate back to recompute its pin.
+rustls-pki-types = { version = "1", features = ["std"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }

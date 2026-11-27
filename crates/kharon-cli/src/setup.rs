@@ -25,6 +25,12 @@
 //!    config. Any failure after the first write removes what was written.
 //! 6. Show the agent token once: on the terminal, or into a new `0600`
 //!    file named by `--agent-token-file`.
+//! 7. With `--cdp-via agent-connector` (path B, #405), also mint the
+//!    tunnel credential and the `[connector]` TLS pair, and write the
+//!    agent-host bundle instead of showing the token: one `0700`
+//!    directory with both tokens (each in a file named for its role),
+//!    the broker pin, the agent id, a ready `connector.toml` and an
+//!    `apply.sh` ([`bundle`]).
 //!
 //! Every prompt has a flag and an answers-file key of the same name, so
 //! a provisioner can run the whole flow with `--non-interactive` (#404
@@ -39,8 +45,10 @@
 //!
 //! Secrets: the client secret is read with echo off or from the JSON file
 //! Bitwarden shows, never from argv or env, and goes only into the key
-//! file. The agent token goes only to the terminal or the token file.
-//! Neither is ever in an error message.
+//! file. The agent token goes only to the terminal, the token file or the
+//! bundle; the tunnel credential only to the bundle; the `[connector]`
+//! private key only to its `0400` file. None is ever in an error message
+//! or anything setup says.
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -55,6 +63,9 @@ use serde::Deserialize;
 use url::Url;
 use zeroize::Zeroizing;
 
+mod bundle;
+use bundle::ConnectorPlan;
+
 /// Where the files go: the Compose example or a host install
 /// (`docs/broker-lifecycle.md`). Both run kharond as uid 10001.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
@@ -67,9 +78,7 @@ pub enum Layout {
     Host,
 }
 
-/// How kharond reaches the agent's Chromium. The path-B agent connector
-/// needs a TLS pin and a tunnel credential; it arrives with the
-/// agent-host bundle (#405).
+/// How kharond reaches the agent's Chromium.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CdpVia {
@@ -77,6 +86,12 @@ pub enum CdpVia {
     Wireguard,
     /// Chromium on this host's loopback.
     Direct,
+    /// Path B: the agent host's connector dials kharond at
+    /// `wss://<public host>/connector`. Setup writes the agent-host
+    /// bundle (#405).
+    #[value(name = "agent-connector")]
+    #[serde(rename = "agent-connector")]
+    AgentConnector,
 }
 
 impl CdpVia {
@@ -84,12 +99,15 @@ impl CdpVia {
         match self {
             Self::Wireguard => "wireguard",
             Self::Direct => "direct",
+            Self::AgentConnector => "agent_connector",
         }
     }
     fn default_endpoint(self) -> &'static str {
         match self {
             Self::Wireguard => "ws://10.66.0.2:9222",
-            Self::Direct => "ws://127.0.0.1:9222",
+            // For path B this is the agent host's loopback, carried
+            // over the connector.
+            Self::Direct | Self::AgentConnector => "ws://127.0.0.1:9222",
         }
     }
 }
@@ -182,6 +200,21 @@ pub struct Answers {
     /// Write the agent token to this new 0600 file instead of the terminal.
     #[arg(long, value_name = "PATH")]
     pub agent_token_file: Option<PathBuf>,
+    /// Path B: the agent-host bundle directory to create (mode 0700)
+    /// [default: secrets/agent-bundle-<agent> (compose),
+    /// ./kharon-agent-bundle-<agent> (host)].
+    #[arg(long, value_name = "DIR")]
+    pub agent_bundle: Option<PathBuf>,
+    /// Path B: where to write the new `[connector]` certificate on this
+    /// host [default: secrets/kharon_connector_tls.crt (compose),
+    /// /etc/kharon/tls.crt (host)].
+    #[arg(long, value_name = "PATH")]
+    pub connector_tls_cert: Option<PathBuf>,
+    /// Path B: where to write its private key (0400, --key-owner)
+    /// [default: secrets/kharon_connector_tls.key (compose),
+    /// /etc/kharon/tls.key (host)].
+    #[arg(long, value_name = "PATH")]
+    pub connector_tls_key: Option<PathBuf>,
 }
 
 impl Answers {
@@ -217,6 +250,9 @@ impl Answers {
             ntfy_topic: self.ntfy_topic.or(file.ntfy_topic),
             ntfy_token_file: self.ntfy_token_file.or(file.ntfy_token_file),
             agent_token_file: self.agent_token_file.or(file.agent_token_file),
+            agent_bundle: self.agent_bundle.or(file.agent_bundle),
+            connector_tls_cert: self.connector_tls_cert.or(file.connector_tls_cert),
+            connector_tls_key: self.connector_tls_key.or(file.connector_tls_key),
         }
     }
 
@@ -464,6 +500,8 @@ pub struct Plan {
     pub ntfy_topic: String,
     pub ntfy_token_file: Option<PathBuf>,
     pub agent_token_file: Option<PathBuf>,
+    /// Path B (`cdp_via = agent-connector`): the connector side.
+    pub connector: Option<ConnectorPlan>,
 }
 
 /// The loopback port `[public_ingress]` listens on in the Compose
@@ -497,8 +535,9 @@ fn path_str(p: &Path) -> String {
     toml_str(&p.to_string_lossy())
 }
 
-/// Render `kharon.toml` for `plan`, with `token_hash` for the first agent.
-pub fn render(plan: &Plan, token_hash: &str) -> String {
+/// Render `kharon.toml` for `plan`, with `token_hash` for the first agent
+/// and, on path B, its `connector_token_hash`.
+pub fn render(plan: &Plan, token_hash: &str, connector_token_hash: Option<&str>) -> String {
     let mut t = String::new();
     t.push_str(
         "# Written by `kharon setup` (#404). kharond refuses unknown keys and\n\
@@ -522,9 +561,19 @@ pub fn render(plan: &Plan, token_hash: &str) -> String {
     }
     t.push_str(&format!(
         "\n# The first agent. Its token was shown once by setup; only the hash is here.\n\
-         [agents.{}]\ntoken_hash = {}\ncdp = {{ endpoint = {}, via = {} }}\n",
+         [agents.{}]\ntoken_hash = {}\n",
         plan.agent_id,
         toml_str(token_hash),
+    ));
+    if let Some(h) = connector_token_hash {
+        t.push_str(&format!(
+            "# The tunnel credential's hash; the credential is in the agent-host bundle.\n\
+             connector_token_hash = {}\n",
+            toml_str(h)
+        ));
+    }
+    t.push_str(&format!(
+        "cdp = {{ endpoint = {}, via = {} }}\n",
         toml_str(&plan.cdp_endpoint),
         toml_str(plan.cdp_via.name())
     ));
@@ -553,6 +602,15 @@ pub fn render(plan: &Plan, token_hash: &str) -> String {
             "\n# The agent API, on the VPN address.\n[api]\nlisten = {}\n",
             toml_str(listen)
         )),
+    }
+    if let Some(c) = &plan.connector {
+        t.push_str(&format!(
+            "\n# Path B: agent connectors dial wss://<public_host>/connector through the\n\
+             # tunnel and pin this certificate (broker_pin in the agent-host bundle).\n\
+             [connector]\ntls_cert_file = {}\ntls_key_file = {}\nwebsocket = true\n",
+            path_str(&c.cert_in_config),
+            path_str(&c.key_in_config)
+        ));
     }
     if let Some(origin) = &plan.owner_origin {
         t.push_str(&format!(
@@ -877,6 +935,23 @@ fn preflight_paths(plan: &Plan, p: &dyn Prompter) -> Result<(), String> {
     if let Some(t) = &plan.agent_token_file {
         targets.push(("agent token file", t));
     }
+    if let Some(c) = &plan.connector {
+        targets.push(("connector certificate", &c.cert_path));
+        targets.push(("connector key", &c.key_path));
+        targets.push(("agent-host bundle directory", &c.bundle_dir));
+        if let Some(o) = &c.compose_override {
+            targets.push(("Compose override", o));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, path) in &targets {
+        if !seen.insert(path.as_path()) {
+            return Err(format!(
+                "{} is named for two of setup's files; give each its own path",
+                path.display()
+            ));
+        }
+    }
     for (what, path) in targets {
         if std::fs::symlink_metadata(path).is_ok() {
             return Err(format!(
@@ -896,9 +971,6 @@ fn preflight_paths(plan: &Plan, p: &dyn Prompter) -> Result<(), String> {
             ));
         }
     }
-    if plan.config_path == plan.key_path {
-        return Err("the config and the key file must be different paths".to_owned());
-    }
     if !can_own(plan.key_owner) {
         return Err(format!(
             "the key file must belong to uid {} gid {} (kharond's), which needs root: run \
@@ -906,7 +978,8 @@ fn preflight_paths(plan: &Plan, p: &dyn Prompter) -> Result<(), String> {
             plan.key_owner.uid, plan.key_owner.gid
         ));
     }
-    if plan.agent_token_file.is_none() && !p.can_show_secret() {
+    // Path B puts the agent token in the bundle, so it needs no terminal.
+    if plan.agent_token_file.is_none() && plan.connector.is_none() && !p.can_show_secret() {
         return Err(
             "there is no terminal to show the agent token on; pass --agent-token-file".to_owned(),
         );
@@ -981,7 +1054,9 @@ fn after_write_hook(path: &Path) -> Result<(), String> {
     AFTER_WRITE.with(|h| h.get().map_or(Ok(()), |f| f(path)))
 }
 
-/// Files written so far; removed on drop unless [`Written::keep`]ed.
+/// Files (and the bundle directory) written so far; removed on drop,
+/// newest first, unless [`Written::keep`]ed. Newest first empties the
+/// bundle directory before it is removed.
 struct Written(Vec<PathBuf>);
 
 impl Written {
@@ -992,17 +1067,45 @@ impl Written {
 
 impl Drop for Written {
     fn drop(&mut self) {
-        for p in self.0.drain(..) {
-            let _ = std::fs::remove_file(p);
+        for p in self.0.drain(..).rev() {
+            match std::fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => {
+                    let _ = std::fs::remove_dir(&p);
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
         }
     }
 }
 
-/// What a finished setup leaves for the next step. #405's agent-host
-/// bundle hooks in here: it is built from the plan and the token before
-/// the token is dropped.
+/// Create the bundle directory, mode 0700. Like `create_file`, it must
+/// not exist yet, and a failure after the create removes it here.
+fn create_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        let _ = std::fs::remove_dir(path);
+        format!("cannot set the mode of {}: {e}", path.display())
+    })
+}
+
+/// One secret (or value) and a newline, in memory that is wiped on drop.
+fn secret_line(s: &str) -> Zeroizing<String> {
+    let mut line = Zeroizing::new(String::with_capacity(s.len() + 1));
+    line.push_str(s);
+    line.push('\n');
+    line
+}
+
+/// What a finished setup leaves for the next step (the agent-host bundle
+/// is already written by then, #405).
 pub struct Outcome {
-    /// Read by the bundle step (#405) and the tests.
+    /// Read by the tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub plan: Plan,
 }
@@ -1128,14 +1231,18 @@ pub fn plan(
         Some(v) => v,
         None => {
             let v = p.ask(
-                "How does kharond reach the agent's browser? wireguard or direct (same host)",
+                "How does kharond reach the agent's browser? wireguard, direct (same host), \
+                 or agent-connector (the agent host dials in through the tunnel)",
                 Some("wireguard"),
                 "--cdp-via",
             )?;
             match v.trim() {
                 "wireguard" => CdpVia::Wireguard,
                 "direct" => CdpVia::Direct,
-                _ => return Err("--cdp-via is wireguard or direct".to_owned()),
+                "agent-connector" => CdpVia::AgentConnector,
+                _ => {
+                    return Err("--cdp-via is wireguard, direct or agent-connector".to_owned());
+                }
             }
         }
     };
@@ -1252,11 +1359,24 @@ pub fn plan(
         Some(o) => parse_owner(o)?,
         None => KHAROND_OWNER,
     };
+    let config_path = answers
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(config_default));
+    let connector = if cdp_via == CdpVia::AgentConnector {
+        Some(plan_connector(
+            answers,
+            layout,
+            &config_path,
+            &agent_id,
+            &listener,
+            &cdp_endpoint,
+        )?)
+    } else {
+        None
+    };
     let plan = Plan {
-        config_path: answers
-            .config
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(config_default)),
+        config_path,
         key_path,
         key_in_config,
         key_owner,
@@ -1274,8 +1394,80 @@ pub fn plan(
         ntfy_topic,
         ntfy_token_file,
         agent_token_file: answers.agent_token_file.clone(),
+        connector,
     };
     Ok((plan, client_id, secret))
+}
+
+/// Path B's files and addresses. The connector dials the public gateway
+/// (`[connector] websocket = true` behind `[public_ingress]`), which is
+/// the tunnel M3 sets up; the raw-TLS listener on a VPN is left to the
+/// manual steps in `docs/deployment.md`.
+fn plan_connector(
+    answers: &Answers,
+    layout: Layout,
+    config_path: &Path,
+    agent_id: &str,
+    listener: &Listener,
+    cdp_endpoint: &str,
+) -> Result<ConnectorPlan, String> {
+    let public_host = match listener {
+        Listener::Public { host } => host.clone(),
+        Listener::Api { .. } => {
+            return Err(
+                "--cdp-via agent-connector needs --public-host: setup's connector dials                  wss://<public host>/connector through the tunnel. For a raw-TLS connector                  on a VPN address, follow \"Path (B)\" in docs/deployment.md by hand"
+                    .to_owned(),
+            );
+        }
+    };
+    let cdp = bundle::cdp_socket(cdp_endpoint)?;
+    let (cert_default, key_default, bundle_default) = match layout {
+        Layout::Compose => (
+            "secrets/kharon_connector_tls.crt",
+            "secrets/kharon_connector_tls.key",
+            format!("secrets/agent-bundle-{agent_id}"),
+        ),
+        Layout::Host => (
+            "/etc/kharon/tls.crt",
+            "/etc/kharon/tls.key",
+            format!("kharon-agent-bundle-{agent_id}"),
+        ),
+    };
+    let cert_path = answers
+        .connector_tls_cert
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(cert_default));
+    let key_path = answers
+        .connector_tls_key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(key_default));
+    let (cert_in_config, key_in_config, compose_override) = match layout {
+        // The Compose example mounts nothing there; the override does.
+        Layout::Compose => (
+            PathBuf::from("/etc/kharon/tls.crt"),
+            PathBuf::from("/etc/kharon/tls.key"),
+            Some(
+                config_path
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join("docker-compose.override.yml"),
+            ),
+        ),
+        Layout::Host => (cert_path.clone(), key_path.clone(), None),
+    };
+    Ok(ConnectorPlan {
+        cert_path,
+        key_path,
+        cert_in_config,
+        key_in_config,
+        compose_override,
+        bundle_dir: answers
+            .agent_bundle
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(bundle_default)),
+        public_host,
+        cdp,
+    })
 }
 
 /// The whole flow: [`plan`], mint, render, validate, write, show.
@@ -1288,9 +1480,22 @@ pub fn run(
     preflight_paths(&plan, p)?;
 
     // Mint first (in memory only) so the config is validated with the
-    // real hash, then write, then show the token.
+    // real hash, then write, then show the token. Path B also mints the
+    // tunnel credential and the `[connector]` TLS pair here.
     let (token, hash) = kharond::api::token::generate(&plan.agent_id);
-    let text = render(&plan, &hash);
+    let path_b = match &plan.connector {
+        Some(c) => {
+            let (tunnel, tunnel_hash) = kharond::api::token::generate_tunnel(&plan.agent_id);
+            Some((
+                c,
+                tunnel,
+                tunnel_hash,
+                bundle::generate_tls(&c.public_host)?,
+            ))
+        }
+        None => None,
+    };
+    let text = render(&plan, &hash, path_b.as_ref().map(|(_, _, h, _)| h.as_str()));
     validate(&text)?;
 
     let mut written = Written(Vec::new());
@@ -1308,6 +1513,23 @@ pub fn run(
         uid: rustix::process::geteuid().as_raw(),
         gid: plan.key_owner.gid,
     };
+    if let Some((c, _, _, tls)) = &path_b {
+        // The private key is kharond's, like the API key file; the
+        // certificate is public.
+        create_file(
+            &c.key_path,
+            tls.key_pem.as_bytes(),
+            0o400,
+            Some(plan.key_owner),
+        )?;
+        written.0.push(c.key_path.clone());
+        create_file(&c.cert_path, tls.cert_pem.as_bytes(), 0o644, None)?;
+        written.0.push(c.cert_path.clone());
+        if let Some(o) = &c.compose_override {
+            create_file(o, bundle::compose_override(c).as_bytes(), 0o644, None)?;
+            written.0.push(o.clone());
+        }
+    }
     create_file(
         &plan.config_path,
         text.as_bytes(),
@@ -1324,17 +1546,48 @@ pub fn run(
             .map_err(|e| format!("kharond would refuse the written files [{}]: {e}", e.code()))?;
     }
 
-    // #405 hook: the agent-host bundle is built here, from `plan` and
-    // `token`, before the token is dropped.
+    // The agent-host bundle (#405), from `plan` and both tokens, before
+    // they are dropped.
     let secret_text = token.expose_secret();
+    if let Some((c, tunnel, _, tls)) = &path_b {
+        let dir = &c.bundle_dir;
+        create_dir(dir)?;
+        written.0.push(dir.clone());
+        let id = &plan.agent_id;
+        let files: [(&str, Zeroizing<String>, u32); 7] = [
+            (
+                bundle::TUNNEL_TOKEN,
+                secret_line(tunnel.expose_secret()),
+                0o600,
+            ),
+            (bundle::AGENT_TOKEN, secret_line(secret_text), 0o600),
+            (
+                bundle::CONNECTOR_TOML,
+                Zeroizing::new(bundle::connector_toml(c, id, &tls.pin_hex)),
+                0o644,
+            ),
+            (bundle::BROKER_PIN, secret_line(&tls.pin_hex), 0o644),
+            (bundle::AGENT_ID, secret_line(id), 0o644),
+            (bundle::APPLY, Zeroizing::new(bundle::apply_sh(id)), 0o700),
+            (
+                bundle::README,
+                Zeroizing::new(bundle::readme(c, id, &tls.pin_hex)),
+                0o644,
+            ),
+        ];
+        for (name, bytes, mode) in &files {
+            let path = dir.join(name);
+            create_file(&path, bytes.as_bytes(), *mode, None)?;
+            written.0.push(path);
+        }
+    }
     match &plan.agent_token_file {
         Some(path) => {
-            let mut line = Zeroizing::new(String::with_capacity(secret_text.len() + 1));
-            line.push_str(secret_text);
-            line.push('\n');
-            create_file(path, line.as_bytes(), 0o600, None)?;
+            create_file(path, secret_line(secret_text).as_bytes(), 0o600, None)?;
             written.0.push(path.clone());
         }
+        // Path B: the token went into the bundle; it is not shown.
+        None if path_b.is_some() => {}
         None => {
             let mut shown = Zeroizing::new(String::with_capacity(secret_text.len() + 400));
             shown.push_str("\nAgent token for `");
@@ -1364,6 +1617,38 @@ pub fn run(
              Copy or chown it for the agent host.",
             plan.agent_id,
             t.display()
+        ));
+    }
+    if let Some((c, _, _, tls)) = &path_b {
+        done.push_str(&format!(
+            "\nPath B: wrote the [connector] certificate {} and its key {} (uid {}, gid {}, \
+             mode 0400)",
+            c.cert_path.display(),
+            c.key_path.display(),
+            plan.key_owner.uid,
+            plan.key_owner.gid
+        ));
+        if let Some(o) = &c.compose_override {
+            done.push_str(&format!(", and {} to mount them", o.display()));
+        }
+        done.push_str(&format!(
+            ".\nbroker_pin = {}\n\
+             \nThe agent-host bundle is in {} (mode 0700{}). IT HOLDS TWO SECRETS: \
+             {} (the connector's tunnel credential) and {} (the agent's MCP token). Move it \
+             to the agent host out of band (scp, a USB stick; not chat, email or a ticket), \
+             run `sudo ./apply.sh path/to/kharon-agent-connector` there, put {} in the agent's \
+             MCP client, and delete every copy. Its README.txt says what each file is. \
+             Compare broker-pin there with the pin above.",
+            tls.pin_hex,
+            c.bundle_dir.display(),
+            if rustix::process::geteuid().is_root() {
+                ", root-owned"
+            } else {
+                ""
+            },
+            bundle::TUNNEL_TOKEN,
+            bundle::AGENT_TOKEN,
+            bundle::AGENT_TOKEN,
         ));
     }
     done.push_str(
@@ -2101,5 +2386,466 @@ mod tests {
         let t = random_topic().unwrap();
         assert!(t.starts_with("kharon-") && t.len() == 27, "{t}");
         assert_ne!(t, random_topic().unwrap());
+    }
+
+    // ---- #405: the agent-host bundle ----
+
+    /// Path B, headless, every file in `dir`.
+    fn path_b(dir: &Path) -> Answers {
+        Answers {
+            cdp_via: Some(CdpVia::AgentConnector),
+            agent_token_file: None,
+            connector_tls_cert: Some(dir.join("tls.crt")),
+            connector_tls_key: Some(dir.join("tls.key")),
+            agent_bundle: Some(dir.join("bundle")),
+            ..headless(dir)
+        }
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    /// The SHA-256 of the certificate in `pem`, as `broker_pin` hex.
+    fn pin_of_pem(pem: &str) -> [u8; 32] {
+        use rustls_pki_types::pem::PemObject;
+        let der = rustls_pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        kharon_connector::pin_of_der(&der)
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Every file in a finished bundle, and what setup wrote around it.
+    fn bundle_files(dir: &Path) -> Vec<PathBuf> {
+        [
+            bundle::TUNNEL_TOKEN,
+            bundle::AGENT_TOKEN,
+            bundle::CONNECTOR_TOML,
+            bundle::BROKER_PIN,
+            bundle::AGENT_ID,
+            bundle::APPLY,
+            bundle::README,
+        ]
+        .iter()
+        .map(|n| dir.join("bundle").join(n))
+        .collect()
+    }
+
+    #[test]
+    fn req_405_bundle_connector_toml_loads_with_the_connectors_own_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let mut p = Headless(Vec::new());
+        let mut vault = Fake::new(sync_with(&[COLL1], |_| {}));
+        run(&path_b(d), &mut p, &mut vault).unwrap();
+        let said = p.0.join("\n");
+        let bdir = d.join("bundle");
+
+        // The broker side: kharond starts on what was written, with the
+        // [connector] pair loaded by its own TLS loader (host layout runs
+        // the startup checks), the WebSocket transport on, and the
+        // tunnel credential's hash on the agent.
+        let cfg_path = d.join("kharon.toml");
+        let text = read(&cfg_path);
+        let (cfg, _) = kharond::config::load_for_startup(
+            &cfg_path,
+            &kharond::config::StaticMlockProbe(Ok(())),
+        )
+        .unwrap();
+        kharond::daemon::check(&cfg).unwrap();
+        assert!(text.contains("via = \"agent_connector\""), "{text}");
+        assert!(text.contains("[connector]\n"), "{text}");
+        assert!(text.contains("websocket = true"), "{text}");
+
+        // The pin is the SHA-256 of the certificate kharond will serve.
+        let pin = pin_of_pem(&read(&d.join("tls.crt")));
+        assert_eq!(
+            read(&bdir.join(bundle::BROKER_PIN)),
+            format!("{}\n", hex(&pin))
+        );
+        assert!(
+            said.contains(&format!("broker_pin = {}", hex(&pin))),
+            "{said}"
+        );
+
+        // The agent side: the emitted connector.toml, with token_file
+        // pointed at the bundle's copy (where apply.sh would have put it
+        // at /etc/kharon-connector/token), goes through the connector's
+        // own loader and names this broker, pin and agent.
+        let emitted = read(&bdir.join(bundle::CONNECTOR_TOML));
+        let token_line = format!("token_file = \"{}\"\n", bundle::AGENT_TOKEN_FILE);
+        assert_eq!(emitted.matches(&token_line).count(), 1, "{emitted}");
+        let applied = d.join("applied.toml");
+        std::fs::write(
+            &applied,
+            emitted.replace(
+                &token_line,
+                &format!(
+                    "token_file = {}\n",
+                    toml_str(&bdir.join(bundle::TUNNEL_TOKEN).to_string_lossy())
+                ),
+            ),
+        )
+        .unwrap();
+        let conn = kharon_agent_connector::load(&applied).unwrap();
+        assert_eq!(conn.pin, pin);
+        assert_eq!(conn.agent_id, "assistant");
+        assert_eq!(conn.server_name, "kharon.example.com");
+        match &conn.dest {
+            kharon_agent_connector::Dest::Ws { host, port, path } => {
+                assert_eq!(
+                    (host.as_str(), *port, path.as_str()),
+                    ("kharon.example.com", 443, "/connector")
+                );
+            }
+            kharon_agent_connector::Dest::Tls { .. } => panic!("expected the ws transport"),
+        }
+        assert_eq!(conn.cdp, "127.0.0.1:9222".parse().unwrap());
+        assert!(conn.devtools.is_none());
+
+        // The credential the connector loaded is the one whose hash
+        // kharond holds, and it is not an agent API token.
+        let tunnel = conn.token.as_str().to_owned();
+        assert_eq!(
+            read(&bdir.join(bundle::TUNNEL_TOKEN)),
+            format!("{tunnel}\n")
+        );
+        let tunnels = kharond::api::token::TokenStore::from_connector_agents(&cfg.agents).unwrap();
+        assert_eq!(tunnels.authenticate(&tunnel).unwrap(), "assistant");
+        let agents = kharond::api::token::TokenStore::from_agents(&cfg.agents, &[]).unwrap();
+        assert!(agents.authenticate(&tunnel).is_err());
+        let agent_token = read(&bdir.join(bundle::AGENT_TOKEN)).trim_end().to_owned();
+        assert!(agent_token.starts_with("kh_agent_assistant_"));
+        assert_eq!(agents.authenticate(&agent_token).unwrap(), "assistant");
+        assert!(tunnels.authenticate(&agent_token).is_err());
+        assert_eq!(read(&bdir.join(bundle::AGENT_ID)), "assistant\n");
+
+        // Neither token, nor the TLS key, is anywhere but its own file:
+        // not said, not in the config, not in the non-secret bundle files.
+        let tls_key = read(&d.join("tls.key"));
+        assert!(tls_key.contains("PRIVATE KEY"));
+        let public = [
+            text.clone(),
+            emitted.clone(),
+            read(&bdir.join(bundle::README)),
+            read(&bdir.join(bundle::APPLY)),
+            read(&bdir.join(bundle::BROKER_PIN)),
+            read(&d.join("tls.crt")),
+        ];
+        for s in [
+            tunnel.as_str(),
+            agent_token.as_str(),
+            tls_key.as_str(),
+            SECRET,
+        ] {
+            assert!(!said.contains(s));
+            for f in &public {
+                assert!(!f.contains(s));
+            }
+        }
+        // ...and setup said the bundle holds secrets, out of band.
+        assert!(said.contains("IT HOLDS TWO SECRETS"), "{said}");
+        assert!(said.contains("out of band"), "{said}");
+    }
+
+    #[test]
+    fn req_405_bundle_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let mut vault = Fake::new(sync_with(&[COLL1], |_| {}));
+        run(&path_b(d), &mut Headless(Vec::new()), &mut vault).unwrap();
+        let b = d.join("bundle");
+        assert_eq!(mode(&b), 0o700);
+        for (name, want) in [
+            (bundle::TUNNEL_TOKEN, 0o600),
+            (bundle::AGENT_TOKEN, 0o600),
+            (bundle::CONNECTOR_TOML, 0o644),
+            (bundle::BROKER_PIN, 0o644),
+            (bundle::AGENT_ID, 0o644),
+            (bundle::APPLY, 0o700),
+            (bundle::README, 0o644),
+        ] {
+            assert_eq!(mode(&b.join(name)), want, "{name}");
+        }
+        // Nothing else is in the bundle.
+        let mut names: Vec<String> = std::fs::read_dir(&b)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 7, "{names:?}");
+        // The [connector] key is kharond's, like the API key file.
+        assert_eq!(mode(&d.join("tls.key")), 0o400);
+        assert_eq!(mode(&d.join("tls.crt")), 0o644);
+        // The connector's own mode rule accepts the token file as is.
+        kharon_agent_connector::read_token(&b.join(bundle::TUNNEL_TOKEN)).unwrap();
+        // Path B shows no token on a terminal and needs none.
+        assert!(!d.join("agent-token").exists());
+    }
+
+    #[test]
+    fn req_405_tokens_are_labelled_by_role() {
+        let c = ConnectorPlan {
+            cert_path: "/etc/kharon/tls.crt".into(),
+            key_path: "/etc/kharon/tls.key".into(),
+            cert_in_config: "/etc/kharon/tls.crt".into(),
+            key_in_config: "/etc/kharon/tls.key".into(),
+            compose_override: None,
+            bundle_dir: "b".into(),
+            public_host: "kharon.example.com".into(),
+            cdp: "127.0.0.1:9222".into(),
+        };
+        let readme = bundle::readme(&c, "assistant", &"ab".repeat(32));
+        let line = |name: &str| {
+            readme
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} not in README:\n{readme}"))
+                .to_owned()
+        };
+        let t = line(bundle::TUNNEL_TOKEN);
+        assert!(
+            t.contains("YES")
+                && t.contains("Tunnel credential (kh_tunnel_...)")
+                && t.contains("CONNECTOR only"),
+            "{t}"
+        );
+        let a = line(bundle::AGENT_TOKEN);
+        assert!(
+            a.contains("YES")
+                && a.contains("Agent API token (kh_agent_...)")
+                && a.contains("MCP CLIENT only"),
+            "{a}"
+        );
+        assert!(line(bundle::BROKER_PIN).contains("no"));
+        assert!(readme.contains("not interchangeable"));
+        assert!(readme.contains("TWO SECRETS"));
+
+        // apply.sh installs only the tunnel credential, for the
+        // connector, and never reads either token into the shell.
+        let apply = bundle::apply_sh("assistant");
+        assert!(apply.contains(
+            "install -m 0400 -o connector -g connector connector-tunnel-token /etc/kharon-connector/token"
+        ));
+        let code: Vec<&str> = apply
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        for l in &code {
+            if l.contains(bundle::AGENT_TOKEN) {
+                assert!(l.trim_start().starts_with("say "), "agent token used: {l}");
+            }
+            assert!(!l.contains("$(cat") && !l.contains("read "), "{l}");
+        }
+        // It is valid sh.
+        let script = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(script.path(), &apply).unwrap();
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(script.path())
+            .status()
+            .unwrap();
+        assert!(st.success());
+        // Its unit is provision-connector.sh's, so both install the same service.
+        let provision = read(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/agent-host/provision-connector.sh"),
+        );
+        let start = "put_file /etc/systemd/system/kharon-agent-connector.service 0644 <<'UNIT'\n";
+        let from = provision.find(start).unwrap() + start.len();
+        let unit = &provision[from..from + provision[from..].find("UNIT\n").unwrap()];
+        assert_eq!(unit, bundle::CONNECTOR_UNIT);
+        assert!(apply.contains(bundle::CONNECTOR_UNIT));
+    }
+
+    #[test]
+    fn req_405_bundle_rolls_back_on_failure() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::AFTER_WRITE.with(|h| h.set(None));
+            }
+        }
+        let _reset = Reset;
+        // Fail on the last bundle file, once both tokens are on disk.
+        fn fail_on_readme(path: &Path) -> Result<(), String> {
+            if path.ends_with(bundle::README) {
+                return Err(format!(
+                    "cannot set the owner of {}: injected",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
+        super::AFTER_WRITE.with(|h| h.set(Some(fail_on_readme)));
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let mut vault = Fake::new(sync_with(&[COLL1], |_| {}));
+        let e = run(&path_b(d), &mut Headless(Vec::new()), &mut vault)
+            .err()
+            .unwrap();
+        assert!(e.contains("injected"), "{e}");
+        assert!(!e.contains("kh_"), "{e}");
+        // Nothing setup wrote is left: not the bundle, its tokens, the TLS
+        // pair, the config or the API key.
+        for f in bundle_files(d) {
+            assert!(!f.exists(), "{}", f.display());
+        }
+        for f in [
+            "bundle",
+            "tls.crt",
+            "tls.key",
+            "kharon.toml",
+            "bw_api_key.json",
+        ] {
+            assert!(!d.join(f).exists(), "{f}");
+        }
+        assert_eq!(
+            std::fs::read_dir(d)
+                .unwrap()
+                .filter(|e| {
+                    let n = e.as_ref().unwrap().file_name();
+                    n != "in-key.json"
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn req_405_never_overwrites_a_bundle_or_tls_file() {
+        for existing in ["bundle", "tls.crt", "tls.key"] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = dir.path();
+            let target = d.join(existing);
+            if existing == "bundle" {
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("keep"), b"x").unwrap();
+            } else {
+                std::fs::write(&target, b"keep").unwrap();
+            }
+            let mut vault = Fake::new(sync_with(&[COLL1], |_| {}));
+            let e = run(&path_b(d), &mut Headless(Vec::new()), &mut vault)
+                .err()
+                .unwrap();
+            assert!(e.contains("already exists"), "{e}");
+            assert!(!d.join("kharon.toml").exists());
+            assert!(!d.join("bw_api_key.json").exists());
+            if existing == "bundle" {
+                assert_eq!(read(&target.join("keep")), "x");
+            } else {
+                assert_eq!(read(&target), "keep");
+            }
+        }
+    }
+
+    #[test]
+    fn req_405_compose_layout_mounts_the_pair_with_an_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir(d.join("secrets")).unwrap();
+        let a = Answers {
+            layout: Some(Layout::Compose),
+            key_file: Some(d.join("secrets/kharon_bw_api_key.json")),
+            connector_tls_cert: Some(d.join("secrets/kharon_connector_tls.crt")),
+            connector_tls_key: Some(d.join("secrets/kharon_connector_tls.key")),
+            agent_bundle: Some(d.join("secrets/agent-bundle-assistant")),
+            ..path_b(d)
+        };
+        let mut vault = Fake::new(sync_with(&[COLL1], |_| {}));
+        let mut p = Headless(Vec::new());
+        run(&a, &mut p, &mut vault).unwrap();
+        let text = read(&d.join("kharon.toml"));
+        assert!(
+            text.contains("tls_cert_file = \"/etc/kharon/tls.crt\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("tls_key_file = \"/etc/kharon/tls.key\""),
+            "{text}"
+        );
+        let o = read(&d.join("docker-compose.override.yml"));
+        assert!(
+            o.contains(&format!(
+                "\"{}:/etc/kharon/tls.crt:ro\"",
+                d.join("secrets/kharon_connector_tls.crt").display()
+            )),
+            "{o}"
+        );
+        assert!(
+            o.contains(&format!(
+                "\"{}:/etc/kharon/tls.key:ro\"",
+                d.join("secrets/kharon_connector_tls.key").display()
+            )),
+            "{o}"
+        );
+        assert!(o.starts_with("# Written by `kharon setup`"));
+        assert!(
+            o.contains("services:\n  kharon:\n    volumes:\n      - \""),
+            "{o}"
+        );
+        assert!(
+            p.0.join("\n")
+                .contains("docker-compose.override.yml to mount them")
+        );
+
+        // A relative default stays relative to the Compose directory.
+        let c = ConnectorPlan {
+            cert_path: "secrets/kharon_connector_tls.crt".into(),
+            key_path: "secrets/kharon_connector_tls.key".into(),
+            cert_in_config: "/etc/kharon/tls.crt".into(),
+            key_in_config: "/etc/kharon/tls.key".into(),
+            compose_override: Some("docker-compose.override.yml".into()),
+            bundle_dir: "secrets/agent-bundle-assistant".into(),
+            public_host: "kharon.example.com".into(),
+            cdp: "127.0.0.1:9222".into(),
+        };
+        assert!(
+            bundle::compose_override(&c)
+                .contains("- \"./secrets/kharon_connector_tls.crt:/etc/kharon/tls.crt:ro\"")
+        );
+    }
+
+    #[test]
+    fn req_405_path_b_refusals() {
+        // The connector dials the public gateway; a VPN-only broker is
+        // the manual path.
+        let dir = tempfile::tempdir().unwrap();
+        let a = Answers {
+            public_host: None,
+            api_listen: Some("10.66.0.1:8787".into()),
+            ..path_b(dir.path())
+        };
+        let mut vault = Fake::new(sync_with(&[COLL1], |_| {}));
+        let e = run(&a, &mut Headless(Vec::new()), &mut vault)
+            .err()
+            .unwrap();
+        assert!(e.contains("--public-host"), "{e}");
+        // kharond and the connector both need a loopback ws:// endpoint.
+        for bad in ["ws://10.66.0.2:9222", "wss://127.0.0.1:9222", "http://x"] {
+            let a = Answers {
+                cdp_endpoint: Some(bad.into()),
+                ..path_b(dir.path())
+            };
+            let e = run(&a, &mut Headless(Vec::new()), &mut vault)
+                .err()
+                .unwrap();
+            assert!(e.contains("loopback"), "{bad}: {e}");
+        }
+        assert!(!dir.path().join("kharon.toml").exists());
+        assert_eq!(
+            bundle::cdp_socket("ws://localhost:9333").unwrap(),
+            "127.0.0.1:9333"
+        );
+        assert_eq!(
+            bundle::cdp_socket("ws://[::1]:9222/devtools").unwrap(),
+            "[::1]:9222"
+        );
+        assert_eq!(
+            bundle::cdp_socket("ws://127.0.0.1:9222").unwrap(),
+            "127.0.0.1:9222"
+        );
     }
 }

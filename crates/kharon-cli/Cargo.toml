@@ -24,7 +24,7 @@ serde_json = "1.0"
 # `kharon setup --answers` (TOML) and the server URL (#404).
 toml = "1"
 url = "2"
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 # Terminal echo control for the unlock password prompt (tty, no
 # echo; SPEC §8), the owner socket's uid check, and the OS RNG for
 # `kharon init`'s master password (REQ-DEP-007), and `fchown` for

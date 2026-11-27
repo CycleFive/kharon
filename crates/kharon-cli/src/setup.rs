@@ -640,21 +640,20 @@ fn ask_api_key(
         );
         let bad =
             || "--api-key-json must be a JSON object {\"client_id\", \"client_secret\"}".to_owned();
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| bad())?;
-        let id = v
-            .get("client_id")
-            .and_then(|x| x.as_str())
-            .ok_or_else(bad)?;
-        check_client_id(id).map_err(|e| e.message().to_owned())?;
-        let secret = v
-            .get("client_secret")
-            .and_then(|x| x.as_str())
-            .ok_or_else(bad)?;
-        let secret = Zeroizing::new(secret.trim().to_owned());
+        // Deserialize the secret into Zeroizing so it is wiped, matching
+        // key_file_bytes. A serde_json::Value would leave a copy on the heap.
+        #[derive(Deserialize)]
+        struct ApiKeyJson {
+            client_id: String,
+            client_secret: Zeroizing<String>,
+        }
+        let parsed: ApiKeyJson = serde_json::from_str(&text).map_err(|_| bad())?;
+        check_client_id(&parsed.client_id).map_err(|e| e.message().to_owned())?;
+        let secret = Zeroizing::new(parsed.client_secret.trim().to_owned());
         if secret.is_empty() {
             return Err("--api-key-json: client_secret is empty".to_owned());
         }
-        return Ok((id.trim().to_owned(), secret));
+        return Ok((parsed.client_id.trim().to_owned(), secret));
     }
     let mut tries = 0;
     let id = loop {
@@ -916,7 +915,11 @@ fn preflight_paths(plan: &Plan, p: &dyn Prompter) -> Result<(), String> {
 }
 
 /// Create `path` (it must not exist) with `mode`, write `bytes`, set the
-/// owner, and sync.
+/// owner, and sync. If anything after a successful `create_new` fails,
+/// the path is removed here so a partial file (and any secret already
+/// written to it) does not stay on disk. The caller only records the
+/// path in [`Written`] after this returns `Ok`, so there is no
+/// double-remove, and a failed open cannot delete a pre-existing file.
 fn create_file(path: &Path, bytes: &[u8], mode: u32, owner: Option<Owner>) -> Result<(), String> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -924,11 +927,31 @@ fn create_file(path: &Path, bytes: &[u8], mode: u32, owner: Option<Owner>) -> Re
         .mode(mode)
         .open(path)
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    let result = write_created_file(&mut f, path, bytes, mode, owner);
+    if result.is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn write_created_file(
+    f: &mut std::fs::File,
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    owner: Option<Owner>,
+) -> Result<(), String> {
     // The umask may have narrowed the mode; set it exactly.
     f.set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(|e| format!("cannot set the mode of {}: {e}", path.display()))?;
     f.write_all(bytes)
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    // Tests inject a failure here, after the bytes are on disk and
+    // before fchown/sync, the window where a leftover file would hold
+    // the secret.
+    #[cfg(test)]
+    after_write_hook(path)?;
     if let Some(o) = owner {
         rustix::fs::fchown(
             &f,
@@ -939,6 +962,23 @@ fn create_file(path: &Path, bytes: &[u8], mode: u32, owner: Option<Owner>) -> Re
     }
     f.sync_all()
         .map_err(|e| format!("cannot sync {}: {e}", path.display()))
+}
+
+// When set, create_file runs this after write_all and before fchown,
+// so a test can force a post-open failure once the secret is already
+// on disk.
+#[cfg(test)]
+type AfterWrite = fn(&Path) -> Result<(), String>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_WRITE: std::cell::Cell<Option<AfterWrite>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn after_write_hook(path: &Path) -> Result<(), String> {
+    AFTER_WRITE.with(|h| h.get().map_or(Ok(()), |f| f(path)))
 }
 
 /// Files written so far; removed on drop unless [`Written::keep`]ed.
@@ -1320,7 +1360,8 @@ pub fn run(
     );
     if let Some(t) = &plan.agent_token_file {
         done.push_str(&format!(
-            "\nThe agent token for `{}` is in {} (mode 0600).",
+            "\nThe agent token for `{}` is in {} (root-owned 0600 when setup ran as root). \
+             Copy or chown it for the agent host.",
             plan.agent_id,
             t.display()
         ));
@@ -1955,6 +1996,40 @@ mod tests {
         assert!(e.contains("EIO"), "{e}");
         assert!(!dir.path().join("kharon.toml").exists());
         assert!(!dir.path().join("bw_api_key.json").exists());
+    }
+
+    #[test]
+    fn req_404_create_file_removes_the_key_after_a_post_open_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::AFTER_WRITE.with(|h| h.set(None));
+            }
+        }
+        let _reset = Reset;
+        fn fail_after_secret_is_on_disk(path: &Path) -> Result<(), String> {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(
+                bytes.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
+                "the secret must already be on disk when this fails"
+            );
+            Err(format!(
+                "cannot set the owner of {}: injected",
+                path.display()
+            ))
+        }
+        super::AFTER_WRITE.with(|h| h.set(Some(fail_after_secret_is_on_disk)));
+
+        let mut vault = Fake::new(sync_with(&[COLL1], |_| {}));
+        let e = run(&headless(dir.path()), &mut Headless(Vec::new()), &mut vault)
+            .err()
+            .unwrap();
+        assert!(e.contains("injected"), "{e}");
+        assert!(!e.contains(SECRET), "{e}");
+        assert!(!dir.path().join("bw_api_key.json").exists());
+        assert!(!dir.path().join("kharon.toml").exists());
+        assert!(!dir.path().join("agent-token").exists());
     }
 
     #[test]

@@ -379,3 +379,56 @@ async fn req_404_prompt_path_on_a_terminal() {
     assert!(tty.contains("API key client_secret (not shown)"), "{tty}");
     assert!(!stdout.contains("client_secret") && !stderr.contains("client_secret"));
 }
+
+/// #405 through the binary: `--cdp-via agent-connector` writes the
+/// agent-host bundle (no terminal, no `--agent-token-file`), the broker
+/// config starts, and neither token is on stdout or stderr.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_405_agent_host_bundle_through_the_binary() {
+    let (server, _log) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = key_json(dir.path(), CLIENT_ID);
+    let out = tokio::task::spawn_blocking({
+        let dir = dir.path().to_owned();
+        move || {
+            Command::new(env!("CARGO_BIN_EXE_kharon"))
+                .args(["setup", "--non-interactive", "--server", &server, "--email"])
+                .arg(fixture_email())
+                .arg("--api-key-json")
+                .arg(&key)
+                .args(["--public-host", "kharon.example.com"])
+                .args(["--cdp-via", "agent-connector"])
+                .args(path_flags(&dir))
+                .arg("--connector-tls-cert")
+                .arg(dir.join("tls.crt"))
+                .arg("--connector-tls-key")
+                .arg(dir.join("tls.key"))
+                .arg("--agent-bundle")
+                .arg(dir.join("bundle"))
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "stderr: {stderr}");
+    let b = dir.path().join("bundle");
+    let read = |n: &str| std::fs::read_to_string(b.join(n)).unwrap();
+    let token = read("agent-api-token").trim().to_owned();
+    let tunnel = read("connector-tunnel-token").trim().to_owned();
+    assert!(token.starts_with("kh_agent_assistant_"));
+    assert!(tunnel.starts_with("kh_tunnel_assistant_"));
+    let text = assert_config_ok(dir.path(), "assistant", &token);
+    assert!(text.contains("via = \"agent_connector\""));
+    let pin = read("broker-pin").trim().to_owned();
+    assert!(read("connector.toml").contains(&format!("broker_pin = \"{pin}\"")));
+    assert!(stderr.contains(&format!("broker_pin = {pin}")), "{stderr}");
+    assert!(stderr.contains("IT HOLDS TWO SECRETS"), "{stderr}");
+    for s in [SECRET, token.as_str(), tunnel.as_str()] {
+        assert!(!stdout.contains(s) && !stderr.contains(s), "leaked");
+        assert!(!text.contains(s));
+    }
+}

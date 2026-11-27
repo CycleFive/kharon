@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use tokio::sync::watch;
 
 use super::SyncError;
+use super::key_type::check_client_id;
 use super::push::{HubToken, NotificationsHub};
 use super::wire::{PreloginResponse, SyncResponse, TokenResponse, normalize_keys};
 
@@ -48,17 +49,12 @@ pub struct ApiKey {
 impl ApiKey {
     /// Build from parts. Only personal keys (`user.<uuid>`) are
     /// accepted: an organization key (`organization.<uuid>`) reaches
-    /// the Public API only and yields no vault keys (SPEC §3.1).
+    /// the Public API only and yields no vault keys (SPEC §3.1). The
+    /// prefix check is [`check_client_id`], shared with `kharon setup`.
     pub fn new(client_id: &str, client_secret: Zeroizing<String>) -> Result<Self, SyncError> {
         let client_id = client_id.trim();
-        if client_id.starts_with("organization.") {
-            return Err(SyncError::ApiKey(
-                "organization API keys cannot sync a vault",
-            ));
-        }
-        if !client_id.starts_with("user.") || client_id.len() <= "user.".len() {
-            return Err(SyncError::ApiKey("client_id must be user.<uuid>"));
-        }
+        // #403: the shared key-type check, also called by `kharon setup`.
+        check_client_id(client_id).map_err(|e| SyncError::ApiKey(e.message()))?;
         let secret = client_secret.trim();
         if secret.is_empty() {
             return Err(SyncError::ApiKey("client_secret is empty"));

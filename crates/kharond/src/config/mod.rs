@@ -777,8 +777,10 @@ impl BitwardenConfig {
     /// Build the sync client (#8) for this config. Reads both files;
     /// does no network I/O.
     pub fn sync_client(&self) -> Result<SyncClient, ConfigError> {
-        let trust = self.tls_trust()?;
+        // The key first (#403): a wrong key type is the likelier
+        // first-run mistake, and its refusal names the fix.
         let key = self.api_key()?;
+        let trust = self.tls_trust()?;
         SyncClient::new(&self.server, &self.email, key, &trust).map_err(|e| match e {
             SyncError::Tls(reason) => ConfigError::CaFile { reason },
             SyncError::ApiKey(reason) => ConfigError::ApiKeyFile { reason },

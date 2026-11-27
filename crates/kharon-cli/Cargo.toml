@@ -42,7 +42,7 @@ rcgen = { version = "0.13", features = ["crypto", "ring"] }
 
 [dev-dependencies]
 # The bundle's connector.toml is checked with the connector's own loader.
-kharon-agent-connector = { path = "../kharon-agent-connector" }
+kharon-agent-connector = { path = "../kharon-agent-connector", version = "0.0.0" }
 # Reads the bundle's certificate back to recompute its pin.
 rustls-pki-types = { version = "1", features = ["std"] }
 tempfile = "3"

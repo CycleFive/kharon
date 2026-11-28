@@ -96,6 +96,28 @@ pub struct Request {
     pub has_post_data: Option<bool>,
 }
 
+/// `Fetch.requestPaused`: a request held at the request stage (#411). Only the parts the
+/// recorder reads; everything here is optional so that a pause the recorder cannot fully read
+/// still parses, and is still continued.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPaused {
+    /// The `Fetch` id, for `Fetch.continueRequest`.
+    pub request_id: String,
+    /// The `Network` id of the same request, as in `Network.requestWillBeSent`.
+    #[serde(default)]
+    pub network_id: Option<String>,
+    #[serde(default)]
+    pub request: Option<PausedRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PausedRequest {
+    #[serde(default)]
+    pub has_post_data: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseReceived {
@@ -305,6 +327,27 @@ pub struct AddScriptToEvaluateOnNewDocument<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetRequestPostData<'a> {
+    pub request_id: &'a str,
+}
+
+/// `Fetch.enable` (#411).
+#[derive(Serialize)]
+pub struct FetchEnable<'a> {
+    pub patterns: &'a [RequestPattern<'a>],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPattern<'a> {
+    pub url_pattern: &'a str,
+    pub resource_type: &'a str,
+    pub request_stage: &'a str,
+}
+
+/// `Fetch.continueRequest` with nothing changed.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueRequest<'a> {
     pub request_id: &'a str,
 }
 

@@ -56,6 +56,13 @@ which wraps these same steps with who does what.
   the tunnel and its DNS records with the Cloudflare API rather than
   the dashboard, the API token needs **Account → Cloudflare Tunnel →
   Edit** and **Zone → DNS → Edit** on the zone.
+  Check the zone's settings too. Keep **Rocket Loader**, **Bot Fight
+  Mode** and **Managed Transforms → Remove visitor IP headers** off
+  for both hostnames. **Browser Integrity Check** (Security →
+  Settings) answers an MCP client with a non-browser user agent with
+  `403` "Error 1010", so either turn it off for the gateway hostname
+  with a configuration rule, or make the client send an ordinary
+  user agent. Details: [Publishing the owner UI](deployment.md#publishing-the-owner-ui).
 - **An agent host** with Chromium serving CDP on its loopback
   (`127.0.0.1:9222`), or a Debian 12 or 13 machine where the
   provisioning script can install it (step 5).
@@ -436,10 +443,19 @@ typed, never the values.
 2. Ask the agent to log in at `https://login.page.twkr.io/login.html`
    with that item. It opens the page (`kharon_open`), asks for a grant
    (`kharon_request_grant`), and waits.
+   **The agent asks once.** The request stays pending for 120 seconds.
+   It must not call `kharon_request_grant` again to see whether it was
+   approved: that never reports approval, and once the owner has
+   approved, the next call opens a new request and a new prompt.
+   Watch `kharon_status` instead: an approved grant shows up in its
+   `grants` list.
 3. Approve the request: in the owner UI, or from the ntfy
-   notification.
-4. The agent calls `kharon_fill` with `submit: true`. Expect
-   `status: filled`, with both fields named.
+   notification. The owner chooses the kind. **Approve once** is a
+   single use that lasts 120 seconds. **Approve for 1 h** is reusable
+   for that item and origin for an hour. Either way, the grant is
+   listed by `kharon_status` with its expiry.
+4. The agent calls `kharon_fill` with `submit: true` and the grant's
+   id. Expect `status: filled`, with both fields named.
 5. The tab lands on `/login/welcome.html?from=strict`, which says it
    is logged in: `#login-status` has `data-state="success"`. The page
    only counts characters, so `#submit-report` has
@@ -459,7 +475,7 @@ on it, and [backup and upgrades](broker-lifecycle.md#data-backup-restore-and-upg
 | `this is an organization API key (client_id organization.<id>); it reaches the Public API only and cannot sync a vault` | An organization key | Step 2, signed in as the dedicated account |
 | `client_id is not a personal API key (expected user.<uuid>)` | Any other prefix, or a pasted id that is not the `client_id` | Step 2, signed in as the dedicated account |
 | `the server refused the API key` | Wrong secret, or a rotated key | Copy the key again; rotating replaces the secret |
-| `the account cannot see that organization` | The invite is not accepted or not confirmed | Step 1.3, both halves |
+| `the account cannot see that organization` | On Bitwarden cloud: the invite is not accepted or not confirmed. On Vaultwarden: the organization was created by another account, or the account hasn't synced it | Cloud: step 1, both halves of the invite. Vaultwarden: create the organization signed in as the dedicated account, or have it invited and confirmed |
 | `… would refuse it [scope_too_broad]` | The account sees a personal item or a second organization | Empty its personal vault; remove it from other organizations |
 | `the key file must belong to uid 10001 …, which needs root` | Setup ran without `sudo` | Run it with `sudo` |
 | `the config … already exists; setup does not overwrite files` | A second run | Move the old files away first; setup never overwrites |

@@ -981,7 +981,11 @@ mode, `(origin …; …)` in local mode.
    Also leave Cloudflare features that rewrite HTML or challenge
    requests (Rocket Loader, Bot Fight Mode) off for the owner hostname
    until tested: the page's script and the phone's approve request must
-   pass unmodified.
+   pass unmodified. **Browser Integrity Check** is a gateway concern:
+   it answers a client with a non-browser `User-Agent` with `403`
+   "Error 1010". An MCP client or script that hits `/mcp` has to send
+   an ordinary user agent, or the zone needs a configuration rule that
+   turns the check off for the gateway hostname.
 
 5. **Restart and enroll.** Restart kharond (`docker compose restart
    kharon`). Have the owner open
@@ -1822,6 +1826,10 @@ rules (the required `/connector` rule is in the checklist above):
 - **Bot Fight Mode and "I'm Under Attack":** keep them off for this
   hostname. MCP clients and the connector cannot answer a browser
   challenge.
+- **Browser Integrity Check:** it blocks requests with a missing or
+  non-browser `User-Agent` with `403` "Error 1010" before they reach
+  kharond. Turn it off for this hostname with a configuration rule, or
+  have the MCP client send an ordinary user agent.
 
 kharond's own limits (fill rate per agent, token-check concurrency)
 apply regardless. #200 adds the `/mcp` hardening that depends on the

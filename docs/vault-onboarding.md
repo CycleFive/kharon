@@ -6,10 +6,13 @@ kharond does not own it. The customer unlocks it, and the keys stay
 in memory. This page is that vault: the organization, the collection,
 the dedicated account, the logins, and the API key file.
 
-It is the Bitwarden side of steps 2–4 in
-[The kharon account and its master password](deployment.md#the-kharon-account-and-its-master-password-req-dep-007).
-That section still generates the master password (`kharon init`) and
-installs the file on the broker. The runbook's order is
+It is the reference for
+[first run, steps 1–2](first-run.md#1-create-the-broker-account-an-organization-and-a-collection):
+what each Bitwarden screen does and why kharond needs it that way.
+`kharon setup` (step 3 there) then checks the key, lists the
+organizations and collections the account can see so nobody copies
+an ID by hand, and installs the key file on the broker. The managed
+runbook's order is
 [The customer's vault](managed-deploy-runbook.md#3-the-customers-vault).
 
 `[bitwarden]` is sync mode, which is the default (`mode = "sync"`).
@@ -82,10 +85,20 @@ says. The dedicated account's personal vault stays empty. A personal
 item there is an item outside `organization_id`, and startup refuses
 it (below).
 
-The customer owns the organization. The dedicated account is invited
-into it. It is not the owner.
+**Who owns the organization depends on the server.** On Bitwarden
+cloud the customer owns the organization, and the dedicated account
+is invited into it as a User. It is not the owner. On Vaultwarden
+that exists for kharon (self-hosted, or run for a tenant), the
+dedicated account creates and owns its organization itself, as Owner
+with manage on the collection, and the invite, accept and confirm
+steps below do not apply. That is the supported Vaultwarden setup,
+by choice: it needs no second account, and the instance is dedicated.
+The tradeoff is that the account's API key can administer that
+organization. kharond's scope check still refuses a second
+organization and any item outside the organization. See
+[first run, step 1](first-run.md#1-create-the-broker-account-an-organization-and-a-collection).
 
-### Invite and confirm
+### Invite and confirm (Bitwarden cloud)
 
 Bitwarden adds a member in three steps, invite, accept, confirm
 ([User management](https://bitwarden.com/help/managing-users/)).
@@ -112,8 +125,8 @@ says that when an organization is first set up, collection settings
 are off and an invited user receives the **View items** permission.
 Owners and admins can access every collection when **Allow owners
 and admins to manage all collections and items from the Admin
-Console** is on. A User is outside that row. Leave the dedicated
-account a User.
+Console** is on. A User is outside that row. On Bitwarden cloud,
+leave the dedicated account a User.
 
 ### Collection permission
 
@@ -175,6 +188,11 @@ place of the parenthetical reason. `--check` does not contact
 Bitwarden.
 
 ## organization_id and collection_ids
+
+`kharon setup` fills both in from what the account can see, so you
+pick from a list. This section is for checking them, or for writing
+them by hand (`kharon setup --no-discover` takes them as
+`--organization-id` and `--collection-id`).
 
 Both keys are UUIDs. kharond lowercases them. Any case is accepted.
 A bad value is `invalid_uuid`:

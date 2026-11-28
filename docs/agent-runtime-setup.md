@@ -18,9 +18,9 @@ steps and says what changes when the agent is root.
 
 | Value | Secret? | Where it goes | Made by |
 |---|---|---|---|
-| Tunnel credential | Yes | A file the connector reads (`token_file`), mode `0400` or `0600` | `kharon tunnel mint <agent>` on the broker |
-| Agent token (`kh_agent_<id>_…`) | Yes | The agent's MCP client, as the bearer for `POST https://<host>/mcp` | `kharon token mint <agent>` |
-| `broker_pin` | No, but it must arrive unaltered | `connector.toml` | `openssl x509 -outform DER \| sha256sum` on the inner `[connector]` certificate |
+| Tunnel credential | Yes | A file the connector reads (`token_file`), mode `0400` or `0600` | `kharon setup` (bundle file `connector-tunnel-token`), or `kharon tunnel mint <agent>` on the broker |
+| Agent token (`kh_agent_<id>_…`) | Yes | The agent's MCP client, as the bearer for `POST https://<host>/mcp` | `kharon setup` (bundle file `agent-api-token`), or `kharon token mint <agent>` |
+| `broker_pin` | No, but it must arrive unaltered | `connector.toml` | `kharon setup` (bundle files `broker-pin` and `connector.toml`), or `openssl x509 -outform DER \| sha256sum` on the inner `[connector]` certificate |
 
 Plus the connector binary (`kharon-agent-connector`, built from this
 repo) and, with an authenticating egress proxy, a proxy credential

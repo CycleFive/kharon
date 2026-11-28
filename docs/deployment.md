@@ -1,5 +1,11 @@
 # Deploying kharon
 
+**New install?** Start with [First run](first-run.md). It takes you
+through `kharon setup`, the agent-host bundle and `kharon doctor` to
+a first fill, and links back here for detail. This guide is the
+reference: what each piece does, and how to set it up by hand when
+setup does not cover your shape.
+
 kharon runs on two machines (SPEC §3.3, option (a)):
 
 - **Broker host.** Your hardware. It runs kharond and, if you
@@ -371,6 +377,12 @@ On a managed deploy the customer runs the `init` step below on their own
 machine and creates the account themselves: whoever runs `kharon init`
 sees the password.
 
+`kharon setup` does steps 2–4's broker side for you: it checks the
+key, discovers the organization and collection, and writes the key
+file with the owner and mode below. The order is
+[first run, steps 1–3](first-run.md#1-create-the-broker-account-an-organization-and-a-collection).
+The steps here are the manual equivalent.
+
 kharond logs in to a dedicated Bitwarden account with an API key and
 reads one organization (SPEC OQ-5). The API-key file sits on the
 broker host. Anyone who gets that file and a copy of the server's
@@ -421,7 +433,10 @@ match, and the API key JSON — are in
 ### Agent tokens (REQ-API-003)
 
 Each agent has one bearer token, `kh_agent_<id>_<64 hex>`. kharond
-stores only its Argon2id PHC hash (`token_hash`). Mint the token on
+stores only its Argon2id PHC hash (`token_hash`). `kharon setup`
+mints the first agent's token and writes its hash into the config
+([first run, step 3](first-run.md#3-run-kharon-setup)). For another
+agent, or to rotate a token, mint the token on
 any machine that has the CLI, in an interactive terminal, for
 example from the Compose example's image:
 
@@ -535,6 +550,15 @@ both on a specific address, never `0.0.0.0` or `::` (REQ-DEP-006):
   `via = "agent_connector"`.
 - `[connector]` — the raw TLS accept the connector dials. Different
   port from `[api]`. Same certificate is fine.
+
+`kharon setup --cdp-via agent-connector --public-host <host>` does
+this section's broker side for the WebSocket shape: it mints the
+tunnel credential, generates the `[connector]` certificate and key,
+writes the config and a Compose override that mounts them, and puts
+everything the agent host needs into one bundle
+([first run, steps 3 and 5](first-run.md#3-run-kharon-setup)). The
+steps below are the manual equivalent, and the only way to a raw TLS
+`[connector] listen` on a VPN address.
 
 On the broker host, mint a tunnel credential. It is not an agent API
 token and cannot call `fill`:
@@ -957,7 +981,11 @@ mode, `(origin …; …)` in local mode.
    Also leave Cloudflare features that rewrite HTML or challenge
    requests (Rocket Loader, Bot Fight Mode) off for the owner hostname
    until tested: the page's script and the phone's approve request must
-   pass unmodified.
+   pass unmodified. **Browser Integrity Check** is a gateway concern:
+   it answers a client with a non-browser `User-Agent` with `403`
+   "Error 1010". An MCP client or script that hits `/mcp` has to send
+   an ordinary user agent, or the zone needs a configuration rule that
+   turns the check off for the gateway hostname.
 
 5. **Restart and enroll.** Restart kharond (`docker compose restart
    kharon`). Have the owner open
@@ -1527,8 +1555,9 @@ lock, idle or manual, leaves Connects alone.
 ### Creating the tunnel (owner)
 
 In the Cloudflare dashboard (Zero Trust, Networks, Tunnels), create a
-dashboard-managed tunnel. Add public-hostname routes for
-`kharon.twkr.io`:
+dashboard-managed tunnel. Add public-hostname routes for your
+gateway hostname (`kharon.twkr.io` on the managed deploy; whatever you
+pass to `kharon setup --public-host` on yours):
 
 | Path | Service |
 |---|---|
@@ -1546,7 +1575,9 @@ Without them a dashboard cannot discover the authorization server.
 The owner hostname has its own route; see
 [Publishing the owner UI](#publishing-the-owner-ui).
 
-The dashboard creates the proxied DNS record. Copy the tunnel token
+The dashboard creates the proxied DNS record. Doing the same through
+the Cloudflare API takes an API token with Account → Cloudflare Tunnel
+→ Edit and Zone → DNS → Edit. Copy the tunnel token
 into the secret file without echoing it or putting it in argv, as in
 the [compose README](../deploy/compose/README.md#run-it): `umask 077`,
 then `cloudflared tunnel token <name> > secrets/cloudflared_tunnel_token`
@@ -1795,6 +1826,10 @@ rules (the required `/connector` rule is in the checklist above):
 - **Bot Fight Mode and "I'm Under Attack":** keep them off for this
   hostname. MCP clients and the connector cannot answer a browser
   challenge.
+- **Browser Integrity Check:** it blocks requests with a missing or
+  non-browser `User-Agent` with `403` "Error 1010" before they reach
+  kharond. Turn it off for this hostname with a configuration rule, or
+  have the MCP client send an ordinary user agent.
 
 kharond's own limits (fill rate per agent, token-check concurrency)
 apply regardless. #200 adds the `/mcp` hardening that depends on the
@@ -1914,7 +1949,9 @@ Same Chromium user, ptrace scope, and password-manager policy as path
 [`deploy/agent-host/provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
 installs that, plus the connector, on Debian 12 or 13. The binary and
 the tunnel credential file are produced on the broker side (above);
-this host only receives them.
+this host only receives them. With an agent-host bundle from
+`kharon setup`, its files supply every value below; see
+[first run, step 5](first-run.md#5-apply-the-agent-host-bundle).
 
 ```sh
 sudo CONNECTOR_BIN=./kharon-agent-connector \

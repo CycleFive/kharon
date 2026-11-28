@@ -3,10 +3,12 @@
 `docker-compose.yml` runs kharond from the repository's `Dockerfile`
 beside cloudflared, against the customer's own Bitwarden vault, with
 no inbound port on the host (#207, REQ-DEP-001, REQ-DEP-002). It is an
-example to adapt, not a hardened deployment. The
-[deployment guide](../../docs/deployment.md) covers the rest: the
-kharon account's master password, agent tokens, the public gateway,
-the WireGuard link, and setting up the agent host. Host install,
+example to adapt, not a hardened deployment. A new install starts at
+[First run](../../docs/first-run.md): `kharon setup` writes the config
+and secrets below, and `kharon doctor` checks them. The
+[deployment guide](../../docs/deployment.md) is the reference for
+the rest: the public gateway, the owner UI, the WireGuard link, and
+the agent host. Host install,
 backup and restore of `/data`, upgrades and the secrets inventory are
 in [Broker lifecycle](../../docs/broker-lifecycle.md).
 
@@ -14,30 +16,41 @@ in [Broker lifecycle](../../docs/broker-lifecycle.md).
 
 ```sh
 cd deploy/compose
-printf 'COMPOSE_PROFILES=edge\n' > .env          # git-ignored; see below for other profiles
 docker compose build kharon
+# the CLI is a static binary: copy it out of the image to run setup on the host
+cid=$(docker create kharon:local); docker cp "$cid":/usr/local/bin/kharon /tmp/kharon; docker rm "$cid"
+sudo install -o root -g root -m 0755 /tmp/kharon /usr/local/bin/kharon; rm -f /tmp/kharon
 docker run --rm -it --entrypoint kharon kharon:local init  # the account's master password, shown once
-# create the kharon account with it, then its org, collection and API key (see the guide)
-docker run --rm -it --entrypoint kharon kharon:local token mint assistant
-# token once on the terminal; paste the $argon2id$ token_hash line into kharon.toml
-cp kharon.toml.example kharon.toml        # then edit: public_host, org, collections, agents, CDP endpoint, token_hash
-cp /path/to/bw-api-key.json secrets/kharon_bw_api_key.json
-sudo chown 10001:10001 secrets/kharon_bw_api_key.json   # kharond's uid; see below
-sudo chmod 0400 secrets/kharon_bw_api_key.json
+# create the kharon account with it, its org, collection and personal API key (docs/first-run.md)
+sudo kharon setup --cdp-via agent-connector \
+  --public-host kharon.example.com --owner-origin https://kharon-owner.example.com
+# writes kharon.toml, secrets/kharon_bw_api_key.json (10001, 0400), the [connector]
+# TLS pair, docker-compose.override.yml, and secrets/agent-bundle-assistant/
 # the tunnel token, from a token-managed tunnel: not echoed, not in argv
 ( umask 077; cloudflared tunnel token kharon > secrets/cloudflared_tunnel_token )
 # or: read -rs T; ( umask 077; printf '%s' "$T" > secrets/cloudflared_tunnel_token ); unset T
 sudo chown 65532:65532 secrets/cloudflared_tunnel_token  # cloudflared's uid
 sudo chmod 0400 secrets/cloudflared_tunnel_token
+printf 'COMPOSE_PROFILES=edge\n' > .env          # git-ignored; see below for other profiles
 docker compose up -d
+docker compose exec kharon kharon passkey-enroll  # after opening /enroll on the owner hostname
+# apply secrets/agent-bundle-assistant/ on the agent host (docs/first-run.md, step 5)
 docker compose exec kharon kharon unlock  # owner unlock, master password on the tty
-docker compose exec kharon kharon status
+docker compose exec kharon kharon doctor  # six checks, each PASS or the fix
 ```
+
+Each step, and the first fill that proves the install, is explained in
+[First run](../../docs/first-run.md). To write `kharon.toml` by hand
+instead, start from `kharon.toml.example`; `kharon token mint` and
+`kharon tunnel mint` print the hashes it needs, and the key file has
+to be owned by uid 10001 with mode `0400` (below).
 
 `COMPOSE_PROFILES=edge` turns cloudflared on. A self-hoster with the
 bundled vault uses `edge,vaultwarden`. To reach an agent host over a
 VPN, also add `COMPOSE_FILE=docker-compose.yml:compose.vpn.yml` to
-`.env`. With `edge` on and no token file, `up` fails with "bind source
+`.env`; Compose then reads only the files listed there, so append
+`:docker-compose.override.yml` when setup wrote one. With `edge` on
+and no token file, `up` fails with "bind source
 path does not exist". That is intended: the tunnel never starts
 without its token.
 

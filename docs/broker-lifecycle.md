@@ -168,7 +168,11 @@ the broker holds the vault credentials.
 
 The image's entrypoint is `kharond` and its default arguments are
 `--config /etc/kharon.toml`. The unit passes that path explicitly.
-Start from
+`sudo kharon setup --layout host` writes that file and
+`/etc/kharon/kharon_bw_api_key.json` for you, owned by uid 10001 (the
+`kharon` user above; pass `--key-owner <uid>:<gid>` if you picked
+another uid), and see [First run](first-run.md) for the
+rest of setup's questions. To write the file by hand, start from
 [`deploy/compose/kharon.toml.example`](../deploy/compose/kharon.toml.example).
 The code does not check the config file's mode. The file holds token
 hashes, not the tokens. `root:kharon` mode `0640` is the

@@ -21,10 +21,11 @@ Vaultwarden fill broker: lets AI agents fill credentials without ever seeing the
 
 ### Deploying and operating
 
-- [`docs/managed-deploy-runbook.md`](docs/managed-deploy-runbook.md): the ordered steps for one managed customer deploy, end to end.
+- [`docs/first-run.md`](docs/first-run.md): **start here for a new install.** Seven steps from nothing to a first fill: the broker account, its personal API key, `kharon setup`, the passkey, the agent-host bundle, unlock, and `kharon doctor`.
+- [`docs/managed-deploy-runbook.md`](docs/managed-deploy-runbook.md): the same install as a managed customer deploy, with who does what, plus the edge, acceptance and handover steps.
 - [`docs/deployment.md`](docs/deployment.md): the deployment guide, the reference each runbook step points into.
 - [`docs/broker-lifecycle.md`](docs/broker-lifecycle.md): host install of kharond, backup and restore of `/data`, upgrades, and the secrets inventory.
-- [`docs/vault-onboarding.md`](docs/vault-onboarding.md): the customer's Bitwarden organization, collection, dedicated account, and API key.
+- [`docs/vault-onboarding.md`](docs/vault-onboarding.md): reference for the Bitwarden side: the organization, collection, dedicated account, URI match, and the personal API key.
 - [`docs/agent-runtime-setup.md`](docs/agent-runtime-setup.md): the agent side on a hosted or root runtime, and handing over credentials.
 - [`docs/teach-mode.md`](docs/teach-mode.md): `kharon-teach`, a program that records how a login works while a person logs in by hand with a throwaway account, and writes a file with no typed value in it (#361).
 - [`docs/hermes-end-to-end.md`](docs/hermes-end-to-end.md): Hermes after the connector is installed: the MCP client, what the agent and the owner do in a fill, and what each failure looks like. A record of one live run.

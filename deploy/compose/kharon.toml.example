@@ -1,4 +1,6 @@
-# kharond config for the compose example (SPEC §9). Every value
+# kharond config for the compose example (SPEC §9). `kharon setup`
+# (docs/first-run.md) writes a kharon.toml for you; this file is the
+# reference for writing one by hand. Every value
 # below is a placeholder; kharond refuses unknown keys and refuses to
 # start on unsafe combinations (REQ-DEP-003). Check a file with
 #   docker compose run --rm kharon --check --config /etc/kharon.toml

@@ -9,11 +9,11 @@ use crate::capture::{
 };
 use crate::cdp::{Cdp, CdpError, Event, parse_quiet};
 use crate::events::{
-    AddBinding, AddScriptToEvaluateOnNewDocument, AttachedToTarget, BindingCalled, Empty,
-    FrameNavigated, GetRequestPostData, Hello, LayoutMetrics, ListenerReport, Navigate, PostData,
-    RemoveBinding, RemoveScript, ReportKind, RequestWillBeSent, ResponseReceived,
-    ResponseReceivedExtraInfo, ScriptId, SetAutoAttach, SetDiscoverTargets, TargetDestroyed,
-    VersionInfo,
+    AddBinding, AddScriptToEvaluateOnNewDocument, AttachedToTarget, BindingCalled, ContinueRequest,
+    Empty, FetchEnable, FrameNavigated, GetRequestPostData, Hello, LayoutMetrics, ListenerReport,
+    Navigate, PostData, RemoveBinding, RemoveScript, ReportKind, RequestPattern, RequestPaused,
+    RequestWillBeSent, ResponseReceived, ResponseReceivedExtraInfo, ScriptId, SetAutoAttach,
+    SetDiscoverTargets, TargetDestroyed, VersionInfo,
 };
 use crate::notice::notice_page_url;
 use kharon_recording::{BrowserInfo, EndedBy, ListenerWorld, Recording, ResourceKind, Viewport};
@@ -38,6 +38,27 @@ const HELLO_WAIT_SKIPPED: Duration = Duration::from_millis(300);
 const LATE_WAIT: Duration = Duration::from_millis(300);
 /// How long `Network.getRequestPostData` may take.
 const POST_DATA_WAIT: Duration = Duration::from_secs(5);
+/// The requests held at the request stage until the recorder has their body (#411): the
+/// script-sent kinds, whose body can be a `Blob` that Chromium never sends inline. Chromium
+/// drops a document's request data when the next document commits, so a page that navigates
+/// as soon as such a request answers could otherwise win the race for the body.
+const HELD_FOR_BODY: [RequestPattern<'static>; 3] = [
+    RequestPattern {
+        url_pattern: "*",
+        resource_type: "XHR",
+        request_stage: "Request",
+    },
+    RequestPattern {
+        url_pattern: "*",
+        resource_type: "Fetch",
+        request_stage: "Request",
+    },
+    RequestPattern {
+        url_pattern: "*",
+        resource_type: "Ping",
+        request_stage: "Request",
+    },
+];
 /// How many times the recorder had to ask the browser for a request body that was not inline.
 #[doc(hidden)]
 pub static POST_DATA_FETCHES: AtomicUsize = AtomicUsize::new(0);
@@ -132,6 +153,11 @@ struct Rec {
     capture: Capture,
     clock: Option<(Instant, SystemTime)>,
     hops: HashMap<String, Vec<Hop>>,
+    /// Bodies read while their request was held (`Fetch.requestPaused` came first), by
+    /// `Network` request id, for `Network.requestWillBeSent` to take (#411).
+    held_bodies: HashMap<String, RawBody>,
+    /// `Network` request ids whose `Network.requestWillBeSent` has already been handled.
+    bodies_taken: HashSet<String>,
     hello: bool,
     /// This attempt's value in the script; only a hello carrying it counts.
     nonce: String,
@@ -293,6 +319,8 @@ async fn run(
         capture: Capture::new(opts.login_url.as_str(), opts.tool_version),
         clock: None,
         hops: HashMap::new(),
+        held_bodies: HashMap::new(),
+        bodies_taken: HashSet::new(),
         hello: false,
         nonce: fresh_nonce(),
         probe,
@@ -521,6 +549,17 @@ impl Rec {
         .await?;
         send(&self.cdp, "Page.enable", &Empty {}, Some(session)).await?;
         send(&self.cdp, "Network.enable", &Empty {}, Some(session)).await?;
+        // #411: hold script-sent requests until their body is read (see `HELD_FOR_BODY`). A
+        // target that refuses interception still records, as before, with the old race.
+        let _ = send(
+            &self.cdp,
+            "Fetch.enable",
+            &FetchEnable {
+                patterns: &HELD_FOR_BODY,
+            },
+            Some(session),
+        )
+        .await;
         send(&self.cdp, "Runtime.enable", &Empty {}, Some(session)).await?;
         self.install(session).await?;
         Ok(())
@@ -532,6 +571,13 @@ impl Rec {
             "Target.attachedToTarget" => {
                 if let Ok(p) = parse_quiet::<AttachedToTarget>(&ev.params) {
                     self.attached(p).await;
+                }
+            }
+            // Before the session check: every held request is continued, whatever else
+            // happens to it, or the page would wait on it forever.
+            "Fetch.requestPaused" => {
+                if let Ok(p) = parse_quiet::<RequestPaused>(&ev.params) {
+                    self.paused(session, p).await;
                 }
             }
             "Target.targetDestroyed" => {
@@ -817,22 +863,17 @@ impl Rec {
             && p.frame_id.is_some()
             && p.frame_id == self.first_main_frame
             && p.request_id == p.loader_id;
+        // A pause that reaches us after this event finds the id here and does not ask again.
+        self.bodies_taken.insert(id.clone());
+        let held = self.held_bodies.remove(&id);
         let body = match (&p.request.post_data, p.request.has_post_data) {
             (Some(d), _) => RawBody::Bytes(Zeroizing::new(d.as_bytes().to_vec())),
-            (None, Some(true)) => {
-                POST_DATA_FETCHES.fetch_add(1, Ordering::Relaxed);
-                // A target that dies mid-call must not stall event handling for CALL_TIMEOUT.
-                let params = GetRequestPostData { request_id: &id };
-                let call = self.cdp.call::<_, PostData>(
-                    "Network.getRequestPostData",
-                    &params,
-                    Some(session),
-                );
-                match tokio::time::timeout(POST_DATA_WAIT, call).await {
-                    Ok(Ok(d)) => RawBody::Bytes(Zeroizing::new(d.post_data.as_bytes().to_vec())),
-                    Ok(Err(_)) | Err(_) => RawBody::Unavailable,
-                }
-            }
+            (None, Some(true)) => match held {
+                Some(body) => body,
+                // Safe to ask now even if the pause has not reached us yet: a held request is
+                // not continued before `paused` has run, and by then the body is read.
+                None => self.post_data(session, &id).await,
+            },
             _ => RawBody::None,
         };
         self.capture.push(CaptureEvent::Request {
@@ -851,6 +892,52 @@ impl Rec {
             body,
             frame_url: p.document_url.clone(),
         });
+    }
+
+    /// Ask the browser for a request body that was not inline.
+    async fn post_data(&self, session: &str, id: &str) -> RawBody {
+        POST_DATA_FETCHES.fetch_add(1, Ordering::Relaxed);
+        // A target that dies mid-call must not stall event handling for CALL_TIMEOUT.
+        let params = GetRequestPostData { request_id: id };
+        let call =
+            self.cdp
+                .call::<_, PostData>("Network.getRequestPostData", &params, Some(session));
+        match tokio::time::timeout(POST_DATA_WAIT, call).await {
+            Ok(Ok(d)) => RawBody::Bytes(Zeroizing::new(d.post_data.as_bytes().to_vec())),
+            Ok(Err(_)) | Err(_) => RawBody::Unavailable,
+        }
+    }
+
+    /// A script-sent request is held (#411). If it has a body and its
+    /// `Network.requestWillBeSent` has not been handled yet, read the body now, while the page
+    /// that sent it cannot have moved on, and keep it for that event; then let the request go.
+    /// It is always continued, even when the body could not be read or the session is not one
+    /// we record.
+    ///
+    /// The body is read with `Network.getRequestPostData` even when the pause carries it
+    /// inline: the browser inlines a `Blob` body here that the page's own event does not, and
+    /// the stored body must not depend on which of the two events came first.
+    async fn paused(&mut self, session: Option<&str>, p: RequestPaused) {
+        if let (Some(session), Some(id), Some(req)) = (session, &p.network_id, &p.request) {
+            let wanted = self.clock.is_some()
+                && self.sessions.contains_key(session)
+                && req.has_post_data == Some(true)
+                && !self.bodies_taken.contains(id)
+                && !self.held_bodies.contains_key(id);
+            if wanted {
+                let body = self.post_data(session, id).await;
+                self.held_bodies.insert(id.clone(), body);
+            }
+        }
+        let _ = send(
+            &self.cdp,
+            "Fetch.continueRequest",
+            &ContinueRequest {
+                request_id: &p.request_id,
+            },
+            session,
+        )
+        .await;
     }
 
     fn finish(self, confirmed: bool) -> Outcome {

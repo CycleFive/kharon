@@ -737,9 +737,26 @@ fn parse_request(line: &[u8]) -> Result<(Request, Option<Zeroizing<String>>, boo
 /// line that does not parse is `false`: the caller refuses it as
 /// `bad_request`.
 fn json_carries_oauth_token(redacted: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(redacted) else {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(redacted) else {
         return false;
     };
+    carries_oauth_token_then_wipe(&mut value)
+}
+
+/// The OAuth check on a parsed request, which then wipes every string
+/// in the tree before it drops (REQ-CRY-006, #411).
+///
+/// The tree is a second, plain copy of each string value in the
+/// request line, made only for this check. The password is already
+/// `x`s here, but other values are not: the `canary-scan` op's needle
+/// (the very secret a scan looks for) and any OAuth token this check
+/// refuses. Freed unwiped, such a copy outlives the request: the
+/// allocator overwrites only its first 16 bytes with free-list
+/// pointers, so the tail of a 27-byte password stayed readable until
+/// the allocation happened to be reused. That is what failed
+/// `req_cry_006_no_secret_left_in_the_daemon_after_a_fill` on master
+/// (#411).
+fn carries_oauth_token_then_wipe(value: &mut serde_json::Value) -> bool {
     fn walk(value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::String(s) => crate::api::oauth::is_oauth_token(s),
@@ -748,7 +765,9 @@ fn json_carries_oauth_token(redacted: &[u8]) -> bool {
             _ => false,
         }
     }
-    walk(&value)
+    let carries = walk(value);
+    crate::cdp::client::zeroize_strings(value);
+    carries
 }
 
 /// The content range (between the quotes) of the first
@@ -1494,6 +1513,27 @@ mod tests {
         assert!(!peer_uid_accepted(Some(0), 1000));
         // Unreadable credentials are a rejection, never a pass.
         assert!(!peer_uid_accepted(None, 1000));
+    }
+
+    /// REQ-CRY-006 (#411): the OAuth check's parsed copy of the
+    /// request has every string wiped before it drops, whether or not
+    /// a token was found, at any depth.
+    #[test]
+    fn the_oauth_check_wipes_its_copy_of_the_request() {
+        let mut found = serde_json::json!({
+            "op": "approve",
+            "token": "kh_at_abcd",
+            "nested": {"list": ["CANARY-NESTED", 7, null]},
+        });
+        assert!(carries_oauth_token_then_wipe(&mut found));
+        assert_eq!(
+            found,
+            serde_json::json!({"op": "", "token": "", "nested": {"list": ["", 7, null]}})
+        );
+
+        let mut clean = serde_json::json!({"op": "scan", "needle": "CANARY-NEEDLE-411"});
+        assert!(!carries_oauth_token_then_wipe(&mut clean));
+        assert_eq!(clean, serde_json::json!({"op": "", "needle": ""}));
     }
 
     /// REQ-OAU-006: a `kh_at_` / `kh_rt_` on the socket does not run

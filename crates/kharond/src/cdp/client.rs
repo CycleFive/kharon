@@ -733,8 +733,8 @@ fn serialize_exact(message: &Value) -> Zeroizing<String> {
 
 /// Zeroize every string in a JSON tree (REQ-CRY-006). A request's
 /// params can carry field values, and a `Value`'s strings are freed on
-/// drop, not wiped.
-fn zeroize_strings(value: &mut Value) {
+/// drop, not wiped. Also used by the owner socket's OAuth check (#411).
+pub(crate) fn zeroize_strings(value: &mut Value) {
     match value {
         Value::String(s) => s.zeroize(),
         Value::Array(items) => items.iter_mut().for_each(zeroize_strings),

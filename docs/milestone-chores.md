@@ -6,7 +6,7 @@ Lead duties (writing issues, grooming the backlog, checking scope creep) are tas
 
 These are two separate things, and they run independently.
 
-- **A milestone is a unit of scope.** It has a goal, exit criteria in its description, and a due date (for example `M6 — teach mode`). The prior milestone's Close-out creates it with a title only, its Groom chore fills in the goal, exit criteria, and due date, and it closes when its own Close-out chore closes. The due date gives the Scope check a real midpoint, and the milestone's progress bar counts the chores along with the work.
+- **A milestone is a unit of scope.** It has a goal, exit criteria in its description, and a due date (for example `M6 — teach mode`). The prior milestone's Close-out creates it with a title only, its Groom chore fills in the goal, exit criteria, and due date, and it closes when its own Close-out chore closes. The Groom also sets the Scope check's trigger (see The chores are gates), and the milestone's progress bar counts the chores along with the work.
 - **The release train is the shipping schedule.** A version (`v0.7.0`, `v0.8.0`, …) is cut whenever master is green and something user-visible has landed. That can happen zero, one, or several times during a milestone. Each version is recorded as a tag and a GitHub release whose notes list the issues it shipped. Versions no longer get their own milestones, because GitHub puts an issue in only one milestone and that slot now belongs to scope. The closed milestones `v0.2.0` through `v0.6.0` stay as history.
 - **[`next`](https://github.com/CycleFive/kharon/milestone/12) is the unscheduled backlog.** Work that isn't in the current milestone waits there. Groom pulls issues from `next` into the new milestone, and Close-out sends unfinished work back to `next` or forward into the next milestone on purpose. `next` itself has no chores and never closes, and the Groom sweeps it at the start of every milestone (see below).
 
@@ -16,9 +16,19 @@ Platform goals are still tracked with `platform:` labels and tracking issues.
 
 ## The three chores
 
-1. **Groom** (start). Set the milestone's goal, exit criteria, and due date (the prior Close-out created it with a title only). Sweep `next` (below). Then write, size, label, and order its issues, pulling them from `next`. For each gate in the exit criteria, list its consequences: the state changes elsewhere that finishing the gate triggers (for example, flipping a platform to supported once its canary passes).
-2. **Scope check** (around the midpoint, using the due date). Compare the open work to the exit criteria, and cut or defer anything that has drifted. Ping Lothrop in #needs-lothrop only when a decision is needed.
-3. **Close-out** (end). Verify the exit criteria or record a waiver, confirm that every consequence from the Groom is done or handed to a named owner, and list the versions the train shipped during the milestone. Create the next milestone (title only) and open its three chores in it, move unfinished issues on purpose (into that milestone or back to `next`), write a short retro, and then close this issue and the milestone. Close-out doesn't cut a release; the train does that whenever its gate passes.
+1. **Groom** (start gate). Set the milestone's goal, exit criteria, and due date (the prior Close-out created it with a title only). Sweep `next` (below). Then write, size, label, and order its issues, pulling them from `next`. For each gate in the exit criteria, list its consequences: the state changes elsewhere that finishing the gate triggers (for example, flipping a platform to supported once its canary passes). Define the Scope check's trigger and write it on the Scope check issue. This issue closes before any work in the milestone starts; on closing, forward the consequences — and any sweep items still awaiting Lothrop's ✅, listed explicitly — to the Scope check issue.
+2. **Scope check** (mid gate). Runs when the trigger the Groom defined fires. Test the Groom's assumptions — its scope calls, ordering, and sizing — against what has actually happened, compare the open work to the exit criteria, and cut or defer anything that has drifted. Ping Lothrop in #needs-lothrop only when a decision is needed. On closing, forward the consequences, statuses updated, to the Close-out issue; after it closes, the milestone's goal is Close-out.
+3. **Close-out** (acceptance gate, end). Verify the exit criteria or record a waiver, confirm that every consequence in the ledger forwarded from the Scope check is done or handed to a named owner, and list the versions the train shipped during the milestone. If the Scope check never ran, run a compressed scope check or record an explicit waiver. Create the next milestone (title only) and open its three chores in it, move unfinished issues on purpose (into that milestone or back to `next`), write a short retro, and then close this issue and the milestone. Close-out doesn't cut a release; the train does that whenever its gate passes.
+
+### The chores are gates
+
+The three chores gate and drive execution; they are not reports about the work. No work in a milestone starts before its Groom closes — closing the Groom is the claim that the work is definable: goal, exit criteria, due date, sized and ordered issues, consequences written. When the Scope check's trigger fires, no new work is claimed in the milestone until the check closes; in-flight PRs land. A milestone is done when its Close-out closes.
+
+The Scope check's trigger is a date or an event, fitted to the milestone's shape by the Groom: a calendar midpoint for a long milestone, an event ("when the canary lands", "when three of five children close") for a short one. The trigger is evaluated whenever milestone activity is triaged; nobody polls for it separately.
+
+The consequences ledger has exactly one living copy at a time. The Groom writes it, forwards it to the Scope check on closing, and the Scope check forwards it to Close-out on closing; after a hand-off, only the receiving chore's copy is authoritative. Each chore closes as it completes, so a milestone's open issues always show its current phase.
+
+Lothrop's directive overrides any gate, at any point, without ceremony.
 
 ### Sweeping `next`
 

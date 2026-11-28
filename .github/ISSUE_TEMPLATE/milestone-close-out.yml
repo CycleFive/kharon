@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        End-of-milestone chore. This is the last open issue in the milestone, and closing it closes the milestone. See `docs/milestone-chores.md`.
+        End-of-milestone chore and acceptance gate. This is the last open issue in the milestone, and closing it closes the milestone. See `docs/milestone-chores.md`.
         Put this issue in the milestone it closes. After opening it, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
         A label counts only when a collaborator with triage access or higher applied it.
         Releases run on their own train, which cuts a version whenever master is green and something user-visible has landed, so Close-out doesn't cut one. Never force-push.
@@ -35,7 +35,8 @@ body:
       label: Checklist
       options:
         - label: Verify that every exit criterion is met, or record an explicit waiver.
-        - label: Check each consequence listed in this milestone's Groom issue. Every one must be done, or handed to a named owner in an issue, before this chore can close.
+        - label: Check each consequence in the ledger forwarded from the Scope check (the only living copy). Every one must be done, or handed to a named owner in an issue, before this chore can close.
+        - label: If the Scope check never ran (its trigger never fired), run a compressed scope check now, or record an explicit waiver in Notes.
         - label: "List the versions the release train shipped during this milestone. If user-visible work landed and no version was cut, raise it in #kharon (or in #needs-lothrop if it needs Lothrop's call), and don't cut one here."
         - label: Create the next milestone with a title only (its Groom sets the goal, exit criteria, and due date). Then open its three chore issues (Groom, Scope check, and Close-out) from the issue forms and put them in it.
         - label: Move every unfinished issue on purpose, either into the next milestone or back to `next`.
@@ -53,7 +54,7 @@ body:
     id: consequences
     attributes:
       label: Consequences
-      description: Each consequence from the Groom issue and its state, either done (with a link) or handed off (with the owner and the issue). Write "none" if the Groom listed none.
+      description: Each consequence from the ledger forwarded by the Scope check and its state, either done (with a link) or handed off (with the owner and the issue). Write "none" if the ledger was empty.
     validations:
       required: true
   - type: textarea

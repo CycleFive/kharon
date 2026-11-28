@@ -29,7 +29,11 @@
 //!   `"owner_ui_without_edge_address":<n>` when a public owner UI is
 //!   configured: how many of its requests arrived without a usable
 //!   `CF-Connecting-IP` (they are not throttled; a count that grows
-//!   means the edge is not sending the header).
+//!   means the edge is not sending the header). It also carries
+//!   `"agents":[{"id":…,"attached":<bool>,"since":<unix seconds>}]`:
+//!   every configured agent, `attached` when it holds a live
+//!   connector session (#406, for `kharon doctor`); `since` is
+//!   present only for an attached agent.
 //! - `{"op":"revoke_grant","grant_id":"g_…"}` — REQ-REV-001.
 //! - `{"op":"revoke_agent","agent_id":"…"}` — REQ-REV-001 (token +
 //!   grants). Durable (#132): the `token_revoke` entry binds the
@@ -202,6 +206,13 @@ pub trait OwnerOps: Send + Sync + 'static {
     /// `CF-Connecting-IP`; `None` when there is no public owner UI.
     fn owner_ui_without_edge_address(&self) -> Option<u64> {
         None
+    }
+
+    /// Every configured agent, with the start of its live connector
+    /// session when one is attached (#406). Default: no agents known
+    /// (test doubles predate the report).
+    fn attached_agents(&self) -> Vec<AgentAttachment> {
+        Vec::new()
     }
 
     /// Record an `owner_auth_fail` audit entry (rejected peer or
@@ -488,6 +499,20 @@ pub struct PasskeyRow {
     pub enrolled_at: Option<String>,
     /// RFC3339 UTC of the last successful assertion, or null until one.
     pub last_used_at: Option<String>,
+}
+
+/// One configured agent's connector attachment, as the `status`
+/// reply reports it (#406). An agent on another transport (direct,
+/// wireguard, …) never has a session: the broker dials it per fill,
+/// so `since` stays `None` and only a path-B / Connect agent can
+/// appear attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAttachment {
+    /// The agent id, from the config's `[agents.<id>]` table name.
+    pub id: String,
+    /// Unix seconds when the live connector session began, or
+    /// `None` when the agent holds no session.
+    pub since: Option<u64>,
 }
 
 /// The owner-facing hint for [`OwnerFailure::ScopeTooBroad`] (#243),
@@ -908,7 +933,11 @@ async fn dispatch_line<O: OwnerOps>(
             ops.lock().await;
             ok_response(Some(true))
         }
-        "status" => status_response(ops.is_locked().await, ops.owner_ui_without_edge_address()),
+        "status" => status_response(
+            ops.is_locked().await,
+            ops.owner_ui_without_edge_address(),
+            &ops.attached_agents(),
+        ),
         "grants" => {
             let prompts = ops.pending_grants().await;
             let pending: Vec<PendingGrantRow<'_>> = prompts
@@ -1172,6 +1201,18 @@ struct StatusReply {
     locked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner_ui_without_edge_address: Option<u64>,
+    /// Every configured agent's attachment (#406). Always present
+    /// (possibly empty), so a reply without the field is a daemon
+    /// too old to report attachment at all.
+    agents: Vec<StatusAgentRow>,
+}
+
+#[derive(Serialize)]
+struct StatusAgentRow {
+    id: String,
+    attached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<u64>,
 }
 
 /// The request's `domain`, normalized to its site key; `None` when absent or blank.
@@ -1257,11 +1298,23 @@ fn reply_line<T: Serialize>(reply: &T) -> String {
     line
 }
 
-fn status_response(locked: bool, without_edge_address: Option<u64>) -> String {
+fn status_response(
+    locked: bool,
+    without_edge_address: Option<u64>,
+    agents: &[AgentAttachment],
+) -> String {
     let reply = StatusReply {
         ok: true,
         locked,
         owner_ui_without_edge_address: without_edge_address,
+        agents: agents
+            .iter()
+            .map(|a| StatusAgentRow {
+                id: a.id.clone(),
+                attached: a.since.is_some(),
+                since: a.since,
+            })
+            .collect(),
     };
     // Plain fields: serializing cannot fail.
     let mut line = serde_json::to_string(&reply).unwrap_or_else(|_| "{\"ok\":true}".to_owned());
@@ -1276,6 +1329,32 @@ fn error_response(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_response_reports_agent_attachment() {
+        let agents = [
+            AgentAttachment {
+                id: "assistant".to_owned(),
+                since: Some(1_700_000_000),
+            },
+            AgentAttachment {
+                id: "beta".to_owned(),
+                since: None,
+            },
+        ];
+        assert_eq!(
+            status_response(false, None, &agents),
+            "{\"ok\":true,\"locked\":false,\"agents\":[\
+             {\"id\":\"assistant\",\"attached\":true,\"since\":1700000000},\
+             {\"id\":\"beta\",\"attached\":false}]}\n"
+        );
+        // No agents configured: the field is present and empty, so a
+        // reader can tell this daemon reports attachment at all.
+        assert_eq!(
+            status_response(true, Some(3), &[]),
+            "{\"ok\":true,\"locked\":true,\"owner_ui_without_edge_address\":3,\"agents\":[]}\n"
+        );
+    }
 
     fn request(line: &[u8]) -> (Request, Option<Zeroizing<String>>) {
         let (req, password, _) = parse_request(line).expect("request parses");
@@ -1457,7 +1536,7 @@ mod tests {
 
         // Without a token the op runs, and a real password reaches unlock.
         let (reply, _) = exchange("{\"op\":\"status\"}\n").await;
-        assert_eq!(reply, "{\"ok\":true,\"locked\":true}\n");
+        assert_eq!(reply, "{\"ok\":true,\"locked\":true,\"agents\":[]}\n");
         let (reply, ops) = exchange("{\"op\":\"unlock\",\"password\":\"secret\"}\n").await;
         assert!(reply.contains("\"ok\":true"), "{reply}");
         assert_eq!(ops.unlocks.load(std::sync::atomic::Ordering::Relaxed), 1);

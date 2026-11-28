@@ -781,7 +781,9 @@ fn server_url(text: &str, discovering: bool) -> Result<Url, String> {
     Ok(url)
 }
 
-fn explain_sync_error(e: &SyncError, server: &Url) -> String {
+/// Shared with `kharon doctor` (#406), so a refused sync names the
+/// same fix in both.
+pub(crate) fn explain_sync_error(e: &SyncError, server: &Url) -> String {
     match e {
         SyncError::Status {
             endpoint: "token",

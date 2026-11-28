@@ -181,6 +181,16 @@ struct Deployment {
 }
 
 fn deployment(server: &str, key_bytes: &str, key_mode: u32) -> Deployment {
+    deployment_variant(server, key_bytes, key_mode, false)
+}
+
+/// A deployment whose checks 5–6 skip: no `[owner_ui]`, and the
+/// agent is on the wireguard transport instead of the connector.
+fn deployment_with_skips(server: &str, key_bytes: &str, key_mode: u32) -> Deployment {
+    deployment_variant(server, key_bytes, key_mode, true)
+}
+
+fn deployment_variant(server: &str, key_bytes: &str, key_mode: u32, skips: bool) -> Deployment {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -192,6 +202,24 @@ fn deployment(server: &str, key_bytes: &str, key_mode: u32) -> Deployment {
     let key_pem = dir.path().join("tls.key");
     std::fs::write(&crt, "doctor fixture cert\n").unwrap();
     std::fs::write(&key_pem, "doctor fixture key\n").unwrap();
+    let (via, connector_token_hash, owner_ui, connector) = if skips {
+        ("wireguard", String::new(), String::new(), String::new())
+    } else {
+        (
+            "agent_connector",
+            format!("connector_token_hash = \"{TOKEN_HASH}\"\n"),
+            "[owner_ui]\n\
+             listen = \"127.0.0.1:8788\"\n\
+             origin = \"http://localhost:8788\"\n"
+                .to_owned(),
+            format!(
+                "[connector]\n\
+                 listen = \"127.0.0.1:8789\"\n\
+                 tls_cert_file = {crt:?}\n\
+                 tls_key_file = {key_pem:?}\n"
+            ),
+        )
+    };
     std::fs::write(
         &config,
         format!(
@@ -204,17 +232,12 @@ fn deployment(server: &str, key_bytes: &str, key_mode: u32) -> Deployment {
              collection_ids = [\"{COLL}\"]\n\
              [agents.assistant]\n\
              token_hash = \"{TOKEN_HASH}\"\n\
-             connector_token_hash = \"{TOKEN_HASH}\"\n\
-             cdp = {{ endpoint = \"ws://127.0.0.1:9222\", via = \"agent_connector\" }}\n\
-             [owner_ui]\n\
-             listen = \"127.0.0.1:8788\"\n\
-             origin = \"http://localhost:8788\"\n\
+             {connector_token_hash}\
+             cdp = {{ endpoint = \"ws://127.0.0.1:9222\", via = \"{via}\" }}\n\
+             {owner_ui}\
              [approval]\n\
              ntfy = {{ url = \"https://ntfy.example.net\", topic = \"kharon-doctor-e2e\" }}\n\
-             [connector]\n\
-             listen = \"127.0.0.1:8789\"\n\
-             tls_cert_file = {crt:?}\n\
-             tls_key_file = {key_pem:?}\n",
+             {connector}",
         ),
     )
     .unwrap();
@@ -278,6 +301,28 @@ async fn req_406_doctor_org_key_and_writable_key_file_fail() {
     assert!(text.contains("chmod 0400"), "{text}");
     assert!(text.contains("FAIL api key type"), "{text}");
     assert!(text.contains("organization API key"), "{text}");
+    assert!(!text.contains(SECRET), "secret leaked:\n{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn req_406_doctor_skips_without_failures_exit_zero() {
+    // Assumption 5: skips never fail the run. No [owner_ui] and a
+    // wireguard agent, so checks 5–6 skip; everything else passes.
+    let server = start_mock_bw().await;
+    let dep = deployment_with_skips(&server, &user_key(), 0o400);
+    let out = doctor(&dep.config);
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "doctor failed:\n{text}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("SKIP passkey enrolled"), "{text}");
+    assert!(text.contains("SKIP agent attached"), "{text}");
+    assert!(
+        text.contains("doctor: 4 passed, 0 failed, 2 skipped"),
+        "{text}"
+    );
     assert!(!text.contains(SECRET), "secret leaked:\n{text}");
 }
 

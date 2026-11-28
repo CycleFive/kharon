@@ -11,13 +11,17 @@
 //! The checks, and where each fact comes from:
 //!
 //! 1. **Config and key files** — metadata of the config and the API
-//!    key file, under the daemon's own REQ-DEP-008 rules: a missing,
-//!    non-regular, or group/world-writable file fails (kharond would
-//!    refuse to start); the rules kharond only warns about (a
-//!    group/other-readable key file, an owner other than doctor's
-//!    euid) are notes on a pass. A config that does not load fails
-//!    this check with the loader's message, and the checks that need
-//!    the config skip gracefully.
+//!    key file, under REQ-DEP-008's rules: a missing, non-regular,
+//!    or group/world-writable file fails. For the key file these are
+//!    the daemon's own rules (kharond would refuse to start); for
+//!    the config file the writable rule is doctor's own — kharond
+//!    never stats the config, but the config holds the agents'
+//!    token hashes, so doctor refuses to call a writable one sound.
+//!    The rules kharond only warns about (a group/other-readable
+//!    key file, an owner other than doctor's euid) are notes on a
+//!    pass. A config that does not load fails this check with the
+//!    loader's message, and the checks that need the config skip
+//!    gracefully.
 //! 2. **API key type** — the key file's `client_id` against #403's
 //!    check (`kharond::sync::check_client_id`), the refusal `kharon
 //!    setup` and kharond share.
@@ -26,10 +30,17 @@
 //!    configured organization and every configured collection must
 //!    be visible from the account's own view, and REQ-CRY-008's
 //!    scope rule must come back clean, as kharond will demand at
-//!    unlock.
+//!    unlock — unless `bitwarden.allow_extra_orgs = true`, the
+//!    escape hatch kharond itself honours, in which case a wider
+//!    scope passes with a note naming the extra orgs and items.
 //! 4. **Audit sink** — an off-host checkpoint sink is configured, or
 //!    `audit.checkpoint_local_only` is set (a pass with a note:
-//!    kharond warns about it at startup, SPEC §7).
+//!    kharond warns about it at startup, SPEC §7). The fail branch
+//!    is unreachable from a loaded config — the loader already
+//!    refuses a config with no off-host sink
+//!    (`AuditNoOffHostSink`), so that operator sees check 1 fail
+//!    with the loader's text and this check skip; the branch stands
+//!    as the judgement's own statement of the fix.
 //! 5. **Passkey enrolled** — the owner socket's `passkey_list` op
 //!    (#258) names at least one passkey. Skipped when the config has
 //!    no `[owner_ui]`; passkeys belong to the owner UI.
@@ -380,7 +391,7 @@ fn assess_visibility(bw: &BitwardenConfig, d: &Discovery, scope: &ScopeViolation
             ),
         );
     }
-    if !scope.is_empty() {
+    if !scope.is_empty() && !bw.allow_extra_orgs {
         return Check::fail(
             name,
             format!(
@@ -397,15 +408,26 @@ fn assess_visibility(bw: &BitwardenConfig, d: &Discovery, scope: &ScopeViolation
         Some(n) => format!("{} ({})", super::plain(n), org.id),
         None => org.id.clone(),
     };
-    Check::pass(
-        name,
-        format!(
-            "organization {label} visible with all {} configured collection(s) ({} items in \
-             the organization's view)",
-            bw.collection_ids.len(),
-            org.items
-        ),
-    )
+    let mut detail = format!(
+        "organization {label} visible with all {} configured collection(s) ({} items in \
+         the organization's view)",
+        bw.collection_ids.len(),
+        org.items
+    );
+    if !scope.is_empty() {
+        // `allow_extra_orgs = true`: kharond's check_dedicated_scope
+        // returns Ok here (only ConfigWarning::ExtraOrgsAllowed), so
+        // doctor passes too, naming what the escape hatch allows.
+        detail.push_str(&format!(
+            "; note: bitwarden.allow_extra_orgs = true, so the {} other organization(s) ({}) \
+             and {} item(s) outside the kharon organization are allowed — kharond warns about \
+             this at startup",
+            scope.other_orgs.len(),
+            scope.other_orgs.join(", "),
+            scope.outside_items.len()
+        ));
+    }
+    Check::pass(name, detail)
 }
 
 /// Check 3: one sync with the broker account, judged by
@@ -430,8 +452,10 @@ fn check_sync(
                     );
                 }
             };
-            let text = match String::from_utf8(bytes.to_vec()) {
-                Ok(t) => Zeroizing::new(t),
+            // Borrow, never copy: a `to_vec()`/`from_utf8` copy of
+            // the key bytes would drop un-zeroized.
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(t) => t,
                 Err(_) => {
                     return Check::fail(
                         name,
@@ -441,7 +465,7 @@ fn check_sync(
                     );
                 }
             };
-            match ApiKey::from_json(&text) {
+            match ApiKey::from_json(text) {
                 Ok(k) => k,
                 Err(e) => return Check::fail(name, e.to_string()),
             }
@@ -1028,6 +1052,23 @@ mod tests {
         let c = assess_visibility(&bw(), &discovery(), &scope);
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("scope_too_broad"), "{}", c.detail);
+    }
+
+    #[test]
+    fn req_406_visibility_allow_extra_orgs_passes_with_a_note() {
+        // The same wider scope, with the REQ-CRY-008 escape hatch
+        // set: kharond's check_dedicated_scope returns Ok (only a
+        // ConfigWarning), so doctor passes too, naming the extras.
+        let scope = ScopeViolation {
+            other_orgs: vec!["other-org".to_owned()],
+            outside_items: vec!["item".to_owned()],
+        };
+        let mut cfg = bw();
+        cfg.allow_extra_orgs = true;
+        let c = assess_visibility(&cfg, &discovery(), &scope);
+        assert_eq!(c.verdict, Verdict::Pass, "{}", c.detail);
+        assert!(c.detail.contains("allow_extra_orgs"), "{}", c.detail);
+        assert!(c.detail.contains("other-org"), "{}", c.detail);
     }
 
     // ---- check 4: audit sink ----

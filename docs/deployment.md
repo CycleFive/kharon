@@ -377,6 +377,12 @@ On a managed deploy the customer runs the `init` step below on their own
 machine and creates the account themselves: whoever runs `kharon init`
 sees the password.
 
+`kharon setup` does steps 2–4's broker side for you: it checks the
+key, discovers the organization and collection, and writes the key
+file with the owner and mode below. The order is
+[first run, steps 1–3](first-run.md#1-create-the-broker-account-an-organization-and-a-collection).
+The steps here are the manual equivalent.
+
 kharond logs in to a dedicated Bitwarden account with an API key and
 reads one organization (SPEC OQ-5). The API-key file sits on the
 broker host. Anyone who gets that file and a copy of the server's
@@ -384,12 +390,6 @@ data (a backup, a compromised Vaultwarden) can fetch the account's
 encrypted keys and is then left with an offline attack on its
 master password. So the master password must be long and random,
 not something a person chose:
-
-`kharon setup` does steps 2–4's broker side for you: it checks the
-key, discovers the organization and collection, and writes the key
-file with the owner and mode below. The order is
-[first run, steps 1–3](first-run.md#1-create-the-broker-account-an-organization-and-a-collection).
-The steps here are the manual equivalent.
 
 1. Generate it with `kharon init`, in an interactive terminal on
    any machine that has the CLI, for example from the Compose

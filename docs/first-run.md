@@ -333,9 +333,8 @@ all six pass:
 | `agent attached` | The agent's connector holds a live session |
 
 Every failure names its fix, and the exit status is non-zero when any
-check fails, so you can run doctor at any point: before step 4 it
-tells you to start kharond, before step 5 that no connector is
-attached. Doctor never prints a secret, and it works while the broker
+check fails, so you can rerun it after any later step: before step 5
+it tells you that no connector is attached. Doctor never prints a secret, and it works while the broker
 is locked.
 
 Doctor checks the parts, not a fill. The last step is one real fill,
@@ -359,9 +358,11 @@ typed, never the values.
    notification.
 4. The agent calls `kharon_fill` with `submit: true`. Expect
    `status: filled`, with both fields named.
-5. The tab lands on `/login/welcome.html`, which says it is logged in
-   (`#login-status` reads `success`). The page only counts characters,
-   so `#submit-report` shows 8 and 28: the lengths of the test pair.
+5. The tab lands on `/login/welcome.html?from=strict`, which says it
+   is logged in: `#login-status` has `data-state="success"`. The page
+   only counts characters, so `#submit-report` has
+   `data-recorded="true"`, `data-username-length="8"` and
+   `data-password-length="28"`: the lengths of the test pair.
 
 That is a working install. To take it further: more agents
 (`kharon token mint`), more logins (add them to the collection; they
@@ -373,7 +374,8 @@ on it, and [backup and upgrades](broker-lifecycle.md#data-backup-restore-and-upg
 
 | You see | It means | Fix |
 |---|---|---|
-| `client_id is not a personal API key (expected user.<uuid>)` | An organization key | Step 2, signed in as the dedicated account |
+| `this is an organization API key (client_id organization.<id>); it reaches the Public API only and cannot sync a vault` | An organization key | Step 2, signed in as the dedicated account |
+| `client_id is not a personal API key (expected user.<uuid>)` | Any other prefix, or a pasted id that is not the `client_id` | Step 2, signed in as the dedicated account |
 | `the server refused the API key` | Wrong secret, or a rotated key | Copy the key again; rotating replaces the secret |
 | `the account cannot see that organization` | The invite is not accepted or not confirmed | Step 1.3, both halves |
 | `… would refuse it [scope_too_broad]` | The account sees a personal item or a second organization | Empty its personal vault; remove it from other organizations |

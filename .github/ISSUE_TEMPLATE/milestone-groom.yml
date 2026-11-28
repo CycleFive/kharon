@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Start-of-milestone chore. A milestone is a unit of scope with a goal, exit criteria, and a due date. Releases run on their own train. See `docs/milestone-chores.md`.
+        Start-of-milestone chore and start gate: this issue closes before any work in the milestone starts, and closing it means the work is definable. A milestone is a unit of scope with a goal, exit criteria, and a due date. Releases run on their own train. See `docs/milestone-chores.md`.
         Put this issue in the milestone it grooms. After opening it, apply one assignment label: `assigned:nyx`, `assigned:muse`, or `assigned:duet`.
         A label counts only when a collaborator with triage access or higher applied it.
   - type: input
@@ -40,7 +40,9 @@ body:
         - label: Size each issue, apply type and priority labels, and put the issues in delivery order.
         - label: "For each gate in the exit criteria, list its consequences: the state changes that finishing it triggers elsewhere, written as conditional tasks (for example \"on canary pass: flip #346/#347 to supported\")."
         - label: Make sure this milestone's Scope check and Close-out issues exist and are in it.
+        - label: Define the Scope check's trigger (a date or an event, fitted to the milestone's shape) and write it on the Scope check issue.
         - label: Confirm the `assigned:<agent>` label matches the dropdown. Don't use the label as a substitute for GitHub assignees.
+        - label: "Close this issue before work in the milestone starts, forwarding the consequences below — and any sweep items still awaiting Lothrop's ✅, listed in Notes — to the Scope check issue. From then on the Scope check's copy is the only living one."
   - type: textarea
     id: scope
     attributes:
@@ -52,7 +54,7 @@ body:
     id: consequences
     attributes:
       label: Consequences
-      description: For each gate, the downstream state changes its completion triggers, one conditional task per line, for example "on canary pass, flip #346/#347 to supported". Write "none" if no gate triggers anything. Close-out isn't done until each one is done or handed to a named owner.
+      description: For each gate, the downstream state changes its completion triggers, one conditional task per line, for example "on canary pass, flip #346/#347 to supported". Write "none" if no gate triggers anything. Forwarded to the Scope check when this issue closes. Close-out isn't done until each one is done or handed to a named owner.
     validations:
       required: true
   - type: textarea

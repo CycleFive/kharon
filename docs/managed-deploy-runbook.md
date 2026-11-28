@@ -74,7 +74,9 @@ the gateway's.
    [first run, steps 1–2](first-run.md#1-create-the-broker-account-an-organization-and-a-collection):
    `kharon init` for the master password (whoever runs it sees the
    password, so the customer does), the dedicated account, the
-   organization and collection, inviting and confirming the account,
+   organization and collection (on Vaultwarden the dedicated account
+   creates and owns the organization; on Bitwarden cloud the customer
+   owns it, and the account is invited as a User and confirmed),
    moving the logins kharon may fill into the collection, and the
    account's personal API key as a JSON file. The Bitwarden web-app
    detail is in [Customer vault onboarding](vault-onboarding.md).

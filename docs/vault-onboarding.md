@@ -85,10 +85,20 @@ says. The dedicated account's personal vault stays empty. A personal
 item there is an item outside `organization_id`, and startup refuses
 it (below).
 
-The customer owns the organization. The dedicated account is invited
-into it. It is not the owner.
+**Who owns the organization depends on the server.** On Bitwarden
+cloud the customer owns the organization, and the dedicated account
+is invited into it as a User. It is not the owner. On Vaultwarden
+that exists for kharon (self-hosted, or run for a tenant), the
+dedicated account creates and owns its organization itself, as Owner
+with manage on the collection, and the invite, accept and confirm
+steps below do not apply. That is the supported Vaultwarden setup,
+by choice: it needs no second account, and the instance is dedicated.
+The tradeoff is that the account's API key can administer that
+organization. kharond's scope check still refuses a second
+organization and any item outside the organization. See
+[first run, step 1](first-run.md#1-create-the-broker-account-an-organization-and-a-collection).
 
-### Invite and confirm
+### Invite and confirm (Bitwarden cloud)
 
 Bitwarden adds a member in three steps, invite, accept, confirm
 ([User management](https://bitwarden.com/help/managing-users/)).
@@ -115,8 +125,8 @@ says that when an organization is first set up, collection settings
 are off and an invited user receives the **View items** permission.
 Owners and admins can access every collection when **Allow owners
 and admins to manage all collections and items from the Admin
-Console** is on. A User is outside that row. Leave the dedicated
-account a User.
+Console** is on. A User is outside that row. On Bitwarden cloud,
+leave the dedicated account a User.
 
 ### Collection permission
 

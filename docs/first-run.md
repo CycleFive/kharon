@@ -84,37 +84,64 @@ If you pick the password some other way, take it from a password
 generator at 128 bits or more, for example 22 or more random letters
 and digits. Never reuse one.
 
-**Then, in the web vault:**
+**Then, in the web vault. The two server types are set up
+differently, on purpose.**
 
-1. Create the dedicated account with that password, on Bitwarden
-   cloud (`https://vault.bitwarden.com` or `https://vault.bitwarden.eu`)
-   or on your own Vaultwarden. Leave its personal vault empty:
-   kharond refuses an account that can see items outside its
-   organization (`scope_too_broad`).
+| | **Vaultwarden** (self-hosted, or run for a tenant) | **Bitwarden cloud** (`vault.bitwarden.com`, `.eu`) |
+|---|---|---|
+| Who creates the organization | **The dedicated account**, signed in as itself | **You**, signed in as yourself |
+| The account's role | **Owner** of that organization, with manage on its collection | **User**, with **View items** on one collection |
+| Invite, accept, confirm | **None.** There is no second person to invite it | Invite as User, accept as the account, then confirm as yourself, checking the fingerprint phrase |
+| Plans | None to pick: any organization works | A Free organization is enough |
+
+**This is how we want Vaultwarden set up.** On a Vaultwarden that
+exists for kharon, whether you self-host it or we run it for a
+tenant, the dedicated account creating and owning its organization
+is the supported path. It needs no invite, no confirm and no second
+account, so there is less to get wrong. The tradeoff is that the
+account's API key can administer that organization, not only read one
+collection. That is acceptable here because the Vaultwarden instance
+and the account exist only for kharon, and nothing else lives in the
+organization. kharond's scope check still applies: it refuses an
+account that can see a second organization, or any item outside its
+organization (`scope_too_broad`). On Bitwarden cloud the organization
+is the customer's, and may hold other people and other collections,
+so the account stays a **User**: there, never make it Owner, Admin or
+Manage. Today, neither `kharon setup` nor kharond checks the role: that is
+on you. (`kharon doctor` is planned to warn about an Owner on
+Bitwarden cloud and only note it on Vaultwarden.)
+
+**Vaultwarden path:**
+
+1. Create the dedicated account with the password you set up above
+   (a Vaultwarden may have signups disabled: then have the server's
+   admin allow them, or invite the account from the admin page).
+   Leave its personal vault empty: an item there is outside the
+   organization and kharond refuses it (`scope_too_broad`).
+2. Signed in as that account, create an organization (Vaultwarden has
+   no plans to pick) and one collection for kharon, for example
+   `kharon`. SMTP is not needed for any of this, and the account's
+   email does not have to be verified.
+3. Create or move the logins kharon may fill into that collection.
+
+**Bitwarden cloud path:**
+
+1. Create the dedicated account with the password you set up above,
+   on `https://vault.bitwarden.com` or `https://vault.bitwarden.eu`.
+   Leave its personal vault empty (`scope_too_broad`, as above).
 2. As yourself, create an organization (a Free organization is
    enough) and one collection for kharon, for example `kharon`.
 3. Invite the dedicated account with the **User** role and **View
    items** on that one collection. Accept the invite as the account,
    then confirm it as yourself, checking the fingerprint phrase.
 4. Move or copy the logins kharon may fill into the collection.
-   Check each login's URI: it has to be `https://`, and its match
-   detection decides which pages it fills (see
-   [URI match](vault-onboarding.md#uri-match)). kharond refuses a fill
-   when the tab does not match (`origin_mismatch`).
 
-**The organization is yours, not the dedicated account's.** Create it
-signed in as yourself. If the dedicated account creates it, it becomes
-the organization's Owner, and its API key can then administer the
-organization, not just read one collection. Neither `kharon setup` nor
-kharond checks the role yet, so this is on you: the account stays a
-**User** with **View items**, never Owner, Admin or Manage.
-
-**On Vaultwarden**, there are no plans to pick: any organization is
-enough. If the server has signups disabled, create the dedicated
-account through an invite (from the admin page or the organization),
-or have the server's admin allow it. Without SMTP, Vaultwarden marks
-an invite accepted as soon as the invited account exists, and you
-still confirm it.
+**On both:** check each login's URI. It has to be `https://`, and its
+match detection decides which pages it fills (see
+[URI match](vault-onboarding.md#uri-match)). Default match detection
+means the base domain, so it fills on every host of that domain;
+**Host** narrows it to one. kharond refuses a fill when the tab does
+not match (`origin_mismatch`).
 
 The plans, the exact menus and the permission details are in
 [Customer vault onboarding](vault-onboarding.md).

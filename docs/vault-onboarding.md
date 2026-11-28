@@ -6,10 +6,13 @@ kharond does not own it. The customer unlocks it, and the keys stay
 in memory. This page is that vault: the organization, the collection,
 the dedicated account, the logins, and the API key file.
 
-It is the Bitwarden side of steps 2–4 in
-[The kharon account and its master password](deployment.md#the-kharon-account-and-its-master-password-req-dep-007).
-That section still generates the master password (`kharon init`) and
-installs the file on the broker. The runbook's order is
+It is the reference for
+[first run, steps 1–2](first-run.md#1-create-the-broker-account-an-organization-and-a-collection):
+what each Bitwarden screen does and why kharond needs it that way.
+`kharon setup` (step 3 there) then checks the key, lists the
+organizations and collections the account can see so nobody copies
+an ID by hand, and installs the key file on the broker. The managed
+runbook's order is
 [The customer's vault](managed-deploy-runbook.md#3-the-customers-vault).
 
 `[bitwarden]` is sync mode, which is the default (`mode = "sync"`).
@@ -175,6 +178,11 @@ place of the parenthetical reason. `--check` does not contact
 Bitwarden.
 
 ## organization_id and collection_ids
+
+`kharon setup` fills both in from what the account can see, so you
+pick from a list. This section is for checking them, or for writing
+them by hand (`kharon setup --no-discover` takes them as
+`--organization-id` and `--collection-id`).
 
 Both keys are UUIDs. kharond lowercases them. Any case is accepted.
 A bad value is `invalid_uuid`:

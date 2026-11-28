@@ -1,5 +1,11 @@
 # Deploying kharon
 
+**New install?** Start with [First run](first-run.md). It takes you
+through `kharon setup`, the agent-host bundle and `kharon doctor` to
+a first fill, and links back here for detail. This guide is the
+reference: what each piece does, and how to set it up by hand when
+setup does not cover your shape.
+
 kharon runs on two machines (SPEC §3.3, option (a)):
 
 - **Broker host.** Your hardware. It runs kharond and, if you
@@ -379,6 +385,12 @@ encrypted keys and is then left with an offline attack on its
 master password. So the master password must be long and random,
 not something a person chose:
 
+`kharon setup` does steps 2–4's broker side for you: it checks the
+key, discovers the organization and collection, and writes the key
+file with the owner and mode below. The order is
+[first run, steps 1–3](first-run.md#1-create-the-broker-account-an-organization-and-a-collection).
+The steps here are the manual equivalent.
+
 1. Generate it with `kharon init`, in an interactive terminal on
    any machine that has the CLI, for example from the Compose
    example's image:
@@ -421,7 +433,10 @@ match, and the API key JSON — are in
 ### Agent tokens (REQ-API-003)
 
 Each agent has one bearer token, `kh_agent_<id>_<64 hex>`. kharond
-stores only its Argon2id PHC hash (`token_hash`). Mint the token on
+stores only its Argon2id PHC hash (`token_hash`). `kharon setup`
+mints the first agent's token and writes its hash into the config
+([first run, step 3](first-run.md#3-run-kharon-setup)). For another
+agent, or to rotate a token, mint the token on
 any machine that has the CLI, in an interactive terminal, for
 example from the Compose example's image:
 
@@ -535,6 +550,15 @@ both on a specific address, never `0.0.0.0` or `::` (REQ-DEP-006):
   `via = "agent_connector"`.
 - `[connector]` — the raw TLS accept the connector dials. Different
   port from `[api]`. Same certificate is fine.
+
+`kharon setup --cdp-via agent-connector --public-host <host>` does
+this section's broker side for the WebSocket shape: it mints the
+tunnel credential, generates the `[connector]` certificate and key,
+writes the config and a Compose override that mounts them, and puts
+everything the agent host needs into one bundle
+([first run, steps 3 and 5](first-run.md#3-run-kharon-setup)). The
+steps below are the manual equivalent, and the only way to a raw TLS
+`[connector] listen` on a VPN address.
 
 On the broker host, mint a tunnel credential. It is not an agent API
 token and cannot call `fill`:
@@ -1914,7 +1938,9 @@ Same Chromium user, ptrace scope, and password-manager policy as path
 [`deploy/agent-host/provision-connector.sh`](../deploy/agent-host/provision-connector.sh)
 installs that, plus the connector, on Debian 12 or 13. The binary and
 the tunnel credential file are produced on the broker side (above);
-this host only receives them.
+this host only receives them. With an agent-host bundle from
+`kharon setup`, its files supply every value below; see
+[first run, step 5](first-run.md#5-apply-the-agent-host-bundle).
 
 ```sh
 sudo CONNECTOR_BIN=./kharon-agent-connector \

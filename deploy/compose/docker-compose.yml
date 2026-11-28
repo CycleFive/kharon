@@ -8,7 +8,8 @@
 # because a container that joins `service:kharon` is stranded when
 # kharond restarts; the holder never restarts for that.
 #
-# Copy kharon.toml.example to kharon.toml and fill it in. Secrets
+# `sudo kharon setup` (docs/first-run.md) writes kharon.toml and the API
+# key file; or copy kharon.toml.example to kharon.toml and fill it in. Secrets
 # (README: Compose keeps the host file's owner and mode):
 #   secrets/kharon_bw_api_key.json        uid 10001, mode 0400
 #   secrets/cloudflared_tunnel_token      uid 65532, mode 0400

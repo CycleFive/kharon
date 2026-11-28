@@ -196,9 +196,10 @@ sudo kharon setup --cdp-via agent-connector \
   --owner-origin https://kharon-owner.example.com
 ```
 
-If `/usr/local/bin/kharon` is already there from an earlier host
-install, don't overwrite it: install the new binary somewhere else,
-such as `~/bin/kharon`, and run `sudo ~/bin/kharon setup …`. Setup asks
+`/usr/local/bin/kharon` is only a suggestion: the CLI runs from any
+path. If that path is already taken by an earlier host install, don't
+overwrite it. Install the new binary somewhere else, such as
+`~/bin/kharon`, and run `sudo ~/bin/kharon setup …`. Setup asks
 its questions on a terminal, so over ssh use `ssh -t`, or pass
 `--non-interactive` with every answer given as a flag.
 
@@ -210,7 +211,7 @@ Setup asks, on the terminal:
 | Bitwarden or Vaultwarden server URL | Enter for Bitwarden US cloud, or your server's `https://` URL |
 | The kharon account's email | The dedicated account's email |
 | API key client_id, then client_secret | From step 2. The secret is read with echo off. Or pass `--api-key-json <file>` instead |
-| Organization number, collections | Pick from the list. Collections show as IDs with item counts: their names are encrypted |
+| Organization number, collections | Pick from the list. Collections show as IDs with item counts: their names are encrypted. With one organization and one collection, setup asks nothing and prints its pick |
 | First agent's id | Enter for `assistant` |
 | The agent's Chromium CDP endpoint | Enter for `ws://127.0.0.1:9222`, on the agent host's loopback |
 | ntfy server, topic, write-token file | Approval prompts and the off-host audit checkpoints go here. The defaults are `https://ntfy.sh` and a fresh random topic |
@@ -233,6 +234,14 @@ When it finishes, `deploy/compose` holds:
 Setup also prints `broker_pin = <64 hex>`. Keep that line on screen
 for step 5: it is how the agent host knows the bundle arrived
 unaltered.
+
+If you passed `--api-key-json`, delete that file now
+(`rm <file>`). Setup has written kharond's own copy.
+
+Setup's closing "Next:" line, and `kharon doctor`'s fix lines, give
+bare `kharon unlock` and `kharon passkey-enroll`. In the Compose
+layout, run every `kharon` command against the running container:
+`docker compose exec kharon kharon …`.
 
 Every question has a flag of the same name, and `--answers <file>`
 takes them as TOML, so `--non-interactive` runs the whole thing from
@@ -308,6 +317,14 @@ root-owned when setup ran as root, so for example:
 sudo tar -C secrets -cf - agent-bundle-assistant | ssh agent-host 'umask 077; tar -xf -'
 ```
 
+If the broker host can't reach the agent host, relay the bundle
+through a machine that can reach both. Pack it into a tar on the
+broker (`umask 077`, mode `0600`), copy the tar on with `scp`, keep it
+`0600` in a `0700` directory at each hop, and shred each copy once it
+has moved on. Never unpack the tar along the way. Compare the tar's
+`sha256sum` at both ends. The hash reveals nothing about the secrets
+inside, so it is safe to compare in chat.
+
 **On the agent host**, check that `broker-pin` matches the
 `broker_pin` setup printed, then install the connector. Build the
 binary from the same checkout with
@@ -324,8 +341,11 @@ the same way.
 
   It creates the `connector` user, installs the credential (`0400`)
   and `connector.toml`, runs `kharon-agent-connector --check`, and
-  starts the connector under systemd (or prints the command for your
-  supervisor). For a runtime where you are not root, or have no shell,
+  starts the connector under systemd. Without systemd, it prints
+  the command instead: run that as the `connector` user under your
+  own supervisor (for example
+  `sudo runuser -u connector -- /usr/local/bin/kharon-agent-connector --config /etc/kharon-connector/connector.toml`).
+  The connector logs `authenticated` once the broker accepts it. For a runtime where you are not root, or have no shell,
   see [Agent side: hosted and root runtimes](agent-runtime-setup.md).
 
 - **On a bare Debian 12 or 13 machine**, let

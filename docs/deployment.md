@@ -1551,8 +1551,9 @@ lock, idle or manual, leaves Connects alone.
 ### Creating the tunnel (owner)
 
 In the Cloudflare dashboard (Zero Trust, Networks, Tunnels), create a
-dashboard-managed tunnel. Add public-hostname routes for
-`kharon.twkr.io`:
+dashboard-managed tunnel. Add public-hostname routes for your
+gateway hostname (`kharon.twkr.io` on the managed deploy; whatever you
+pass to `kharon setup --public-host` on yours):
 
 | Path | Service |
 |---|---|
@@ -1570,7 +1571,9 @@ Without them a dashboard cannot discover the authorization server.
 The owner hostname has its own route; see
 [Publishing the owner UI](#publishing-the-owner-ui).
 
-The dashboard creates the proxied DNS record. Copy the tunnel token
+The dashboard creates the proxied DNS record. Doing the same through
+the Cloudflare API takes an API token with Account → Cloudflare Tunnel
+→ Edit and Zone → DNS → Edit. Copy the tunnel token
 into the secret file without echoing it or putting it in argv, as in
 the [compose README](../deploy/compose/README.md#run-it): `umask 077`,
 then `cloudflared tunnel token <name> > secrets/cloudflared_tunnel_token`

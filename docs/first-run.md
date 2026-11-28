@@ -42,12 +42,20 @@ which wraps these same steps with who does what.
   checkout of a kharon release that has `kharon setup` (any release
   after v0.5.0). OS and sizing notes are in
   [Host install](broker-lifecycle.md#host-install).
+- **The kharon image, built on the broker** before step 1, so that
+  `kharon init` and `kharon setup` are at hand:
+  `cd deploy/compose && docker compose build kharon`. It builds from
+  source; on 2 vCPU with about 1 GB of free memory it took about
+  4.5 minutes.
 - **A Cloudflare tunnel with two hostnames**, the gateway and the
   owner UI, both pointing at the broker. Agents and the connector
   reach kharond only through it. Creating it is in
   [Creating the tunnel](deployment.md#creating-the-tunnel-owner) and
   [Publishing the owner UI](deployment.md#publishing-the-owner-ui),
-  steps 3–4. You need the tunnel token for step 4 below.
+  steps 3–4. You need the tunnel token for step 4 below. To create
+  the tunnel and its DNS records with the Cloudflare API rather than
+  the dashboard, the API token needs **Account → Cloudflare Tunnel →
+  Edit** and **Zone → DNS → Edit** on the zone.
 - **An agent host** with Chromium serving CDP on its loopback
   (`127.0.0.1:9222`), or a Debian 12 or 13 machine where the
   provisioning script can install it (step 5).
@@ -62,11 +70,9 @@ grant kharon access: there is nothing else to grant.
 **First, the account's master password.** Anyone with the account's
 API key file and a copy of the server's data is left with an offline
 attack on that password, so it must be long and random (REQ-DEP-007).
-Let kharon generate it, in a terminal on any machine with Docker:
+Let kharon generate it, in a terminal, from the image you built:
 
 ```sh
-cd deploy/compose
-docker compose build kharon
 docker run --rm -it --entrypoint kharon kharon:local init
 ```
 
@@ -74,6 +80,9 @@ It prints a 160-bit password once, to the terminal only. Store it in
 your own vault, outside the kharon organization. kharon never keeps
 it. (`kharon setup` offers the same thing if you answer `n` to its
 first question, and then walks you through the rest of this step.)
+If you pick the password some other way, take it from a password
+generator at 128 bits or more, for example 22 or more random letters
+and digits. Never reuse one.
 
 **Then, in the web vault:**
 
@@ -92,6 +101,20 @@ first question, and then walks you through the rest of this step.)
    detection decides which pages it fills (see
    [URI match](vault-onboarding.md#uri-match)). kharond refuses a fill
    when the tab does not match (`origin_mismatch`).
+
+**The organization is yours, not the dedicated account's.** Create it
+signed in as yourself. If the dedicated account creates it, it becomes
+the organization's Owner, and its API key can then administer the
+organization, not just read one collection. Neither `kharon setup` nor
+kharond checks the role yet, so this is on you: the account stays a
+**User** with **View items**, never Owner, Admin or Manage.
+
+**On Vaultwarden**, there are no plans to pick: any organization is
+enough. If the server has signups disabled, create the dedicated
+account through an invite (from the admin page or the organization),
+or have the server's admin allow it. Without SMTP, Vaultwarden marks
+an invite accepted as soon as the invited account exists, and you
+still confirm it.
 
 The plans, the exact menus and the permission details are in
 [Customer vault onboarding](vault-onboarding.md).
@@ -113,6 +136,12 @@ JSON file that only you can read:
   "client_secret": "…"
 }
 ```
+
+If the broker is a different machine from the one with the web vault,
+create that file on the broker itself under `umask 077`, or copy it
+there out of band (`scp`, never chat or email). Keep it `0600` and
+pass it to setup as `--api-key-json <file>`. Delete it once setup has
+finished, because setup writes its own copy for kharond.
 
 ## 3. Run `kharon setup`
 
@@ -139,6 +168,12 @@ sudo kharon setup --cdp-via agent-connector \
   --public-host kharon.example.com \
   --owner-origin https://kharon-owner.example.com
 ```
+
+If `/usr/local/bin/kharon` is already there from an earlier host
+install, don't overwrite it: install the new binary somewhere else,
+such as `~/bin/kharon`, and run `sudo ~/bin/kharon setup …`. Setup asks
+its questions on a terminal, so over ssh use `ssh -t`, or pass
+`--non-interactive` with every answer given as a flag.
 
 Setup asks, on the terminal:
 
